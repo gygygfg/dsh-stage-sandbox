@@ -1,3 +1,21 @@
 node_modules
 lib
 *.log
+
+# Build output
+dist/
+coverage/
+*.tsbuildinfo
+
+# Test / ebk packaging run outputs
+ebk/container-artifacts/
+ebk/compose/
+ebk/storage/
+ebk/linux-shared/
+/compose/
+/storage/
+/artifacts/
+
+# ebk run artifacts, except the committed host reference result
+ebk/artifacts/*
+!ebk/artifacts/RESULT_linux_host.json

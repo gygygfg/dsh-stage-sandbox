@@ -1,14 +1,14 @@
 /**
- * Platform runtime backends for the local sandbox provider. Each backend owns
- * one host platform's functionally probed runner chain and reports the
- * capability set the PAL contract exposes. A backend is selected by
- * `process.platform` through {@link SandboxPal}; the provider never branches on
- * an operating-system name.
- * @module dsh-sandbox-plugin/backends
+ * The Linux runtime backend for the local sandbox provider. It owns the
+ * functionally probed runner chain (bubblewrap first, the Landlock launcher as
+ * the unprivileged fallback) and reports the capability set the PAL contract
+ * exposes. A host with no usable rung fails closed rather than returning the
+ * original argv.
+ * @module dsh-sandbox-linux/backends
  */
 
 import { spawnSync } from 'node:child_process'
-import { release, tmpdir } from 'node:os'
+import { release } from 'node:os'
 import {
   LAUNCHER_BIN,
   LAUNCHER_FAILURE_EXIT,
@@ -16,116 +16,79 @@ import {
 } from '@deepseek-ai/node-addon-system/landlock-run'
 import { SandboxUnavailableError } from '@deepseek-ai/dsh-sandbox'
 import type { ConfinedArgv, RunnerFailureRule, SandboxEnforcement, SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
-import type { CapabilityReport, CapabilityStatus, RuntimeBackend, RuntimeBackendId, SandboxCapability } from '@deepseek-ai/dsh-sandbox-pal'
+import type { CapabilityReport, CapabilityStatus, EnvironmentFingerprint, ExecutionValidation, RuntimeBackend, RuntimeBackendId, SandboxCapability } from './pal/index.ts'
+import { environmentFingerprint, validateExecution } from './pal/probe.ts'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
-import { bwrapProfileArgs, seatbeltProfileArgs } from './profiles.ts'
 
 /** The backend implementation's own version, bound into execution intents. */
 const BACKEND_VERSION = '1'
 
-/** One confinement runner a platform chain can select. */
-export type Runner = 'bwrap' | 'landlock' | 'seatbelt' | 'windows-acl'
+/** One confinement runner the Linux chain can select. */
+export type Runner = 'bwrap' | 'landlock'
 
 /** The chain's verdict: which runner confines, and how completely it enforces. */
 export type SelectedRunner = { runner: Runner; enforcement: SandboxEnforcement }
 
 /**
- * Test hook: inject probe verdicts, a fake launcher, a platform, or a chain
- * without real runners. The provider owns the object; a backend reads it
- * through {@link BackendDeps.internals} at call time so an assignment after
- * plugin load is observed.
+ * Test hook: inject probe verdicts, a fake launcher, a platform, a chain, or
+ * an execution validation without real runners. The provider owns the object;
+ * a backend reads it through {@link BackendDeps.internals} at call time so an
+ * assignment after plugin load is observed.
  */
 export interface SandboxInternals {
-  /** Replaces `process.platform` for chain selection (exercise any platform's chain from any host). */
+  /** Replaces `process.platform` for chain selection (exercise the Linux chain from any host). */
   platform?: string
-  /** Replaces the platform's chain wholesale (walk mechanics — e.g. probing a rung the product chains only reach unprobed). */
+  /** Replaces the platform's chain wholesale. */
   chain?: readonly Runner[]
-  /** Replaces the functional `bwrap` probe (the Linux chain's first rung). */
+  /** Replaces the functional `bwrap` probe (the chain's first rung). */
   probeBwrap?: () => boolean
-  /** Replaces the functional Landlock launcher probe (the Linux chain's second rung). */
+  /** Replaces the functional Landlock launcher probe (the chain's second rung). */
   probeLandlock?: (launcher: string) => SandboxEnforcement | 'unusable'
-  /** Replaces the functional Seatbelt probe (the darwin chain's sole rung — only consulted if that chain ever grows). */
-  probeSeatbelt?: (seatbeltExec: string) => boolean
   /** Replaces the resolved `landlock-run` launcher path (a fake launcher script). */
   landlockLauncher?: string
-  /** Replaces the `sandbox-exec` executable the probe and wraps invoke (a fake script). */
-  seatbeltExec?: string
-  /** Replaces the resolved windows-acl runner argv prefix (a fake runner). */
-  windowsAclRunnerArgs?: string[]
-  /** Replaces the resolved windows-acl runner built entry path (a fake lib/runner.js location). */
-  windowsAclRunnerEntry?: string
-  /** Replaces the functional windows-acl probe (the win32 chain's sole rung — only consulted if that chain ever grows). */
-  probeWindowsAcl?: () => boolean
-  /** Replaces the private-temp-directory removal at provider dispose (a throwing fake exercises the cleanup-failure path). */
-  rmTempDir?: (path: string) => void
+  /** Replaces the actual-execution validation (create/read/modify/delete/dir/capture/cleanup). */
+  probeExecution?: () => ExecutionValidation
+  /** Replaces the measured environment fingerprint. */
+  environment?: () => EnvironmentFingerprint
 }
 
 /**
- * The runner chain per platform — selection is BY PLATFORM first, probes
- * second: a platform's chain is probed in preference order only when it has
- * MORE than one candidate (probing arbitrates; it does not re-validate a
- * choice that has no alternative). A platform with no chain fails closed at
- * `confine()`. Linux prefers `bwrap` (its mount profile is closest to the
- * mode vocabulary) over the Landlock launcher; darwin has exactly one
- * candidate, selected without any probe.
+ * The runner chain. Linux prefers `bwrap` (its mount profile is closest to the
+ * mode vocabulary) over the Landlock launcher. The chain has two rungs, so it
+ * is probed in order: the first usable rung confines.
  */
 export const PLATFORM_CHAINS: Record<string, readonly Runner[]> = {
   linux: ['bwrap', 'landlock'],
-  darwin: ['seatbelt'],
-  // The Windows restricted-token runner (@deepseek-ai/dsh-sandbox-windows-acl):
-  // a sole candidate, selected without a probe — its execution-time refusal
-  // fails closed through its stderr signature (windows-acl-run:) and exit 127.
-  win32: ['windows-acl'],
 }
 
 /**
- * Enforcement completeness a rung claims when selected WITHOUT a probe (a
- * chain of one). `bwrap` and Seatbelt govern every promised file effect by
- * construction, so the claim is a profile fact; `landlock` is listed for the
- * table's totality but is unreachable without a probe (the Linux chain has
- * two rungs, so it is only ever selected through its probe, whose report is
- * what distinguishes full from per-ABI-partial — and the launcher additionally
- * self-reports partial enforcement on stderr at every confined run).
+ * Enforcement completeness a rung claims when selected WITHOUT a probe. Both
+ * govern every promised file effect by construction; the Landlock launcher is
+ * only ever selected through its probe, whose report distinguishes full from
+ * per-ABI-partial.
  */
 export const STATIC_ENFORCEMENT: Record<Runner, SandboxEnforcement> = {
   bwrap: 'full',
   landlock: 'full',
-  seatbelt: 'full',
-  // WRITE_RESTRICTED needs Everyone in both restricting lists for process
-  // initialization. An external object that grants Everyone write access
-  // therefore remains writable, and NTFS hard links can alias a granted
-  // workspace file to a path outside it. The backend enforces the remaining
-  // ACL-addressable surface but must not advertise the absolute promise.
-  'windows-acl': 'partial',
 }
 
 /**
- * The denial dialect each runner's kernel speaks — the case-insensitive stderr substrings a
- * denied file effect produces under it, carried on every wrap (the seam's
- * `ConfinedArgv.denialSignatures`).
+ * The denial dialect each runner's kernel speaks — the case-insensitive stderr
+ * substrings a denied file effect produces under it, carried on every wrap (the
+ * seam's `ConfinedArgv.denialSignatures`).
  */
 export const DENIAL_SIGNATURES = {
   bwrap: ['read-only file system'],
   landlock: ['permission denied'],
-  seatbelt: ['operation not permitted'],
-  // pwsh/.NET: "Access to the path '...' is denied."; cmd: "Access is denied.";
-  // node EACCES: "permission denied".
-  'windows-acl': ['access is denied', 'access to the path', 'permission denied'],
   runnerCommand: ['read-only file system', 'permission denied'],
 } as const satisfies Record<Runner | 'runnerCommand', readonly string[]>
 
 /**
  * Runner-owned fatal diagnostics. Landlock has a versioned exit-125 plus
- * fatal-line launcher-failure contract. Bubblewrap's current fatal paths exit
- * 1 but its public contract does not reserve that status, while sandbox-exec
- * publishes no launcher-failure status; those backends remain signature-only.
- * The windows-acl runner prints `windows-acl-run: <detail>` on every
- * runner-side failure and exits 127 — the rule is exit-gated on that status
- * so a confined command that merely PRINTS the signature (or a runner
- * cleanup failure reported on a non-zero child exit) is never misclassified
- * as "the command did not run". Keep the Landlock tuple aligned with the
- * assembled snapshot fixture at
- * `packages/test-support/session-snapshot/tests/fixtures/partial-landlock-sandbox.ts`.
+ * fatal-line launcher-failure contract; bubblewrap's current fatal paths exit 1
+ * but its public contract does not reserve that status, so bwrap remains
+ * signature-only. Keep the Landlock tuple aligned with the assembled snapshot
+ * fixture.
  */
 export const RUNNER_FAILURE_RULES = {
   bwrap: [{ fatalSignatures: ['bwrap: '] }],
@@ -134,8 +97,6 @@ export const RUNNER_FAILURE_RULES = {
     fatalSignatures: [`${LAUNCHER_BIN}: `],
     informationalLines: [`${LAUNCHER_BIN}: partial enforcement (older Landlock ABI)`],
   }],
-  seatbelt: [{ fatalSignatures: ['sandbox-exec: '] }],
-  'windows-acl': [{ allowedExitCodes: [127], fatalSignatures: ['windows-acl-run: '] }],
 } as const satisfies Record<Runner, readonly RunnerFailureRule[]>
 
 /** Every capability absent — the base a runner profile overlays. */
@@ -153,33 +114,17 @@ const NO_CAPABILITIES: Record<SandboxCapability, CapabilityStatus> = {
 }
 
 /**
- * What each runner can enforce, as the PAL capability report. `bwrap` and the
- * file-effect runners govern the mode's file effects (enforced, except the
- * Windows ACL runner's documented Everyone and hard-link boundaries) but none
- * provides the resource, syscall, transaction, identity, reparse, or network
- * dimensions; bwrap is the only one that adds namespace isolation.
+ * What each runner can enforce, as the PAL capability report. Both govern the
+ * mode's file effects; bwrap is the only one that adds namespace isolation.
  */
 export const RUNNER_CAPABILITIES: Record<Runner, Record<SandboxCapability, CapabilityStatus>> = {
   bwrap: { ...NO_CAPABILITIES, fileEffectPolicy: 'enforced', isolation: 'partial', privilegeReduction: 'partial' },
   landlock: { ...NO_CAPABILITIES, fileEffectPolicy: 'enforced', privilegeReduction: 'partial' },
-  seatbelt: { ...NO_CAPABILITIES, fileEffectPolicy: 'enforced' },
-  'windows-acl': {
-    ...NO_CAPABILITIES,
-    fileEffectPolicy: 'partial',
-    isolation: 'partial',
-    integrity: 'partial',
-    privilegeReduction: 'partial',
-  },
 }
 
-/**
- * The host platforms a backend serves, keyed by backend id. `process.platform`
- * is `win32`, while the backend id is `windows`.
- */
+/** The host platform the Linux backend serves. */
 export const PLATFORM_BACKENDS: readonly { id: RuntimeBackendId; platform: string }[] = [
   { id: 'linux', platform: 'linux' },
-  { id: 'darwin', platform: 'darwin' },
-  { id: 'windows', platform: 'win32' },
 ]
 
 /**
@@ -192,78 +137,45 @@ export function backendIdForPlatform(platform: string): RuntimeBackendId | undef
   return PLATFORM_BACKENDS.find(entry => entry.platform === platform)?.id
 }
 
-/** Probe whether `bwrap` can create the profile; the backend caches the bounded result. */
-function defaultProbeBwrap(timeoutMs: number): boolean {
-  const probe = spawnSync('bwrap', [...bwrapProfileArgs({ mode: 'read-only', workspaceRoot: '/' }), '--', 'true'], {
-    timeout: timeoutMs,
-    stdio: 'ignore',
-  })
-  return probe.status === 0
-}
-
 /**
- * Functional Seatbelt probe: apply the real `read-only` profile through
- * `sandbox-exec -p` and run `true` under it — exit 0 means the kernel
- * accepted and enforced the profile (`sandbox-exec` exits non-zero when
- * `sandbox_init` refuses it). A missing `sandbox-exec` (every non-macOS
- * host) fails the spawn and probes `unusable`, exactly like the other
- * rungs' absent binaries. Apple marks the CLI deprecated but ships it on
- * every macOS; if it ever disappears, this probe is what fails closed.
+ * Probe whether `bwrap` can create the profile — including the seccomp wrapper
+ * when enabled, so a host that cannot load the filter is reported unusable
+ * rather than silently degrading. The provider's `runnerArgv` owns the flag
+ * dialect, keeping the probe and real runs in lockstep.
  */
-function defaultProbeSeatbelt(seatbeltExec: string, timeoutMs: number): boolean {
-  const probe = spawnSync(seatbeltExec, [...seatbeltProfileArgs({ mode: 'read-only', workspaceRoot: '/' }), '--', 'true'], {
-    timeout: timeoutMs,
-    stdio: 'ignore',
-  })
-  return probe.status === 0
-}
-
-/**
- * Functional windows-acl probe: run the runner in read-only mode (zero grants,
- * no ACL mutation) around `cmd /c exit 0` — exit 0 means the runner created
- * the restricted token and spawned the child under it. The win32 chain is a
- * sole candidate, so the product never probes; the probe exists for override
- * chains and mirrors the other rungs' shape.
- */
-function defaultProbeWindowsAcl(runnerInvocation: string[], timeoutMs: number): boolean {
-  const program = runnerInvocation[0]
+function defaultProbeBwrap(runnerArgv: (runner: Runner, policy: SandboxPolicy) => string[], timeoutMs: number): boolean {
+  const [program, ...args] = [...runnerArgv('bwrap', { mode: 'read-only', workspaceRoot: '/' }), '--', 'true']
   if (program === undefined) return false
-  const probe = spawnSync(program, [
-    ...runnerInvocation.slice(1),
-    '--workspace', tmpdir(), '--temp', tmpdir(), '--mode', 'read-only',
-    '--', 'cmd', '/c', 'exit', '0',
-  ], {
-    timeout: timeoutMs,
-    stdio: 'ignore',
-  })
+  const probe = spawnSync(program, args, { timeout: timeoutMs, stdio: 'ignore' })
   return probe.status === 0
 }
 
 /**
  * The provider-owned hooks a backend needs: the test-internals accessor, the
- * probe timeout, the resolved runner executables, and the provider's runner
- * argv builder (which owns the per-session Windows ACL grants).
+ * probe timeout, the resolved Landlock launcher, the runner argv builder, and
+ * the runtime capability overrides.
  */
 export interface BackendDeps {
   /** The provider's current test internals, read at call time. */
   internals(): SandboxInternals
   /** Positive probe timeout in milliseconds. */
   probeTimeoutMs: number
-  /** The `sandbox-exec` executable to probe (test hook over the resolved one). */
-  seatbeltExec(): string
   /** The Landlock launcher to probe and exec (test hook over the resolved one). */
   landlockLauncher(): string
-  /** The windows-acl runner argv prefix (test hook over the resolved one). */
-  windowsAclRunnerInvocation(): string[]
-  /** The full runner argv for one policy, including the Windows ACL grant flags. */
+  /** The full runner argv for one policy. */
   runnerArgv(runner: Runner, policy: SandboxPolicy): string[]
+  /**
+   * Capability overrides the configured runtime actually provides (network
+   * control, syscall policy, resource limits). The provider computes these
+   * from its config and probes.
+   */
+  runtimeCapabilities(): Partial<Record<SandboxCapability, CapabilityStatus>>
 }
 
 /**
- * One host platform's sandbox backend. `selected()` walks and caches the
- * platform's runner chain once for the backend's lifetime; `probe()` projects
- * that verdict into a PAL capability report; `confine()` wraps argv with the
- * selected runner's dialect. A platform with no chain fails closed.
+ * The Linux sandbox backend. `selected()` walks and caches the runner chain
+ * once for the backend's lifetime; `probe()` projects that verdict into a PAL
+ * capability report; `confine()` wraps argv with the selected runner's dialect.
  */
 export class PlatformBackend implements RuntimeBackend {
   readonly id: RuntimeBackendId
@@ -272,11 +184,17 @@ export class PlatformBackend implements RuntimeBackend {
   private readonly platform: string
   /** Cached chain verdict; undefined until the first selection needs it. */
   private verdict: SelectedRunner | 'unusable' | undefined
+  /** Cached actual-execution validation, keyed by the backend's lifetime. */
+  private validation: ExecutionValidation | undefined
+  /** Cached measured environment fingerprint. */
+  private environment: EnvironmentFingerprint | undefined
+  private readonly deps: BackendDeps
 
-  constructor(id: RuntimeBackendId, platform: string, private readonly deps: BackendDeps) {
+  constructor(id: RuntimeBackendId, platform: string, deps: BackendDeps) {
     this.id = id
     this.platforms = [platform]
     this.platform = platform
+    this.deps = deps
   }
 
   /**
@@ -288,17 +206,28 @@ export class PlatformBackend implements RuntimeBackend {
   }
 
   /**
-   * Probe this host and report what the backend can enforce.
+   * Probe this host and report what the backend can enforce. The report
+   * includes the measured environment fingerprint and the actual-execution
+   * validation, so a capability verdict is bound to the deployment it was
+   * measured in.
    * @returns the capability report, or `unusable` when no chain rung is usable.
    */
   probe(): CapabilityReport | 'unusable' {
     const selected = this.selected()
     if (selected === 'unusable') return 'unusable'
+    const environment = this.environment ??= (this.deps.internals().environment ?? (() => environmentFingerprint()))()
+    const validation = this.validation ??= (this.deps.internals().probeExecution ?? (() => validateExecution({ environment })))()
+    const base = RUNNER_CAPABILITIES[selected.runner]
+    const capabilities = selected.runner === 'bwrap'
+      ? { ...base, ...this.deps.runtimeCapabilities() }
+      : base
     return {
       backendId: this.id,
       backendVersion: BACKEND_VERSION,
       kernelVersion: release(),
-      capabilities: RUNNER_CAPABILITIES[selected.runner],
+      capabilities,
+      environment,
+      validation,
     }
   }
 
@@ -320,13 +249,9 @@ export class PlatformBackend implements RuntimeBackend {
     }
   }
 
-  /** Walk this platform's chain: sole candidate unprobed, several probed in order, none usable → unavailable. */
+  /** Walk this platform's chain in preference order; none usable → unavailable. */
   private chainVerdict(): SelectedRunner | 'unusable' {
     const chain = this.deps.internals().chain ?? PLATFORM_CHAINS[this.platform] ?? []
-    const [first, ...rest] = chain
-    if (first === undefined) return 'unusable'
-    // A sole candidate needs no arbitration; its execution-time refusal still fails closed.
-    if (rest.length === 0) return { runner: first, enforcement: STATIC_ENFORCEMENT[first] }
     for (const runner of chain) {
       const enforcement = this.probeRunner(runner)
       if (enforcement !== 'unusable') return { runner, enforcement }
@@ -337,30 +262,15 @@ export class PlatformBackend implements RuntimeBackend {
   /** One rung's functional probe (each at most once, via the chain walk). */
   private probeRunner(runner: Runner): SandboxEnforcement | 'unusable' {
     const internals = this.deps.internals()
-    // bwrap's mount profile and Seatbelt's deny-file-write* profile govern
-    // every promised file effect by construction, so their passing probes
-    // are always full enforcement; the Landlock launcher's probe report
-    // distinguishes full from per-ABI-partial, while windows-acl is always
-    // partial for its documented Everyone and hard-link boundaries.
     switch (runner) {
       case 'bwrap': {
-        const probe = internals.probeBwrap ?? (() => defaultProbeBwrap(this.deps.probeTimeoutMs))
+        const probe = internals.probeBwrap ?? (() => defaultProbeBwrap(this.deps.runnerArgv, this.deps.probeTimeoutMs))
         return probe() ? 'full' : 'unusable'
       }
       case 'landlock': {
         const launcher = this.deps.landlockLauncher()
         const probe = internals.probeLandlock ?? (path => defaultProbeLandlock(path, { timeoutMs: this.deps.probeTimeoutMs }))
         return probe(launcher)
-      }
-      case 'seatbelt': {
-        const exec = this.deps.seatbeltExec()
-        const probe = internals.probeSeatbelt ?? (path => defaultProbeSeatbelt(path, this.deps.probeTimeoutMs))
-        return probe(exec) ? 'full' : 'unusable'
-      }
-      case 'windows-acl': {
-        const probe = internals.probeWindowsAcl
-          ?? (() => defaultProbeWindowsAcl(this.deps.windowsAclRunnerInvocation(), this.deps.probeTimeoutMs))
-        return probe() ? 'partial' : 'unusable'
       }
       default: return assertNever(runner)
     }

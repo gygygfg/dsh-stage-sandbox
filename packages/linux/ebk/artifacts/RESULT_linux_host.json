@@ -1,0 +1,27 @@
+{
+  "runId": "linux-host",
+  "platform": "linux",
+  "kernel": "6.12.90+deb13.1-amd64",
+  "runner": "bwrap (landlock-run absent)",
+  "profile": "bwrap --ro-bind / / --dev /dev --unshare-pid --proc /proc --die-with-parent --tmpfs /tmp --bind <ws> <ws>",
+  "results": {
+    "bwrap-available": { "passed": true, "detail": "bwrap ran the read-only profile" },
+    "readonly-root-denies-write": { "passed": true, "detail": "write outside the workspace denied (EROFS)" },
+    "workspace-bind-writable": { "passed": true, "detail": "workspace bind is writable" },
+    "private-pid-namespace": { "passed": true, "detail": "visible pids=4; /proc/1 is the sandbox itself" },
+    "landlock-launcher": { "passed": false, "detail": "landlock-run absent; bwrap rung selected" }
+  },
+  "findings": [
+    {
+      "id": "host-root-readable",
+      "severity": "high",
+      "detail": "The workspace-write profile ro-binds the whole host root, so any host file is readable (e.g. /etc/shadow). v2.3 requires reads to be authorized and the host full-root read-only mount to leave the default scheme."
+    },
+    {
+      "id": "no-network-isolation",
+      "severity": "high",
+      "detail": "The bwrap profile does not pass --unshare-net, so the sandbox enforces no network boundary. The observed NET-BLOCKED is environmental (the host itself cannot reach the target); the OFFLINE mode is not enforced by the backend."
+    }
+  ],
+  "passed": true
+}

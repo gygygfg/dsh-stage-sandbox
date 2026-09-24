@@ -1,47 +1,50 @@
 /**
- * Local sandbox provider. It selects a platform runtime backend through the
- * Platform Abstraction Layer (`SandboxPal`) and delegates confinement to it.
- * Each backend owns one platform's functionally probed runner chain and
- * reports the capability set the PAL contract exposes; a host with no backend,
- * or a backend whose chain has no usable rung, fails closed rather than
- * returning the original argv.
+ * Linux process-sandbox provider. It selects the Linux runtime backend through
+ * the Platform Abstraction Layer (`SandboxPal`) and delegates confinement to
+ * its runner chain (bubblewrap, with the Landlock launcher as the fallback). A
+ * host with no usable runner fails closed rather than returning the original
+ * argv.
  *
- * The windows-acl backend's write grants are provider-owned: the write SID is
- * the per-WORKSPACE identity derived from the canonical workspace path
- * (`workspaceWriteSid`), while every live session receives a RANDOM private
- * temp directory and its own derived capability (`tempWriteSid`). The
- * workspace-root ACE materializes once per workspace per server lifetime
- * and STANDS (the cross-session reuse cache — the exact-ACE skip makes
- * every later provision O(1) instead of re-propagating the tree per
- * session); the private-temp ACEs are revoked on dispose. The runner
- * receives both SIDs (their presence marks the seam-managed contract) and
- * stops managing DACLs itself. The rung reports partial enforcement because
- * WRITE_RESTRICTED must retain Everyone in its
- * restricting list and NTFS hard links alias one file object across paths.
- * @module dsh-sandbox-plugin
+ * The provider also owns the workspace-overlay registry: a workspace's command
+ * paths register their delta layer so the generic `ctx.sandbox.confine` call
+ * (which the harness shell/subprocess executors make) runs against the overlay.
+ * @module dsh-sandbox-linux
  */
 
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { join, resolve } from 'node:path'
 import { launcherPath as landlockLauncherPath } from '@deepseek-ai/node-addon-system/landlock-run'
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { SandboxProvider, SandboxUnavailableError } from '@deepseek-ai/dsh-sandbox'
 import type { ConfinedArgv, SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
-import { SandboxPal } from '@deepseek-ai/dsh-sandbox-pal'
-import type { SessionId } from '@deepseek-ai/dsh-session'
-import { AclWriteGrant, assertTempRootOutsideWorkspace, tempWriteSid, workspaceWriteSid } from '@deepseek-ai/dsh-sandbox-windows-acl'
+import { SandboxPal } from './pal/index.ts'
+import type { CapabilityReport, CapabilityStatus, SandboxCapability } from './pal/index.ts'
+import {
+  cgroupAvailable,
+  ensureSeccompFilter,
+  networkEnforced,
+  probeOverlaySupport,
+  seccompAvailable,
+  seccompWrapper,
+  DEFAULT_MASK_PATHS,
+  DEFAULT_PROC_MASK_PATHS,
+  DEFAULT_READONLY_PATHS,
+  DEFAULT_READONLY_ROOTS,
+  DEFAULT_TMPFS_ROOTS,
+} from './runtime/index.ts'
+import type { OverlaySpec, RuntimeOptions } from './runtime/index.ts'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
 import {
   DENIAL_SIGNATURES,
   PLATFORM_BACKENDS,
+  RUNNER_FAILURE_RULES,
   PlatformBackend,
   backendIdForPlatform,
 } from './backends.ts'
 import type { BackendDeps, Runner, SandboxInternals } from './backends.ts'
-import { bwrapProfileArgs, landlockProfileArgs, seatbeltProfileArgs } from './profiles.ts'
+import { bwrapProfileArgs, landlockProfileArgs } from './profiles.ts'
 
 export type { SandboxInternals } from './backends.ts'
 
@@ -67,13 +70,40 @@ export interface Config {
   runnerFailureSignatures?: string[]
   /** Positive timeout for each functional probe; zero would mean unbounded to Node. */
   probeTimeoutMs?: number
-}
-
-/** One live session/workspace pair's private temp directory and capability. */
-interface AclTempCapability {
-  dir: string
-  writeSid: string
-  grant: AclWriteGrant
+  /**
+   * The explicit network mode (v2.3 §9). `OFFLINE` and `CONTROLLED_ONLINE`
+   * create a private network namespace (all egress kernel-forced off);
+   * `OBSERVED_ONLINE` shares egress and only reports that direct paths are not
+   * covered. Defaults to `OBSERVED_ONLINE` so a plain deployment keeps
+   * working while honestly advertising the boundary.
+   */
+  networkMode?: string
+  /** Host directories exposed read-only inside the sandbox (minimal whitelist). */
+  readonlyRoots?: string[]
+  /** Host files/globs exposed read-only inside the sandbox. */
+  readonlyPaths?: string[]
+  /** Host sensitive paths masked (empty tmpfs for dirs, `/dev/null` for files). */
+  maskPaths?: string[]
+  /** Roots replaced by a private writable tmpfs under `workspace-write`. */
+  tmpfsRoots?: string[]
+  /** Dangerous `/proc` entries masked with an empty read-only file. */
+  procMaskPaths?: string[]
+  /** Whether the seccomp denylist baseline is applied. */
+  seccompEnabled?: boolean
+  /** An operator-supplied seccomp filter path (else a baseline is generated). */
+  seccompFilterPath?: string
+  /** When `true`, an unavailable filter refuses confined execution. */
+  requireSeccomp?: boolean
+  /** Whether cgroup v2 resource domains are created for staged executions. */
+  cgroupEnabled?: boolean
+  /** Memory cap as a fraction of host total (0..1). */
+  memoryRatio?: number
+  /** Maximum PIDs in a resource domain. */
+  pidsMax?: number
+  /** CPU quota as a percent of one core (`0` = unbounded). */
+  cpuMax?: number
+  /** The cgroup v2 mount root. */
+  cgroupBase?: string
 }
 
 /**
@@ -87,45 +117,91 @@ function assertPositiveFinite(name: string, value: number): void {
   }
 }
 
+/** Assemble the resolved runtime options from the schema-defaulted config. */
+function buildRuntimeOptions(config: Config): RuntimeOptions {
+  const networkMode = config.networkMode as string
+  if (networkMode !== 'OFFLINE' && networkMode !== 'CONTROLLED_ONLINE' && networkMode !== 'OBSERVED_ONLINE') {
+    throw new Error(`sandbox-local: networkMode must be OFFLINE, CONTROLLED_ONLINE, or OBSERVED_ONLINE (got '${networkMode}')`)
+  }
+  const filterPath = config.seccompFilterPath as string
+  return {
+    networkMode,
+    readonlyRoots: config.readonlyRoots as string[],
+    readonlyPaths: config.readonlyPaths as string[],
+    maskPaths: config.maskPaths as string[],
+    tmpfsRoots: config.tmpfsRoots as string[],
+    procMaskPaths: config.procMaskPaths as string[],
+    seccomp: {
+      enabled: config.seccompEnabled as boolean,
+      ...(filterPath === '' ? {} : { filterPath }),
+      require: config.requireSeccomp as boolean,
+    },
+    limits: {
+      enabled: config.cgroupEnabled as boolean,
+      memoryRatio: config.memoryRatio as number,
+      pidsMax: config.pidsMax as number,
+      cpuMax: config.cpuMax as number,
+      cgroupBase: config.cgroupBase as string,
+    },
+  }
+}
+
 /**
- * Local process-sandbox provider. Registers as `ctx.sandbox`. Selects a
- * {@link PlatformBackend} through `SandboxPal` and caches, on the windows-acl
- * backend, the write grants ({@link AclWriteGrant}: the standing
- * workspace-root grant per workspace and the revocable private-temp grant per
- * live session/workspace pair, the latter revoked on provider dispose); the
- * one-time probes spawn nothing else.
+ * Linux process-sandbox provider. Registers as `ctx.sandbox`. Selects a
+ * {@link PlatformBackend} through `SandboxPal`, owns the workspace-overlay
+ * registry, and caches the one-time probes for its lifetime.
  */
-export class CrossPlatformSandboxProvider extends SandboxProvider {
+export class LinuxSandboxProvider extends SandboxProvider {
   // Inline schema call: the config catalog walks `static Config` statically.
   static Config: z<Config> = z.object({
     runnerCommand: z.array(z.string()).default([]),
     runnerFailureSignatures: z.array(z.string()).default([]),
     probeTimeoutMs: z.natural().default(5_000),
+    networkMode: z.string().default('OBSERVED_ONLINE'),
+    readonlyRoots: z.array(z.string()).default([...DEFAULT_READONLY_ROOTS]),
+    readonlyPaths: z.array(z.string()).default([...DEFAULT_READONLY_PATHS]),
+    maskPaths: z.array(z.string()).default([...DEFAULT_MASK_PATHS]),
+    tmpfsRoots: z.array(z.string()).default([...DEFAULT_TMPFS_ROOTS]),
+    procMaskPaths: z.array(z.string()).default([...DEFAULT_PROC_MASK_PATHS]),
+    seccompEnabled: z.boolean().default(true),
+    seccompFilterPath: z.string().default(''),
+    requireSeccomp: z.boolean().default(false),
+    cgroupEnabled: z.boolean().default(true),
+    memoryRatio: z.number().default(0.75),
+    pidsMax: z.natural().default(8_192),
+    cpuMax: z.natural().default(0),
+    cgroupBase: z.string().default('/sys/fs/cgroup'),
   })
 
   /** Test hook (mirrors the bash executors' `internals`). */
   internals: SandboxInternals = {}
 
+  /** The resolved runtime isolation options (read-only). */
+  get runtimeOptions(): RuntimeOptions {
+    return this.runtime
+  }
+
   private readonly runnerCommand: string[] | undefined
   private readonly configuredRunnerFailureSignatures: string[]
   private readonly probeTimeoutMs: number
+  /** The resolved runtime isolation options (minimal root, masking, network, seccomp, limits). */
+  private readonly runtime: RuntimeOptions
+  /** The directory generated seccomp baselines are written under. */
+  private readonly seccompDir: string
   /** Lazily built PAL registry; undefined until the first confined wrap needs it. */
   private pal: SandboxPal<PlatformBackend> | undefined
+  /** Cached overlay-support verdict (bwrap overlays are a per-host fact). */
+  private overlaySupport: boolean | undefined
   /**
-   * Server-lifetime write grants (windows-acl rung): the STANDING
-   * workspace-root grant per workspace (its ACE is the cross-session reuse
-   * cache and outlives the provider — never revoked) and the REVOCABLE
-   * private-temp grant per live session/workspace pair (revoked on provider
-   * dispose).
+   * Overlay layers registered per canonical workspace root. A workspace's
+   * command paths register their delta layer here so the generic
+   * `ctx.sandbox.confine` call (which the harness shell/subprocess executors
+   * make) runs against the overlay without the executor needing to know.
    */
-  private readonly workspaceGrants = new Map<string, AclWriteGrant>()
-  private readonly tempCapabilities = new Map<string, AclTempCapability>()
+  private readonly overlays = new Map<string, OverlaySpec>()
 
   constructor(ctx: Context, config: Config) {
     super(ctx)
-    // The schema (static Config) defaults every field — the casts record
-    // those runtime facts. An empty runnerCommand means "not configured":
-    // use the platform chain.
     const runner = config.runnerCommand as string[]
     const runnerFailureSignatures = config.runnerFailureSignatures as string[]
     if (runner.length === 0 && runnerFailureSignatures.length > 0) {
@@ -141,12 +217,10 @@ export class CrossPlatformSandboxProvider extends SandboxProvider {
     this.configuredRunnerFailureSignatures = runnerFailureSignatures
     this.probeTimeoutMs = config.probeTimeoutMs as number
     assertPositiveFinite('probeTimeoutMs', this.probeTimeoutMs)
-    // The temp grants are revoked with the provider: a clean server
-    // shutdown leaves no temp ACEs behind (workspace ACEs stand by design —
-    // the reuse cache; an unclean shutdown leaves them for the next
-    // provision's exact-ACE skip).
+    this.runtime = buildRuntimeOptions(config)
+    this.seccompDir = join(tmpdir(), 'dsh-seccomp')
     ctx.effect(() => () => {
-      this.revokeAclGrants()
+      this.overlays.clear()
     })
   }
 
@@ -165,7 +239,7 @@ export class CrossPlatformSandboxProvider extends SandboxProvider {
     if (this.runnerCommand !== undefined) {
       const backendId = backendIdForPlatform(this.internals.platform ?? process.platform)
       return {
-        argv: [...this.runnerCommand, ...bwrapProfileArgs(policy), '--', ...argv],
+        argv: [...this.runnerCommand, ...bwrapProfileArgs(policy, this.runtime), '--', ...argv],
         ...(backendId === undefined ? {} : { backendId }),
         enforcement: 'full',
         denialSignatures: DENIAL_SIGNATURES.runnerCommand,
@@ -181,6 +255,93 @@ export class CrossPlatformSandboxProvider extends SandboxProvider {
   }
 
   /**
+   * Wrap `argv` so the workspace root is an overlay (lower = the real root,
+   * upper = the private delta layer). Only the Linux `bwrap` rung can express
+   * this; a Landlock fallback and the configured `runnerCommand` fall back to
+   * the plain {@link confine}. Callers check {@link overlaySupported} first so
+   * the fallback and the chosen path stay consistent.
+   * @param argv - the exact argv the caller is about to spawn.
+   * @param policy - the file-effect policy this execution runs under.
+   * @param overlay - the writable upper and work directories.
+   * @returns the wrapped argv plus the selected backend's enforcement and dialect.
+   */
+  confineOverlay(argv: readonly string[], policy: SandboxPolicy, overlay: OverlaySpec): ConfinedArgv {
+    const platform = this.internals.platform ?? process.platform
+    const backend = this.palOf().backendFor(platform)
+    if (backend === undefined) throw new SandboxUnavailableError(policy.mode)
+    if (backend.probe() === 'unusable') throw new SandboxUnavailableError(policy.mode)
+    const selected = backend.selected()
+    if (this.runnerCommand !== undefined || selected === 'unusable' || selected.runner !== 'bwrap') {
+      return this.confine(argv, policy)
+    }
+    return {
+      argv: [...this.bwrapRunnerArgv(policy, overlay), '--', ...argv],
+      backendId: backend.id,
+      enforcement: selected.enforcement,
+      denialSignatures: DENIAL_SIGNATURES.bwrap,
+      runnerFailureRules: RUNNER_FAILURE_RULES.bwrap,
+    }
+  }
+
+  /**
+   * Whether this host can execute commands through a bwrap overlay (the bwrap
+   * rung with working overlayfs). The verdict is cached for the provider
+   * lifetime; a false verdict means callers must use the copy-based fallback.
+   * @returns `true` when overlays are usable here.
+   */
+  overlaySupported(): boolean {
+    if ((this.internals.platform ?? process.platform) !== 'linux') return false
+    if (this.runnerCommand !== undefined) return false
+    return this.overlaySupport ??= probeOverlaySupport(this.probeTimeoutMs)
+  }
+
+  /**
+   * Register the overlay layer for one workspace root. Every subsequent
+   * `confine` call whose policy root matches runs the workspace root as an
+   * overlay, so a shell/subprocess executor keeps calling `ctx.sandbox.confine`
+   * while actually writing to the delta layer. Idempotent per root.
+   * @param workspaceRoot - the real workspace root.
+   * @param overlay - the writable upper and work directories.
+   */
+  registerOverlay(workspaceRoot: string, overlay: OverlaySpec): void {
+    this.overlays.set(resolve(workspaceRoot), overlay)
+  }
+
+  /**
+   * Forget a workspace root's overlay (a disposed branch's delta is gone).
+   * @param workspaceRoot - the real workspace root.
+   */
+  unregisterOverlay(workspaceRoot: string): void {
+    this.overlays.delete(resolve(workspaceRoot))
+  }
+
+  /**
+   * The overlay for a policy, or `undefined` when none is registered, the mode
+   * cannot overlay, or the registered layer no longer exists (a stale entry is
+   * ignored rather than failing the command).
+   */
+  private overlayFor(policy: SandboxPolicy): OverlaySpec | undefined {
+    if (policy.mode !== 'workspace-write') return undefined
+    const overlay = this.overlays.get(resolve(policy.workspaceRoot))
+    if (overlay === undefined) return undefined
+    if (!existsSync(overlay.upper) || !existsSync(overlay.work)) return undefined
+    return overlay
+  }
+
+  /**
+   * Probe the backend that serves a host platform, for the control plane's
+   * capability gate. This is a per-host fact; the underlying PAL verdict is
+   * cached for the provider's lifetime.
+   * @param hostPlatform - a `process.platform` value (`linux`).
+   * @returns the capability report, or `unusable` when no backend can confine here.
+   */
+  reportForHostPlatform(hostPlatform: string): CapabilityReport | 'unusable' {
+    const backend = this.palOf().backendFor(hostPlatform)
+    if (backend === undefined) return 'unusable'
+    return backend.probe()
+  }
+
+  /**
    * Build the PAL registry once, after `internals` is final: the provider
    * assigns `internals` after plugin load, so the registry and its backends
    * read the live object through {@link BackendDeps.internals} at call time.
@@ -190,10 +351,9 @@ export class CrossPlatformSandboxProvider extends SandboxProvider {
     const deps: BackendDeps = {
       internals: () => this.internals,
       probeTimeoutMs: this.probeTimeoutMs,
-      seatbeltExec: () => this.seatbeltExec(),
       landlockLauncher: () => this.landlockLauncher(),
-      windowsAclRunnerInvocation: () => this.windowsAclRunnerInvocation(),
       runnerArgv: (runner, policy) => this.runnerArgv(runner, policy),
+      runtimeCapabilities: () => this.runtimeCapabilities(),
     }
     const pal = new SandboxPal<PlatformBackend>()
     for (const { id, platform } of PLATFORM_BACKENDS) pal.register(new PlatformBackend(id, platform, deps))
@@ -204,177 +364,60 @@ export class CrossPlatformSandboxProvider extends SandboxProvider {
   /** The selected rung's runner invocation (program + profile arguments) for one policy. */
   private runnerArgv(runner: Runner, policy: SandboxPolicy): string[] {
     switch (runner) {
-      case 'bwrap': return ['bwrap', ...bwrapProfileArgs(policy)]
+      case 'bwrap': return this.bwrapRunnerArgv(policy, this.overlayFor(policy))
       case 'landlock': return [this.landlockLauncher(), ...landlockProfileArgs(policy)]
-      case 'seatbelt': return [this.seatbeltExec(), ...seatbeltProfileArgs(policy)]
-      case 'windows-acl': return this.windowsAclRunnerArgv(policy)
       default: return assertNever(runner)
     }
   }
 
   /**
-   * The windows-acl runner argv for one policy. With a calling session (the
-   * policy's `sessionId`) under workspace-write, the grants are materialized
-   * once per provider lifetime — the standing workspace-root grant per
-   * workspace and a revocable, RANDOM private-temp capability per live
-   * session/workspace pair. The runner receives `--write-sid` plus
-   * `--temp-write-sid` and grants nothing itself. Agentless workspace-write
-   * calls pass the ambient temp ROOT and no SID flags: the runner creates and
-   * removes a random private child directory for that one invocation.
-   * @param policy - the resolved per-call policy.
-   * @returns the runner invocation.
+   * The bwrap runner argv for one policy: the hardened profile plus, when the
+   * seccomp baseline is enabled, a bash wrapper that opens the filter on fd 9
+   * and execs `bwrap --seccomp 9`. A required-but-unavailable filter throws so
+   * the execution fails closed rather than running without the baseline. When
+   * `overlay` is given the workspace root is mounted as an overlay.
    */
-  private windowsAclRunnerArgv(policy: SandboxPolicy): string[] {
-    const sessionId = policy.sessionId
-    if (sessionId === undefined || policy.mode === 'read-only') {
-      return [
-        ...this.windowsAclRunnerInvocation(),
-        '--workspace', policy.workspaceRoot,
-        '--temp', tmpdir(),
-        '--mode', policy.mode,
-      ]
-    }
-    const temp = this.materializeAclGrant(sessionId, policy.workspaceRoot)
-    return [
-      ...this.windowsAclRunnerInvocation(),
-      '--workspace', policy.workspaceRoot,
-      '--temp', temp.dir,
-      '--mode', policy.mode,
-      '--write-sid', workspaceWriteSid(policy.workspaceRoot),
-      '--temp-write-sid', temp.writeSid,
-    ]
+  private bwrapRunnerArgv(policy: SandboxPolicy, overlay?: OverlaySpec): string[] {
+    const profile = bwrapProfileArgs(policy, this.runtime, overlay)
+    const seccomp = this.resolveSeccomp()
+    if (seccomp === undefined) return ['bwrap', ...profile]
+    return seccompWrapper(seccomp, ['bwrap', ...profile, '--seccomp', '9'])
   }
 
   /**
-   * Materialize one workspace-write policy's ACEs once per provider
-   * lifetime. The workspace SID and standing root grant are shared by the
-   * workspace. The temp directory is random and carries a distinct SID, so
-   * another session on the same workspace cannot use the shared workspace
-   * SID to enter it. A fresh provider always chooses a new path; crash
-   * residue therefore cannot collide with or authorize a resumed session.
-   * Fail-closed: a half-materialized temp grant is revoked and its directory
-   * removed before the error propagates.
-   * @param sessionId - the policy's calling-session identity.
-   * @param workspaceRoot - the resolved policy root.
-   * @returns the pair's private temp directory and write capability.
+   * Resolve the seccomp filter path, or `undefined` when disabled/degraded.
+   * Throws when the baseline is required but cannot be provided.
    */
-  private materializeAclGrant(sessionId: SessionId, workspaceRoot: string): AclTempCapability {
-    assertTempRootOutsideWorkspace(workspaceRoot, tmpdir())
-    const writeSid = workspaceWriteSid(workspaceRoot)
-    if (!this.workspaceGrants.has(workspaceRoot)) {
-      const grant = AclWriteGrant.create(writeSid)
-      try {
-        grant.add(workspaceRoot, true)
-      } catch (error) {
-        // Free the SID; a standing ACE (if the apply succeeded before a
-        // post-apply throw) is the intended end state, not an error
-        // artifact — nothing to revoke.
-        try {
-          grant.dispose()
-        } catch (cleanupError) {
-          throw new AggregateError([error, cleanupError], 'sandbox-local windows-acl workspace grant failed and its cleanup also failed')
-        }
-        throw error
-      }
-      this.workspaceGrants.set(workspaceRoot, grant)
-    }
-    const key = JSON.stringify([String(sessionId), workspaceRoot])
-    const existing = this.tempCapabilities.get(key)
-    if (existing !== undefined) return existing
-    const tempDir = mkdtempSync(join(tmpdir(), 'dsh-'))
-    const tempSid = tempWriteSid(tempDir)
-    let grant: AclWriteGrant | undefined
-    try {
-      grant = AclWriteGrant.create(tempSid)
-      grant.add(tempDir)
-    } catch (error) {
-      const cleanupFailures: unknown[] = []
-      if (grant !== undefined) {
-        try {
-          grant.dispose()
-        } catch (cleanupError) {
-          cleanupFailures.push(cleanupError)
-        }
-      }
-      try {
-        this.removeTempDir(tempDir)
-      } catch (cleanupError) {
-        cleanupFailures.push(cleanupError)
-      }
-      if (cleanupFailures.length > 0) {
-        throw new AggregateError([error, ...cleanupFailures], 'sandbox-local windows-acl temp grant materialization failed and its cleanup also failed')
-      }
-      throw error
-    }
-    const capability = { dir: tempDir, writeSid: tempSid, grant }
-    this.tempCapabilities.set(key, capability)
-    return capability
+  private resolveSeccomp(): string | undefined {
+    if (!this.runtime.seccomp.enabled) return undefined
+    const resolution = ensureSeccompFilter(this.runtime.seccomp, this.seccompDir)
+    if (resolution.ok) return resolution.path
+    if (this.runtime.seccomp.require) throw new Error(`sandbox-local: ${resolution.reason}`)
+    return undefined
   }
 
   /**
-   * Dispose every write grant (provider dispose): the revocable temp ACEs
-   * are revoked, the private temp directories this provider created are
-   * removed, and every SID allocation is freed; the standing workspace ACEs
-   * stay (the reuse cache). Cleanup failures are reported, not thrown:
-   * cordis teardown must not be aborted by grant cleanup. A crash skips all
-   * of it, but a new provider never reuses the residue's random path or SID;
-   * OS temp hygiene (or manual removal) eventually reclaims it.
+   * Capability overrides the configured runtime actually provides, merged into
+   * the bwrap capability report. Honest about the limits: `resourceLimits` is
+   * `partial` because domains are applied by the staged executor, not by every
+   * `confine` call.
    */
-  private revokeAclGrants(): void {
-    if (this.workspaceGrants.size === 0 && this.tempCapabilities.size === 0) return
-    const failures: unknown[] = []
-    for (const grant of [...this.workspaceGrants.values(), ...[...this.tempCapabilities.values()].map(capability => capability.grant)]) {
-      try {
-        grant.dispose()
-      } catch (error) {
-        failures.push(error)
-      }
+  private runtimeCapabilities(): Partial<Record<SandboxCapability, CapabilityStatus>> {
+    const syscallPolicy: CapabilityStatus = this.runtime.seccomp.enabled
+      && seccompAvailable(this.runtime.seccomp, this.seccompDir)
+      ? 'enforced'
+      : 'absent'
+    return {
+      networkControl: networkEnforced(this.runtime.networkMode) ? 'enforced' : 'partial',
+      syscallPolicy,
+      resourceLimits: cgroupAvailable(this.runtime.limits.cgroupBase) ? 'partial' : 'absent',
     }
-    for (const { dir } of this.tempCapabilities.values()) {
-      try {
-        this.removeTempDir(dir)
-      } catch (error) {
-        failures.push(error)
-      }
-    }
-    this.workspaceGrants.clear()
-    this.tempCapabilities.clear()
-    if (failures.length > 0) {
-      this.ctx.logger.warn(`sandbox-local: windows-acl grant cleanup completed with ${failures.length} failure(s)`)
-      for (const error of failures) this.ctx.logger.warn(error)
-    }
-  }
-
-  /** Remove one provider-owned private temp directory (injectable for cleanup tests). */
-  private removeTempDir(dir: string): void {
-    const remove = this.internals.rmTempDir ?? ((path: string) => { rmSync(path, { recursive: true, force: true }) })
-    remove(dir)
   }
 
   /** The Landlock launcher to probe and exec (test hook over the resolved one). */
   private landlockLauncher(): string {
     return this.internals.landlockLauncher ?? landlockLauncherPath()
   }
-
-  /** The `sandbox-exec` executable to probe and exec (test hook over the system one). */
-  private seatbeltExec(): string {
-    return this.internals.seatbeltExec ?? 'sandbox-exec'
-  }
-
-  /**
-   * The windows-acl runner argv prefix: the built lib/runner.js entry when
-   * present (production), else the package source through tsx (development).
-   * The prefix stays `[node, runner, ...]` — a future native-exe runner keeps
-   * the same argv contract and only swaps these entries.
-   */
-  private windowsAclRunnerInvocation(): string[] {
-    const override = this.internals.windowsAclRunnerArgs
-    if (override !== undefined) return override
-    const builtEntry = this.internals.windowsAclRunnerEntry ?? fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-sandbox-windows-acl/runner'))
-    if (existsSync(builtEntry)) return [process.execPath, builtEntry]
-    const sourceEntry = fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-sandbox-windows-acl/src/runner.ts'))
-    return [process.execPath, '--import', 'tsx/esm', sourceEntry]
-  }
 }
 
-export default CrossPlatformSandboxProvider
+export default LinuxSandboxProvider

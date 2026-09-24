@@ -1,14 +1,18 @@
 {
-  "name": "dsh-sandbox-plugin",
-  "version": "0.1.0",
+  "name": "dsh-sandbox-linux",
+  "version": "0.2.0",
   "private": true,
-  "description": "Standalone cross-platform sandbox plugin for dsh: a PAL-backed provider that registers ctx.sandbox",
+  "description": "Standalone Linux sandbox plugin for dsh: bubblewrap/Landlock confinement plus the dry-run/commit control plane (overlay staging, CAS publish, policy evaluation)",
   "type": "module",
   "main": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
     "./src/*": "./src/*",
     "./package.json": "./package.json"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",
@@ -17,9 +21,20 @@
     "@deepseek-ai/dsh-session": "*"
   },
   "dependencies": {
-    "@deepseek-ai/dsh-sandbox-pal": "*",
-    "@deepseek-ai/dsh-sandbox-windows-acl": "*",
+    "@deepseek-ai/dsh-approval": "*",
+    "@deepseek-ai/dsh-bash-local": "*",
+    "@deepseek-ai/dsh-bash-sandbox": "*",
+    "@deepseek-ai/dsh-brand": "*",
+    "@deepseek-ai/dsh-commands": "*",
+    "@deepseek-ai/dsh-fs": "*",
+    "@deepseek-ai/dsh-fs-local": "*",
+    "@deepseek-ai/dsh-sandbox-policy": "*",
+    "@deepseek-ai/dsh-shell": "*",
+    "@deepseek-ai/dsh-storage": "*",
+    "@deepseek-ai/dsh-subprocess": "*",
+    "@deepseek-ai/dsh-subprocess-local": "*",
     "@deepseek-ai/dsh-util-values": "*",
+    "@deepseek-ai/dsh-web": "*",
     "@deepseek-ai/node-addon-system": "*",
     "@deepseek-ai/schemastery": "*"
   }
