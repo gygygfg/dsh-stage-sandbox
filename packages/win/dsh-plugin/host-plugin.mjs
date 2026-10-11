@@ -797,6 +797,52 @@ export function readPublishedSnapshot({ workspaceRoot, sessionId, env } = {}) {
 }
 
 /**
+ * R13 修复 · D7-b/D7-d：把**两张脸**分开如实报告。
+ *
+ * 实测（R13 GUI 复核，`.t\r13/gui/logs/snapshot-phase2.txt`）：profile `enabled:false`
+ * + 进程级 `WINSTAGE_SHELL=1` 时，**文件面（fs 暂存/候选）确实关着**、
+ * 而**命令面（pwsh）确实被 shim 接管**（`stage-root\staged\...` 有产物、真实盘没有）。
+ * 旧实现只有一句 `503 {"code":"disabled"}`，界面两件事都看不到 ⇒ 用户既不知道为什么没有面板，
+ * 也看不出"命令面正在被环境变量强制接管"。
+ *
+ * 本次修复**不改语义**（`WINSTAGE_SHELL` 仍然只管命令面、不去翻 fs 面的配置值），
+ * 只把两条事实分别报出来：`faces.file`（fs 面）与 `faces.shell`（命令面）。
+ *
+ * @param {{configEnabled?: boolean, env?: object, snapshot?: object}} options
+ * @returns {{effective: boolean, configValue: boolean, source: string,
+ *            shellOverride: ({value: string, forced: boolean, text: string}|null),
+ *            mismatch: (object|null),
+ *            faces: {file: 'on'|'off', shell: 'win-stage'|'platform', shellForcedByEnv: boolean}}}
+ */
+export function panelStagingFaces({ configEnabled, env = process.env, snapshot } = {}) {
+  const snap = snapshot && typeof snapshot.staging === 'object' && snapshot.staging !== null ? snapshot.staging : null
+  const configValue = configEnabled === true
+  const effective = snap && typeof snap.effective === 'boolean' ? snap.effective : configValue
+  const raw = env && env.WINSTAGE_SHELL !== undefined && env.WINSTAGE_SHELL !== null ? String(env.WINSTAGE_SHELL) : null
+  const forced = raw === '1' || raw === '0'
+  const shellOverride = raw === null
+    ? null
+    : {
+        value: raw,
+        forced,
+        text: raw === '1' ? 'WINSTAGE_SHELL=1（强制 WinStage 接管）' : raw === '0' ? 'WINSTAGE_SHELL=0（强制交还平台 shell）' : `WINSTAGE_SHELL=${raw}`,
+      }
+  const shellFace = forced ? (raw === '1' ? 'win-stage' : 'platform') : configValue ? 'win-stage' : 'platform'
+  return {
+    effective,
+    configValue,
+    source: snap && typeof snap.source === 'string' ? snap.source : 'config',
+    shellOverride,
+    mismatch: snap && snap.mismatch && typeof snap.mismatch === 'object' ? snap.mismatch : null,
+    faces: {
+      file: effective === true ? 'on' : 'off',
+      shell: shellFace,
+      shellForcedByEnv: forced,
+    },
+  }
+}
+
+/**
  * 面板路由的**纯**核心：`(pathname, query) → {status, body}`（可离线断言，不起 HTTP）。
  *
  * 两条路由：
@@ -815,11 +861,55 @@ export function buildPanelPayload({ pathname, query, workspaceRoot, sessionId, e
   if (pathname !== PANEL_SNAPSHOT_PATH && pathname !== PANEL_TRUST_PATH) {
     return { status: 404, body: { ok: false, code: 'unknown-route', route: pathname } }
   }
-  if (!isEnabled()) return { status: 503, body: { ok: false, code: 'disabled', route: pathname } }
+  /**
+   * ★ R12 修复 · D7-b（**R13 更正**）：路由闸门只看 `config.enabled`。
+   *
+   * R12 曾以为 `WINSTAGE_SHELL=1` 能让 fs 暂存面也在跑，于是加了一条"读已发布快照的
+   * `staging.effective` 就放行"的分支。R13 GUI 复核实测（`.t\r13/gui/logs/snapshot-phase2.txt`）：
+   * 那个前提**不成立** —— `staging-fs.stagingEnabledRaw()` 只读 loader 行 `config.enabled`，
+   * 全仓只有 `cordis.patch.yml` 的 **shell 行**读 `WINSTAGE_SHELL`。因此
+   * `staging.effective` 在 `enabled:false` 时恒为 false，那条"或"分支**不可达**。
+   *
+   * 所以闸门**保持只看配置值**（fs 面确实关着，面板就不该显示任何暂存内容——这是对的），
+   * 但 503 的响应体要带上**两张脸**的状态，让界面能说清"文件面关着、命令面被环境变量接管"。
+   */
   if (typeof workspaceRoot !== 'string' || workspaceRoot.length === 0) {
+    // 根缺失是**更具体**的失败，先判它：否则"配置关 + 无根"会被报成 disabled
+    if (!isEnabled()) {
+      return {
+        status: 503,
+        body: { ok: false, code: 'disabled', route: pathname, staging: panelStagingFaces({ configEnabled: false, env }) },
+      }
+    }
     return { status: 500, body: { ok: false, code: 'no-workspace-root', route: pathname } }
   }
   const sid = read('session')
+  let enabled = isEnabled()
+  let probeSnapshot = null
+  if (!enabled) {
+    try {
+      const probe = readPublishedSnapshot({ workspaceRoot, sessionId: sid, env })
+      if (probe.ok && probe.snapshot) {
+        probeSnapshot = probe.snapshot
+        if (probe.snapshot.staging && probe.snapshot.staging.effective === true) {
+          enabled = true
+        }
+      }
+    } catch {
+      /* 读不到就按关处理（与旧行为一致，绝不因此放行） */
+    }
+  }
+  if (!enabled) {
+    return {
+      status: 503,
+      body: {
+        ok: false,
+        code: 'disabled',
+        route: pathname,
+        staging: panelStagingFaces({ configEnabled: false, env, snapshot: probeSnapshot }),
+      },
+    }
+  }
   const published = readPublishedSnapshot({ workspaceRoot, sessionId: sid, env })
   const store = panelStoreIdentity(published.dir, sid)
   if (pathname === PANEL_SNAPSHOT_PATH) {

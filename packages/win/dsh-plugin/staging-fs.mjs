@@ -78,6 +78,8 @@ import { FAILURE_CODE_ENVIRONMENT, FAILURE_SEMANTICS, resolveDshModuleRoot } fro
 import { STAGE_GUARD_UNAVAILABLE, STAGE_ROOT_LOST, checkTransparentMessages } from '../src/stage-guard.mjs'
 import { getReviewService, recordReadVisibility, setReadVisibilityPolicy } from './review-service.mjs'
 import { rootSessionIdFor, rootSessionIdOf } from './session-identity.mjs'
+import { UNSTAGED_REASONS, recordUnstaged } from './unstaged-ledger.mjs'
+import { noteEffectiveStaging } from './review-service.mjs'
 
 /** 在候选 node_modules 根中定位**真实文件**（包的 exports 映射不作用于绝对 file: URL） */
 function locatePackageFile(relativePath) {
@@ -633,6 +635,17 @@ export function createStagingFileSystem(options = {}) {
       this.sessionServices = new Map()
       /** 无会话的共享服务（日志用；也保证升级前的 `.dshstage/` 布局原样存在） */
       this.staging = this.stagingFor(undefined)
+      /**
+       * R12 修复 · D7-a：绕过暂存的账本**与 `review.json` 同一个存储根**。
+       *
+       * 为什么在这里取而不是让调用方传：`stagingFor(undefined)` 的 `storeDir` 就是
+       * `resolveReviewStoreDir()` 对同一个 `workspaceRoot` 的解析结果，
+       * 与 `ReviewService.publish()` 写 `review.json` 的目录**逐字同源**。
+       * 于是"记了账"与"面板读得到账"是结构性事实，不靠两处约定。
+       */
+      this.unstagedLedgerDir = this.staging?.storeDir ?? this.staging?.workspace?.store?.dir
+      /** 已就"某类操作绕过暂存"报过 error 日志的键（只报一次；账本本身不丢） */
+      this.warnedUnstaged = new Set()
       /** 本实例登记的 `watch()` 观察者：`{ rel, isDir, changed }`（见下方 watch 覆写） */
       this.watchers = new Set()
       /**
@@ -743,10 +756,71 @@ export function createStagingFileSystem(options = {}) {
     warnForeignWorkspace(sandboxPolicy) {
       if (this.warnedForeignWorkspace) return
       this.warnedForeignWorkspace = true
-      this.log(
+      this.logError(
         `会话工作区（${this.sessionWorkspaceOf(sandboxPolicy) ?? '未知'}）与 WinStage 配置的暂存根（${this.workspaceRoot}）不同：` +
-          '本会话的读写**不经过暂存**，直接走平台沙箱/审批面（避免"工具说写成功、真实磁盘却没有"）。',
+          '本会话的写入**仍然进暂存**（暂存优先，R12 D7-a 修复），并会记一条"配置根不一致"的账到 review.json 的 unstaged 段。',
       )
+    }
+
+    /**
+     * R12 修复 · D7-a：**"本次操作没有走暂存"必须落账，绝不静默**。
+     *
+     * 落点选择（为什么是账本文件而不是只打日志）：
+     *   · 日志只有读宿主日志的人看得到；R11 D7-a 的实测结论正是"**界面与审计零提示**"；
+     *   · 账本写在**与 `review.json` 同一个存储根**，`ReviewService.publish()` 会把
+     *     它并进快照的 `unstaged` 段 ⇒ 面板/审计/复核者都必然看得到。
+     *
+     * 本方法**绝不抛**（记账失败不能把一次正常写入变成失败），失败只走 error 日志。
+     *
+     * @returns {{reason:string, path:string, appliedToDisk:boolean}|undefined}
+     */
+    noteUnstaged(op, path, reason, extras = {}) {
+      const display = String(path ?? '')
+      const record = recordUnstaged(
+        this.unstagedLedgerDir,
+        {
+          op,
+          path: display,
+          reason,
+          appliedToDisk: extras.appliedToDisk === true,
+          physical: extras.physical,
+          sessionId: extras.sessionId,
+        },
+        { onError: (message) => this.logError(message) },
+      )
+      // 人工侧也响一次（与账本同源，不重复计数）：同一个"操作+原因"只报一次，避免刷屏
+      const key = `${op}\u0000${reason}`
+      if (!this.warnedUnstaged.has(key)) {
+        this.warnedUnstaged.add(key)
+        this.logError(
+          `本次 ${op} **没有走暂存**（原因 ${reason}）："${display}" ` +
+            `${extras.appliedToDisk === true ? '已直接落到真实磁盘' : '落在平台面'}` +
+            `${extras.physical ? `（物理落点 ${extras.physical}）` : ''}。` +
+            '该动作不会出现在待审面板里，也无法被拒绝 —— 这条事实已记入 review.json 的 unstaged 段。',
+        )
+      }
+      return record ? { reason, path: display, appliedToDisk: record.appliedToDisk } : undefined
+    }
+
+    /**
+     * 会话工作区与配置暂存根不一致时的处理（R12 修复 · D7-a 第 ① 条：**暂存优先**）。
+     *
+     * ── 为什么改掉旧的"直接 `super.*`"（本次修复的核心决定）──────────────────────
+     * 旧实现：`inConfiguredWorkspace()` 为假 ⇒ 立刻 `return super.writeText(...)`。
+     * 后果（R11 D7-a 实测）：写入**绕过暂存**、不进 `manifest.json`、不进 `staged\`、
+     * 不进待审面板，**却真实落到磁盘**，而界面与审计零提示 ——
+     * 一个**配置问题**（暂存根与会话工作区不一致）被翻译成了**隔离悄悄失效**。
+     *
+     * 现在的口径：**仍然进暂存**，另记一条 `foreign-session-workspace` 的账。
+     * 于是"工具说写成功"与"真实磁盘未变"始终一致，面板也一定看得见这条。
+     */
+    stageOverForeignWorkspace(op, target, sandboxPolicy) {
+      const sessionRoot = this.sessionWorkspaceOf(sandboxPolicy)
+      this.warnForeignWorkspace(sandboxPolicy)
+      this.noteUnstaged(op, target?.displayPath ?? target?.targetKey, UNSTAGED_REASONS.FOREIGN_WORKSPACE, {
+        sessionId: this.sessionIdOf(sandboxPolicy),
+        physical: sessionRoot,
+      })
     }
 
     /** 会话身份 → 该会话自己的审阅服务（缓存；`undefined` ⇒ 共享存储） */
@@ -754,6 +828,8 @@ export function createStagingFileSystem(options = {}) {
       const key = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : ''
       let service = this.sessionServices.get(key)
       if (!service) {
+        // eslint-disable-next-line @typescript-eslint/no-this-alias
+        const self = this
         service = getReviewService({
           workspaceRoot: this.workspaceRoot,
           ...(key ? { sessionId: key } : {}),
@@ -762,6 +838,17 @@ export function createStagingFileSystem(options = {}) {
           //   所以关闭态的写既不走暂存也不会认领。）
           claimShared: this.stagingEnabled(),
           ...(this.logger ? { logger: this.logger } : {}),
+          /**
+           * R12 修复 · D7-b/d：把**生效值**注入审阅服务（与 `stagingEnabled()` 同一处真值）。
+           *
+           * 这是 `effectiveStagingHint` 的唯一生产来源：`snapshot()` 拿它写出
+           * `staging.{effective, mismatch}`，界面因此不会再把"配置值"当成"生效值"。
+           * 用 getter 而不是一个固定布尔：开关是**每次现读**的（见 `stagingEnabled()` 注释），
+           * 注入快照值会把"热切换"变成"要重启"。
+           */
+          get effectiveStaging() {
+            return { enabled: self.stagingEnabled() }
+          },
         })
         this.sessionServices.set(key, service)
       }
@@ -781,6 +868,24 @@ export function createStagingFileSystem(options = {}) {
      * 树里找不到该行（离线自测、行被移除）时默认 `true`：保持"接管"这一历史行为。
      */
     stagingEnabled() {
+      const enabled = this.stagingEnabledRaw()
+      /**
+       * R12 修复 · D7-b/d：**顺手登记生效值**（进程内台账，零 IO）。
+       *
+       * 登记点是这里而不是构造时：`stagingEnabled()` 是"开关的唯一真源"，
+       * 每次调用都现读 ⇒ 用户热切换开关时台账跟着变，快照里的 `staging.effective`
+       * 也必然跟着变。`snapshot()` 只是把它读出来，不另立一个权威。
+       */
+      try {
+        noteEffectiveStaging(this.workspaceRoot, enabled)
+      } catch {
+        /* 登记失败绝不影响开关判定 */
+      }
+      return enabled
+    }
+
+    /** `stagingEnabled()` 的原始判定（登记逻辑见上面的包装） */
+    stagingEnabledRaw() {
       if (enabledOverride) return enabledOverride() !== false
       try {
         // 只认构造时抓住的 rootEntry；`this.ctx.fiber.entry` 会指向**调用方**（见构造函数注释）
@@ -1435,15 +1540,23 @@ export function createStagingFileSystem(options = {}) {
     }
 
     async writeTextStaged(target, content, expected, signal, sandboxPolicy) {
-      // 关：原样走平台沙箱后端（围栏 + 真实磁盘），暂存树一位不碰
+      // 关：原样走平台沙箱后端（围栏 + 真实磁盘），暂存树一位不碰。
+      // ⚠ 这是"用户把开关关掉"的**显式**选择（`enabled:false` 且未被
+      //   `WINSTAGE_SHELL=1` 强制）⇒ 不是"绕过暂存"，**不记账**（记了会把
+      //   "用户主动关掉沙箱"误报成"隔离失效"）。判据与面板的 `readSwitch()` 同源。
       if (!this.stagingEnabled()) return super.writeText(target, content, expected, signal, sandboxPolicy)
-      if (!this.inConfiguredWorkspace(sandboxPolicy)) {
-        this.warnForeignWorkspace(sandboxPolicy)
-        return super.writeText(target, content, expected, signal, sandboxPolicy)
-      }
+      // R12 D7-a：会话工作区与配置暂存根不一致时**仍然进暂存**（旧实现直接 super ⇒ 静默落真实盘）
+      if (!this.inConfiguredWorkspace(sandboxPolicy)) this.stageOverForeignWorkspace('write', target, sandboxPolicy)
       if (signal?.aborted) throw new FsError('write aborted', 'FS_ABORTED')
       const place = this.keyOf(target)
-      if (place === undefined) return super.writeText(target, content, expected, signal, sandboxPolicy)
+      if (place === undefined) {
+        // 目标拿不到暂存键 ⇒ 只能交给平台面。**必须落账**（R11 D7-a 的形态之一）
+        this.noteUnstaged('write', target?.displayPath ?? target?.targetKey, UNSTAGED_REASONS.UNRESOLVED_TARGET, {
+          sessionId: this.sessionIdOf(sandboxPolicy),
+          appliedToDisk: true,
+        })
+        return super.writeText(target, content, expected, signal, sandboxPolicy)
+      }
       if (place.key === '') {
         throw new FsError(`cannot write "${target.displayPath}": the workspace root is not a regular file`, 'FS_NOT_REGULAR_FILE')
       }
@@ -1452,6 +1565,10 @@ export function createStagingFileSystem(options = {}) {
       if (isStoreStatePath(place.abs)) this.denyStoreWrite(place, 'write')
       // 显式逃生口（默认关闭）：直通真实磁盘。**不是**默认路径，也不再有"拒绝"分支。
       if (place.external && stageOutside === 'direct') {
+        this.noteUnstaged('write', target?.displayPath ?? place.abs, UNSTAGED_REASONS.STAGE_OUTSIDE_DIRECT, {
+          sessionId: this.sessionIdOf(sandboxPolicy),
+          appliedToDisk: true,
+        })
         return super.writeText(target, content, expected, signal, sandboxPolicy)
       }
       // 显式拒绝档（`stageOutside: 'deny'`）：工作区外写一律拒绝，**在一切变更之前**抛。
@@ -1513,20 +1630,29 @@ export function createStagingFileSystem(options = {}) {
     }
 
     async editTextStaged(target, edit, expected, signal, sandboxPolicy) {
+      // 关：显式退回平台面（用户主动关掉沙箱 ⇒ 不是"绕过暂存"，不记账）
       if (!this.stagingEnabled()) return super.editText(target, edit, expected, signal, sandboxPolicy)
-      if (!this.inConfiguredWorkspace(sandboxPolicy)) {
-        this.warnForeignWorkspace(sandboxPolicy)
-        return super.editText(target, edit, expected, signal, sandboxPolicy)
-      }
+      // R12 D7-a：与 writeTextStaged 同一口径 —— 会话根不一致时**仍然进暂存**
+      if (!this.inConfiguredWorkspace(sandboxPolicy)) this.stageOverForeignWorkspace('edit', target, sandboxPolicy)
       if (signal?.aborted) throw new FsError('edit aborted', 'FS_ABORTED')
       const place = this.keyOf(target)
-      if (place === undefined) return super.editText(target, edit, expected, signal, sandboxPolicy)
+      if (place === undefined) {
+        this.noteUnstaged('edit', target?.displayPath ?? target?.targetKey, UNSTAGED_REASONS.UNRESOLVED_TARGET, {
+          sessionId: this.sessionIdOf(sandboxPolicy),
+          appliedToDisk: true,
+        })
+        return super.editText(target, edit, expected, signal, sandboxPolicy)
+      }
       if (place.key === '') {
         throw new FsError(`cannot edit "${target.displayPath}": the workspace root is not a regular file`, 'FS_NOT_REGULAR_FILE')
       }
       // ── P0-8：同 writeText（见那里的说明）────────────────────────────────────
       if (isStoreStatePath(place.abs)) this.denyStoreWrite(place, 'edit')
       if (place.external && stageOutside === 'direct') {
+        this.noteUnstaged('edit', target?.displayPath ?? place.abs, UNSTAGED_REASONS.STAGE_OUTSIDE_DIRECT, {
+          sessionId: this.sessionIdOf(sandboxPolicy),
+          appliedToDisk: true,
+        })
         return super.editText(target, edit, expected, signal, sandboxPolicy)
       }
       if (place.external && stageOutside === 'deny') this.denyOutsideWrite(place, 'edit')

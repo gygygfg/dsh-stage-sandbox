@@ -114,6 +114,30 @@ window.__ModuleLoader__.load({
         on: '已启用',
         off: '已关闭',
         unavailable: 'Host 未提供该设置项',
+        // ── R12 修复 · D7-c/d：状态词与**实际生效档**对齐（配置值 / 生效值分列）────────
+        // R11 实测：行内写 `已关闭`，而同一宿主里 pwsh 的写入确实进了暂存（TS 在跑）；
+        // 进程级 `WINSTAGE_SHELL=1` 这个覆盖在界面上完全不可见。
+        effectivePrefix: '当前生效：',
+        effectiveOn: 'WinStage 接管中',
+        effectiveOff: '平台面',
+        forcedPrefix: '当前由环境变量强制：',
+        forcedHint:
+          '进程级环境变量 WINSTAGE_SHELL 的优先级高于本行开关，因此这一行的开关此刻不改变实际生效档。要看权威结论请跑 /winstage status；要真正交还平台，请用 WINSTAGE_SHELL=0 重启宿主。',
+        /**
+         * ── R13 修复 · D7-b/D7-d：**把两张脸分开说** ─────────────────────────────
+         * 实测（R13 GUI 复核）：`enabled:false` + `WINSTAGE_SHELL=1` 时
+         * **文件面（fs 暂存/候选）确实关着**、**命令面（pwsh）确实被 shim 接管**。
+         * 旧文案把两张脸混成一句（"已关闭 · 当前由环境变量强制：平台面 · 强制 WinStage 接管"），
+         * 自相矛盾。现在文件面与命令面各自成句，且**各自的判据**都来自宿主快照的两面字段。
+         */
+        faceFileOn: '文件面（暂存/候选）：已启用',
+        faceFileOff: '文件面（暂存/候选）：已关闭',
+        faceShellEnvOn: '命令面（pwsh）：由 WINSTAGE_SHELL=1 强制接管',
+        faceShellEnvOff: '命令面（pwsh）：由 WINSTAGE_SHELL=0 强制交还平台 shell',
+        faceShellFollow: '命令面（pwsh）：跟随开关（换提供方需重启宿主）',
+        toggleAccepted: '本次开关已写入（生效时机见上面的说明）。',
+        toggleRejected: '本次开关未写入：设置通道拒绝了这次修改（本行 config 可能被 profile 覆盖层固定）。可核对 %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml。',
+        toggleThrew: '本次开关出错：',
         /**
          * R11-C 修复③（D1b）：旧文案是 `写入失败，已保留原值` —— 它只说了**值**的结局，
          * 却让用户以为"磁盘什么都没发生"。实测：同一个交互把
@@ -259,6 +283,17 @@ window.__ModuleLoader__.load({
         error:
           'The setting value did NOT take effect; the previous value was kept (this row\'s config is pinned by a profile overlay or an environment variable). Note: this interaction may still have re-serialized the profile file (formatting normalization only, no key/value change) — check the mtime and sha256 of %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml; if several hosts share that profile, avoid concurrent edits. **This plugin cannot roll file bytes back**: the settings transport only carries key/values, so a "pre-write snapshot + rollback on failure" must be implemented by the host-side settings layer.',
         loading: 'Loading…',
+        // R12 fix · D7-c/d: status words follow the EFFECTIVE tier (config vs effective split)
+        effectivePrefix: 'Currently effective: ',
+        effectiveOn: 'WinStage is intercepting',
+        effectiveOff: 'platform tier',
+        forcedPrefix: 'Currently forced by an environment variable: ',
+        forcedHint:
+          'The process-level WINSTAGE_SHELL variable outranks this row, so toggling this row does not change the effective tier right now. Run /winstage status for the authoritative answer; to really hand control back to the platform, restart the host with WINSTAGE_SHELL=0.',
+        toggleAccepted: 'The toggle was written (see the timing note above).',
+        toggleRejected:
+          'The toggle was NOT written: the settings channel rejected this change (this row may be pinned by a profile overlay). Check %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml.',
+        toggleThrew: 'The toggle failed: ',
         reviewTitle: 'WinStage staged changes',
         reviewWaiting: 'Nothing is written to the real workspace until you approve',
         reviewFiles: '{files} files',
@@ -372,6 +407,16 @@ window.__ModuleLoader__.load({
     const store = {
       listeners: new Set(),
       state: { status: 'idle', sessionId: undefined, workspaceRoot: undefined, snapshot: null, error: undefined, alert: null, enabled: undefined },
+      /**
+       * R12 修复 · D7-d：**最近一次从快照读到的"生效值"事实**。
+       *
+       * 为什么要单独存一份：设置页那一行（`WinStageRow`）拿不到快照，只能读 configForms；
+       * 而 R11 实测"行内状态词 `已关闭`、事实是 TS 在跑"。把每拍读到的
+       * `snapshot.staging.{effective, configValue, shellOverride, mismatch}` 放在这里，
+       * 设置行就能显示**配置值与生效值两列**，并标明"被环境变量强制"。
+       * 与快照同源（同一个字段），不另立判据。
+       */
+      staging: undefined,
       dismissed: undefined,
       /**
        * 「默认收起」偏好是否已在**本次页面加载**上生效过（page 级，刷新即重置）。
@@ -475,6 +520,36 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * R12 修复 · D7-b/d：**生效值**（快照里的 `staging` 段）—— 与配置值分列的第二个权威。
+     *
+     * R11 实测的形态：profile 写 `enabled: false`，而进程级 `WINSTAGE_SHELL=1`
+     * 让宿主侧 `stagingEnabled()` 返回真 ⇒ **暂存在跑、面板不出现**（隐藏 20 次
+     * innerText 快照里一条面板文案都没有），用户完全不知道自己丢了批准权。
+     *
+     * 为什么不能只靠"配置值"：那是**用户写的**，而"是否真的接管"由宿主侧
+     * `stagingEnabled()`（可被环境变量越过）决定。两者必须**同时**呈现。
+     *
+     * @returns {{effective:'on'|'off'|'unknown', configValue:boolean|null, forced:boolean,
+     *            mismatch:object|null, text:string|null, effectiveSource:string|null}}
+     */
+    function stagingFacts(snapshot) {
+      const staging = snapshot && typeof snapshot === 'object' ? snapshot.staging : undefined
+      if (!staging || typeof staging !== 'object') {
+        return { effective: 'unknown', configValue: null, forced: false, mismatch: null, text: null, effectiveSource: null }
+      }
+      const effective = staging.effective === true ? 'on' : staging.effective === false ? 'off' : 'unknown'
+      const override = staging.shellOverride && typeof staging.shellOverride === 'object' ? staging.shellOverride : null
+      return {
+        effective,
+        configValue: typeof staging.configValue === 'boolean' ? staging.configValue : null,
+        forced: Boolean(override && override.forced),
+        mismatch: staging.mismatch && typeof staging.mismatch === 'object' ? staging.mismatch : null,
+        text: override && typeof override.text === 'string' ? override.text : null,
+        effectiveSource: typeof staging.source === 'string' ? staging.source : null,
+      }
+    }
+
+    /**
      * 接管判据的**唯一实现**。
      *
      * 两处调用它，避免判据漂移：
@@ -485,10 +560,21 @@ window.__ModuleLoader__.load({
      */
     function winstageElection(sessionId) {
       if (!sessionId) return null
-      // ★ 开关必须先**确定开着**（轮询器只在 readSwitch()==='on' 时发布 enabled:true）。
-      //   'unknown'（configForms 还在 loading，或命名空间 unavailable ⇒ 宿主插件没装）
-      //   ⇒ 不接管 composer：那时输入区必须留给平台自己的审批卡/审批弹窗。
-      if (store.state.enabled !== true) return null
+      /**
+       * ★ R12 修复 · D7-b：**生效值也可以立起面板**。
+       *
+       * 旧判据是 `store.state.enabled !== true ⇒ null`（只认 `config.enabled`）。
+       * R11 实测：`enabled:false` + `WINSTAGE_SHELL=1` ⇒ 宿主侧暂存**确实在跑**
+       * （`review.json pending=true/files=10`、lane `tierEffective=TS`），
+       * 而面板**完全不出现** ⇒ 用户拿到"待审却没有批准权"，且界面一字不提。
+       *
+       * 现在的判据（两者取或，仍然要求"确定开着"）：
+       *   1. `store.state.enabled === true` —— 配置值说开着（原行为，不变）；
+       *   2. 快照 `staging.effective === true` —— **生效值**说在接管（新增）。
+       * `'unknown'` 仍然**不**接管（快照没到/字段缺失时不覆盖平台 UI，原纪律不变）。
+       */
+      const staging = stagingFacts(store.state.snapshot)
+      if (store.state.enabled !== true && staging.effective !== 'on') return null
       const snapshot = store.state.snapshot
       // β（V2-1）：判据收敛为 `pending === true`。
       // 为什么不保留 `counts.files >= 1`：`review-service.snapshot()` 的 `pending` 就是
@@ -500,7 +586,7 @@ window.__ModuleLoader__.load({
       // 记忆失配 ⇒ `select` 重新接管 ⇒ 面板自动展开（用户诉求要修的正是这一条：C3）。
       // 注意：不换槽位、不动上面的 `pending`/`sameRoot` 判据、不改本函数返回形状。
       if (isCollapsedNow(snapshot)) return null
-      return { kind: 'winstage-review', sessionId, generatedAt: snapshot.generatedAt }
+      return { kind: 'winstage-review', sessionId, generatedAt: snapshot.generatedAt, stagingEffective: staging.effective }
     }
 
     /**
@@ -926,8 +1012,14 @@ window.__ModuleLoader__.load({
           const type = String((response && response.headers && response.headers.get && response.headers.get('content-type')) || '')
           if (!type.includes('application/json')) return { ok: false, code: 'not-json' }
           const body = await response.json().catch(() => undefined)
-          if (!response.ok) return { ok: false, code: String(body && body.code ? body.code : `http-${response.status}`) }
-          if (!body || body.ok !== true) return { ok: false, code: String((body && body.code) || 'bad-body') }
+          /**
+           * R13 修复 · D7-b/d：**失败响应体也要带回去**。
+           * 宿主在 `503 {"code":"disabled"}` 时会附上 `staging`（两张脸：文件面/命令面），
+           * 客户端据此才能在设置行里说清"文件面关着、命令面被 WINSTAGE_SHELL 强制接管"，
+           * 而不是像以前那样一片空白。
+           */
+          if (!response.ok) return { ok: false, code: String(body && body.code ? body.code : `http-${response.status}`), body }
+          if (!body || body.ok !== true) return { ok: false, code: String((body && body.code) || 'bad-body'), body }
           return { ok: true, value: body }
         })
         .catch((error) => ({ ok: false, code: `fetch-failed: ${String((error && error.message) || error)}` }))
@@ -943,7 +1035,7 @@ window.__ModuleLoader__.load({
       if (!result.ok) {
         return result.code === 'no-snapshot'
           ? { ok: true, snapshot: null, store: undefined, source: 'host-route' }
-          : { ok: false, code: result.code }
+          : { ok: false, code: result.code, staging: result.body && result.body.staging ? result.body.staging : undefined }
       }
       const body = result.value
       return { ok: true, snapshot: body.snapshot ?? null, store: body.store, source: 'host-route' }
@@ -992,7 +1084,11 @@ window.__ModuleLoader__.load({
       const viaRoute = await readReviewViaRoute(ctx, sessionId)
       if (viaRoute.ok) return { snapshot: viaRoute.snapshot, source: viaRoute.source, store: viaRoute.store }
       const snapshot = await readReviewViaLegacyPath(ctx, sessionId, root)
-      return { snapshot, source: 'legacy-compat-path', store: undefined, routeFallback: viaRoute.code }
+      /**
+       * R13 修复 · D7-b/d：路由被关（`503 disabled`）时宿主仍然告诉我们**两张脸**的状态，
+       * 一定要把它带出去 —— 否则设置行在"配置关 + 环境变量强制命令面"这个组合下什么都显示不出来。
+       */
+      return { snapshot, source: 'legacy-compat-path', store: undefined, routeFallback: viaRoute.code, staging: viaRoute.staging }
     }
 
     /**
@@ -1085,7 +1181,49 @@ window.__ModuleLoader__.load({
               typeof configValue.workspaceRoot === 'string' && configValue.workspaceRoot.trim().length > 0
                 ? configValue.workspaceRoot.trim()
                 : undefined
-            store.publish({ status: 'idle', snapshot: null, workspaceRoot: configuredRoot, sessionId, alert: null, enabled: false })
+            /**
+             * ★ R12 修复 · D7-b：**配置说关、但生效值说在跑**时，仍然要读快照。
+             *
+             * 旧实现到这里就 `publish(idle)` 并 return ⇒ 面板永不出现（R11 实测 20 次
+             * 快照零面板文案），而宿主侧暂存**确实在跑**、`review.json` 里躺着 10 条待审。
+             * 用户因此"拿到暂存却没有批准权"，且界面一字不提。
+             *
+             * 新口径：先**探一次**快照的 `staging.effective`
+             *   · `true`  ⇒ 继续读（下面的正常路径），面板/横幅按生效值立起来；
+             *   · `false`/缺失 ⇒ 保持旧行为（当作关着，完全不接管；快照在这一拍之前
+             *     还没有 ⇒ 本拍按关处理，下一拍拿到 `effective:true` 才接管，
+             *     与"未知不接管"的既有纪律一致）。
+             *
+             * 代价：开关关着时会**额外读一次** review.json（一拍一次，读不到即放弃）。
+             * 这一拍的成本换的是"用户不会在不知情的情况下失去批准权"，值得。
+             */
+            const probe = await readReview(ctx, sessionId, configuredRoot)
+            const probeStaging = stagingFacts(probe.snapshot)
+            // R12 · D7-d：把这一拍读到的事实**原样**放进 store，供设置行显示"配置值 / 生效值 / 环境强制"
+            store.staging = probe.snapshot && probe.snapshot.staging ? probe.snapshot.staging : { effective: probeStaging.effective === 'on' }
+            if (probeStaging.effective !== 'on') {
+              store.publish({ status: 'idle', snapshot: null, workspaceRoot: configuredRoot, sessionId, alert: null, enabled: false })
+              return
+            }
+            // 走到这里：生效值说"暂存在跑" ⇒ 按 ready 处理（下面的代码与开关开时同一套）
+            const readyRoot = configuredRoot ?? (probe.snapshot && probe.snapshot.workspaceRoot)
+            if (!readyRoot || (probe.snapshot && !sameRoot(probe.snapshot.workspaceRoot, readyRoot))) {
+              store.publish({ status: 'idle', snapshot: null, workspaceRoot: readyRoot, sessionId, alert: null, enabled: true })
+              return
+            }
+            store.publish({
+              status: 'ready',
+              snapshot: probe.snapshot,
+              error: undefined,
+              workspaceRoot: readyRoot,
+              sessionId,
+              alert: null,
+              /** ⚠ 语义：这个 `enabled` 是"面板是否立起来"，不是"配置值"；配置值读 `snapshot.staging.configValue` */
+              enabled: true,
+              forcedByEffectiveStaging: true,
+              storeSource: probe.source,
+              ...(probe.routeFallback ? { routeFallback: probe.routeFallback } : {}),
+            })
             return
           }
           // C-7：根**只有一个来源** —— 插件 Config 里的 workspaceRoot。
@@ -1170,6 +1308,11 @@ window.__ModuleLoader__.load({
             sessionId,
             alert: currentAlert,
             enabled: true,
+            /**
+             * R12 · D7-d：`staging` 段随**同一版快照**一起进 store（配置值 / 生效值 /
+             * 环境强制三者同源）。设置行据此把状态词写成"配置值 X / 生效值 Y"。
+             */
+            staging: snapshot && snapshot.staging ? snapshot.staging : read.staging ? read.staging : undefined,
             // WP3-B：读侧来源（`host-route` = 宿主解析的新存储 / `legacy-compat-path` = 兜底旧布局）。
             // 面板据此显示一行"读取来源"，让"读到的是哪一份"永远可分辨。
             storeSource: read.source,
@@ -2831,17 +2974,68 @@ window.__ModuleLoader__.load({
      * 一行设置。宿主不传 props，因此这里自己画标题、说明与开关。
      * 收到的 props：`useValue`（读 configForms 快照）、`setEnabled`、`t`。
      */
-    function WinStageRow({ useValue, setEnabled, t }) {
+    function WinStageRow({ useValue, setEnabled, readStaging, t }) {
       const snapshot = useValue((s) => s)
       const [busy, setBusy] = React.useState(false)
       const [failed, setFailed] = React.useState(false)
+      /**
+       * R12 修复 · D7-d：**本行自己读到的生效值**（不依赖有没有会话）。
+       *
+       * 打开时读一次、每次开关动作后重读一次 —— 于是"配置值 / 生效值"两列的
+       * 数据来源与面板完全同源（同一个 `readReview()` 路由），不会再出现
+       * "界面说关、事实在跑"。
+       */
+      const [liveFacts, setLiveFacts] = React.useState(null)
+      React.useEffect(() => {
+        let alive = true
+        if (typeof readStaging !== 'function') return () => {}
+        Promise.resolve()
+          .then(() => readStaging())
+          .then((facts) => {
+            if (alive && facts) setLiveFacts(facts)
+          })
+          .catch(() => {})
+        return () => {
+          alive = false
+        }
+      }, [readStaging])
       /** S3e：默认收起偏好（localStorage 持久化；纯客户端，不动 host Config schema） */
       const [prefCollapsed, setPrefCollapsed] = React.useState(() => readStr(localStore, PREF_KEY) === '1')
+      /**
+       * R12 修复 · D7-c：**这次点击的结果**（`null` = 还没点过 / `accepted` / `rejected` /
+       * `threw:<原文>`）。它把"无声 no-op"变成"有结果的交互"：
+       * 失败时行内会同时给出原因与出路（见 `forcedHint` 与 `error` 文案）。
+       */
+      const [lastAttempt, setLastAttempt] = React.useState(null)
 
       const writable = snapshot && snapshot.status === 'ready' && snapshot.writable !== false
       const value = snapshot && snapshot.value ? snapshot.value : undefined
       const enabled = value && typeof value.enabled === 'boolean' ? value.enabled : true
       const unavailable = Boolean(snapshot && (snapshot.status === 'unavailable' || snapshot.writable === false))
+      /**
+       * R12 修复 · D7-c/d：**状态词必须反映"实际生效档"**，并显式标注"被环境变量强制"。
+       *
+       * R11 实测两条：
+       *   · D7-d：行内写 `已关闭`，而同一宿主里 `pwsh` 的写入**确实进了暂存**
+       *     （`staged\…` 存在、真实盘 ABSENT、lane `tierEffective=TS`）；
+       *   · D7-c：点这个开关是**无声 no-op**（`aria-checked` 不变、零提示、文件 0 字节变化），
+       *     用户拿不到任何出路说明。
+       *
+       * 现在三件事同时做：
+       *   1. 状态词读**快照的 `staging` 段**（生效值），配置值与生效值不一致时**两条都显示**；
+       *   2. 进程级 `WINSTAGE_SHELL` 强制时，行内显式写"当前由环境变量强制"；
+       *   3. 把这三个事实挂成 `data-winstage-staging-*` 属性 —— GUI 验收可以逐字核对
+       *      （R11 的 `aria-checked` 判据仍然保留，没有换掉既有锚点）。
+       */
+      const liveStaging =
+        (liveFacts && typeof liveFacts === 'object' ? liveFacts : undefined) ??
+        (store.state.staging && typeof store.state.staging === 'object' ? store.state.staging : undefined)
+      const liveEffective = liveStaging && liveStaging.effective === true ? 'on' : liveStaging && liveStaging.effective === false ? 'off' : 'unknown'
+      const liveOverride = liveStaging && liveStaging.shellOverride && liveStaging.shellOverride.forced === true
+      const liveOverrideText = liveStaging && liveStaging.shellOverride && typeof liveStaging.shellOverride.text === 'string'
+        ? liveStaging.shellOverride.text
+        : null
+      const liveMismatch = liveStaging && liveStaging.mismatch && typeof liveStaging.mismatch === 'object' ? liveStaging.mismatch : null
       // 状态文字**三选一**，必须互斥（早期版本 loading 与 unavailable 会同时显示）
       const statusText = unavailable
         ? t('unavailable')
@@ -2850,6 +3044,37 @@ window.__ModuleLoader__.load({
           : enabled
             ? t('on')
             : t('off')
+      /** 生效值那一行（**只有**观察到生效值、且与配置值不同才显示 —— 一致时不加噪） */
+      /**
+       * R13 修复 · D7-b/d：**两张脸分开写**（见 i18n 的 face* 键说明）。
+       * `faces` 由宿主在 200 与 503 两种响应里都给（`panelStagingFaces()`）。
+       * 旧宿主的快照没有 `faces` ⇒ 回落到 R12 的单句写法（向后兼容）。
+       */
+      const stagingFaces = liveStaging && liveStaging.faces && typeof liveStaging.faces === 'object' ? liveStaging.faces : null
+      const fileFaceText = !liveStaging
+        ? null
+        : liveStaging.effective === true
+          ? t('faceFileOn')
+          : liveStaging.effective === false
+            ? t('faceFileOff')
+            : null
+      const shellFaceText = !liveStaging
+        ? null
+        : liveStaging.shellOverride && liveStaging.shellOverride.forced === true
+          ? String(liveStaging.shellOverride.value) === '1'
+            ? t('faceShellEnvOn')
+            : t('faceShellEnvOff')
+          : stagingFaces
+            ? t('faceShellFollow')
+            : null
+      const faceText = [fileFaceText, shellFaceText].filter(Boolean).join(' · ')
+      const effectiveText =
+        faceText ||
+        (liveOverride && liveEffective !== 'unknown'
+          ? `${t('forcedPrefix')} ${liveEffective === 'on' ? t('effectiveOn') : t('effectiveOff')} · ${liveOverrideText}`
+          : liveMismatch
+            ? `${t('effectivePrefix')} ${liveMismatch.effective === true ? t('effectiveOn') : t('effectiveOff')}`
+            : null)
 
       const switchStyle = {
         position: 'relative',
@@ -2898,6 +3123,32 @@ window.__ModuleLoader__.load({
             h('span', { style: { marginLeft: '8px', fontSize: '12px', opacity: 0.6 } }, statusText),
           ),
           h('div', { style: { marginTop: '2px', fontSize: '12px', opacity: 0.6, lineHeight: '18px' } }, t('description')),
+          /**
+           * R12 修复 · D7-d：**生效值那一行**（配置值与生效值不一致 / 被环境变量强制时出现）。
+           *
+           * `data-winstage-staging-effective` 是给 GUI 验收的稳定锚点：
+           * 逐字读出 `on|off|unknown`，就能判定"界面说的"是不是"事实"。
+           */
+          h(
+            'div',
+            {
+              ...DR,
+              style: { marginTop: '2px', fontSize: '12px', lineHeight: '18px', opacity: 0.85 },
+              'data-winstage-staging-effective': liveEffective,
+              'data-winstage-staging-forced': liveOverride ? '1' : '0',
+              ...(liveMismatch ? { 'data-winstage-staging-mismatch': '1' } : {}),
+            },
+            effectiveText ? `${statusText} · ${effectiveText}` : null,
+          ),
+          /**
+           * R12 修复 · D7-c：开关"点了没反应"必须给出**可读原因与出路**。
+           *
+           * 三种已知成因各有各的出路，且都是**用户可核对的事实**：
+           *   · 进程环境变量强制（`WINSTAGE_SHELL`）—— 换 `WINSTAGE_SHELL=0` 重启宿主；
+           *   · profile 覆盖层固定 —— 改 `%DSH_HOME%\profiles\<profile>\cordis.patch.yml`；
+           *   · 设置面不可写（`writable === false`）—— 命中上面 `unavailable` 的既有分支。
+           */
+          liveOverride ? h('div', { ...DR, style: { marginTop: '4px', fontSize: '12px', opacity: 0.75 }, 'data-winstage-staging-forced-note': '1' }, t('forcedHint')) : null,
           // S3e 第 2 条退路：默认展开/默认收起。纯客户端偏好（localStorage），
           // 不改 host 的 Config schema（那不在本任务写范围），因此不需要重启就能生效。
           h(
@@ -2917,6 +3168,26 @@ window.__ModuleLoader__.load({
           ),
           unavailable && h('div', { style: { marginTop: '4px', fontSize: '12px', opacity: 0.7 } }, t('unavailable')),
           failed && h('div', { role: 'alert', style: { marginTop: '4px', fontSize: '12px' } }, t('error')),
+          /**
+           * R12 修复 · D7-c：**点击结果的可见回执**（成功/失败/抛错三类，逐字可读）。
+           * 旧实现失败时只显示 `error` 文案，`ok === undefined`（通道没回值）时**什么都不显示**
+           * —— 那正是"无声 no-op"在界面上的样子。
+           */
+          lastAttempt
+            ? h(
+                'div',
+                {
+                  ...DR,
+                  style: { marginTop: '4px', fontSize: '12px', opacity: 0.85 },
+                  'data-winstage-toggle-attempt': lastAttempt,
+                },
+                lastAttempt === 'accepted'
+                  ? t('toggleAccepted')
+                  : lastAttempt === 'rejected'
+                    ? t('toggleRejected')
+                    : `${t('toggleThrew')} ${lastAttempt.replace(/^threw:/, '')}`,
+              )
+            : null,
         ),
         h(
           'button',
@@ -2932,11 +3203,35 @@ window.__ModuleLoader__.load({
               if (!writable || busy) return
               setFailed(false)
               setBusy(true)
+              // R12 修复 · D7-c：记录"这一次点击到底发生了什么"（GUI 验收逐字可读）
+              setLastAttempt(null)
               Promise.resolve(setEnabled(!enabled))
                 .then((ok) => {
-                  if (ok === false) setFailed(true)
+                  /**
+                   * ⚠ 语义差别（R11 D7-c 的根因之一）：`setEnabled()` 返回**假值**时
+                   * 旧实现只 `setFailed(true)`，而这里的 `ok === undefined` 也可能只是
+                   * "通道没回值"。两者都判失败，但**文案必须说出出路**（见上面的 forcedHint）。
+                   */
+                  if (ok === false) {
+                    setFailed(true)
+                    setLastAttempt('rejected')
+                  } else {
+                    setLastAttempt('accepted')
+                  }
+                  // D7-d：动作之后重读一次生效值（热切换必须立刻反映到"当前生效"那一行）
+                  if (typeof readStaging === 'function') {
+                    Promise.resolve()
+                      .then(() => readStaging())
+                      .then((facts) => {
+                        if (facts) setLiveFacts(facts)
+                      })
+                      .catch(() => {})
+                  }
                 })
-                .catch(() => setFailed(true))
+                .catch((error) => {
+                  setFailed(true)
+                  setLastAttempt(`threw:${String(error?.message ?? error).slice(0, 120)}`)
+                })
                 .finally(() => setBusy(false))
             },
           },
@@ -3039,6 +3334,45 @@ window.__ModuleLoader__.load({
               inject: () => ({
                 hooks: { value: form },
                 setEnabled: (next) => form.set('enabled', next),
+                /**
+                 * R12 修复 · D7-d：给设置行一个**与会话无关**的读法，读它自己的根。
+                 *
+                 * 为什么必须是"行自己读"：面板的轮询器只在**有会话**时才跑
+                 * （`observe(owner)` 才拿到 sessionId），而设置页可能在**没有任何会话**时
+                 * 打开 —— R12 GUI 实测第一版就是这个形态：行内读到了 `unknown`，
+                 * 于是"生效值"那一行显示不出来，用户仍然只看到配置值。
+                 * 这里直接用与面板**同一个** `readReview()`（同一路由、同一自校验），
+                 * 只是根来自本行 config，因此不需要会话身份即可读。
+                 */
+                readStaging: async () => {
+                  const snap = form && typeof form.getSnapshot === 'function' ? form.getSnapshot() : undefined
+                  const val = (snap && snap.value) || {}
+                  const root = typeof val.workspaceRoot === 'string' ? val.workspaceRoot.trim() : ''
+                  if (root.length === 0) return undefined
+                  /**
+                   * ⚠ 必须带上**轮询器已经解析出的会话身份**：宿主路由按
+                   * `(workspaceRoot, sessionId)` 解析存储根，而**不带 session** 时
+                   * 解析出的是另一个根（R12 GUI 实测：不带 session 的那次调用拿到
+                   * 空快照 ⇒ 行内 `effective` 恒 `unknown`，等于没修）。
+                   * 会话身份的唯一来源是轮询器的 `store.state.sessionId`（它由面板的
+                   * owner props 喂进来），这里只读、不新建通道。
+                   */
+                  const sid = store.state.sessionId
+                  try {
+                    const read = await readReview(ctx, sid, root)
+                    /**
+                     * R13 修复 · D7-b/d：**面板被关时也要返回两面状态**。
+                     * 路由在 `enabled:false` 时答 `503 disabled`，但响应体带着
+                     * `staging.faces`（文件面/命令面）——`readReview()` 会把它放进 `read.staging`。
+                     * 旧实现只看 `read.snapshot.staging`，于是这个组合下行内永远是 `unknown`。
+                     */
+                    if (read && read.snapshot && read.snapshot.staging) return read.snapshot.staging
+                    if (read && read.staging) return read.staging
+                    return undefined
+                  } catch {
+                    return undefined
+                  }
+                },
               }),
             },
             WinStageRow,

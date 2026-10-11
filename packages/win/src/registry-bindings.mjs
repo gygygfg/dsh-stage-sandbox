@@ -146,9 +146,40 @@ function describeSpawnError(error) {
   return `${error?.code ?? error?.name ?? 'ERR'}: ${error?.message ?? error}`
 }
 
+/**
+ * R11 修复：`reg.exe` 在中文 Windows 上按 **OEM 代码页（本机 936/GBK）** 输出，
+ * 而旧实现一律按 UTF-8 解 —— `系统` (CF B5 CD B3) 变成 `ϵͳ`、`错误` (B4 ED CE F3)
+ * 变成 4 个 U+FFFD。后果不是"显示难看"，而是**语义被吃**：
+ * `classifyQueryFailure()` 的 `QUERY_NOT_FOUND` 再也匹配不上
+ * "系统找不到指定的注册表项或值"，于是"这个键不存在"被归到
+ * "读不到（unreadable）"分支 ⇒ `diffOverlay()` 拒绝冻结 ⇒ 新建键下的**每一条值写**
+ * 都不进候选（R11-D4-R1：WAL 109 条 SET_VALUE，候选 `values=0`）。
+ *
+ * 修法：UTF-8 解出替换字符（U+FFFD）时，改用 OEM 代码页重解。
+ * 优先试东亚多字节表（本机实测 `gbk` 全字命中、零 U+FFFD），最后回落到单字节表，
+ * 保证任何 locale 都不会比旧行为更差。
+ * @param {Buffer} buffer
+ * @returns {string|null} 无替换字符的解码结果；都不干净时返回 null
+ */
+function decodeOemIfMojibake(buffer) {
+  for (const label of ['gbk', 'gb18030', 'big5', 'shift_jis', 'euc-kr', 'windows-1251', 'windows-1252']) {
+    try {
+      const text = new TextDecoder(label, { fatal: false }).decode(buffer)
+      if (!text.includes('\uFFFD')) return text
+    } catch {
+      /* 该 ICU 构建不支持这个 label —— 试下一个 */
+    }
+  }
+  return null
+}
+
 function decodeRegOutput(value) {
-  if (Buffer.isBuffer(value)) return value.toString(guessEncoding(value))
-  return typeof value === 'string' ? value : ''
+  if (!Buffer.isBuffer(value)) return typeof value === 'string' ? value : ''
+  if (value.length === 0) return ''
+  if (guessEncoding(value) === 'utf16le') return value.toString('utf16le')
+  const utf8 = value.toString('utf8')
+  if (!utf8.includes('\uFFFD')) return utf8
+  return decodeOemIfMojibake(value) ?? utf8
 }
 
 /** 管道版：输出按行解析需要 Buffer，所以不走 `encoding: 'utf8'`。 */

@@ -688,6 +688,27 @@ function stringOption(raw, key) {
 }
 
 /**
+ * ── R14 修复 · D5-N5：网络档位的**唯一入口**（此前 `dsh-plugin/**` 从不传它）───────
+ *
+ * R11 实测（`docs/round11/network-报告.md`）：出站/入站全开、真实 WFP 过滤器 0 个、
+ * `sandbox-lane.json` 里**零网络字段**。代码侧的根因不是 `src/netpolicy.mjs`（那套
+ * 安装/回读/fail-closed 判定是齐的），而是**装配侧从没把 `networkTier` 交给执行器**：
+ * `src/executor.mjs:1985` 的默认值 `OBSERVED_ONLINE` 于是永远是唯一取值，
+ * `installNetworkPolicy()` 那条路径**一次都没被走过**，而用户在任何界面都看不出这一点。
+ *
+ * 现在显式接线：行 `config.networkTier`（或环境变量 `WINSTAGE_NETWORK_TIER`）。
+ * **默认仍是 `OBSERVED_ONLINE`** ⇒ 既有行为逐字不变；显式设 `OFFLINE` 时，
+ * 执行器会按既有设计尝试安装真实 WFP 过滤器，挡不住就 fail-closed 拒绝执行命令。
+ * 取值不合法一律**回落默认**并只记录，绝不静默接受一个拼错的档位。
+ */
+const NETWORK_TIERS = new Set(['OBSERVED_ONLINE', 'OFFLINE'])
+function normalizeNetworkTier(value) {
+  if (typeof value !== 'string' || value.length === 0) return 'OBSERVED_ONLINE'
+  const upper = value.toUpperCase()
+  return NETWORK_TIERS.has(upper) ? upper : 'OBSERVED_ONLINE'
+}
+
+/**
  * 有界捕获一条输出流，返回 `CollectedOutput` **形状**（`{text, truncated}`）。
  * 与 `dsh-subprocess` 的 `CollectedOutput` 逐字对齐：`text` 是**尾部**，`truncated`
  * 表示丢过字节。`spillPath` 只在真有完整落盘文件时才出现 —— 这里没有（见文件头
@@ -1037,6 +1058,13 @@ export function createWinStageShellExecutor(options = {}) {
        * 所以"每条命令新建执行器"不会每条都重跑一次金丝雀。
        */
       this.tier = stringOption(raw, 'tier') ?? stringOption(process.env, 'WINSTAGE_TIER') ?? 'auto'
+
+      /**
+       * ── R14 修复 · D5-N5：网络档位接线（默认 `OBSERVED_ONLINE`，行为不变）────────
+       * 见 `normalizeNetworkTier()` 的注释：此前这个值**没有任何入口**，
+       * 于是 `installNetworkPolicy()` 永远不被调用，而网络姿态在 lane/状态面上也看不见。
+       */
+      this.networkTier = normalizeNetworkTier(stringOption(raw, 'networkTier') ?? stringOption(process.env, 'WINSTAGE_NETWORK_TIER'))
 
       /**
        * 工作区来源：**每次 execute() 现读**（见 `currentWorkspaceOf`），
@@ -1592,6 +1620,8 @@ export function createWinStageShellExecutor(options = {}) {
         registryStageDir: workspace.store?.dir,
         mode: this.mode,
         tier: this.tier,
+        /** R14：把网络档位真正交给执行器（此前从不传 ⇒ 永远停在默认档） */
+        networkTier: this.networkTier,
         timeoutMs: spec.timeoutMs,
       })
 
@@ -1666,6 +1696,24 @@ export function createWinStageShellExecutor(options = {}) {
           fallbackClass: classifyLaneFallback(executor.fallbackReason).code,
           degraded: effectiveLane !== 'shim',
           at: new Date().toISOString(),
+          /**
+           * ── R14 修复 · D5-N2/N5：网络姿态**进 lane 产物** ──────────────────────
+           * R11 实测：`sandbox-lane.json` 12 个键里**零网络字段**，于是"有没有网络策略
+           * 在生效"只能靠读源码回答。这里把执行器的网络摘要原样带上（`state/enforced/
+           * verified/reason` 全部来自 `src/netpolicy.mjs`，不在这里重算、不伪造），
+           * 并如实标注"逐条网络 op 的审计尚未实现"。
+           */
+          network: {
+            requested: this.networkTier,
+            state: executor.networkPolicy && typeof executor.networkPolicy.state === 'string' ? executor.networkPolicy.state : 'not-evaluated',
+            enforced: Boolean(executor.networkPolicy && executor.networkPolicy.enforced === true),
+            verified: Boolean(executor.networkPolicy && executor.networkPolicy.verified === true),
+            reason: executor.networkPolicy && typeof executor.networkPolicy.reason === 'string' ? executor.networkPolicy.reason : null,
+            perOpAudit: false,
+            note:
+              '逐条网络操作（connect/bind）的审计未实现；本字段只回答"当前档位与是否真的强制"。' +
+              '默认档 OBSERVED_ONLINE 下本机不安装任何真实 WFP 过滤器（R11 实测 netsh wfp 前后逐字节相同）。',
+          },
         }
         this.persistLane(lane, workspace)
         /**

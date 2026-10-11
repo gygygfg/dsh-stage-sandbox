@@ -426,11 +426,20 @@ W('=== 6. 真实 shim/out：体检 + 在镜像里验证恢复路径 ===')
       check('补齐后镜像体检通过', afterMirror.ok === true, JSON.stringify(afterMirror.detail))
     } else {
       /* 真实树里已经没有可恢复副本：这正是必须显式报错、且只能靠重新编译
-       * 解决的场景，绝不能悄悄放过。 */
+       * 解决的场景，绝不能悄悄放过。
+       *
+       * R12 修正：直接对**健康**镜像调用 repairFromStale() 测不到这条路径 ——
+       * 三个产物都"已存在且形态正确"时全部进 skipped，返回值是
+       * `ok:true`（含义是"本来就健康、无需恢复"），而不是"静默恢复成功"。
+       * 要测的是"**有产物需要修复**但没有 stale 可用" ⇒ 先在镜像里制造一个
+       * 待修产物（删除 injector），再看它是否明确拒绝。 */
+      try { fs.rmSync(path.join(mirror, INJECTOR), { force: true }) } catch { /* 制造待修产物失败也不静默放过 */ }
+      const refused = repairFromStale(mirror, names)
       check(
         '无 stale 可恢复时，恢复被明确拒绝而不是静默成功',
-        repairFromStale(mirror, names).ok === false,
-        `mirror=[${listNames(mirror).join(',')}]`,
+        refused.ok === false && refused.unrecoverable.some((u) => u.name === INJECTOR),
+        `ok=${refused.ok} restored=[${refused.restored.map((r) => r.name).join(',')}] ` +
+          `unrecoverable=[${refused.unrecoverable.map((u) => u.name).join(',')}]`,
       )
       W('  注意：shim/out 里已无 winstage-inject.exe 的任何 .stale-* 副本；')
       W('        该产物只能重新编译找回，--repair-stale 会明确失败（这是设计要求）。')

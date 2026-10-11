@@ -11,7 +11,7 @@ rem  code page, so non-ASCII comments get decoded as garbage and executed.
 rem  This is documented residual boundary R11 in the Windows feature list
 rem  document, section 13 (that .md file is UTF-8; this .cmd must not be).
 rem ---------------------------------------------------------------------------
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
 if "%NODE_EXE%"=="" set "NODE_EXE=C:\Program Files\nodejs\node.exe"
 if not exist "%NODE_EXE%" set "NODE_EXE=node.exe"
 cd /d "%~dp0"
@@ -82,6 +82,16 @@ rem  dsh-plugin\cordis.patch.yml as exact mutual inverses across env x profile, 
 rem  also pins the YAML shape (a scalar starting with `!` is parsed as a second tag
 rem  and skips the whole bundle patch).
 for %%S in (tests\selftest.mjs tests\e2e-flow.mjs tests\struct-layout.mjs tests\appcontainer-layout.mjs tests\resolve-exec.mjs tests\executor-stub.mjs tests\audit-parse.mjs tests\paths-masks.mjs tests\registry-guard.mjs tests\workspace-regressions.mjs tests\meta-runner.mjs tests\appcontainer-runtime.mjs tests\probe-selfkill-guard.mjs tests\netpolicy.mjs tests\mitigations.mjs tests\limits.mjs tests\integration-wiring.mjs tests\wfp-layout.mjs tests\suite-wiring.mjs tests\residual-baseline.mjs tests\policy-never-consistency.mjs tests\baseline-integrity.mjs tests\dsh-patch-guard.mjs tests\boundary-degraded-failclosed.mjs tests\whiteout-candidate-capture.mjs tests\assembly-toggle-selftest.mjs tests\session-enclosure-selftest.mjs tests\sandbox-audit.mjs tests\environment-gate.mjs) do (
+  rem R11 hermeticity fix: without an explicit per-suite root every suite in this
+  rem loop shares %LOCALAPPDATA%\Temp\winstage-stage\<DSH_SESSION_ID>. Leftover
+  rem staged files/candidates from an earlier suite then leak into a later one:
+  rem whiteout-candidate-capture read a foreign a.txt (create=4 instead of 1) and
+  rem failed apply with BLOB_MISSING a.txt -- reproducible in-gate, green when run
+  rem alone. A unique pinned root per suite is the supported escape hatch.
+  rem NOTE: base it on LOCALAPPDATA (long form), NOT %TEMP% -- this box exports
+  rem TEMP as the 8.3 alias C:\Users\ADMINI~1\... and the store-internal-marker
+  rem check compares against the long path, so a short-form root fails it.
+  set "WINSTAGE_STAGE_ROOT=%LOCALAPPDATA%\Temp\winstage-stage-gate-%%~nS-!RANDOM!!RANDOM!"
   echo === %%S ===
   "%NODE_EXE%" %%S
   if errorlevel 1 set FAIL=1

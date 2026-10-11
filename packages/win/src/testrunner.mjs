@@ -18,8 +18,28 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WINDOWS_HIDE, suppressWindowsCriticalErrorDialogs } from './spawn-window.mjs'
 import { stageBaseDir } from './stage-guard.mjs'
+import { installChildProcessPipeGuard } from './child-capture.mjs'
 
 suppressWindowsCriticalErrorDialogs()
+/**
+ * R12 修复 · D5-N1 的**运行期接线**（不是只放一个新模块）：
+ *
+ * R11 实测：沙箱里任何走默认 `stdio:'pipe'` 的 spawn 一旦被拒（`read ENOTCONN`），
+ * 那条 Socket 的 `error` 没有监听者 ⇒ **整个进程死亡**。套件本身（或它拉起的
+ * 子进程）踩到这一条时，后果不是"某个断言失败"，而是**证据链整体丢失**。
+ * 因此运行器进程装一次守卫：同类错误降级为可读注记 + 非零退出码，进程继续。
+ *
+ * 惰性安装（`runCaptured()` 首次真正要拉子进程时装），避免"只是 import 运行器"
+ * 就改变 `uncaughtException` 语义。
+ */
+let pipeGuardInstalled = false
+function ensurePipeGuard() {
+  if (pipeGuardInstalled) return
+  pipeGuardInstalled = true
+  installChildProcessPipeGuard({
+    log: (message) => console.error(message),
+  })
+}
 
 export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -158,6 +178,8 @@ export const ALL_SUITE_IDS = [...OFFLINE_SUITES, ...SANDBOX_SUITES].map((s) => s
  * @returns {{status:number|null, signal:string|null, error:Error|undefined, text:string, durationMs:number}}
  */
 export function runCaptured(command, argv, options = {}) {
+  // D5-N1：真正要拉子进程之前才装守卫（见文件头的惰性安装说明）
+  ensurePipeGuard()
   const outFile = options.outFile
   mkdirSync(dirname(outFile), { recursive: true })
   const fd = openSync(outFile, 'w')

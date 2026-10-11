@@ -31,6 +31,8 @@ import { STATE, STORE_DIR, hashAbsent, hashFile, makeRemovable, writeFileAtomic 
 import { resolveStageRoot } from '../src/stage-guard.mjs'
 import { Workspace, driftReasonOf } from '../src/workspace.mjs'
 import { renderCandidateDiff } from '../src/tools.mjs'
+import { MASK_REASON, maskSensitiveLines, redactedToken } from './sensitive-content.mjs'
+import { unstagedSnapshot } from './unstaged-ledger.mjs'
 import { REGISTRY_CANDIDATE_SOURCE, createRegistryStage, registryWireBytes } from '../src/registry-stage.mjs'
 import { createRegExeReader, createRegExeWriter } from '../src/registry-bindings.mjs'
 
@@ -54,6 +56,56 @@ export function isRegistryCandidate(candidate) {
 export const REVIEW_BASENAME = 'review.json'
 
 /**
+ * R12 修复 · D7-b/d：**进程内"暂存面此刻是否真的在跑"的生效台账**。
+ *
+ * ── 为什么需要一块进程级状态（而不是从快照别的字段推）────────────────────────
+ * R11 D7-b/d 实测：profile 写 `enabled: false`，而进程级 `WINSTAGE_SHELL=1`
+ * 让 `staging-fs.mjs` 的 `stagingEnabled()` 返回真 ⇒ **暂存在跑、面板不出现**
+ * （客户端只认 `config.enabled`）。两者是**两个不同的权威**：
+ *   · `config.enabled` = 用户写在 profile 里的配置值；
+ *   · 是否真的接管     = `staging-fs.stagingEnabled()`（进程环境变量可越过配置）。
+ * 用户在界面上读到"已关闭"而事实是"已在跑"，正是这两个权威**没有同时呈现**。
+ *
+ * 实现：`key = canonical(workspaceRoot)` → `{ enabled, workspaceRoot, seenAt }`。
+ * `staging-fs.mjs` 在自己的读/写入口登记，`snapshot()` 按**本服务的根**查表。
+ * 纯进程内、无 IO、无副作用 —— 关掉开关的实例不会登记，于是它照旧报 `enabled:false`。
+ */
+const EFFECTIVE_STAGING = new Map()
+
+/**
+ * 登记"这个暂存根此刻真的在接管"。
+ * @param {string} workspaceRoot canonical 根
+ * @param {boolean} enabled
+ */
+export function noteEffectiveStaging(workspaceRoot, enabled) {
+  const key = String(workspaceRoot ?? '').toLowerCase()
+  if (key.length === 0) return
+  EFFECTIVE_STAGING.set(key, { enabled: enabled === true, workspaceRoot, seenAt: Date.now() })
+}
+
+/** 读生效台账（自测/诊断用；生产由 `snapshot()` 读） */
+export function effectiveStagingOf(workspaceRoot) {
+  return EFFECTIVE_STAGING.get(String(workspaceRoot ?? '').toLowerCase())
+}
+
+/** 清空生效台账（自测用；生产不调用） */
+export function __resetEffectiveStaging() {
+  EFFECTIVE_STAGING.clear()
+}
+
+/**
+ * 进程级三态：`WINSTAGE_SHELL` 是否**强制**了 shell/fs 半边（D7-c/d 的"被环境变量强制"）。
+ *
+ * `'1'` = 强制接管（可越过"开关关"）；`'0'` = 强制交还平台（优先级最高）；其它 = 未设/无强制。
+ */
+export function shellEnvOverride(env = process.env) {
+  const raw = env?.WINSTAGE_SHELL
+  if (raw === '1') return { value: '1', forced: true, text: 'WINSTAGE_SHELL=1（强制 WinStage 接管）' }
+  if (raw === '0') return { value: '0', forced: true, text: 'WINSTAGE_SHELL=0（强制交还平台）' }
+  return { value: raw === undefined ? null : String(raw), forced: false, text: null }
+}
+
+/**
  * 自动对准基线（`autoRebaseDrifted()`）的最小间隔。
  *
  * `reload()` 在 fs 面的每次操作上都会跑，而"基线漂移"要逐条 stat+hash 真实文件；
@@ -68,6 +120,17 @@ const AUTO_REBASE_INTERVAL_MS = 1000
  * 逐字由第三阶段面板与断言共用，**不要**在别处再写一份字面量。
  */
 export const SENSITIVE_OMIT_NOTE = '内容已按敏感策略省略（不把凭据/密钥片段写入 review.json）'
+
+/**
+ * R12 修复 · D2：敏感档条目写进 `review.json` 的 `note`（**保留结构、遮蔽值**）。
+ *
+ * 与 `SENSITIVE_OMIT_NOTE` 的分工是"两条不同的策略"，不是同一件事的两种措辞：
+ *   · `danger` 档（凭据/密钥/本工具自身存储）：**整份内容不进 payload**（原契约不动）；
+ *   · `sensitive` 档（命中遮蔽表但不是 danger id，例如 `.dsh/.credentials.yaml` 被
+ *     更宽的 `dsh-home` 规则命中）：**结构照给、值换成 `<REDACTED len=N>`**。
+ * R11 D2 的明文泄漏正是"只做了前者、后者的 `diff` 原样照写"这一条缝。
+ */
+export const SENSITIVE_MASK_NOTE = '内容已按敏感策略掩码（保留键名/缩进/长度，值替换为 <REDACTED len=…>）'
 
 /**
  * `safety:"danger"` 的判定依据：命中的 mask id 属于"凭据 / 本工具自身"这一组，
@@ -114,6 +177,48 @@ export const DANGER_MASK_IDS = Object.freeze([
 export const REQUIRED_MASK_IDS = Object.freeze([...DANGER_MASK_IDS, 'hosts'])
 
 const DANGER_IDS = new Set(DANGER_MASK_IDS)
+
+/**
+ * R12 修复 · D7-b/c/d：**配置值 / 生效值 / 环境强制** 三者一起给（界面据此说真话）。
+ *
+ * `effective` 的来源是 `noteEffectiveStaging()` 的进程内台账（`staging-fs` 在真接管时登记）。
+ * 拿不到台账时**返回 `null` 而不是 false**：`null` 的语义是"本进程没观察到接管"
+ * （可能根本没装 fs 半边、也可能根不同），与"明确知道它关着"是两件事 ——
+ * 界面必须能区分这两种，否则又会变成"未知当已知"。
+ *
+ * @param {string} workspaceRoot
+ * @param {{enabled?: boolean, reason?: string}|undefined} hint 装配方显式给的生效值（可选）
+ */
+export function effectiveStagingSnapshot(workspaceRoot, hint) {
+  const observed = effectiveStagingOf(workspaceRoot)
+  const override = shellEnvOverride()
+  const effective = hint && typeof hint.enabled === 'boolean' ? hint.enabled : observed?.enabled ?? null
+  return {
+    /** 快照根（面板据此确认这是不是自己的根） */
+    workspaceRoot,
+    /** **生效值**：这个暂存根此刻是否真的在接管；`null` = 本进程未观察到 */
+    effective,
+    /**
+     * **配置值**（loader 行 `config.enabled` 的判定结果）：
+     * `true` / `false` = 读到明确值；`null` = 没注入（自测/无装配方）。
+     * 与 `effective` 并列给出 ⇒ 界面不必再"用一个猜另一个"（R11 D7-d 的根因）。
+     */
+    configValue: hint && typeof hint.enabled === 'boolean' ? hint.enabled : null,
+    /** 观察时间（`null` = 没有观察记录） */
+    observedAt: observed ? new Date(observed.seenAt).toISOString() : null,
+    /** 生效值的**依据**（`staging-fs` 登记 / 装配方注入 / 未观察到） */
+    source: hint && typeof hint.enabled === 'boolean' ? 'config' : observed ? 'staging-fs' : 'unobserved',
+    /** 进程级 `WINSTAGE_SHELL` 是否**强制**了某一侧（D7-c/d 的"被环境变量强制"） */
+    shellOverride: { value: override.value, forced: override.forced, text: override.text },
+    /**
+     * "配置值 vs 生效值不一致"的机读结论。`null` = 一致或无法比较。
+     * 面板据此把状态词写成"已关闭（但当前由环境变量强制接管）"这类**同时呈现两者**的句子。
+     */
+    mismatch: hint && typeof hint.enabled === 'boolean' && effective !== null && hint.enabled !== effective
+      ? { configValue: hint.enabled, effective, reason: override.forced ? 'env-override' : 'profile-overlay' }
+      : null,
+  }
+}
 
 /**
  * 清单漂移**硬失败**校验：`MASK_CLASSES` 里找不到的 id 直接抛错，
@@ -558,6 +663,16 @@ export class ReviewService {
      * 实现见 `dsh-plugin/audit-mirror.mjs`（含回合内校验与"失败不影响审批"）。
      */
     this.audit = options.audit
+    /**
+     * R12 修复 · D7-b/d：装配方（`staging-fs`）把自己**实际是否接管**的判定结果注入进来。
+     *
+     * 为什么不在这里自己读 loader 行：`staging-fs.stagingEnabled()` 才是唯一权威
+     * （它读 host 行的 `config.enabled`，并受 `WINSTAGE_SHELL` 影响），
+     * 在 review-service 里再读一遍就是**第二个权威** —— 两个权威迟早会漂移，
+     * 而 R11 D7-b/d 正是"客户端读配置值、服务端按生效值跑"的那种漂移。
+     * 注入的是**同一个函数的结果**，因此两者不可能说不同的话。
+     */
+    this.effectiveStagingHint = options.effectiveStaging
     /** 清除路径上"回收 / 丢弃失败"的记账（`reject()` / `_rebase()` 复位并随返回值上报） */
     this.clearFailures = []
     /**
@@ -1193,6 +1308,10 @@ export class ReviewService {
     // 候选被修剪之后这个集合自然收缩到空 —— 它不再是历史的容器。
     const frozenFiles = this.frozenOnlyRows(ws, netKeys)
     const listed = [...netFiles, ...registryFiles, ...frozenFiles]
+    /** R12 · D2：被掩码 / 被省略的**净 diff 条目**（顶层 `redactions` 段的来源） */
+    const masked = netFiles.filter(
+      (entry) => entry && (entry.contentMasked === true || entry.note === SENSITIVE_OMIT_NOTE),
+    )
 
     /**
      * ── WP5′.2：`listed` / `totalFiles` / `truncated` **三者自洽** ────────────────
@@ -1276,6 +1395,63 @@ export class ReviewService {
         appliedPaths: [...(candidate.appliedPaths || [])],
       })),
       readVisibility: readVisibilitySnapshot(this.sessionId),
+      /**
+       * R12 修复 · D7-a：**本次会话里"没有走暂存"的动作**（机读，绝不静默）。
+       *
+       * 来源是 `staging-fs` 落在**同一存储根**的 `unstaged.json`（`dsh-plugin/unstaged-ledger.mjs`）。
+       * R11 D7-a 的实测结论是"`write` 工具在平台一次提权后绕过暂存直落真实盘，
+       * 而界面与审计零提示" ⇒ 现在这件事必然出现在快照里：
+       * 面板据此显示常驻提示，复核者据此判定"这一条的写入不进待审、也无法被拒绝"。
+       *
+       * 语义边界：`any=false` 只说明**账本里没有记录**，不等于"平台面一定没有别的写入通道"
+       * （`pwsh` 工具的落点由 shell 半边负责，不在本账本范围内）。
+       */
+      unstaged: unstagedSnapshot(this.storeDir),
+      /**
+       * R12 修复 · D7-b/c/d：**配置值与生效值分列**（界面必须能同时看到两者）。
+       *
+       *   · `configValue`      —— 本插件 loader 行 `config.enabled` 的**配置值**
+       *     （`staging-fs.stagingEnabled()` 的判据；`null` = 读不到行 ⇒ 视为接管）；
+       *   · `effective`        —— 本进程里这个暂存根**是否真的在接管**（生效值）；
+       *   · `shellOverride`    —— 进程级 `WINSTAGE_SHELL` 是否**强制**了某一侧。
+       *
+       * R11 D7-d 的形态是"行内状态词 `已关闭`，而实测 TS 在跑"：客户端当时只读了
+       * `config.enabled`。现在两者都在同一份快照里 ⇒ 面板可以显式说
+       * "配置值：已关闭 / 生效值：接管中（原因：WINSTAGE_SHELL=1 强制）"，
+       * 而"被 profile 覆盖层固定 / 被进程环境变量强制"这两种失败原因也各有字段。
+       */
+      staging: effectiveStagingSnapshot(this.workspaceRoot, this.effectiveStagingHint),
+      /**
+       * R12 修复 · D2：**本版快照里哪些字段被掩码**（机读，绝不静默）。
+       *
+       * 与 `files[].contentMasked` 同源（同一批 `renderChange()` 结果），
+       * 但额外给出"整版汇总"：面板/审计可以一眼回答
+       * "这份 review.json 里有没有被掩码的内容、掩了几段、为什么掩"，
+       * 不需要逐条扫 `files[]`。
+       *
+       * 语义边界（**不要读成"哈希也被掩码了"**）：
+       * 本段只描述**展示文本**。`before/after` 哈希与字节数永远按真实字节算，
+       * 因此掩码不影响"基线是否漂移 / 能不能批准"的任何判定。
+       */
+      redactions: {
+        /** 有**任何**条目被掩码时为 true（含 danger 档的整份省略） */
+        masked: masked.length > 0,
+        /** 被掩码的条目数 */
+        fields: masked.length,
+        /** 被掩码的**段**总数（一行里可能有多个值） */
+        segments: masked.reduce((sum, entry) => sum + (entry.maskedSegments || 0), 0),
+        /** 逐条明细（path + 理由 + 段数）——面板据此在行内标"内容已掩码" */
+        items: masked.map((entry) => ({
+          path: entry.path,
+          reason: entry.note === SENSITIVE_OMIT_NOTE ? 'omitted' : 'masked',
+          segments: entry.maskedSegments || 0,
+          maskReasons: entry.maskReasons || [],
+        })),
+        /** 掩码策略的两条口径（字面量，供断言逐字核对） */
+        policies: { omitted: SENSITIVE_OMIT_NOTE, masked: SENSITIVE_MASK_NOTE },
+        /** 占位形态（Client 可拿它做二次校验：出现这个前缀就说明这一段没有原文） */
+        token: redactedToken(0).replace(' len=0', ' len=…'),
+      },
       /** Method A 主线：AI 进程树读了/改了什么的分类统计（见 `auditSummary()`） */
       audit: this.auditSummary(),
       files,
@@ -1308,6 +1484,15 @@ export class ReviewService {
       masks: ws.extraMasks,
     })
     const sensitiveOmitted = verdict.safety === 'danger'
+    /**
+     * R12 修复 · D2：**命中敏感遮蔽表但不是 danger id** 的条目（`safety === 'risk'`
+     * 且 `risk === 'sensitive'`）也要掩码 —— 只掩**值**，保留结构与长度。
+     *
+     * 为什么必须在这一档也做：`.dsh/.credentials.yaml` 命中的是 `MASK_CLASSES` 里
+     * 更早的宽规则 `dsh-home`（不在 `DANGER_MASK_IDS` 里）⇒ `safety === 'risk'`，
+     * R11 实测它的**整份 10 行明文**（含 `sk-` 值）就是从这里进 `review.json` 的。
+     */
+    const sensitiveMasked = !sensitiveOmitted && verdict.risk === 'sensitive'
 
     const item = {
       // ── 老字段（向后兼容：一个都不能少、不能改名）──────────────────────
@@ -1377,6 +1562,49 @@ export class ReviewService {
     // 而是策略上有意不给，两个语义不能混）
     if (sensitiveOmitted) return item
 
+    /**
+     * R12 修复 · D2：敏感档（非 danger）**在这里掩码**。
+     *
+     * 关键顺序（三条都不能颠倒）：
+     *   1. `totals` **已经**在掩码之前由 `renderCandidateDiff()` 数完 ⇒
+     *      "改了多少行"永远是真实计数（掩码不参与统计）；
+     *   2. 掩码只作用于**写进 payload 的文本**，`change.before.hash` /
+     *      `change.after.hash` / `after.bytes` 一个字节都不碰 ⇒
+     *      before/after 哈希比对语义逐字不变（哈希按真实字节算，见
+     *      `src/workspace.mjs` 的 `entry.stagedHash`）；
+     *   3. 掩码结果用 `redacted: true` 逐行标记，条目上加
+     *      `contentMasked` / `maskedSegments` / `maskReasons`，
+     *      顶层快照再汇总一份 `redactions`（"哪些字段被掩码"可机读）。
+     */
+    let redaction = { lines: [], masked: false, segments: 0, reasons: [] }
+    if (sensitiveMasked) {
+      const view = []
+      for (const line of all) {
+        if (line.type === 'change-header' || line.type === 'note') continue
+        if (view.length >= limits.maxLinesPerFile) break
+        const text = String(line.text ?? '')
+        /**
+         * ⚠ 截断必须发生在**掩码之前**，但报的长度必须是**整行**的。
+         *
+         * 早先的写法是先 `slice(0, maxLineChars)` 再掩 —— 那会让"值比 `maxLineChars`
+         * 长"的秘密只被遮住前 140 字符，**尾巴留在 payload 里**（一个自己造出来的新泄漏）。
+         * 正确做法：拿整行去数长度与命中，只在最后按显示宽度裁剪。
+         * 因为 `<REDACTED len=N>` 比任何密钥都短，`sensitiveMasked` 条目实际不会被裁到。
+         */
+        const masked = maskSensitiveLines([{ type: line.type, line: line.line, text }])
+        const shown = masked.masked ? masked.lines[0]?.text ?? text : text
+        view.push({
+          type: line.type,
+          line: line.line,
+          text: shown.length > limits.maxLineChars ? `${shown.slice(0, limits.maxLineChars)}…` : shown,
+        })
+        redaction.masked = redaction.masked || masked.masked
+        redaction.segments += masked.segments
+        for (const reason of masked.reasons) if (!redaction.reasons.includes(reason)) redaction.reasons.push(reason)
+      }
+      redaction.lines = view
+    }
+
     for (const line of all) {
       if (line.type === 'change-header' || line.type === 'note') continue
       if (item.diff.length >= limits.maxLinesPerFile) {
@@ -1389,6 +1617,13 @@ export class ReviewService {
         line: line.line,
         text: text.length > limits.maxLineChars ? `${text.slice(0, limits.maxLineChars)}…` : text,
       })
+    }
+    if (sensitiveMasked && redaction.masked) {
+      item.diff = redaction.lines
+      item.contentMasked = true
+      item.maskedSegments = redaction.segments
+      item.maskReasons = redaction.reasons
+      item.note = SENSITIVE_MASK_NOTE
     }
     return item
   }

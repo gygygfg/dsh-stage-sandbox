@@ -129,6 +129,14 @@
         enabled: true
         workspaceRoot: &winstageRoot C:\Users\Administrator\Desktop\dsh-winstage-sandbox
         probeOnStart: true
+        # ── R14 · D5-N5：网络档位的**唯一入口**（默认值 = 既有行为，逐字不变）──────
+        # `OBSERVED_ONLINE`（默认）：不安装任何 WFP 过滤器，出站/入站全开；
+        #   执行器仍会把档位与 `enforced:false` 如实写进 `sandbox-lane.json` 的 `network` 段。
+        # `OFFLINE`：执行器尝试安装真实 WFP 过滤器（`src/netpolicy.mjs::installNetworkPolicy`），
+        #   **挡不住就 fail-closed 拒绝执行命令**（`src/executor.mjs` 的既有判定）。
+        # ⚠ profile 覆盖层对**整行 config 做整体替换**：若覆盖层重述 `winstage-sandbox` 行
+        #   而不带本键，本键会被丢弃并回落到代码默认值（`normalizeNetworkTier()`）。
+        networkTier: OBSERVED_ONLINE
 
     - id: winstage-fs
       # **必须**保持子路径 specifier（不要改成裸包名）：
