@@ -129,14 +129,17 @@
         enabled: true
         workspaceRoot: &winstageRoot C:\Users\Administrator\Desktop\dsh-winstage-sandbox
         probeOnStart: true
-        # ── R14 · D5-N5：网络档位的**唯一入口**（默认值 = 既有行为，逐字不变）──────
-        # `OBSERVED_ONLINE`（默认）：不安装任何 WFP 过滤器，出站/入站全开；
-        #   执行器仍会把档位与 `enforced:false` 如实写进 `sandbox-lane.json` 的 `network` 段。
-        # `OFFLINE`：执行器尝试安装真实 WFP 过滤器（`src/netpolicy.mjs::installNetworkPolicy`），
-        #   **挡不住就 fail-closed 拒绝执行命令**（`src/executor.mjs` 的既有判定）。
-        # ⚠ profile 覆盖层对**整行 config 做整体替换**：若覆盖层重述 `winstage-sandbox` 行
-        #   而不带本键，本键会被丢弃并回落到代码默认值（`normalizeNetworkTier()`）。
-        networkTier: OBSERVED_ONLINE
+        # ── R16 修复 · D5-R16-1：网络档位的入口**不在本行**，在下面的 `winstage-shell` 行 ──
+        # R15（D5-N5）曾把 `networkTier` 写在本行，R16 实测证明那是**死键**：
+        #   唯一读者是 `shell-executor.mjs` 的
+        #   `normalizeNetworkTier(stringOption(raw, 'networkTier') ?? env)`，
+        #   而 `raw` 取的是 **shell 行** 的 config（`shell-executor.mjs:1067`；源码依据见
+        #   `shell-executor.mjs:989/:1005`）。`grep networkTier dsh-plugin/*.mjs` 只命中
+        #   `shell-executor.mjs`，`host-plugin.mjs` 0 命中 ⇒ 写在本行只会静默无效。
+        #   实测（`.t\r16\network\`）：本行注入 `OFFLINE` 后 lane 仍 `requested=OBSERVED_ONLINE`
+        #   且命令照跑；改写 shell 行才生效。
+        # ⚠ profile 覆盖层对**整行 config 做整体替换**：覆盖层若要改档位，必须在
+        #   `winstage-shell` 行重述 `networkTier`（见 `profiles/sbx` 的对应行）。
 
     - id: winstage-fs
       # **必须**保持子路径 specifier（不要改成裸包名）：
@@ -166,3 +169,14 @@
         # `shell-executor.mjs` 的 `effectiveWorkspaceRoot()` 以 **fs 行的 `cwd`** 为权威、
         # 与这里的值交叉校验；漂移 ⇒ error 级日志 + 以 fs 根为准（绝不两个根各建一个单例）。
         workspaceRoot: *winstageRoot
+        # ── R16 修复 · D5-R16-1：网络档位的**唯一有效入口**（默认值 = 既有行为，逐字不变）──
+        # `OBSERVED_ONLINE`（默认）：不安装任何 WFP 过滤器，出站/入站全开；执行器仍把档位与
+        #   `enforced:false` 如实写进 `sandbox-lane.json` 的 `network` 段。
+        # `OFFLINE`：执行器尝试安装真实 WFP 过滤器（`src/netpolicy.mjs::installNetworkPolicy`），
+        #   **挡不住就 fail-closed 拒绝执行命令**（`src/executor.mjs` 的既有判定）。
+        # 读取处：`shell-executor.mjs:1067`
+        #   `normalizeNetworkTier(stringOption(raw,'networkTier') ?? stringOption(process.env,'WINSTAGE_NETWORK_TIER'))`
+        #   —— `raw` = **本行** config；环境变量 `WINSTAGE_NETWORK_TIER` 是显式逃生口（同一优先级链）。
+        # ⚠ 本行 config 被 profile 覆盖层**整体替换**：覆盖层若重述本行而不带 `networkTier`，
+        #   本键会被丢弃并回落默认（`profiles/sbx/cordis.patch.yml` 已同步重述，见 R16 修复说明）。
+        networkTier: OBSERVED_ONLINE

@@ -795,6 +795,20 @@ export function shellFailure(code, message) {
 export const SEMANTIC_CODES = FAILURE_CATEGORY_CODES
 
 /**
+ * R16-D3-2：MSI 家族命令在 WinStage 接管时的**模型可见**一句话。
+ *
+ * ⚠ 必须是**中性**的：`transparencyViolations()` 会对
+ *   `沙箱|暂存|替代路径|sandbox|staging|stage|overlay` 做大小写不敏感**子串**机检
+ *   （`src/executor.mjs:4252-4274`），而 `semanticShellFailure()` 会对**整句**跑这个机检。
+ *   因此这里**不写**"进程外服务 / 无法暂存"之类机制措辞 —— 那些一律走人工侧
+ *   （error 级日志 + `error.winstage.*`），见下面的 MSI 闸门调用点。
+ */
+const MSI_UNSUPPORTED_MESSAGE =
+  'MSI 安装（msiexec / msiserver）在当前模式下不被允许，本次未执行；' +
+  '该方式依赖系统级安装服务，请改用便携式/免安装分发方式，' +
+  '或改用不依赖 MSI 服务的安装方式（见 docs/round16/exe-缺陷.md 的 R16-D3-2）。'
+
+/**
  * fail-closed 分支的机读码 → 三层语义（内部口径表）。
  *
  * 键是 `shellFailure()` 用的**技术码**（人工侧归因用）；值里的 `category` 决定
@@ -813,6 +827,16 @@ export const SHELL_FAILURE_CLASSIFICATION = Object.freeze({
   WINSTAGE_SHELL_BASE_MISSING: { category: FAILURE_SEMANTICS.ENVIRONMENT },
   WINSTAGE_SHELL_BASE_LOAD_FAILED: { category: FAILURE_SEMANTICS.ENVIRONMENT },
   WINSTAGE_SHELL_WORKSPACE_FAILED: { category: FAILURE_SEMANTICS.ENVIRONMENT },
+  // ── R16-D3-2：MSI 家族命令在 WinStage 接管时 fail-closed ─────────────────────────
+  //   category 选 **POLICY**：本表 policy 族的定义就是"**本就不允许的操作**"
+  //   （`src/executor.mjs:4188`）；"该命令在**当前模式**下不被允许"正是这个语义，
+  //   且 `CLEARTEXT_CREDENTIAL_IN_REQUEST`（下一行）已是"模式相关拒绝"的先例。
+  //   为什么不选 ENVIRONMENT：那会让 `retryable=true`，把"重试一万次也不会成功"
+  //   说成"可重试的环境故障"—— 与事实相反。
+  //   为什么不选 COMMAND：其文案是 `COMMAND_FAILED: 命令失败。`，会被读成
+  //   "命令跑了但失败"；而本闸门在**任何执行动作之前**抛错 ⇒ 事实是"未执行"。
+  //   （Lead 2026-10-11 裁定：D1=POLICY、D2=fail-closed、D3=保守触发面。）
+  WINSTAGE_SHELL_MSI_UNSUPPORTED: { category: FAILURE_SEMANTICS.POLICY, presetMessage: MSI_UNSUPPORTED_MESSAGE },
   // WP7′：明文出站请求里出现密钥形态 ⇒ 判定"该请求不被允许"（policy 族，独立机读码）
   CLEARTEXT_CREDENTIAL_IN_REQUEST: { category: FAILURE_SEMANTICS.POLICY, presetMessage: CLEARTEXT_SECRET_FAILURE.message },
   // ③ 普通失败（`RUN_FAILED` 逐条命令判定；见 `runFailureClassification()`）
@@ -869,6 +893,83 @@ export function semanticShellFailure(technicalCode, options = {}) {
   }
   return error
 }
+
+// ── R16-D3-2 MSI 闸门：纯函数（零依赖；离线脚本按此标记抽取源码后在 node:vm 里执行）—— begin ──
+/**
+ * 判断一条命令是否属于**MSI 家族**：`msiexec`（任意参数/带路径/任何目录）、`msiserver`（命令位）、
+ * `sc|net start msiserver`。
+ *
+ * 匹配口径（宁可保守 —— 宁可漏报可被复核的形态，也不误伤普通文本）：
+ *   · 先按 shell 分隔符切段：`;` `|` `||` `&&` `&` 换行；
+ *   · 段内**跳过启动器**（`cmd` / `powershell` / `pwsh` / `start-process` / `iex` /
+ *     `invoke-expression` / `start-job`）与**旗标 token**（以 `-` 开头，或形如 `/c` 的短旗标；
+ *     `/usr/bin/x` 这种含分隔符的按**路径**处理），取**第一个非旗标 token** 作为"有效程序名"；
+ *   · 只比较**整个 basename 相等**（去引号、去目录、去尾部 `.exe`、转小写），**不做子串匹配**
+ *     ⇒ `my-msiexec-notes.txt`、`msiexec_helper.exe`、`Get-Process msiexec` 一律**不命中**；
+ *   · `sc|net start msiserver` 在段内任意位置命中；
+ *   · 启动器后那个**被引号包住、且内部含空白**的 token（`powershell -Command "…"`）
+ *     递归检查一层（深度上限 2）。
+ *
+ * 触发面由 Lead 2026-10-11 裁定为保守面：`sc query msiserver`、`taskkill /im msiexec.exe`
+ * 这类"提到名字但不运行安装"的命令**故意不拦**（要扩面只需加一行白/黑名单）。
+ *
+ * @param {unknown} command
+ * @returns {{blocked: boolean, matched: string|null, head: string|null}}
+ */
+export function msiFamilyCommandVerdict(command) {
+  const verdict = { blocked: false, matched: null, head: null }
+  const text = typeof command === 'string' ? command : ''
+  if (text.trim().length === 0) return verdict
+
+  const basename = (token) => {
+    let t = String(token).trim().replace(/^["']+|["']+$/g, '')
+    t = t.replace(/[.,;:]+$/g, '').replace(/\.exe$/i, '')
+    const cut = Math.max(t.lastIndexOf('\\'), t.lastIndexOf('/'))
+    return (cut >= 0 ? t.slice(cut + 1) : t).toLowerCase()
+  }
+  const tokenize = (s) => s.match(/"[^"]*"|'[^']*'|\S+/g) ?? []
+  const LAUNCHERS = new Set(['cmd', 'powershell', 'pwsh', 'start-process', 'iex', 'invoke-expression', 'start-job'])
+  /* 旗标 vs 路径：`-x` / `/c` / `/?` 是旗标；`/usr/bin/msiexec` 是**路径**（basename 必须活下来）。
+   * ⚠ 别拿 basename 去判旗标：`basename('/c')` 会按路径分隔符剥成 `c`
+   *   （离线判据脚本 `.t/r16/exe/msi-gate-check.mjs` 在准备阶段抓到的真实 bug）。 */
+  const isFlag = (tok) => {
+    const s = String(tok).trim().replace(/^["']|["']$/g, '')
+    if (s.startsWith('-')) return true
+    if (s.startsWith('/')) return !/[/\\]/.test(s.slice(1))
+    return false
+  }
+
+  const scan = (segment, depth) => {
+    const tokens = tokenize(segment)
+    let i = 0
+    while (i < tokens.length) {
+      if (LAUNCHERS.has(basename(tokens[i])) || isFlag(tokens[i])) { i++; continue }
+      break
+    }
+    if (i >= tokens.length) return null
+    const headToken = tokens[i]
+    const head = basename(headToken)
+    if (head === 'msiexec' || head === 'msiserver') return { matched: head, head: headToken }
+    for (let j = i; j + 2 < tokens.length; j++) {
+      const a = basename(tokens[j]); const b = basename(tokens[j + 1]); const c = basename(tokens[j + 2])
+      if ((a === 'sc' || a === 'net') && b === 'start' && c === 'msiserver') {
+        return { matched: `${a} start msiserver`, head: tokens[j] }
+      }
+    }
+    if (depth < 2 && /^["']/.test(headToken)) {
+      const inner = headToken.replace(/^["']|["']$/g, '')
+      if (/\s/.test(inner)) return scan(inner, depth + 1)
+    }
+    return null
+  }
+
+  for (const segment of text.split(/\r?\n|;|\|\||&&|&|\|/g)) {
+    const hit = scan(segment, 0)
+    if (hit) return { blocked: true, matched: hit.matched, head: hit.head }
+  }
+  return verdict
+}
+// ── R16-D3-2 MSI 闸门：纯函数 —— end ──
 
 /**
  * `executor.run()` 抛错时的**逐条命令**判定（不许一刀切说"没有执行"）。
@@ -1063,8 +1164,21 @@ export function createWinStageShellExecutor(options = {}) {
        * ── R14 修复 · D5-N5：网络档位接线（默认 `OBSERVED_ONLINE`，行为不变）────────
        * 见 `normalizeNetworkTier()` 的注释：此前这个值**没有任何入口**，
        * 于是 `installNetworkPolicy()` 永远不被调用，而网络姿态在 lane/状态面上也看不见。
+       *
+       * ── R16 修复 · D5-R16-2（独立复核者 A/B 实证的回归）──────────────────────────
+       * **优先级：显式环境变量 > 行 `config.networkTier` > 代码默认。**
+       * 理由：R16 的 D5-R16-1 把 `networkTier` 写进了 bundle 的 shell 行**与**
+       * `profiles/sbx` 的 shell 行 ⇒ `raw` 恒有值 ⇒ 原先 `stringOption(raw,…) ?? env`
+       * 的顺序会让 `WINSTAGE_NETWORK_TIER` **永远被短路**（A/B 实证：`env=OFFLINE`
+       * 且行有键 ⇒ 仍 `OBSERVED_ONLINE`、命令照跑），与 `cordis.patch.yml` 注释承诺的
+       * "进程级环境变量是显式逃生口"相矛盾，也与 `WINSTAGE_SHELL` 的"进程级强制"语义不一致。
+       * 非法值一律回落 `OBSERVED_ONLINE`（由 `normalizeNetworkTier()` 统一兜底，
+       * 本行只负责**取哪个来源**，不做值校验）。env 未设 + 行键 `OBSERVED_ONLINE`
+       * ⇒ 仍是 `OBSERVED_ONLINE`（默认行为逐字不变）。
        */
-      this.networkTier = normalizeNetworkTier(stringOption(raw, 'networkTier') ?? stringOption(process.env, 'WINSTAGE_NETWORK_TIER'))
+      this.networkTier = normalizeNetworkTier(
+        stringOption(process.env, 'WINSTAGE_NETWORK_TIER') ?? stringOption(raw, 'networkTier'),
+      )
 
       /**
        * 工作区来源：**每次 execute() 现读**（见 `currentWorkspaceOf`），
@@ -1581,6 +1695,36 @@ export function createWinStageShellExecutor(options = {}) {
       if (!spec || typeof spec.command !== 'string' || spec.command.trim().length === 0) {
         throw semanticShellFailure('WINSTAGE_SHELL_BAD_COMMAND', {
           detail: 'command must be a non-empty string.',
+        })
+      }
+
+      // ── R16-D3-2：MSI 家族命令在 WinStage 接管时 fail-closed ─────────────────────
+      //   原因（实测见 docs/round16/exe-报告.md §4.3）：`msiexec /a` 退出码 0，但真正的写入由
+      //   **进程外 `msiserver` 服务**完成（客户端进程虽被挂接，对该 msi 的产物零记录）⇒ 用户态
+      //   挂接点覆盖不了另一个进程的系统调用 ⇒ 与其"成功却静默落到真实盘"，不如明确拒绝。
+      //
+      //   平台档不受影响是**结构保证**：`WINSTAGE_SHELL=0`（或开关关且未 `WINSTAGE_SHELL=1`）时
+      //   `dsh-plugin/cordis.patch.yml:157-166` 的 `winstage-shell` 行 `disabled:true` ⇒ 本模块
+      //   根本不装载 ⇒ 本闸门不可达。因此这里**刻意不读** `process.env.WINSTAGE_SHELL`：
+      //   那会把"行是否装载"这一权威真源复制成第二份（本仓库最忌双真源）。
+      const msiVerdict = msiFamilyCommandVerdict(spec.command)
+      if (msiVerdict.blocked) {
+        // 机制措辞只走**人工侧**：error 级日志 + error.winstage.*（模型可见文案由 presetMessage 给定）
+        this.logError(
+          `MSI 家族命令被 fail-closed 拒绝（matched=${msiVerdict.matched}）：msiexec 的实际写入由进程外 ` +
+            'msiserver 服务完成，不经过本进程的挂接点，无法进入暂存/覆盖层；' +
+            '依据 docs/round16/exe-缺陷.md 的 R16-D3-2。',
+        )
+        throw semanticShellFailure('WINSTAGE_SHELL_MSI_UNSUPPORTED', {
+          presetMessage: MSI_UNSUPPORTED_MESSAGE,
+          winstage: {
+            msiGate: true,
+            matched: msiVerdict.matched,
+            matchedHead: msiVerdict.head,
+            reason: 'msiserver 是进程外服务：其文件写入不经过本进程的挂接点，无法进入暂存/覆盖层。',
+            doc: 'docs/round16/exe-缺陷.md#R16-D3-2',
+            evidence: 'docs/round16/exe-报告.md §4.3（真实盘 +2,449 文件 / 134,868,847 B）',
+          },
         })
       }
 

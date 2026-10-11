@@ -78,7 +78,13 @@ if /i "%MODE%"=="platform" (set "WINSTAGE_SHELL=0") else (set "WINSTAGE_SHELL=1"
 if not exist "%OUT%" mkdir "%OUT%" >nul 2>&1
 
 rem ---- pinned, per-run stage root (never collides, survives the run) --------
-set "STAGE_ROOT=%OUT%\stage-root-%RANDOM%%RANDOM%%RANDOM%"
+rem  R16 修复 · fileio N5：原写法是 `%RANDOM%%RANDOM%%RANDOM%`，实测在**同一刻并行启动**的两个
+rem  cmd 里会给出**完全相同的三段随机数**（三个 run 出现同后缀，靠 outDir 才没互踩）。
+rem  现改为 GUID（`[guid]::NewGuid()`）；PowerShell 不可用时回落到五段 %RANDOM%。
+set "RUN_ID="
+for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "[guid]::NewGuid().ToString('N')" 2^>nul`) do set "RUN_ID=%%i"
+if not defined RUN_ID set "RUN_ID=%RANDOM%%RANDOM%%RANDOM%%RANDOM%%RANDOM%"
+set "STAGE_ROOT=%OUT%\stage-root-%RUN_ID%"
 if not "%SBX_STAGE_ROOT%"=="" set "STAGE_ROOT=%SBX_STAGE_ROOT%"
 set "WINSTAGE_STAGE_ROOT=%STAGE_ROOT%"
 > "%OUT%\stage-root-path.txt" echo %STAGE_ROOT%

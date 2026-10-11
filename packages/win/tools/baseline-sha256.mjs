@@ -18,6 +18,14 @@
  * 收录范围（任务书给定，逐项对齐）：
  *   `src/*.mjs`、`tests/*.mjs`、`dsh-plugin/*.mjs`、`tools/*.mjs`
  *   加上根目录四个入口：`autotest.mjs`、`verify.cmd`、`run.cmd`、`testservice.cmd`
+ *
+ * R16 追加：`dsh-plugin/*.yml`（即 `dsh-plugin/cordis.patch.yml`）。
+ *   理由（R16 实测，独立复核者发现）：该 yml 是**沙箱门控与装配的唯一真源**
+ *   （`winstage-fs` / `winstage-shell` / `pwsh-sandbox` 三行的 `disabled` 表达式、
+ *   `networkTier` 落点都在这里），但 R16 之前**不在任何封印面内**：
+ *   `--check` 全绿 + 118 条**根本不含它**（0 条 `.yml`），`tests/dsh-patch-guard.mjs`
+ *   管的又是 DSH harness 安装文件、不是本仓这份 yml。⇒ "改门控不会红"是真实缺口。
+ *   纳入后条数 118 → 119（见 docs/round16/汇总报告.md 的修复清单）。
  * 排除：清单自身，以及 `.t/`、`node_modules/`、`shim/`、`esc/`、`filemod/`、`retest/`、`.dshstage/`
  *   下的任何东西；`tools/lib`、`tools/toolchain` 这类子目录**不在** `tools/*.mjs` 的深度内
  *   （这是"深度 1"这一给定范围的自然结果，已作为残余写明）。
@@ -39,7 +47,7 @@ export const MANIFEST_REL = 'docs/源码基线.sha256'
 export const MANIFEST_PATH = join(REPO, MANIFEST_REL)
 
 /** 收录的"目录 + 文件后缀"面（深度 1，按给定范围）。 */
-export const INCLUDED_GLOBS = Object.freeze(['src/*.mjs', 'tests/*.mjs', 'dsh-plugin/*.mjs', 'tools/*.mjs'])
+export const INCLUDED_GLOBS = Object.freeze(['src/*.mjs', 'tests/*.mjs', 'dsh-plugin/*.mjs', 'dsh-plugin/*.yml', 'tools/*.mjs'])
 /** 收录的根目录单个文件。 */
 export const INCLUDED_ROOT_FILES = Object.freeze(['autotest.mjs', 'verify.cmd', 'run.cmd', 'testservice.cmd'])
 /** 排除的目录名（任意层级都排除；本清单的收录面是深度 1，这里仍做段级过滤以免范围被误改宽）。 */
