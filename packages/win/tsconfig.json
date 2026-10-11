@@ -1,0 +1,31 @@
+{
+  "//": "WinStageSandbox —— Cordis 插件 TS 工程配置。全量 TS 化（外壳 + 引擎 + 工具 + 测试）。",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2023"],
+    "types": ["node"],
+
+    "strict": false,
+    "noImplicitAny": false,
+    "noUncheckedIndexedAccess": false,
+    "exactOptionalPropertyTypes": false,
+    "noImplicitOverride": false,
+    "noFallthroughCasesInSwitch": false,
+
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": false,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true
+  },
+  "include": ["plugin/**/*.ts", "src/**/*.ts", "dsh-plugin/**/*.ts", "tools/**/*.ts", "tests/**/*.ts", "*.ts"],
+  "exclude": ["node_modules", ".t", "shim", "tools/toolchain", "docs", "esc", "patches"]
+}
