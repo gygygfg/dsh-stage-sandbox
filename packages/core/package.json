@@ -1,0 +1,14 @@
+{
+  "name": "dsh-sandbox-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared platform-abstraction (PAL) contract and control-plane interfaces for the dsh-sandbox monorepo. Placeholder: the concrete extraction from packages/win and packages/linux is a follow-up task.",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  }
+}

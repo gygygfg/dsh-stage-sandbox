@@ -1,0 +1,20 @@
+{
+  "name": "dsh-sandbox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cross-platform dsh sandbox monorepo: Windows (WinStage staging sandbox) + Linux (bubblewrap/Landlock, v2.3 control plane) implementations, plus a shared platform-abstraction layer.",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck": "pnpm -r run typecheck",
+    "typecheck:win": "pnpm -C packages/win run typecheck",
+    "typecheck:linux": "pnpm -C packages/linux run typecheck",
+    "test:linux": "pnpm -C packages/linux test",
+    "win:verify": "pnpm -C packages/win exec node tests/suite-wiring.ts && pnpm -C packages/win exec node tests/baseline-integrity.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

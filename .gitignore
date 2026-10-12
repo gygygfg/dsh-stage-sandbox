@@ -1,0 +1,14 @@
+# ── 根工作区（pnpm monorepo）─────────────────────────────────────────────────
+node_modules/
+.pnpm-store/
+pnpm-debug.log*
+
+# 根级运行时/测试产物（各包自己的 .gitignore 仍生效）
+.t/
+.dshstage/
+*.log
+
+# 根级构建产物
+/dist/
+/coverage/
+*.tsbuildinfo
