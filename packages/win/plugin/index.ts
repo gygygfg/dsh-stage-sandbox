@@ -31,10 +31,16 @@ import {
   inject as implInject,
   name as implName,
   probeRuntime,
-} from '../dsh-plugin/host-plugin.mjs'
+} from '../dsh-plugin/host-plugin.ts'
 
 export { Config }
 export { probeRuntime }
+export * as policy from './policy/engine.ts'
+export * as risk from './risk.ts'
+export * as approvalHub from './approval-hub.ts'
+export * as reviewState from './review-state.ts'
+export { applyWithGuard, discardAll, renderReview, parseApplyArgs, registerAlignedCommands } from './commands.ts'
+export { buildAlignedDeps, riskFactsOf, unitOf } from './wire.ts'
 
 /** 插件名（与旧入口逐字一致；`cordis.patch.yml` 的 `name` 断言依赖它）。 */
 export const name: string = implName

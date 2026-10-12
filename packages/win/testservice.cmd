@@ -19,5 +19,5 @@ setlocal
 if "%NODE_EXE%"=="" set "NODE_EXE=C:\Program Files\nodejs\node.exe"
 if not exist "%NODE_EXE%" set "NODE_EXE=node.exe"
 cd /d "%~dp0"
-"%NODE_EXE%" src\testservice.mjs %*
+"%NODE_EXE%" src\testservice.ts %*
 exit /b %ERRORLEVEL%

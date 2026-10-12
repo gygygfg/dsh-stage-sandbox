@@ -1,4 +1,4 @@
-// @ts-nocheck — EDITFILE-TEST
+// @ts-nocheck —— 全量 TS 化过渡脚手架：本文件由 .mjs 机械转换而来，类型待逐步补齐。
 /**
  * 统一工作区服务（Workspace Service）
  *
@@ -71,7 +71,7 @@ export class SandboxError extends Error {
  * 此前一直绿，只因为受限会话里 `mklink` 失败、测试走了 `--SKIP--` 分支：
  * 典型的"假通过"（与缺陷 11 同级）。
  *
- * ── 判据怎么选出来的：**实测选型**，不是推断（`node tests\workspace-regressions.mjs --probe-reparse`）
+ * ── 判据怎么选出来的：**实测选型**，不是推断（`node tests\workspace-regressions.ts --probe-reparse`）
  * `[实测]` 本机 node v24.21.0 / win32，node 的 `fs.Stats` 逐字段打印：
  *
  * | 对象 | `lstat.isSymbolicLink()` | `mode & 0x400` | `readlinkSync()` | `realpath.native()` | `dirent.isSymbolicLink()` |
@@ -154,7 +154,7 @@ function logicalFromWhiteoutMarker(woRoot, markerPath) {
     return `\\\\${parts.slice(1).join(sep)}`
   }
   if (!/^[a-zA-Z]$/.test(parts[0])) return undefined
-  // 盘符统一大写，与 `paths.mjs::lexical()` 的口径一致（只影响盘符，不动其余大小写）
+  // 盘符统一大写，与 `paths.ts::lexical()` 的口径一致（只影响盘符，不动其余大小写）
   return `${parts[0].toUpperCase()}:${sep}${parts.slice(1).join(sep)}`
 }
 
@@ -401,7 +401,7 @@ export function baselineConflictOf(expectedFingerprint, foundFingerprint) {
 /**
  * **原子替换**（WP8.1）：同卷"写临时文件 → 原子替换目标"。
  *
- * 相对 `store.mjs::writeFileAtomic`（它只用 `renameSync`）多两件事：
+ * 相对 `store.ts::writeFileAtomic`（它只用 `renameSync`）多两件事：
  *   1. `renameSync` 在"目标是**已存在**文件"时本机实测会抛 `EPERM`（Windows 的
  *      `MoveFileEx` 语义不是 POSIX 的"覆盖式 rename"）。因此这里先试 `renameSync`，
  *      失败后退到"**显式删掉目标再改名**"—— 两步都在目标**同目录同卷**，
@@ -441,7 +441,7 @@ export function writeFileAtomicReplacing(target, content) {
   }
 }
 
-/** 失败路径上清理临时文件；清理失败**不掩盖**原错误（与 store.mjs 同一纪律） */
+/** 失败路径上清理临时文件；清理失败**不掩盖**原错误（与 store.ts 同一纪律） */
 function cleanupTemp(path) {
   try {
     unlinkSync(path)
@@ -549,7 +549,7 @@ export class Workspace {
     const resolved = canonical(absolutePath)
     // ── Phase 1 / WP0：自身存储的遮蔽必须**跟着存储根走** ──────────────────────────
     // 旧规则只认工作区里的 `<root>\.dshstage`，因为存储根以前必定在工作区内；
-    // 现在默认根搬到了 `%LOCALAPPDATA%\Temp\winstage-stage\<会话键>`（见 `stage-guard.mjs`），
+    // 现在默认根搬到了 `%LOCALAPPDATA%\Temp\winstage-stage\<会话键>`（见 `stage-guard.ts`），
     // 那条相对路径规则**再也命中不到任何东西** —— 于是"存储面不出现在模型视野里"
     // 这条不变式会**静默失效**。所以这里改成按**实际存储根**判定，
     // 工作区内/外一视同仁；旧规则保留，覆盖迁移期仍未搬走的布局。
@@ -988,7 +988,7 @@ export class Workspace {
       // 现在每次（重新）暂存都以真实磁盘为基线 —— 与 `rebaseEntry()` 同一语义、同一判据
       // （只比 hash），因此"面板说没 stale"与"批准会成功"不会再互相矛盾。
       // #12.1 的硬闸门**不受影响**：它拦的是"最后一次暂存之后真实文件又被外部改动"
-      // （那条路径不经过本方法），`tests/selftest.mjs` 的 #12.1/#12.2 逐字不动。
+      // （那条路径不经过本方法），`tests/selftest.ts` 的 #12.1/#12.2 逐字不动。
       if (opts.refreshBaseline !== false) {
         const absNow = this.absolute(rel)
         const infoNow = statKind(absNow)
@@ -1329,9 +1329,9 @@ export class Workspace {
    *                       所以候选文件不是任何事实的唯一载体。
    *
    * 刻意**不**回收：`pending` / `partially-applied` / `stale`（都还有决定价值）、
-   * 以及注册表候选（它们的产物由 `src/registry-stage.mjs` 持有，本文件不越界处置）。
+   * 以及注册表候选（它们的产物由 `src/registry-stage.ts` 持有，本文件不越界处置）。
    *
-   * 不变式（`_r3/wp5-test.mjs` 断言）：连续 N 轮写入后
+   * 不变式（`_r3/wp5-test.ts` 断言）：连续 N 轮写入后
    *   `queue.order.length` 与 `candidates/*.json` 的条数都 **≤ 1**，与 N 无关。
    *
    * @returns {{pruned: string[], kept: number}}
@@ -1497,7 +1497,7 @@ export class Workspace {
      *
      * 与 `applyOneChange()` 的分工：这里管"整批拒绝"，那里管"逐条兜底"——`applyOneChange()`
      * 同样会检查（因此**不存在**"绕过预检就静默覆盖"的路径），且 `opts.force === true` 时两者
-     * 都放行。这正是 `_r3/wp5-test.mjs` 断言④⑤的两条通道。
+     * 都放行。这正是 `_r3/wp5-test.ts` 断言④⑤的两条通道。
      */
     const conflicts = []
     const pendingChanges = []
@@ -1544,7 +1544,7 @@ export class Workspace {
        *   · `conflicts[]`（**新增**键）：结构化的人工/面板通道 —— 谁、什么形状、
        *     期望/实际指纹、变了哪几项。面板据此列"覆盖 / 放弃"。
        *   · `failed[]`（**既有**键）：逐条保留"若真的逐条落盘会抛什么"的**旧口径**
-       *     （`code: 'STALE_BASELINE'` + `driftReason`）。旧消费者（`tests/selftest.mjs`
+       *     （`code: 'STALE_BASELINE'` + `driftReason`）。旧消费者（`tests/selftest.ts`
        *     的 #12.1、命令面的失败渲染）读的就是它；把整批预检做成"`failed` 为空"
        *     会让"拒绝覆盖"在它们眼里变成"什么都没发生" —— 那是**安全语义的静默降级**，
        *     比多一个字段危险得多。两者同源（都出自 `baselineConflictOf()`），不会漂移。
@@ -1775,7 +1775,7 @@ export class Workspace {
     }
     const content = this.store.readBlob(change.after.hash)
     /**
-     * ── WP8.2 逐条兜底：宿主原件指纹冲突 ⇒ 拒绝替换（`_r3/wp5-test.mjs` 断言⑤）─────
+     * ── WP8.2 逐条兜底：宿主原件指纹冲突 ⇒ 拒绝替换（`_r3/wp5-test.ts` 断言⑤）─────
      *
      * 这条路与 `applyCandidate()` 的整批预检**必须都做**，理由不是重复，而是**覆盖所有入口**：
      * 除 `applyCandidate()` 之外，测试与自测会直接调它，"整批预检"在单条调用上根本不存在。
@@ -1811,7 +1811,7 @@ export class Workspace {
    * 而 `cli exec` 每次都会先 `executor.init()`；因此**下一次任何命令都会自愈**，
    * 与审计记下的"重跑 init 不自愈"正好相反。
    *
-   * 判定与执行都在 `src/appcontainer.mjs`（纯 SDDL 判据）+ `src/executor.mjs`
+   * 判定与执行都在 `src/appcontainer.ts`（纯 SDDL 判据）+ `src/executor.ts`
    * （`repairStaleAppContainerAces`，用 icacls 落地），本方法只做工作区侧的转接，
    * 不重复实现判据（判据漂移会让"修复"和"测量"对不上）。
    *
@@ -1852,7 +1852,7 @@ export class Workspace {
    * ——`seen` 里包含它们，下面的删除检测据此跳过。
    *
    * ── 删除的第二条来源：白障标记（缺陷①b）──────────────────────────────────────
-   * 快照是**执行前**取的（`src\cli.mjs:204`），shim 不可能让一个"从未暂存过的路径"
+   * 快照是**执行前**取的（`src\cli.ts:204`），shim 不可能让一个"从未暂存过的路径"
    * 出现在里面；它在 `<staging root>\wo\…` 写下的标记才是"这条路径被删除了"的唯一痕迹。
    * 因此：内容对象消失（非 shim 档的 `del` 直接删暂存副本）与**新出现的白障标记**
    * 两条来源都要报删除，并按逻辑路径去重（同一次删除在两个面上都留痕时只报一次）。
@@ -1938,7 +1938,7 @@ export class Workspace {
    * 文档承诺的 `exec → review → apply` 链路**根本跑不通**
    * （原始证据 `.t\sbx3\t-fs\out\07-cli-exec-clean-smoke.out` / `09-cli-status-clean-exec.out` /
    *  `10-cli-review-clean-exec.out`：执行成功、`capturedChanges=1`，但 `pendingCandidates=0`）。
-   * 这段逻辑原先只存在于 `tests\e2e-flow.mjs` 里（测试自己在 CLI 之外手工补了这两步），
+   * 这段逻辑原先只存在于 `tests\e2e-flow.ts` 里（测试自己在 CLI 之外手工补了这两步），
    * 属于"测试替被测代码干活"——所以这里把它搬进正主，测试改为调用本方法。
    *
    * 幂等（#3.10）：`captured` 是**相对执行前快照**的净变化，已暂存路径不会被重复暂存；
@@ -1991,7 +1991,7 @@ export class Workspace {
    * `freezeCandidate()` 无条件新建候选并取代同路径旧待审；如果每次 `exec` 都调它，
    * 队列会被无意义地刷屏（同一个变更反复产生候选）。因此这里先看
    * 最新待审候选是否**恰好**覆盖当前净变化（按路径 + 操作 + 两侧 hash），
-   * 是则复用，否则才冻结。判据与 `dsh-plugin\review-service.mjs::represents()` 同一口径。
+   * 是则复用，否则才冻结。判据与 `dsh-plugin\review-service.ts::represents()` 同一口径。
    *
    * @returns {{frozen: boolean, candidate?: object, reason?: string, changes: number}}
    */
@@ -2032,7 +2032,7 @@ function change_isDelete(candidate, path) {
 /**
  * 两份变更清单是否**恰好**描述同一件事（按路径 + 操作 + 两侧 hash）。
  *
- * 与 `dsh-plugin\review-service.mjs::represents()` 同一判据：只比较"做了什么"，
+ * 与 `dsh-plugin\review-service.ts::represents()` 同一判据：只比较"做了什么"，
  * 不比较时间戳/候选 id，因此"同一批净变化重复冻结"会被识别为重复。
  */
 function candidateRepresents(candidateChanges, changes) {

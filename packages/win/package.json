@@ -25,11 +25,11 @@
     "node": ">=20"
   },
   "exports": {
-    ".": "./plugin/index.ts",
-    "./host-plugin": "./plugin/index.ts",
-    "./fs": "./dsh-plugin/fs-entry.ts",
-    "./shell": "./dsh-plugin/shell-entry.ts",
-    "./client": "./dsh-plugin/client.ts",
+    ".": "./dist/index.mjs",
+    "./host-plugin": "./dist/index.mjs",
+    "./fs": "./dist/fs-entry.mjs",
+    "./shell": "./dist/shell-entry.mjs",
+    "./client": "./dist/client.js",
     "./package.json": "./package.json"
   },
   "dsh": {
@@ -39,7 +39,9 @@
     "client": {
       "platform": "web",
       "immediately": true,
-      "inject": ["@deepseek-ai/dsh-client-ui-settings"]
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
     }
   },
   "meta": {
@@ -47,11 +49,13 @@
     "description": "Staging–candidate–selective-commit sandbox (Windows restricted token + ACL + Job Object). Toggleable in Settings; when off, the platform's original shell and file tools are left in place."
   },
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "node tools/build-plugin.mjs",
+    "prepack": "node tools/build-plugin.mjs",
+    "prepare": "node tools/build-plugin.mjs"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
-    "@deepseek-ai/schemastery": "^3.18.4",
     "@deepseek-ai/dsh-commands": "0.0.1-rc.1",
     "@deepseek-ai/dsh-fs": "0.0.1-rc.1",
     "@deepseek-ai/dsh-fs-local": "0.0.1-rc.1",
@@ -66,9 +70,12 @@
     "@deepseek-ai/dsh-subprocess-local": "0.0.1-rc.1",
     "@deepseek-ai/dsh-util-values": "^0.1.2-alpha.2",
     "@deepseek-ai/dsh-web": "0.0.1-rc.1",
-    "@types/node": "^24.0.0"
+    "@deepseek-ai/schemastery": "^3.18.4",
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2"
   },
   "files": [
+    "dist/",
     "plugin/",
     "dsh-plugin/",
     "src/",

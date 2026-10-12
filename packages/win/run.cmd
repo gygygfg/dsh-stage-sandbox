@@ -13,7 +13,7 @@ rem  NOTE: keep this file pure ASCII. cmd.exe parses batch files using the OEM
 rem  code page, so UTF-8 comments (Chinese text, box-drawing characters) are
 rem  decoded as garbage and executed as commands.
 rem
-rem  USAGE:  run.cmd <script.mjs> [args...]
+rem  USAGE:  run.cmd <script.ts> [args...]
 rem ---------------------------------------------------------------------------
 setlocal
 if "%NODE_EXE%"=="" set "NODE_EXE=C:\Program Files\nodejs\node.exe"
