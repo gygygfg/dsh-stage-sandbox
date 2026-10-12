@@ -1,0 +1,181 @@
+{
+  "area": "registry",
+  "tester": "registry-tester",
+  "sessionId": "session-eb7c901d-97ed-4f83-9096-33c97138c361",
+  "generatedAt": "2026-10-03T02:15:00+08:00",
+  "channelModel": {
+    "PS": "PowerShell provider in the injected harness process (RegOpenKeyExW/RegQueryValueExW -> shim overlay). Read-back of own writes works.",
+    "CMD": "reg.exe / cmd.exe in a CHILD process. Children ARE injected (verified: child cmd pid 1748 had winstage-shim.dll loaded and got its own overlay.1748.hive) but get their own per-process overlay hive, so they never see the parent's staged values.",
+    "STAGE": "Direct read of .dshstage/sessions/<sid>/registry/{overlay.journal,overlay.state.json,host-capture.json} + candidates/cs_*.json + review.json.",
+    "realHive": "reg.exe from a child process = real-hive view, because that child cannot attach to the session app hive and reads through to the real registry. Cross-checked with host hive file mtimes."
+  },
+  "statusCounts": { "OK": 3, "FAIL": 5, "BLOCKED": 0, "N-A": 0, "FINDING": 3, "checkpoints": 8 },
+  "results": [
+    {
+      "id": "REG-01",
+      "title": "HKCU 写入/覆盖/删除：建键、5 种值类型、覆盖、删值、删键（PS 回读 + reg.exe 交叉 + STAGE）",
+      "status": "FAIL",
+      "channel": ["PS", "CMD", "STAGE"],
+      "command": "New-Item HKCU:\\Software\\DshRegT01; New-ItemProperty (String/DWord/QWord/MultiString/Binary); Set-ItemProperty; Remove-ItemProperty; Remove-Item -Recurse; reg query \"HKCU\\Software\\DshRegT01\" /s",
+      "expected": "每步 PS 回读一致，reg.exe 交叉通道看到同一状态，改动进入 overlay/候选且真实 hive 零写入",
+      "observed": "PS 侧全部通过且取证完整：建键 OK；空键上立刻 New-ItemProperty 成功（T7 空键重开修复在位）；5 种值类型回读与原值逐字一致（canon=Bin:Binary=deadbeef; Dw:DWord=1234; Msz:MultiString=a|b|c; Qw:QWord=1234567890123; Sz:String=hello-sz，SHA256=EB41EEE4C4B0536733D1E5295D2883AECF81AF35D911FCEB95F5E78266F324C3）；覆盖 Sz->hello-sz-v2 生效（SHA256 变为 2D9EEF25...）；删值 Dw 生效（canon 中消失）；删键后 Test-Path=False。但两个交叉通道 FAIL：(1) 任何子进程 reg query 该键都返回 exit=1 且输出 'ERROR: The system was unable to find the specified registry key or value'；(2) 同一 cmd 命令行里 'reg add ... /f' 输出 'The operation completed successfully' 之后紧跟的 'reg query' 找不到刚写的键（QUERY-RC 输出 ERROR），写入者自己的下一次调用也读不回来。候选侧：cs_0138/0139 记录 mkdir+5 个 value-added，cs_0141 记录 reg.exe 写的 DshRegT01C（说明写入确实进了共享 WAL，只是没人能读回来）。",
+      "evidence": [
+        "evidence/reg01.txt",
+        "evidence/raw-transcript.md#reg-01",
+        "executions.log (REG-01/REG-01b/REG-01c sections)",
+        "staged: .dshstage/sessions/session-eb7c901d-97ed-4f83-9096-33c97138c361/candidates/cs_0138_881e147d.json",
+        "staged: .dshstage/sessions/session-eb7c901d-97ed-4f83-9096-33c97138c361/candidates/cs_0141_f946cf95.json"
+      ],
+      "usability": "最坑的一条：`reg add` 报成功、`reg query` 报找不到，用户无法判断到底成没成。PS 与 reg.exe 对同一操作给出相反结论，且没有任何提示说明『不同进程看到不同的注册表视图』。PS 侧需要 3 条命令（写/回读/取证）才能确认隔离语义，'第 1a 步空键能否写值' 曾经是该产品的真缺陷（见 docs/T7），用户无从得知自己踩的是哪一个。"
+    },
+    {
+      "id": "REG-02",
+      "title": "HKLM\\Software\\<唯一名> 建键写值：是否可见、是否报权限错误、真实注册表是否不变",
+      "status": "OK",
+      "channel": ["PS", "CMD", "STAGE"],
+      "command": "New-Item HKLM:\\Software\\DshRegT02 -Force; New-ItemProperty -Name Sz -Value hklm-sz; reg query \"HKLM\\Software\\DshRegT02\" /s; Remove-Item -Recurse",
+      "expected": "HKLM 写入被暂存、沙箱内可见、真实注册表不可见；如被权限拦截则记录错误文本",
+      "observed": "无任何权限错误：PS-CREATE-HKLM-key=OK、PS-CREATE-HKLM-value-Sz=OK（HKLM 通常需要管理员，但 shim 在访问检查前接管，故不报 ERROR_ACCESS_DENIED）。PS 回读 canon=Sz:String=hklm-sz，SHA256=DEB88FE28ACA83BE87FA0601136CF3A3DC905D0310992E1EF1E4CCBF3369A4DF。子进程 reg query exit=1（'unable to find'）→ 真实 hive 无此键。建后删除，Test-Path=False，无遗留。",
+      "evidence": ["evidence/raw-transcript.md#reg-02", "executions.log (REG-02..05 section)"],
+      "usability": "用户视角完全无感：HKLM 这种『平时要 UAC 提权』的位置在沙箱里静默成功，既不提示『这是暂存，不是真的』，也不提示『需要批准』。要确认真实 hive 没变，必须另起一个 reg.exe 进程对照 + 人工比对，至少 3 步。"
+    },
+    {
+      "id": "REG-03",
+      "title": "读取真实存在的注册表值，确认 read-through 与真实系统一致",
+      "status": "OK",
+      "channel": ["PS", "CMD"],
+      "command": "Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion; reg query ... /v ProductName|CurrentBuild|UBR; Get-ItemProperty HKCU:\\Software\\7-Zip; reg query HKCU\\Software\\7-Zip /v Path",
+      "expected": "PS 通道与 reg.exe 通道读到相同的真实值",
+      "observed": "逐条一致：ProductName PS=[Windows Server 2025 Datacenter] == CMD=同值；CurrentBuild PS=26100 == CMD=26100；UBR PS=33438 == CMD=0x829e(=33438，仅十进制/十六进制表示差异)；HKCU\\Software\\7-Zip Path PS=[C:\\Progra~1\\7-Zip\\] == CMD=同值。环境为 Windows Server 2025 Datacenter / 10.0.26100.33438。唯一不一致项是 AllFlights，属于覆盖层可见性（归入 REG-07），不是 read-through 缺陷。",
+      "evidence": ["evidence/raw-transcript.md#reg-03", "executions.log (REG-02..05 section)"],
+      "usability": "read-through 本身对用户是透明的、体验好（真实值照常可读）。坑在于『哪些值来自覆盖层、哪些来自真实 hive』没有任何标记，用户无法区分；UBR 这类 DWord 的 PS/reg.exe 表示差异（33438 vs 0x829e）也会让粗心的比对脚本误报不一致。"
+    },
+    {
+      "id": "REG-04",
+      "title": "修改真实存在的键值再读回：沙箱见新值、真实 hive 保持原值、测后还原",
+      "status": "FAIL",
+      "channel": ["PS", "CMD", "STAGE"],
+      "command": "Get-ItemProperty HKCU:\\Software\\Microsoft\\Notepad; Set-ItemProperty -Name searchString -Value DshRegT04-marker; Get-ItemProperty; reg query HKCU\\Software\\Microsoft\\Notepad /v searchString; Set-ItemProperty 还原",
+      "expected": "(a) 沙箱内读到新值；(b) 真实注册表仍是原值；(c) review.json 标 outside/sensitive",
+      "observed": "(a) PASS：改前记录原值 searchString REG_SZ = 'enable'（reg.exe 同样读到 'enable'）；改为 'DshRegT04-marker' 后 PS 读到 'DshRegT04-marker'。(b) PASS：同一时刻子进程 reg.exe 仍读到 'enable' → 真实 hive 未被改；改完后已还原，PS 读回 'enable'。真实 hive 文件 NTUSER.DAT/SOFTWARE/SYSTEM 的 mtime 全程停留在 2026-09-30，未变。(c) FAIL：真正的产物 review.json 里没有任何注册表行（files[].kind 全为 file:40），riskCounts={normal:40,outside:0,sensitive:0,danger:0}，alerts=[] —— 这次对真实既有键的修改既没有标 outside/sensitive，也没有出现在 files[] 里；只有候选队列 candidates[] 里列了路径（无 risk 字段）。",
+      "evidence": [
+        "evidence/raw-transcript.md#reg-04",
+        "evidence/raw-transcript.md#reg-08-review",
+        "staged: .dshstage/sessions/session-eb7c901d-97ed-4f83-9096-33c97138c361/review.json",
+        ".dshstage/sessions/session-eb7c901d-97ed-4f83-9096-33c97138c361/registry/overlay.journal"
+      ],
+      "usability": "隔离语义本身很好（改真实键也不落盘、可还原），但『改了真实存在的键』这件事在审批产物里完全不可见，用户没有任何渠道知道需要批准或拒绝，也无法从 review.json 判断风险等级。"
+    },
+    {
+      "id": "REG-05",
+      "title": "高风险位置只读探测 + 最小无害写入尝试（HKLM 服务键 / HKCU+HKC 跑项 / HKLM 跑项 / 文件关联）",
+      "status": "OK",
+      "channel": ["PS", "CMD", "STAGE"],
+      "command": "New-Item HKLM:\\SYSTEM\\CurrentControlSet\\Services\\DshRegSvcT05 + ImagePath='cmd /c exit'; New-ItemProperty HKCU\\...\\Run DshRegT05Run='cmd /c exit'; New-ItemProperty HKLM\\...\\Run DshRegT05RunHKLM; New-Item HKCU:\\Software\\Classes\\.dshtest; reg query 每项; 全部删除",
+      "expected": "记录每项是被拦还是放行，以及沙箱内/真实 hive/review.json 风险分级/是否有 danger 或告警",
+      "observed": "四项全部被『放行到覆盖层』，全部没有 BLOCKED、没有 HARD_DENY、没有任何 danger 或告警：5.1 HKLM\\SYSTEM\\CurrentControlSet\\Services\\DshRegSvcT05 建键 OK、ImagePath(ExpandString)='cmd /c exit' 写 OK、PS 回读 OK，reg.exe exit=1（真实 hive 干净），已删；5.2 HKCU Run 原有值 [LocalSend] 只读探测后加 DshRegT05Run='cmd /c exit' OK、PS 回读 [cmd /c exit]，reg.exe exit=1，已删且 Run 恢复为 [LocalSend]；5.3 HKLM Run 原有值 [AzureArcSetup, SecurityHealth] 只读探测后加 DshRegT05RunHKLM OK，reg.exe exit=1，已删且恢复原两值；5.4 HKCU\\Software\\Classes\\.dshtest 建键 OK，reg.exe exit=1，已删。风险分级：候选 change 的 risk/safety 字段全为空，review.json 中 danger=0 且 alerts=[]。5.4 一个次要不一致：用 New-ItemProperty -Name '(default)' 写默认值后 PS 回读 canon 为空（默认值没体现出来）。",
+      "evidence": ["evidence/raw-transcript.md#reg-05", "evidence/reg05c-06-07-summary.txt", "executions.log (REG-02..05 section)"],
+      "usability": "对用户没有任何『这里很危险』的信号：服务键、Run 启动项、文件关联与普通 HKCU 键的体验完全一样，都是静默成功。用户会以为自己获得了管理员级持久化能力（实际上只是覆盖层），也不会被告知要批准。这是『看起来成功』与『实际未发生』之间最大的认知落差。"
+    },
+    {
+      "id": "REG-06",
+      "title": "覆盖层一致性：journal / overlay.state.json / host-capture.json / candidates 与实测操作是否一一对应；per-process hive 是否复现",
+      "status": "FAIL",
+      "channel": ["STAGE"],
+      "command": "读取 registry/overlay.journal + overlay.state.json + host-capture.json + candidates/cs_*.json，与 REG-01/02/05 的实际操作逐项比对",
+      "expected": "四个产物的数量/路径/值与实际改动一一对应，状态指针指向当前有效候选",
+      "observed": "部分对应、部分不一致：(1) 对应项：我写的 HKCU\\Software\\DshRegT01（mkdir + Bin/Dw/Msz/Qw/Sz 5 个 value-added）精确出现在 cs_0138，覆盖后的 Sz 值出现在 cs_0139，reg.exe 写的 HKCU\\Software\\DshRegT01C\\Cv 出现在 cs_0141/cs_0156，值与类型逐字一致；overlay.state.json 与 host-capture.json 都指向 cs_0156，appliedPaths=[]。(2) 不一致项：host-capture.json 记 records=25/bytes=39832，而它指向的 cs_0156 只有 2 条 registry change，且 journal 实际已 65766 字节 —— 计数口径无法与候选条数对账；cs_0139 在被 superseded 之后仍把已删除的键 DshRegT01 与已删除的值 Dw 列为 value-added（删除只有在下一份候选里才消失），把删除后的状态重新提议给审批；overlay.state.json 在 01:11:11–01:15 期间指向已被 superseded 的 cs_0045（当时活动候选是 cs_0087），出现约 3.5 分钟的过期指针。(3) per-process hive 复现：registry/ 下有 255 个 overlay.<pid>.hive，我自己的 pwsh 进程各自命中不同路径（pid 11028 生成了 overlay.11028.hive；本轮 pid 6944 反而没有自己名字的 hive），子进程 cmd.exe pid 1748 也生成了 overlay.1748.hive 且已加载 winstage-shim.dll —— 'shared hive unusable (32) -> per-process hive' 在并发/多进程场景下稳定复现，直接导致 REG-07 的可见性不一致。(4) 噪声：cs_0156 的 25 条路径中约 21 条是 OS/浏览器产生的 SystemCertificates / AppContainer Storage 写入（非本次测试），journal 里还有大量 'unresolved-base-handle' 的 UNSTAGED 记录（证书 Blob），这些也进入同一个审批候选。",
+      "evidence": [
+        "evidence/reg05c-06-07-summary.txt",
+        "evidence/raw-transcript.md#reg-06",
+        ".dshstage/sessions/session-eb7c901d-97ed-4f83-9096-33c97138c361/registry/overlay.state.json",
+        ".dshstage/sessions/session-eb7c901d-97ed-4f83-9096-33c97138c361/registry/host-capture.json",
+        ".dshstage/sessions/session-eb7c901d-97ed-4f83-9096-33c97138c361/candidates/cs_0156_e9889f37.json"
+      ],
+      "usability": "对账困难是主要易用性问题：三个产物用三套计数口径（journal 字节数 / host-capture 的 records / candidate 的 change 条数），没有任何一处能让用户回答『我改的 3 个键在审批里是几条』。候选里混入 21 条与本人无关的系统/浏览器注册表写入，用户无法分辨哪些是自己造成的；删除操作会短暂地把已删对象重新提议回来。"
+    },
+    {
+      "id": "REG-07",
+      "title": "跨进程可见性：A 进程写、B 进程读；并发两进程写不同值是否丢失",
+      "status": "FAIL",
+      "channel": ["PS", "CMD", "STAGE"],
+      "command": "父进程写 HKCU:\\Software\\DshRegT07\\V='written-by-parent'；子 powershell.exe 与子 reg.exe 各自读取 T07 与 HKLM\\...\\WindowsSelfHost\\FIDs\\AllFlights",
+      "expected": "同一会话内 staging 注册表视图一致：B 进程能看到 A 进程写的值",
+      "observed": "可见性不一致，且是双向矛盾：父进程(本轮 pid 6944)写 HKCU\\Software\\DshRegT07\\V 后自己读到 'written-by-parent'；子 powershell.exe 报 'CHILD-CANNOT-SEE-T07'；子 reg.exe query exit=1。反向也不一致：同一个键 HKLM\\SOFTWARE\\Microsoft\\WindowsSelfHost\\FIDs\\AllFlights，父进程 PS 读到覆盖层值 [RS:3F769,FX:124117A5,FX:136813A1]，子 powershell 与子 reg.exe 都只读到真实值 [FX:124117A5,FX:136813A1]。真实 hive 均未被改：子 reg.exe 读不到 'written-by-parent'，T07 已清理，NTUSER.DAT/SOFTWARE/SYSTEM mtime 全程 2026-09-30。结论：由于每个进程各自持有 overlay.<pid>.hive（shared hive 拿到 ERROR_SHARING_VIOLATION 32 后回退），只有共享 WAL 是真正共享的；抢到共享 app hive 的进程之间可以互见，抢不到的进程（包括所有 reg.exe 子进程）自成一套只读真实 hive 的视图，因此 A 进程写的值 B 进程多数情况下看不到，同一键甚至能读出两个不同值。并发两进程同时写不同值是否丢失：未单独构造（N-A），但从机制上看写入落各自的 per-process hive，不存在互相覆盖，只存在互不可见。",
+      "evidence": [
+        "evidence/reg05c-06-07-summary.txt",
+        "evidence/raw-transcript.md#reg-07",
+        "evidence/raw-transcript.md#injection-scope",
+        ".dshstage/sessions/session-eb7c901d-97ed-4f83-9096-33c97138c361/registry/ (255 个 overlay.<pid>.hive)"
+      ],
+      "usability": "这是本域最严重的用户级缺陷：『刚才那条命令明明成功了，为什么现在读不到？』——脚本 author 会据此判定写失败并重试，或误以为需要在同一进程里做完整流程。没有任何文档或错误信息提示『注册表视图是按进程隔离的』。"
+    },
+    {
+      "id": "REG-08",
+      "title": "易用性：『沙箱内成功、真实未写』语义是否清晰；review.json 有无提示与风险分级；reg.exe 与 PowerShell 不一致是否误导",
+      "status": "FAIL",
+      "channel": ["STAGE", "PS", "CMD"],
+      "command": "审查 review.json / candidates / overlay.state.json，并把 reg.exe 与 PowerShell 的结果不一致逐条对照",
+      "expected": "审批产物明确提示注册表改动只存在于覆盖层、需要人工批准，并给出风险分级",
+      "observed": "四类问题：(1) review.json 里一条注册表行都没有：files[].kind 全为 'file'（40/40），风险全为 normal（40/40），riskCounts={normal:40,outside:0,sensitive:0,danger:0}，alerts=[]，而同一份文件里 candidates[] 却带着一份 25 条注册表路径的 pending 候选 —— 读这份产物的用户/自动化会得出『没有任何注册表改动、没有任何越界风险』的结论，与事实完全相反。(2) 仓库源码 dsh-plugin/review-service.mjs:803-844 的 registryRows() 本来会为注册表变更生成 kind:'registry'、risk:'outside'、带中文 note 的可批准行，并在 :908-914 写入 counts.listed/totalFiles；但实测产物里既没有 registry 行，counts 也没有 listed/totalFiles 键 → 运行的产物与本仓库这份源码不一致，『注册表候选渲染成可批准行』的修复在本会话未生效。(3) 注册表 change 自身没有 risk/safety 字段（只有 external:true），因此除了那条缺失的渲染行，风险分级在数据层根本不存在。(4) reg.exe 与 PowerShell 结论相反：写成功提示 'The operation completed successfully'（RC=0）↔ 紧接着 reg query 提示 'ERROR: The system was unable to find the specified registry key or value'，且没有任何一句话解释『这是按进程隔离的覆盖层视图』。",
+      "evidence": [
+        "evidence/raw-transcript.md#reg-08-review",
+        "evidence/raw-transcript.md#reg-01",
+        ".dshstage/sessions/session-eb7c901d-97ed-4f83-9096-33c97138c361/review.json",
+        "dsh-plugin/review-service.mjs:803-844 (registryRows), :878-881 (files = listed.slice), :908-914 (counts.listed/totalFiles)"
+      ],
+      "usability": "『在沙箱内成功、真实未写』这个语义对用户完全不透明：没有任何面板提示、没有文档说明、错误信息还会误导（成功提示 + 读不到）。用户要判断一件事是否真的发生，至少需要 3 个通道（PS 写、reg.exe 对照、翻 .dshstage 产物），且必须自己知道去哪找。"
+    },
+    {
+      "id": "REG-F1",
+      "title": "FINDING：注册表覆盖层是逐进程 hive，只有 WAL 共享",
+      "status": "FINDING",
+      "channel": ["STAGE"],
+      "command": "统计 registry/overlay.*.hive；检查子进程加载的模块",
+      "expected": "会话内共享一个覆盖层 hive（设计文档称之为 app hive 覆盖区）",
+      "observed": "registry/ 下存在 255 个 overlay.<pid>.hive（每个 8192 字节），子进程 cmd.exe pid 1748 实测已加载 winstage-shim.dll 并生成自己的 overlay.1748.hive。每进程一套 overlay、共享的只有 overlay.journal —— 这是 REG-01/07 中所有跨进程不一致的根因。",
+      "evidence": ["evidence/reg05c-06-07-summary.txt", "evidence/raw-transcript.md#injection-scope"],
+      "usability": "对用户不可见；只能从 .dshstage 里数 hive 文件数量才能发现。"
+    },
+    {
+      "id": "REG-F2",
+      "title": "FINDING：HKLM/服务键/Run 键在沙箱内无提权提示即可写（暂存）",
+      "status": "FINDING",
+      "channel": ["PS"],
+      "command": "New-Item HKLM:\\Software\\DshRegT02; New-Item HKLM:\\SYSTEM\\CurrentControlSet\\Services\\DshRegSvcT05; New-ItemProperty HKLM\\...\\Run",
+      "expected": "HKLM/服务/Run 这些通常需要管理员的位置应当报权限错误或被明确拦下",
+      "observed": "三项全部静默成功（无 ERROR_ACCESS_DENIED、无 BLOCKED、无 HARD_DENY、无 danger 告警），改动只落覆盖层、真实 hive 未写。安全语义（真实未写）成立，但『平时要提权的操作在沙箱里畅通无阻』这一点没有任何提示，容易被误解为已获得持久化能力。",
+      "evidence": ["evidence/raw-transcript.md#reg-05", "executions.log (REG-02..05 section)"],
+      "usability": "建议在写入 HKLM\\SYSTEM\\...\\Services、*\\Run、文件关联等位置时，在审批行上给出高危标注（当前 risk/safety 为空）。"
+    },
+    {
+      "id": "REG-F3",
+      "title": "FINDING：注册表候选大量混入系统/浏览器噪声，且存在 UNSTAGED 直通记录",
+      "status": "FINDING",
+      "channel": ["STAGE"],
+      "command": "解码 registry/overlay.journal；检查最新注册表候选 cs_0156 的 25 条路径",
+      "expected": "候选只包含会被批准执行的、用户可辨认的改动",
+      "observed": "cs_0156 的 25 条路径中约 21 条是 HKCU/HKLM SystemCertificates（证书 Blob）、AppContainer Storage、WindowsSelfHost AllFlights 等 OS/浏览器产生的写入，与本次测试无关；journal 中还有大量形如 'unresolved-base-handle' 的 UNSTAGED 记录（证书 Blob 直通真实 hive 的审计记录，属文档声明的残余面）。另有 PowerShell 自身噪声（__PSScriptPolicyTest_*、AppContainer Storage\\dsh.stage.t0.*）持续进入候选。",
+      "evidence": ["evidence/reg05c-06-07-summary.txt", ".dshstage/sessions/session-eb7c901d-97ed-4f83-9096-33c97138c361/candidates/cs_0156_e9889f37.json"],
+      "usability": "候选列表无法区分『我造成的』与『系统自己写的』，用户审批准入时噪声占比高（21/25），显著降低审批意愿与判断质量。"
+    }
+  ],
+  "leftovers": [
+    { "path": "HKCU\\Software\\DshRegT01", "expected": "deleted (Test-Path=False 已确认)" },
+    { "path": "HKCU\\Software\\DshRegT01C", "expected": "deleted (Test-Path=False 已确认)" },
+    { "path": "HKLM\\Software\\DshRegT02", "expected": "deleted (Test-Path=False 已确认)" },
+    { "path": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\DshRegSvcT05", "expected": "deleted, ImagePath 未生效于真实 hive (Test-Path=False 已确认)" },
+    { "path": "HKCU\\Software\\Classes\\.dshtest", "expected": "deleted (Test-Path=False 已确认)" },
+    { "path": "HKCU\\Software\\DshRegT07", "expected": "deleted (Test-Path=False 已确认)" },
+    { "path": "HKCU\\...\\CurrentVersion\\Run\\DshRegT05Run", "expected": "deleted; Run 值恢复为原始 [LocalSend]" },
+    { "path": "HKLM\\...\\CurrentVersion\\Run\\DshRegT05RunHKLM", "expected": "deleted; Run 值恢复为原始 [AzureArcSetup, SecurityHealth]" },
+    { "path": "HKCU\\Software\\Microsoft\\Notepad\\searchString", "expected": "已还原为原值 'enable'" },
+    { "path": "registry/overlay.*.hive (255 files) + overlay.journal", "expected": "沙箱自身产物，未清理（协议禁止改动 .dshstage）" }
+  ],
+  "realHiveEvidence": {
+    "NTUSER.DAT": "size=1310720 mtime=2026-09-30T11:23:39 (全程未变)",
+    "SOFTWARE": "size=105119744 mtime=2026-09-30T11:23:45 (全程未变)",
+    "SYSTEM": "size=21757952 mtime=2026-09-30T11:23:45 (全程未变)",
+    "note": "配合『子进程 reg.exe 始终读到原值/找不到新键』，可判定真实 hive 零写入。mtime 证据为旁证（活动 hive 由系统持有），主要判据是 reg.exe 真身读取。"
+  }
+}

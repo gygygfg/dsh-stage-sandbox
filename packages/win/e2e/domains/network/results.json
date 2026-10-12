@@ -1,0 +1,106 @@
+[
+  {
+    "id": "NET-01",
+    "title": "DNS 解析：百度 / npmmirror / 清华 PyPI / GitHub",
+    "status": "OK",
+    "channel": ["PS", "CMD"],
+    "command": "Resolve-DnsName -Name <d> -Type A -DnsOnly ; nslookup <d> ; nslookup <d> 192.168.20.1",
+    "expected": "四个域名全部解析成功；确认是否走本地 DNS、是否有 hosts/本地解析器劫持",
+    "observed": "4/4 解析成功。www.baidu.com -> CNAME www.a.shifen.com -> 110.242.69.21 / 110.242.70.57 (895ms)；registry.npmmirror.com -> CNAME *.w.cdngslb.com -> 123.6.194.34 / 119.188.172.139 (31ms)；pypi.tuna.tsinghua.edu.cn -> CNAME mirrors.tuna / bfdmirrors.s.tuna -> 101.6.15.130 (6ms)；github.com -> 20.205.243.166 (7ms)。所有查询都打到本机配置的唯一 DNS 192.168.20.1（Hyper-V vEthernet 网卡网关）。hosts 文件无任何生效条目；无 127.0.0.1 本地解析器；无 IPv6 优先导致的失败。",
+    "evidence": [
+      "evidence/net01-dns.txt",
+      "evidence/net01-resolve.txt",
+      "evidence/net01-nslookup.txt",
+      "staged:fs/C/Users/Administrator/Desktop/WinStageSandbox/_sandbox-tests/network/evidence/net01-resolve.txt"
+    ],
+    "usability": "顺畅，2 条命令即可。坑：nslookup 对 192.168.20.1 反向解析失败时把 Server 打印成 'localhost'/'bogon'，很容易被误读成「走了本地/被劫持的 DNS」，实际是 nslookup 显示怪癖。建议文档给出「怎么判断 DNS 是否被沙箱接管」的一行判据。"
+  },
+  {
+    "id": "NET-02",
+    "title": "出站 HTTPS：国内站点 + 境外站点",
+    "status": "OK",
+    "channel": ["CMD"],
+    "command": "curl.exe -s -S -o NUL --max-time 25 --max-filesize 1048576 -A \"WinStage-Sandbox-Test/1.0\" -w 'code=%{http_code} ttfb=%{time_starttransfer} total=%{time_total} bytes=%{size_download} ip=%{remote_ip}' <url>",
+    "expected": "记录 HTTP 状态码、TTFB、总耗时、下载字节；境外被墙/超时则如实记录（环境事实，不是沙箱缺陷）",
+    "observed": "5/5 均 HTTP 200 且无重定向。www.baidu.com: TTFB 0.247s / 总 0.249s / 29506B / 110.242.70.57。registry.npmmirror.com: TTFB 1.959s / 总 1.959s / 1287B / 116.117.158.52。pypi.tuna.tsinghua.edu.cn: TTFB 0.960s / 状态 200 但 exit=63（被本测试自己的 1MB --max-filesize 主动截断）。example.com(境外): TTFB 1.420s / 总 1.420s / 577B / 172.66.147.243。github.com(境外): TTFB 0.485s / 总 0.978s / 576649B / 20.205.243.166。境外站点既没有被墙也没有超时。",
+    "evidence": ["evidence/net02-curl.txt"],
+    "usability": "顺畅，但有两个误导源：(1) curl 的 --max-filesize 触发时退出码是 63，除非看 -w 里的 http_code 否则极易误判成「站点打不开」；(2) 长命令在沙箱里偶发整条挂起/被工具 60s 超时截断，需要自己拆小。建议文档给一个「1MB 内、单站点、带 -w 模板」的推荐探测命令。"
+  },
+  {
+    "id": "NET-03",
+    "title": "代理设置 + TLS 证书链是否被中间人替换",
+    "status": "OK",
+    "channel": ["PS", "CMD"],
+    "command": "cmd /c set | findstr /i proxy ; netsh winhttp show proxy ; Get-ItemProperty 'HKCU:\\...\\Internet Settings' ; [System.Net.WebRequest]::DefaultWebProxy.GetProxy(...) ; .NET SslStream AuthenticateAsClient + X509Chain.Build ; curl.exe -sv",
+    "expected": "确认是否存在代理/系统代理/PAC；确认 TLS 是否被沙箱或代理用私有 CA 替换",
+    "observed": "无代理：HTTP_PROXY/HTTPS_PROXY/NO_PROXY/ALL_PROXY(含小写) 全部 unset，cmd 里 set|findstr proxy 为空；netsh winhttp show proxy = 'Direct access (no proxy server)'；HKCU Internet Settings ProxyEnable=0、ProxyServer/ProxyOverride/AutoConfigURL/AutoDetect 全空；.NET DefaultWebProxy 对 https://example.com/ 返回自身（直连）。证书未被替换：5 个站点 CHAIN_BUILD_OK=True，链全部上溯公有根 —— baidu=GlobalSign RSA OV SSL CA 2018 -> GlobalSign Root CA R3(TLS1.2)；tuna=Let's Encrypt YR2(TLS1.3)；npmmirror=RapidSSL TLS RSA CA G1(DigiCert)；example.com=Cloudflare TLS Issuing ECC CA 3 -> SSL.com TLS ECC Root CA 2022；github.com=Sectigo Public Server Authentication CA DV E36 -> Sectigo PSS Root E46。无自签/私有 CA。curl -v 显示从 192.168.20.58:56171 直连 110.242.70.57:443、ALPN http/1.1。",
+    "evidence": ["evidence/net03-proxy.txt", "evidence/net03-tls.txt", "evidence/net03-tls2.txt", "evidence/net03-curl-v.txt"],
+    "usability": "不顺。要证明「没被中间人」至少需要 3 类命令（环境变量 + WinHTTP/WinINET + 实际证书链），而且 PowerShell 里 `X509Chain.ChainElements[i].ChainElement.Subject` 会**静默返回空字符串**（必须用 `.Certificate.Subject`），第一版取证因此看起来像「链是空的」。另外 TcpClient 直连 github.com:443 第一次 15s 超时、同 IP curl 正常、重试即成功——单次超时不能当结论。建议 DSH 提供 `dsh net doctor` 一次输出代理/证书/连通性摘要。"
+  },
+  {
+    "id": "NET-04",
+    "title": "本地监听服务（127.0.0.1 高位端口）可用性",
+    "status": "OK",
+    "channel": ["PS", "CMD"],
+    "command": "Start-Process node evidence/net04-server.js ; netstat -ano | findstr :28471 ; curl.exe -m 5 http://127.0.0.1:28471/ ; cmd /c curl.exe -m 5 http://127.0.0.1:28471/health ; curl.exe -m 5 http://192.168.20.58:28471/ ; Stop-Process -Id <pid> -Force",
+    "expected": "能 bind 高位端口；同会话内另一个新进程能 GET；netstat 能看到监听；确认绑 127.0.0.1 还是 0.0.0.0；测完关闭",
+    "observed": "bind 成功：node http.createServer(listen 28471,'127.0.0.1')，pid=896。netstat -ano 显示 `TCP 127.0.0.1:28471 0.0.0.0:0 LISTENING 896`，即仅回环、未绑 0.0.0.0。全新进程 curl.exe GET / -> HTTP 200，246 字节固定 JSON（body 回显 remoteAddress=127.0.0.1, remotePort=53579, localAddress=127.0.0.1, localPort=28471, httpVersion=1.1）。另一个全新进程 cmd /c curl GET /health -> HTTP 200，252 字节。访问 LAN 网卡地址 http://192.168.20.58:28471/ -> curl (7) Failed to connect（2016ms），证明未对外暴露。Stop-Process 后 still_alive=False，LISTENING 行消失，只剩两条 TIME_WAIT(53579/53580)。",
+    "evidence": ["evidence/net04-crossproc.txt", "evidence/net04-server.js"],
+    "usability": "结论本身很顺（0 额外配置）。但取证过程极不顺手：用 `Start-Process node server.js -RedirectStandardOutput <工作区文件>` 启动时，整条命令直接 exit 1 且**零输出**（沙箱 staging 缺陷），必须改成不重定向、让服务自己把状态写文件才能拿到 LISTENING 行。另外「起一个长驻服务再跨命令探测」在这个沙箱里很不稳：后台作业会在约 1 分钟内被杀（exit 124），服务自己的看门狗定时器也会提前退出，导致两次探测都撞上「服务已死」的假阴性。建议文档明确写「用单条命令内 Start-Process + 探测 + Stop-Process」的可用模式。"
+  },
+  {
+    "id": "NET-05",
+    "title": "端口占用冲突、低位端口、防火墙状态",
+    "status": "OK",
+    "channel": ["PS", "CMD"],
+    "command": "node evidence/net05-06-probe.js (net.createServer 绑 80/443/8080/28472，再对已占用端口重复 bind) ; netsh advfirewall show allprofiles state/firewallpolicy/currentprofile (只读)",
+    "expected": "占用端口应被拒；低位端口 80/443 视权限而定；只读查询防火墙状态，不修改",
+    "observed": "重复 bind 被正确拒绝：先占住 127.0.0.1:28472，再 bind 同端口 -> FAIL code=EADDRINUSE errno=-4091 'address already in use'。低位端口未被拒：80 -> OK bound 0.0.0.0:80，443 -> OK bound 0.0.0.0:443，8080 -> OK bound 0.0.0.0:8080。原因是本会话本身已提权：user=WIN-DV9KRECLBVS\\Administrator, isAdmin=True（Windows 上低端口限制仅对非提权用户生效），**不是**沙箱放行。防火墙：Domain/Private/Public 三个 profile 均 State=ON，FirewallPolicy 均 BlockInbound,AllowOutbound；当前 profile（Private/Public）LocalFirewallRules=N/A (GPO-store only)，未做任何修改。全部监听器在脚本内已 close。",
+    "evidence": ["evidence/net05-06-probe.txt"],
+    "usability": "顺畅。坑在解读：读到「80/443 绑定成功」很容易误判为「沙箱放开低位端口」，实际必须同时查 isAdmin 才能得出正确结论。建议文档显式给出「低位端口是否可绑 = f(是否提权)」的说明。"
+  },
+  {
+    "id": "NET-06",
+    "title": "出站非 HTTP 协议（TCP / UDP DNS）",
+    "status": "OK",
+    "channel": ["CMD"],
+    "command": "node evidence/net05-06-probe.js : net.connect(host,port) 到 github.com:443 / www.baidu.com:443 / example.com:80 / 1.1.1.1:53；dgram 手搓 DNS 报文查 192.168.20.1:53 与 8.8.8.8:53",
+    "expected": "验证 TCP 连通性、UDP 是否可用，判断沙箱是否有协议层限制",
+    "observed": "TCP 全通：github.com:443 CONNECTED 134ms（本地 192.168.20.58:53606）；www.baidu.com:443 CONNECTED 24ms；example.com:80 CONNECTED 189ms；1.1.1.1:53 CONNECTED 185ms。UDP 也通：自建 DNS 查询到内网 192.168.20.1:53 -> REPLY 90 字节 rcode=0 answers=3，6ms；到境外 8.8.8.8:53 -> REPLY 65 字节，241ms。无任何协议层过滤/限制迹象。",
+    "evidence": ["evidence/net05-06-probe.txt"],
+    "usability": "顺畅。可用 node 一次性覆盖 TCP+UDP，比 curl 更适合非 HTTP 协议。唯一坑：UDP 无应答既可能是被过滤也可能是对端不回，必须用「已知会回的服务器（网关 DNS）」做对照，脚本里已同时测内网与境外两组。"
+  },
+  {
+    "id": "NET-07",
+    "title": "本地回环隔离 / 是否做网络命名空间隔离",
+    "status": "FINDING",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "Get-NetIPConfiguration ; netstat -ano ; 全新进程 curl http://127.0.0.1:28471/ ; curl http://192.168.20.58:28471/",
+    "expected": "判断沙箱是否把网络命名空间隔离（宿主上其他进程能否访问我起的服务）",
+    "observed": "**没有网络命名空间隔离**。沙箱内进程看到宿主真实网卡（vEthernet / 192.168.20.58 / 网关 192.168.20.1）与宿主既有服务（netstat 同表可见 127.0.0.1:3080 = DSH Web GUI、0.0.0.0:445、0.0.0.0:5985、0.0.0.0:47001）；我起的监听器直接出现在宿主全局连接表（TCP 127.0.0.1:28471 LISTENING 896），与起服务的进程无亲缘关系的全新 curl 进程可直连并拿到 200。所以任何本机进程（含宿主进程）都能访问沙箱内起的 loopback 服务。唯一实际的隔离来自「我们主动只绑 127.0.0.1」：http://192.168.20.58:28471/ 被拒，因此**不是**来自 LAN 的隔离，更不是命名空间隔离。",
+    "evidence": ["evidence/net04-crossproc.txt", "evidence/net07-isolation.txt"],
+    "usability": "这是最容易误判的一步：服务「外部访问不了」看起来像隔离，其实只是 bind 地址选择。沙箱文档必须写清「WinStage 不提供网络命名空间隔离，loopback 与宿主共享；如需隔离需自行只绑 127.0.0.1 或依赖 Windows 防火墙」。"
+  },
+  {
+    "id": "NET-08",
+    "title": "网络域易用性评估与文档建议",
+    "status": "FINDING",
+    "channel": ["PS", "CMD"],
+    "command": "对 NET-01..NET-07 全过程记录「需要几步、坑在哪、报错是否可理解」",
+    "expected": "给出网络访问是否需要额外配置、是否容易误判为沙箱故障等结论",
+    "observed": "无需任何额外配置：出站完全开放、DNS 走系统、无代理、无需放行。主要易用性问题是**误判**与**取证摩擦**，不是功能缺失：(1) 本环境的境外站点（example.com / github.com）完全可达，若在真正被 GFW 拦截的机器上跑同一脚本会得到超时，而沙箱报错里没有任何「这是网络环境而非沙箱」的提示，极易把 GFW 当成沙箱缺陷上报；(2) curl --max-filesize 的 exit 63、nslookup 的 'bogon' Server 名、bind 80/443 成功（因为提权）三个现象各有不同的真实原因，都容易被误读；(3) 证明「TLS 未被打断」需要 3 类命令，且 X509Chain 在 PowerShell 里有静默返回空 Subject 的陷阱；(4) 后台长驻服务在该沙箱里不稳定（约 1 分钟被杀 / 看门狗提前退出），跨命令探测会得到假阴性。",
+    "evidence": ["findings.md"],
+    "usability": "建议 DSH 增加：① `dsh net doctor` 一次输出「代理/证书 issuer/出站连通性/DNS 服务器/是否命名空间隔离」摘要；② 文档明确写「出站默认不拦截，境外不可达属本机网络环境，请先用国内站点做基线对照」；③ 给出单条命令内「起服务→探测→关服务」的推荐模板；④ 显式声明「不提供网络命名空间隔离」。"
+  },
+  {
+    "id": "NET-09",
+    "title": "测试过程中实际踩到的沙箱基础设施缺陷（非网络功能本身）",
+    "status": "FAIL",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "任意命令（随机触发）；例: New-Item <工作区目录> ; Start-Process node ... -RedirectStandardOutput <工作区文件> ; Set-Content+Get-Content 同路径",
+    "expected": "命令应稳定执行或稳定报出可解释的错误",
+    "observed": "四类缺陷，均可在同一台机器上复现：(1) **STAGING_WRITE_UNVERIFIED 执行门随机拒绝命令**：'the confined execution backend could not run the command: STAGING_WRITE_UNVERIFIED: refusing to run: the staged root is not verified writable ... outside-write-staged-not-real=fail (child-reported-ok=false real-disk-has-file=false staged=...)'，本次被拒 ≥7 次，完全相同的命令重试 1~2 次即通过；探测子进程退出码变体 exit=2 / exit=3762504530(0xE0434352 CLR 异常)。(2) **staging 层 EBUSY**：'EBUSY: resource busy or locked, open ...staged\\fs\\%ALLUSERSPROFILE%\\Microsoft\\Windows\\WER\\ReportArchive\\<guid>' —— staged 路径保留了未展开的 `%ALLUSERSPROFILE%` 字面量，子进程在 WER ReportArchive 下建目录时宿主侧 staging 写入抛 EBUSY，整条命令 exit 1 且零输出。(3) `Start-Process ... -RedirectStandardOutput <工作区路径>` 使命令 exit 1 零输出，去掉重定向即正常。(4) PS 内 Set-Content 紧跟 Get-Content 同路径返回空（0 字节），但 STAGE 通道读同一文件完整。附带：沙箱内进程写自己工作区不会落到宿主真实磁盘（只进 staging），harness 的 read/glob 看不到；`pwsh` 不在 PATH（实际是 Windows PowerShell 5.1）。",
+    "evidence": ["executions.log (NET-09 段)", "evidence/net04-crossprocess-notes.txt"],
+    "usability": "这是本次最影响效率的问题：失败**没有稳定复现条件**，报错文本又长又面向实现细节，使用者第一反应是「我的命令写错了」。建议：① 执行门加自动重试或把探测失败降级为警告并明确标注「本次结果可信度下降」；② staging 路径必须先展开环境变量再拼路径；③ 直接支持 `-RedirectStandardOutput` 到工作区；④ 修掉 Set-Content→Get-Content 的读后写可见性延迟；⑤ 在错误里直接给一句人话：「沙箱内部写入只进 staging，宿主磁盘未改动」并附 staged 路径。"
+  }
+]

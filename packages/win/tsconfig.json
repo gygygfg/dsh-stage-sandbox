@@ -26,6 +26,6 @@
     "checkJs": false,
     "noEmit": true
   },
-  "include": ["plugin/**/*.ts", "src/**/*.ts", "dsh-plugin/**/*.ts", "tools/**/*.ts", "tests/**/*.ts", "*.ts"],
+  "include": ["plugin/**/*.ts", "src/**/*.ts", "dsh-plugin/**/*.ts", "tools/**/*.ts", "tests/**/*.ts", "e2e/**/*.ts", "*.ts"],
   "exclude": ["node_modules", ".t", "shim", "tools/toolchain", "docs", "esc", "patches"]
 }

@@ -1462,7 +1462,6 @@ window.__ModuleLoader__.load({
         // 当正文色时实测不合格（amber-600 在白底只有 2.79:1；red-600 4.4976:1 临界不过）。
         // 语义保留在**背景 tint + 左边条/边框**上。
         color: 'var(--dsw-alias-label-primary)',
-        background: 'var(--dsw-alias-state-error-tertiary, rgba(220,60,60,.14))',
       },
       badge: {
         fontSize: '11px',

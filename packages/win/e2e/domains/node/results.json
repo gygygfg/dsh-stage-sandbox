@@ -1,0 +1,145 @@
+[
+  {
+    "id": "NODE-01",
+    "title": "环境取证：node/npm 版本、registry 默认值、cache/prefix 落点",
+    "status": "OK",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "node -v; npm -v; npm config get registry; npm config get cache; npm config get prefix; npm config get userconfig; npm config get globalconfig; npm root -g; npm config list -l",
+    "expected": "拿到 node/npm 版本与 registry/cache/prefix 的默认值，并判定这些值的来源（真实磁盘 vs overlay）",
+    "observed": "node v24.21.0（C:\\Program Files\\nodejs\\node.exe），npm 11.19.0（npm.ps1 shim）。registry=https://registry.npmmirror.com —— **本机默认就是国内镜像，不是 registry.npmjs.org**；cache=C:\\Users\\Administrator\\AppData\\Local\\npm-cache；prefix=C:\\Users\\Administrator\\AppData\\Roaming\\npm；userconfig=C:\\Users\\Administrator\\.npmrc；globalconfig=<prefix>\\etc\\npmrc；npm root -g=<prefix>\\node_modules。disturl / electron_mirror 未设置。STAGE 通道判定该 .npmrc 来自真实磁盘：变更前遍历 13 个会话的 staged\\fs\\C\\Users\\Administrator\\.npmrc 全部不存在，.dshstage\\real 为空；其宿主 CreationTime/LastWriteTime 均为 2026/9/11 3:17:43（远早于本会话）",
+    "evidence": ["evidence/node01.txt", "staged: 变更前 .dshstage/sessions/*/staged/fs/C/Users/Administrator/.npmrc = 不存在"],
+    "usability": "顺。npm 自己就能把落点说清楚（config get userconfig/globalconfig）。坑在于：cache 与 prefix 都在工作区之外，任何 npm 写入都必须依赖 staging，而 staging 恰恰是本沙箱最不稳定的一环；另外「默认 registry 已经是镜像」这件事没有任何提示，容易让人以为测试没生效。"
+  },
+  {
+    "id": "NODE-02",
+    "title": "配置国内全局镜像 registry，并验证 .npmrc 写到哪里",
+    "status": "OK",
+    "channel": ["PS", "STAGE"],
+    "command": "npm config set registry https://registry.npmmirror.com; npm config get registry; npm config list; Get-Content $env:USERPROFILE\\.npmrc",
+    "expected": "registry 生效为镜像，写入 %USERPROFILE%\\.npmrc（工作区外）并被 staging 捕获为候选",
+    "observed": "exit=0；npm config get registry -> https://registry.npmmirror.com。写入后 staged\\fs\\C\\Users\\Administrator\\.npmrc 出现（40 字节，LastWriteTime 2026/10/3 1:19:06），read-through 返回的 mtime 与之一致。candidates 地面真值记录：cs_0118_a793af0c.json 第2703行 {path:'fs\\\\C\\\\Users\\\\Administrator\\\\.npmrc', op:'create', before:{hash:'absent'}, after:{hash:'3fc62c79e2d5c41dd6446a8b328705ea8384bd99c9a6b3ec2f6e9de1dbe612bc', bytes:40}, frozen:true} —— 宿主 2026/9/11 的文件未被改写，宿主写盘需人工批准",
+    "evidence": ["evidence/node02-mirror.txt"],
+    "usability": "中等。要证明「写到了 overlay 而不是宿主」，必须自己手工比对 staged 路径 + candidates JSON 三处，DSH 没有任何 `dsh stage ls` 之类的命令；不过 .npmrc 恰好在 %USERPROFILE%，是演示 staging 捕获的教科书场景，算顺。"
+  },
+  {
+    "id": "NODE-02b",
+    "title": "设置 disturl / electron_mirror 等常用镜像项",
+    "status": "FAIL",
+    "channel": ["PS"],
+    "command": "npm config set disturl https://npmmirror.com/mirrors/node; npm config set electron_mirror https://npmmirror.com/mirrors/electron/",
+    "expected": "两个键写入 .npmrc，供 node-gyp / electron 下载使用",
+    "observed": "两条命令都 exit=1：`npm error \\`disturl\\` is not a valid npm option`、`npm error \\`electron_mirror\\` is not a valid npm option`。npm 11.19.0 已禁止 `npm config set` 写入未知键。npm config list -l 中 disturl/electron_mirror 仍不存在",
+    "evidence": ["evidence/node02-mirror.txt"],
+    "usability": "坑。这是**网上通用的国内镜像配方**（`npm config set disturl ...` / `electron_mirror`），在本机 npm 11.19.0 上直接失效；报错只说 not a valid option，不提示「请改用直接编辑 .npmrc」。用户必须自己知道退路（手写 %USERPROFILE%\\.npmrc），且手写又落到工作区外，需要额外做 staging 取证。"
+  },
+  {
+    "id": "NODE-03",
+    "title": "本地安装小型包（npm init -y + npm install is-odd）",
+    "status": "FAIL",
+    "channel": ["PS", "CMD"],
+    "command": "Set-Location <proj1>; npm init -y; npm install is-odd --loglevel=http --no-audit --no-fund",
+    "expected": "生成 package.json / package-lock.json / node_modules，tarball 解析到 registry.npmmirror.com",
+    "observed": "两段式失败。(1) 在沙箱内新建的 proj1 里跑任何 npm：`Program 'node.exe' failed to run: The directory name is invalid`（CWD 问题，见 NODE-F1）。(2) 规避 CWD 后用 `npm install --prefix <proj1> is-odd`：npm **确实联上了镜像**（`npm http fetch GET 200 https://registry.npmmirror.com/is-odd 279ms (cache miss)`），随即死于缓存：`npm error code EEXIST syscall mkdir path %LOCALAPPDATA%\\npm-cache\\_cacache\\content-v2\\sha512\\6d\\93` 紧接着 `ENOENT: no such file or directory, mkdir 同一路径`。换工作区内 cache（--cache <node\\npm-cache>）同样失败；加 --force 后改为 `ENOENT mkdir ...\\_cacache\\tmp`。最终 proj1 无 package-lock.json、无 node_modules。tarball URL 已证明为镜像域名：https://registry.npmmirror.com/is-odd/-/is-odd-3.0.1.tgz",
+    "evidence": ["evidence/node03-05-install.txt", "evidence/f1-cwd-matrix.md"],
+    "usability": "很难用。要走到「知道是缓存坏了」这一步，需要：建目录、发现 CWD 失败、猜 --prefix、再试 3 种缓存位置、加 --force 才能把错误从 EEXIST 推进到 ENOENT。npm 的报错建议是「run npm with --force to overwrite files recklessly」——**这条建议在本沙箱里是误导**，照做只会换一个错误。耗时与步数是正常环境的 5 倍以上。"
+  },
+  {
+    "id": "NODE-04",
+    "title": "完整性校验：lock 的 sha512 与 tarball/文件实际哈希",
+    "status": "BLOCKED",
+    "channel": ["PS", "CMD"],
+    "command": "Test-Path proj1\\package-lock.json; npm view is-odd@3.0.1 dist --json; Invoke-RestMethod https://registry.npmmirror.com/is-odd; Invoke-WebRequest <tarball>; SHA512/SHA1 比对",
+    "expected": "package-lock.json 的 integrity(sha512) 与 node_modules 内实际内容一致；npm ci 后 npm ls 无 missing/invalid",
+    "observed": "**主目标 BLOCKED**：NODE-03 未产出 package-lock.json 与 node_modules（两者 Test-Path 均为 False），`npm ci` / `npm ls --depth=0` 无对象可比；`npm view`（纯元数据命令）也因同一缓存缺陷失败。**等价链路已跑通（部分 OK）**：直连镜像取 dist.integrity=sha512-CQpnWPrDwmP1+SMHXZhtLtJv90yiyVfluGsX5iNCVkrhQtU3TQHsUWPG9wkdk9Lgd5yNpAg9jQEo90CBaXgWMA==，实际下载 tarball（2774 字节，URL=https://registry.npmmirror.com/is-odd/-/is-odd-3.0.1.tgz）计算 sha512-base64 完全一致（INTEGRITY MATCH=True），sha1 亦与 dist.shasum=65101baf3727d728b66fa62f50cda7f2d3989601 一致；tarball 文件 SHA256=13c23b3f1f3a5c146b8906e23c8e674f8e4a6ff44b77720e1d4bddb7b2caf312。=> 镜像与完整性链路本身健康，坏的是 npm 的缓存目录创建",
+    "evidence": ["evidence/node04-integrity.txt", "evidence/is-odd-3.0.1.tgz"],
+    "usability": "很难用且容易误判。伪装成「网络/镜像不可信」的其实是「沙箱里 Node 建不了目录」——如果只测到 `npm install` 失败并看到镜像域名，极易得出「国内镜像有问题」的错误结论。要证伪必须绕开 npm 自己拼 sha512-base64 比对，正常测试人员不会走这一步。"
+  },
+  {
+    "id": "NODE-05",
+    "title": "全局安装 npm install -g 与 %APPDATA%\\npm 落点、shim 可执行性",
+    "status": "BLOCKED",
+    "channel": ["PS", "STAGE"],
+    "command": "npm install -g is-odd --cache <node\\npm-cache> --loglevel=http --no-audit --no-fund; Test-Path $env:APPDATA\\npm\\is-odd.cmd; npm ls -g --depth=0",
+    "expected": "包进 %APPDATA%\\npm\\node_modules，生成 is-odd.cmd/.ps1 shim 且可执行、退出码正常",
+    "observed": "安装 exit=1（2689ms），死于与 NODE-03 相同的 `ENOENT ... mkdir <cache>\\_cacache\\tmp`；已先成功按镜像取到 `GET 200 https://registry.npmmirror.com/npm` 与 `GET 200 https://registry.npmmirror.com/is-odd`。落点后验（PS 通道）：prefix 目录存在=True（宿主既有，pnpm 在用），prefix\\node_modules\\is-odd=False，prefix\\is-odd.cmd=False —— **没有生成任何 shim，因此「shim 是否可执行」无对象可测**。npm ls -g 仅显示既有 pnpm@10.34.5。测试遗留物：本域零新增；npm 只在 cache 目录留下 `_logs\\2026-10-02T18_05_48_177Z-debug-0.log`（在 staged overlay 内）。清理方式：无需清理宿主；如需清空 staging 由宿主丢弃会话 overlay 即可",
+    "evidence": ["evidence/node03-05-install.txt"],
+    "usability": "中等偏差。好处是失败得很彻底（没写出半个 shim，不会留脏），坏处是无法验证「全局 shim 能否执行」这个真实用户最关心的点；npm 的失败信息只指向自己的私有缓存路径，看不出是沙箱问题。"
+  },
+  {
+    "id": "NODE-06",
+    "title": "运行安装产物：require 刚装的包并打印结果",
+    "status": "BLOCKED",
+    "channel": ["CMD"],
+    "command": "node -e \"console.log(require('...\\proj1\\node_modules\\is-odd')('5'))\"（等价: require 一个 overlay 内包目录）",
+    "expected": "安装的包能被 require 并返回值，形成「完整性 -> 可执行性」闭环",
+    "observed": "**前半段 BLOCKED**：NODE-03/05 都没能装出任何包，node_modules 不存在，无真实安装产物可 require。**后半段 OK**：用一个 write 工具放置的 reqprobe/{package.json,index.js}（overlay 内、非真实磁盘）验证 Node 模块加载能力——`require(overlay dir module)` 与 `require(overlay .js file)` 均返回 {\"ok\":true,\"tag\":\"reqprobe-from-staging\"}；直接 `node <script.js>` 执行 overlay 内脚本（mkdir-probe/dir-probe2/stat-probe/cwd-spawn-probe）全部成功。=> 断点在 install 侧，require 侧能力正常",
+    "evidence": ["evidence/node06-require.txt"],
+    "usability": "坑。require 对 overlay 是可见的，而 stat 对 overlay 是不可见的——同一个 Node 进程里两种 API 给出矛盾答案，非常反直觉；「能不能用」的答案取决于你问的是哪个 API。"
+  },
+  {
+    "id": "NODE-07",
+    "title": "沙箱特有：Node 写文件是否被 staging 捕获、pipe 是否失败、npm 是否被 pipe 拖累",
+    "status": "FAIL",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "node stat-probe.js; node mkdir-probe.js; node dir-probe2.js; node cwd-spawn-probe.js {inherit|ignore|pipe} <cwd>",
+    "expected": "Node 写工作区外/内文件进 staging 且三通道一致；stdio:'pipe' 失败并给出原始错误；npm 不因 pipe 报 EPERM",
+    "observed": "(A) 写入被捕获但**元数据失明**：writeFileSync+readFileSync 对同一 overlay 文件均成功，而 fs.existsSync=false、statSync/lstatSync/realpathSync=ENOENT；同一进程内 statSync 一个真实磁盘文件(PROTOCOL.md, 6275字节)却正常。三通道对 node 写入的 nodestat-probe.txt：PS Test-Path=True，Node existsSync=false。=> 写入族被 hook，元数据族没有被 hook。(B) **Node mkdir 全废**：`mkdirSync(deep,{recursive:true})` 抛 ENOENT(stat)，非递归对同一路径抛 EEXIST，异步 `fs.promises.mkdir(tmpdir,{recursive:true})` 返回 **ok 但目录不存在**（静默假成功）；mkdtempSync 同样假成功。(C) `stdio:'pipe'` 复现失败，但原始文本是 `ENOENT spawnSync C:\\Program Files\\nodejs\\node.exe ENOENT`（status=null/stdout=undefined），**不是 PROTOCOL 记载的 EPERM**；inherit 与 ignore 均 status=0。(D) npm 的失败发生在更早的 cacache mkdir，未观察到 pipe 噪声，也没有 EPERM 字样",
+    "evidence": ["evidence/node07-sandbox.txt", "evidence/node06-require.txt"],
+    "usability": "极难用。诊断这条链需要理解 libuv 的 mkdir 实现（先 stat 后 create）才能把「npm EEXIST」和「fs.existsSync 说 false」联系起来；三个通道对同一路径三种答案（PS True / CMD 找不到 / Node ENOENT），没有官方工具能一眼看出「哪些 API 家族被 hook 了、哪些没有」。"
+  },
+  {
+    "id": "NODE-F1",
+    "title": "F1：沙箱内新建目录不能作为任何子进程的 CWD（矩阵判定）",
+    "status": "FAIL",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "见 evidence/f1-cwd-matrix.md 的 8 行矩阵（Push-Location / cmd cd /d / Start-Process -WorkingDirectory / Node spawn cwd）",
+    "expected": "在沙箱内新建的目录里能正常启动 node/npm（正常环境必然成立）",
+    "observed": "真实已存在目录作 CWD（工作区根、_sandbox-tests）=> OK v24.21.0 exit=0，含「真实存在但本会话有 overlay 改动」的目录也 OK。沙箱内**新建**目录作 CWD => FAIL：PS 调 node 报 `The directory name is invalid`；`cmd /c cd /d` 报 `The system cannot find the file specified.` exit=1；工作区**外**新建目录（%LOCALAPPDATA%\\Temp\\winstage-cwd-probe）同样 `The directory name is invalid`；`Start-Process -WorkingDirectory <新目录>` 报 `This command cannot be run due to the error: The directory name is invalid.`（换成真实目录 exit=0）；Node 侧 `spawnSync(...,{cwd:<新目录>,stdio:'inherit'})` 报 statSync ENOENT + `process.chdir FAILED ENOENT` + `spawnSync ENOENT`。根因假设：CreateProcessW 的 lpCurrentDirectory 由内核在真实文件系统上解析，overlay 未为新目录建立真实目录项、也未 hook CWD 校验（H1）；同时元数据族 API 未被 hook，导致 Node stat/existsSync 对 overlay 一律 ENOENT（H2）。规避法有效性：`npm --prefix <dir>` + CWD 留真实目录 **有效绕过 F1**（npm 真的联网并命中镜像），但 npm 仍因第二个独立缺陷而失败；`npm init -y` 无法规避（它本身要求 CWD 是新目录）",
+    "evidence": ["evidence/f1-cwd-matrix.md", "evidence/node07-sandbox.txt"],
+    "usability": "最严重的一处易用性缺陷。报错文本（The directory name is invalid / The system cannot find the file specified.）完全不提沙箱，用户会怀疑自己的路径写错了；而 `Test-Path`/资源管理器里这个目录**明明看得见**，形成强烈误导。正常「pwd -> cd -> npm install」三步流程在这里第一步就断，必须自己悟出 `--prefix` + 保持 CWD 在真实目录。"
+  },
+  {
+    "id": "NODE-08",
+    "title": "易用性：npm 在沙箱里的额外摩擦（缓存/引擎/权限/报错/步数/耗时）",
+    "status": "FINDING",
+    "channel": ["PS", "CMD"],
+    "command": "汇总本域所有命令的耗时、步数与报错可理解度",
+    "expected": "记录 npm 使用中的额外摩擦点",
+    "observed": "1) 缓存目录：cache 默认在工作区外(%LOCALAPPDATA%\\npm-cache)，恰恰是 Node 在 overlay 上建不了目录的位置 -> npm 必然失败；改 --cache 到工作区内同样失败（说明与位置无关，是 overlay 语义问题）。2) 引擎检查：无额外摩擦（engine-strict=false，Node 24 正常）。3) 权限：未见 EACCES/EPERM；沙箱表现为「文件系统调用静默返回 ENOENT/成功但无效果」，比权限拒绝更难懂。4) 报错可理解度：低。npm 建议 `--force` 属误导，照做只是换错误；真正的根因（Node stat 对 overlay 失明、递归 mkdir 假成功）在 npm 之外。5) 步数：正常「npm init -y && npm install is-odd」2 步；实测需要 建目录→发现 CWD 失败→改 --prefix→换 cache→加 --force→npm view 也失败→手工直连 registry 校验 共 7+ 步仍未装成。6) 耗时：单次 npm 调用 2.1~3.3s 后即失败（比正常慢不了多少，但全部无效）。7) 附带：`npm config get/list`、`npm ls -g`、`npm -v` 等不落缓存的命令完全正常，容易造成「npm 是好的」的假象（第一印象 OK -> 一 install 就崩）。8) PowerShell 调用 npm 会因 stderr 里带 "npm http fetch..." 而被记成 NativeCommandError（红字），加剧误导",
+    "evidence": ["evidence/node03-05-install.txt", "evidence/node02-mirror.txt"],
+    "usability": "见 observed 逐条。核心建议：DSH 应在启动时自检「被 hook 的 API 家族覆盖度」（至少 CreateFile/CreateDirectory/GetFileAttributesEx/GetFileInformationByHandle），对已知不兼容的运行时（libuv/Node）给出显式告警，而不是让用户在 npm 的 EEXIST/ENOENT 里绕圈。"
+  },
+  {
+    "id": "NODE-EX-01",
+    "title": "执行门 STAGING_WRITE_UNVERIFIED 间歇性拒绝（探针子进程崩溃）",
+    "status": "FINDING",
+    "channel": ["PS"],
+    "command": "同一命令重复执行（npm install / Get-FileHash / 纯读取命令）",
+    "expected": "命令要么执行，要么给出可复现的稳定拒绝理由",
+    "observed": "多次被拒：`STAGING_WRITE_UNVERIFIED: refusing to run: the staged root is not verified writable by the identity this run uses (measured as not writable). reason: 1 staging-write check(s) failed: outside-write-staged-not-real=fail (child-reported-ok=false real-disk-has-file=false staged=not-found exit=<X>)`，同一台机器不同时刻的探针退出码为 exit=2 / 3221225477(0xC0000005 ACCESS_VIOLATION) / 4294901760(0xFFFF0000) / 3762504530(0xE0434352 .NET CLR 异常)，说明**门自检的子进程自身在崩**，于是全量拒绝；重试同一命令有时成功。另有两次后端异常：`EBUSY: resource busy or locked, open '...\\staged\\fs\\%ALLUSERSPROFILE%\\Microsoft\\Windows\\WER\\ReportArchive\\0783bbe5-...'`（注意 staged 树里出现**未展开的字面量 `%ALLUSERSPROFILE%` 目录名**），以及 2 次「命令返回空输出、无报错」的静默 no-op。门探针自身会往 %USERPROFILE% 写 dsh-probe-home.txt（staged 内可见）",
+    "evidence": ["evidence/node07-sandbox.txt"],
+    "usability": "严重。命令有时能跑有时被拒，且拒绝理由只出现在工具层、退出码都不给；无法区分「被沙箱拒绝」与「沙箱自检坏了」，重试次数与成功率都不可预期。"
+  },
+  {
+    "id": "NODE-EX-02",
+    "title": "review.json 陈旧：本会话候选与风险分级取不到",
+    "status": "FINDING",
+    "channel": ["STAGE"],
+    "command": "Get-Content .dshstage\\review.json（grep npmrc/risk）",
+    "expected": "review.json 呈现本会话候选及 normal/outside/sensitive/danger 分级（人工勾选批准的唯一入口）",
+    "observed": "review.json 内容为 `{\"generatedAt\":\"2026-10-02T10:36:21.594Z\",\"sessionId\":\"dsh-host\",\"revision\":0,\"pending\":false,\"counts\":{...全0},\"riskCounts\":{\"normal\":0,\"outside\":0,\"sensitive\":0,\"danger\":0},\"alerts\":[],\"candidates\":[],\"files\":[]}` —— 生成于本会话之前约 7 小时，sessionId 为 dsh-host 而非本会话 id，候选与 files 均为空数组。而 .dshstage\\sessions\\<本会话>\\candidates\\ 下已有 120+ 个候选文件（含 .npmrc、%USERPROFILE%\\.dsh\\.credentials.yaml 等）。candidates JSON 内不带风险分级字段，只有 path/op/before/after/frozen/status(superseded)",
+    "evidence": ["staged:.dshstage/review.json", "staged:.dshstage/sessions/session-eb7c901d-.../candidates/cs_0118_a793af0c.json#L2703"],
+    "usability": "严重且危险。同一份改动在 candidates（地面真值）里有记录、在 review.json（人工批准界面）里却没有 —— 用户打开审查界面会看到「本次没有任何改动」，可能误以为沙箱没捕获，或反过来在别处误批准。风险分级也拿不到值，协议第 4 条要求的 normal/outside/sensitive/danger 证据在本会话无法获得。"
+  },
+  {
+    "id": "NODE-EX-03",
+    "title": "副作用：npm 尝试在 %LOCALAPPDATA% 与 %APPDATA% 写入的真实范围",
+    "status": "FINDING",
+    "channel": ["STAGE"],
+    "command": "Get-ChildItem .dshstage\\sessions\\<session>\\staged\\fs\\C\\Users\\Administrator\\-recurse(受限于仅查指定路径)",
+    "expected": "明确 npm 在被沙箱捕获时的写入面，以便报告与清理",
+    "observed": "STAGE 通道确认：staged\\fs\\C\\Users\\Administrator\\ 下出现 .npmrc、AppData\\Local\\npm-cache\\_logs\\*.log（失败日志）、AppData\\Local\\Microsoft\\Windows\\PowerShell\\StartupProfileData-NonInteractive（PowerShell 噪声，非 npm）；AppData\\Roaming\\npm 前缀目录未出现 is-odd 相关新增。npm 的目标写入面为：<cache>\\_cacache\\**、<cache>\\_logs\\*、<prefix>\\node_modules\\**、<prefix>\\<pkg>.cmd/.ps1、工作区项目内 node_modules/** 与 package-lock.json。本次测试遗留物：仅 2 个失败日志 + 1 个 .npmrc overlay + 一批 staged 目录；宿主真实磁盘零新增（see NODE-05）。",
+    "evidence": ["evidence/node03-05-install.txt", "evidence/node02-mirror.txt"],
+    "usability": "中等。要回答「npm 到底想写哪儿、有没有落地」需要自己在 staged 树里翻，没有现成清单。"
+  }
+]

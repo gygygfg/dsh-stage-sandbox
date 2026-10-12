@@ -1,5 +1,5 @@
 /**
- * 包入口（thin shim）——真正的实现住在 `host-plugin.mjs`。
+ * 包入口（thin shim）——真正的实现住在 `host-plugin.ts`。
  *
  * 为什么入口是薄壳而不是实现本身：DSH 的 loader 按**模块 URL**缓存已导入的插件，
  * 改文件不会让运行中的进程重新执行 `apply()`（本 profile 启动时 `hmr.root` 为 `[]`，
@@ -9,4 +9,4 @@
  * 对使用者没有影响：入口导出与实现完全一致（`Config` / `name` / `inject` / `apply`）。
  */
 
-export * from './host-plugin.mjs'
+export * from './host-plugin.ts'

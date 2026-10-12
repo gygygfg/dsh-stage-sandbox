@@ -98,7 +98,7 @@ check('S0 能切出 execute() 方法体', execBody.length > 0, `len=${execBody.l
   )
   check(
     'S4c writeFileAtomic 已从 store.ts 导入',
-    /import \{[^}]*writeFileAtomic[^}]*\} from '\.\.\/src\/store\.mjs'/.test(review),
+    /import \{[^}]*writeFileAtomic[^}]*\} from '\.\.\/src\/store\.ts'/.test(review),
   )
 }
 

@@ -1,0 +1,178 @@
+{
+  "domain": "exe",
+  "session": "session-4c5d9889-7b7f-4132-931b-a26a3c1d924d",
+  "area": "r2/exe",
+  "generatedAt": "2026-10-03T20:5x+08:00",
+  "environmentFacts": {
+    "powershell": "5.1.26100.33438 (Windows PowerShell, not pwsh 7)",
+    "processCwdForAllPS": "C:\\Users\\Administrator\\Desktop\\WinStageSandbox\\.dshstage\\sessions\\session-4c5d9889-...\\staged",
+    "identityOfSandboxedChildren": "WIN-DV9KRECLBVS\\Administrator, IsInRole(Administrator)=False, 'whoami' inside shimmed child returns 'ERROR: Access is denied.'",
+    "https": "BROKEN MACHINE-WIDE: every Schannel-based client fails with curl(35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030E). Reproduced with --insecure AND with WINSTAGE_SHIM_DISABLE=1, and with .NET WebClient. Plain HTTP works (example.com -> 200). GNU curl is 8.16.0.",
+    "httpsWorkaround": "node.exe (OpenSSL + own CA bundle) reaches HTTPS fine: 7-zip.org -> 302 -> github.com -> 302 -> release-assets.githubusercontent.com -> 200",
+    "curlFromPowerShell": "& curl.exe ... fails with 'Program curl.exe failed to run: Access is denied'; the SAME curl.exe runs fine when started by cmd.exe",
+    "cmdFromPowerShell": "cmd.exe /c works, but piping its stdout INTO PowerShell ('cmd ... | Out-File') fails with 'Program cmd.exe failed to run: Access is denied'; redirect cmd's output to a file and read the file instead"
+  },
+  "checkpoints": [
+    {
+      "id": "EXE-01",
+      "title": "Download the 7-Zip release package",
+      "status": "OK",
+      "channel": ["PS", "HOST"],
+      "command": "node.exe dl7z.js <out> https://www.7-zip.org/a/7z2408-x64.exe (curl/https unavailable, see env facts)",
+      "expected": "HTTP 200 download, record status / bytes / SHA256 / elapsed",
+      "observed": "302 -> github.com/ip7z/7zip/releases/download/24.08/7z2408-x64.exe -> 302 -> release-assets.githubusercontent.com -> STATUS=200, CONTENT_LENGTH=1624144, BYTES=1624144, SHA256=67CB9D3452C9DD974B04F4A5FD842DBCBA8184F2344FF72E3662D7CDB68B099B, elapsed 6425 ms. Second sample PsInfo64.exe: 200, 498992 B, SHA256=983270DAA5A2FFA9C5C0C0A8D0F572BC5B6E68E5151AE84BDEA7CF76A1D711B9, 2704 ms",
+      "hostTruth": "host glob 'Program Files/7-Zip/*' -> nothing; the .exe exists only in .dshstage overlay, listed in manifest.json files list",
+      "evidence": ["evidence/exe01-download.txt"],
+      "usability": "curl.exe cannot do HTTPS at all here, so the PROTOCOL's suggested 'curl.exe download' falls over at step 1. Needed 4 failed attempts (curl, Invoke-WebRequest, WebClient, curl in cmd) before node.exe worked. Report a clear 'Schannel has no credentials' hint plus a documented fallback."
+    },
+    {
+      "id": "EXE-02",
+      "title": "Integrity / provenance verification",
+      "status": "OK",
+      "channel": ["PS", "HOST"],
+      "command": "Get-AuthenticodeSignature; Get-FileHash -Algorithm SHA256/SHA1/MD5; read PE manifest",
+      "expected": "signer identity, Valid/NotSigned, timestamp, hash cross-check",
+      "observed": "7z2408-x64.exe: NotSigned (SignatureType=None) - 7-Zip installers are not Authenticode-signed; VersionInfo FileVersion/ProductVersion=24.08, CompanyName='Igor Pavlov', FileDescription='7-Zip Installer', OriginalFilename='7zipInstall.exe'; embedded manifest requestedExecutionLevel level=\"requireAdministrator\" uiAccess=\"false\". SHA256=67CB9D3452C9DD974B04F4A5FD842DBCBA8184F2344FF72E3662D7CDB68B099B; SHA1=86918E72F2E43C9C664C246E62B41452D662FBF3; MD5=0330D0BD7341A9AFE5B6D161B1FF4AA1. PsInfo64.exe: Authenticode **Valid**, CN=Microsoft Corporation, thumbprint AB172913A2960A224809EE8A0C371CD47A079B72, timestamped by CN=Microsoft Time-Stamp Service",
+      "hostTruth": "hashes recomputed with the host read/PS channel agree byte-for-byte with the download-time hash in dl7z.log (write==readback)",
+      "evidence": ["evidence/exe02-authenticode.txt"],
+      "usability": "Official SHA256 for 24.08 is not published on 7-zip.org/download.html (page has no hash column) - same wall the round-1 thread hit. Only the Authenticode path gives a strong, verifiable provenance answer, and 7-Zip has no signature to offer. Cross-check therefore relies on a second independent mirror + node-side hash."
+    },
+    {
+      "id": "EXE-03",
+      "title": "Silent install (7z2408-x64.exe /S)",
+      "status": "BLOCKED",
+      "channel": ["PS", "HOST"],
+      "command": "Start-Process 7z2408-x64.exe -ArgumentList '/S' -PassThru  (and via cmd '7z2408-x64.exe /S', and 'start /wait \"\" ... /S')",
+      "expected": "exit code 0, install tree on the target, per-file SHA256",
+      "observed": "Every launch path blocks: the process either never returns or the tool call never returns while the installer sits on the UAC elevation path. Cause chain: (a) the PE manifest demands requireAdministrator; (b) the session token the shim injects into is NOT elevated - WindowsPrincipal.IsInRole(Administrator)=False and 'whoami' inside a shimmed cmd child prints 'ERROR: Access is denied.'; (c) the shim cannot present a UAC consent UI. D:\\winstage-r2\\7zip was never created. A side effect worth recording: after the attempts, an .exe named 7z2408-x64.exe was left in the background job/process table once and pwsh calls to Start-Process hung until it drained.",
+      "hostTruth": "host glob 'Program Files/7-Zip/*' -> nothing; D:\\winstage-r2 contains only another thread's fs02-d.txt; Test-Path 'C:\\Program Files\\7-Zip'=False. Installer never landed anywhere.",
+      "evidence": ["evidence/exe03-install-attempt.txt"],
+      "usability": "Worst usability wall in this domain: 'requireAdministrator' + non-elevated sandbox token = silent hang with no error text. There is no 'this installer needs elevation and elevation is unavailable' message anywhere. A user cannot tell whether they are waiting for UAC, for the install, or for a hung tool."
+    },
+    {
+      "id": "EXE-03b",
+      "title": "Non-elevated substitute: official standalone 7zr.exe as 'installed program'",
+      "status": "OK",
+      "channel": ["PS", "HOST"],
+      "command": "node.exe <dl> https://github.com/ip7z/7zip/releases/download/24.08/7zr.exe; 7zr.exe i",
+      "expected": "obtain a runnable 7-Zip console binary without elevation",
+      "observed": "200, 591360 B, SHA256=1B16C41AE39B679384B06F1492B587B650716430FF9C2E079DCA2AD1F62C952D, ms=2962. Authenticode: NotSigned. VersionInfo FileVersion=24.08, Desc='7-Zip Reduced Standalone Console'. '7zr.exe i' -> RC=0, full format/codec table printed (7z, xz, lzma, split, sha256, AES256CBC, BCJ2, LZMA2 ...)",
+      "hostTruth": "binary present only in overlay: <stageRoot>\\fs\\C\\...\\r2\\exe\\pkg\\7zr.exe; listed in manifest.json",
+      "evidence": ["evidence/exe06-7zr-functional.txt"],
+      "usability": "This is the only 'install an exe' route that works end-to-end in this sandbox: pick a portable/standalone binary instead of an installer. That workaround is not documented anywhere."
+    },
+    {
+      "id": "EXE-04",
+      "title": "Integrity of the installed/obtained program",
+      "status": "OK",
+      "channel": ["PS", "HOST"],
+      "command": "Get-AuthenticodeSignature on the downloaded+staged binaries; hash compare",
+      "expected": "installed main binary still Valid / matches package",
+      "observed": "For the installer itself no installed copy exists (EXE-03 BLOCKED). For the runnable substitute: 7zr.exe hash after copy into the overlay == download-time hash 1B16C4...952D; PsInfo64.exe after copy == 983270...11B9 and Authenticode remains Valid with the same thumbprint + timestamp. So staging does not mutate byte content or break Authenticode.",
+      "hostTruth": "SHA256 recomputed on the staged copies equals the values recorded at download time",
+      "evidence": ["evidence/exe02-authenticode.txt", "evidence/exe04-artifact-hashes.txt"],
+      "usability": "Smooth. The only surprise is that 7-Zip ships unsigned, so 'signature valid' can never be the integrity answer for this package."
+    },
+    {
+      "id": "EXE-05",
+      "title": "Sandbox isolation verdict (core)",
+      "status": "OK",
+      "channel": ["PS", "CMD", "STAGE", "HOST"],
+      "command": "Get-ChildItem overlay; host glob on C:\\Program Files\\7-Zip and _sandbox-tests/r2/exe; review.json / manifest.json read",
+      "expected": "all installer activity captured into staging, real disk untouched",
+      "observed": "CONFIRMED CONTAINED. All 25 r2/exe artifacts live under <stageRoot>\\fs\\C\\Users\\Administrator\\Desktop\\WinStageSandbox\\_sandbox-tests\\r2\\exe\\{pkg,work,evidence}. manifest.json 'files' contains every one of them plus the 'r2\\exe', 'r2\\exe\\pkg', 'r2\\exe\\work', 'r2\\exe\\evidence' directory entries; manifest.json 'hostOperations' = [] (no real-disk operations recorded). review.json: riskCounts normal=2945, outside=15, sensitive=1, danger=0; counts.files=2961, listed=40, truncated=true. Attempts to write OUTSIDE the stage tree were refused, not silently dropped: New-Item C:\\dsh-probe-real -> 'Access to the path dsh-probe-real is denied'; 7zr a C:\\winstage-r2-newcwd\\fresh.7z -> 'ERROR: cannot open file' (7zr RC=2).",
+      "hostTruth": "HOST read/glob of the real disk: _sandbox-tests\\r2\\exe contains only the .hostdir-marker created by the DSH write tool itself; C:\\Program Files\\7-Zip ABSENT; C:\\winstage-r2-newcwd ABSENT; D:\\winstage-r2 has only another thread's file. Zero bytes of my installer/download activity reached the real disk.",
+      "evidence": ["evidence/exe05-isolation.txt", "evidence/exe05-review.json.txt"],
+      "usability": "The isolation itself is solid and I could not make it leak. But proving per-artifact risk is impossible from review.json (only 40 of 2961 files are listed, mine are not among them); manifest.json is a 2.8 MB single-line JSON whose 'files' member is one enormous semicolon-joined string, so there is no per-path risk or size lookup."
+    },
+    {
+      "id": "EXE-05b",
+      "title": "Sandbox refuses workspace-path writes (fail-closed regression)",
+      "status": "FAIL",
+      "channel": ["PS", "CMD", "HOST"],
+      "command": "Set-Content _sandbox-tests\\r2\\exe\\probe-ws.txt; New-Item _sandbox-tests\\r2\\exe\\pkg; cmd /c echo X> ...\\shim-canary.txt",
+      "expected": "write inside the workspace is captured into staging",
+      "observed": "Every write whose path is expressed in WORKSPACE form is refused: parent dir absent -> 'Could not find a part of the path ...\\r2\\exe\\t.txt'; parent dir present -> 'Access to the path ...\\r2\\exe\\pkg is denied'; cmd -> 'The system cannot find the path specified.' (exit 1) / 'The directory or file cannot be created.' Writes to the same tree in STAGE form (<stageRoot>\\fs\\C\\...) succeed 100%. The marker .hostdir-marker created by the DSH host write tool is visible through the workspace path, so read-through works; only the write mapping is dead.",
+      "hostTruth": "host glob shows .hostdir-marker (written by the host tool) but none of the PS/cmd workspace-path writes -> those were neither staged-in-workspace-form nor written to disk; they simply errored.",
+      "evidence": ["evidence/exe05-isolation.txt"],
+      "usability": "This is the single biggest usability trap of the round: the documented, obvious way to write your own outputs (workspace path) is broken, while an undocumented internal path (stageRoot\\fs\\C\\...) silently works. It cost me ~8 diagnostic commands and forced every download/test to be rewritten against the overlay path."
+    },
+    {
+      "id": "EXE-06",
+      "title": "Running the obtained program from four launch contexts",
+      "status": "OK",
+      "channel": ["CMD", "PS", "HOST"],
+      "command": "7zr.exe a/l/x from staged abs path; 7zr.exe from C:\\winstage-r2-newcwd as CWD; 7zr.exe via relative path; PsInfo64.exe across contexts",
+      "expected": "record which contexts work and the raw error text",
+      "observed": "(1) staged absolute path + CWD=staged -> WORKS (7zr RC=0, PsInfo64 rc=0). (2) **BRAND-NEW EMPTY DIRECTORY AS CWD -> WORKS** (pushd C:\\winstage-r2-newcwd; 7zr a -t7z C:\\winstage-r2-newcwd\\fresh.7z <payload>): the process started and 7zr returned RC=0 with CWD_AT_RUN=C:\\winstage-r2-newcwd; the archive write failed separately with 7zr 'ERROR: cannot open file' because the OUTPUT path was outside the stage tree. Round 1's 'a newly created directory cannot be a child-process CWD' did NOT reproduce - it is not a CWD problem, it is an output-path-permission problem. (3) workspace-path launch -> 'Not enough memory resources are available to process this command.' + 'The system cannot find the path specified.' exit 1 (this is the real 'workspace path cannot be executed' behaviour). (4) relative path from CWD=staged root (.\\pkg\\7zr.exe) -> works. Real functional test: 7zr a -t7z payload.7z payload.txt -> RC=0, 197 bytes, SHA256=4972DD175A7B9C6777C14DC3E2D9106D135838C8D369A928A1F9166B1E06D459; 7zr l lists 1 file/5202 B; 7zr x -> RC=0; extracted payload.txt SHA256=D1A1787F7661BDB8062021F38E2AC4BA6428E90246A49268AD91626298590CBC == source payload SHA256 (round-trip verified).",
+      "hostTruth": "host glob on the real _sandbox-tests\\r2\\exe\\work -> nothing, i.e. archive + extracted file exist only in the overlay; hashes verified through the staged path",
+      "evidence": ["evidence/exe06-7zr-functional.txt", "evidence/exe06-contexts.txt"],
+      "usability": "Two conflicting error strings for the same intent ('workspace path'): 'Not enough memory resources are available' (from cmd) and a bare 'file not found'. Neither says 'use the staged path'. The new-CWD scare from round 1 turned out to be a misdiagnosis - worth correcting in the round-1 report."
+    },
+    {
+      "id": "EXE-07",
+      "title": "Package-manager install path (winget / choco)",
+      "status": "BLOCKED",
+      "channel": ["CMD", "PS", "HOST"],
+      "command": "winget install -e --id 7zip.7zip --silent --accept-package-agreements --accept-source-agreements --disable-interactivity; choco install 7zip.install -y --no-progress",
+      "expected": "manager-driven install, exit code + real-disk delta",
+      "observed": "winget: every subcommand (--version, source list, install, list) exits -1978335231 = 0x8A150021 (APPINSTALLER_CLI_ERROR_... app-execution failure); winget.exe is the WindowsApps AppExecutionAlias. choco: version 2.7.4, RC=0; install runs but fails: 'Unable to load the service index for source https://community.chocolatey.org/api/v2/' + the Schannel credential error text (garbled as GBK in the log: 瀹夊叏鍖呬腑娌℃湁鍙敤...), then '7zip.install not installed ... Chocolatey installed 0/1 packages.' Also 'Chocolatey detected you are not running from an elevated command shell'.",
+      "hostTruth": "no 7-Zip anywhere on the real disk before or after; host glob Program Files/7-Zip -> nothing",
+      "evidence": ["evidence/exe07-pkgmgr.txt"],
+      "usability": "Both manager routes dead, for two different reasons (AppX activation refusal vs. no HTTPS). Winget's hex exit code is undocumented in-band. Choco's Chinese error text is mojibake in the captured log - the shim's stdout/stderr transcoding mangles non-ASCII."
+    },
+    {
+      "id": "EXE-08",
+      "title": "Uninstall + cleanup of real-disk residue",
+      "status": "N-A",
+      "channel": ["HOST", "PS"],
+      "command": "checked C:\\Program Files\\7-Zip\\Uninstall.exe; winget list (also broken); HOST channel cleanup of my one real-disk artifact",
+      "expected": "uninstall the installed product, then verify no real-disk residue",
+      "observed": "N-A for the product: nothing was ever installed, so there is nothing to uninstall (no Uninstall.exe, no new registry uninstall key; the pre-existing HKLM '7-Zip' key claiming 24.09 + InstallLocation C:\\Progra~1\\7-Zip\\ has NO corresponding directory - it is a stale/ghost entry that pre-dates this test and was not created by me). Cleanup of my one real-disk artifact FAILED: I attempted to delete C:\\Users\\Administrator\\Desktop\\WinStageSandbox\\_sandbox-tests\\r2\\exe\\.hostdir-marker (58 B, created by the DSH host write tool to materialize the output directory) and the shim refused both operations - Remove-Item -Force -> 'Access to the path is denied.' and Set-Content -Value '' -> \"Access to the path '...\\.hostdir-marker' is denied.\" (attributes are plain Archive, so it is not a read-only problem). The file is therefore STILL PRESENT on the real disk and needs a host-side delete by the Lead. Deliberately kept: the results.json/findings.md/executions.log/evidence deliverables (required output of this thread). Related channel asymmetry: host-tool-created files in that directory cannot be overwritten or deleted by any shimmed process either.",
+      "hostTruth": "host glob Program Files/7-Zip -> nothing; D:\\winstage-r2\\7zip never created; C:\\winstage-r2-newcwd never created; C:\\dsh-probe-real never created; _sandbox-tests\\r2\\exe\\.hostdir-marker still present (cleanup refused)",
+      "evidence": ["evidence/exe08-cleanup.txt"],
+      "usability": "Because nothing installed, the uninstall story is untested end-to-end - the same conclusion as round 1, for a different reason (round 1: installer could not execute at all; round 2: installer executes but cannot elevate). Cleanup is also impossible from inside the sandbox for host-created files: you can create the problem through the host channel but cannot undo it from the sandbox."
+    },
+    {
+      "id": "EXE-09",
+      "title": "Usability walkthrough 'I want to install an exe'",
+      "status": "FINDING",
+      "channel": ["PS", "CMD", "STAGE", "HOST"],
+      "command": "counted steps and gate refusals across the whole run",
+      "expected": "a short, understandable path from download to a working program",
+      "observed": "Steps for the happy path: 1 download (impossible with curl -> use node) 2 verify Authenticode (works) 3 run installer (blocked on elevation) 4 run program (only from staged path) 5 clean up. Realistically >= 12 user actions and 2 undocumented workarounds. STAGING_WRITE_UNVERIFIED gate hits on this thread: **3** (one of them on a command containing no writes at all), each refusing to start the whole tool call, with the probe text naming 'outside-write-staged-not-real=fail'; recovery was a plain retry every time. Also hit: EBUSY 'resource busy or locked, read' once, and a first read of PROTOCOL.md coincided with a gate refusal.",
+      "hostTruth": "n/a (usability synthesis)",
+      "evidence": ["evidence/exe09-usability.txt"],
+      "usability": "Top 3 blockers: (1) workspace-path writes are dead while staged-path writes work and neither is documented; (2) requireAdministrator installers hang silently because the sandbox token is non-elevated; (3) HTTPS is globally broken (Schannel credentials) so the documented curl flow fails. All three produce error text that misdirects: 'not enough memory', 'access is denied', 'cannot find the path'."
+    },
+    {
+      "id": "EXE-10",
+      "title": "Escape hatch / host channel check",
+      "status": "FINDING",
+      "channel": ["CMD", "HOST"],
+      "command": "cmd /c with WINSTAGE_SHIM_DISABLE=1 vs without",
+      "expected": "the escapement lets the child reach the real disk",
+      "observed": "Could not be demonstrated positively in this session because the target directory did not exist on the real disk: with or without WINSTAGE_SHIM_DISABLE=1, 'echo X> C:\\...\\r2\\exe\\host-canary.txt' fails with 'The system cannot find the path specified.' (cmd returns 0 even so, so the failure is silent unless you check). The escape hatch itself did not misbehave, and nothing leaked. After the host tool materialized the directory, the host write tool (not the escape hatch) is what provably wrote to the real disk.",
+      "hostTruth": "after the host write tool created .hostdir-marker, host glob could see it; the escape-hatch cmd writes produced nothing on the real disk in either mode",
+      "evidence": ["evidence/exe08-cleanup.txt"],
+      "usability": "cmd returns exit 0 for a redirect that failed to open its target, so a script that trusts %ERRORLEVEL% alone will think it cleaned up / wrote when it did not. This is exactly the silent-degradation shape the protocol warns about, though here it is cmd, not the shim."
+    }
+  ],
+  "summary": {
+    "OK": 6,
+    "FAIL": 1,
+    "BLOCKED": 2,
+    "N-A": 1,
+    "FINDING": 2
+  },
+  "critical": [
+    "Sandbox env: every Schannel-based HTTPS client fails with SEC_E_NO_CREDENTIALS even with WINSTAGE_SHIM_DISABLE=1 -> the protocol's documented download step is impossible via curl/.NET; node.exe is the only working HTTPS path.",
+    "Sandbox env: workspace-path writes from shimmed children are refused outright ('access denied' / 'could not find a part of the path') although staged-path writes to the same tree succeed; the shim fails closed instead of reporting 'staging unavailable'.",
+    "Sandbox env: the injected token is non-elevated (IsInRole(Administrator)=False, whoami -> 'Access is denied') while installer EXEs commonly declare requireAdministrator -> installer EXEs hang silently with no diagnostic.",
+    "Channel asymmetry: files created on the real disk by the DSH host write tool cannot be deleted or overwritten by any shimmed process ('Access to the path is denied'), so a shim-side test thread cannot clean up after a host-side materialization."
+  ],
+  "residueOnRealDisk": [
+    "_sandbox-tests\\r2\\exe\\.hostdir-marker (58 B) - COULD NOT BE REMOVED by the shim; needs a host-side delete by the Lead",
+    "_sandbox-tests\\r2\\exe\\{results.json, findings.md, executions.log, evidence\\*} - intentional deliverables, created via the host write tool"
+  ]
+}

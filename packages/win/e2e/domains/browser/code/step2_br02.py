@@ -1,0 +1,6 @@
+tabs = list_tabs()
+print("TABS_BEFORE:", tabs)
+r = new_tab("https://www.baidu.com")
+print("NEW_TAB_RET:", r)
+wait_for_load()
+print("PAGE_INFO:", page_info())

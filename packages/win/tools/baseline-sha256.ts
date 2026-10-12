@@ -47,8 +47,21 @@ export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 export const MANIFEST_REL = 'docs/源码基线.sha256'
 export const MANIFEST_PATH = join(REPO, MANIFEST_REL)
 
-/** 收录的"目录 + 文件后缀"面（深度 1，按给定范围）。 */
-export const INCLUDED_GLOBS = Object.freeze(['src/*.ts', 'tests/*.ts', 'dsh-plugin/*.ts', 'plugin/*.ts', 'dsh-plugin/*.yml', 'tools/*.ts'])
+/**
+ * 收录面。两种形状：
+ *   · `dir/*.ext`       —— 单层目录（历史口径，深度 1）
+ *   · `dir/**\/*.ext`   —— 递归（整理轮新增，用于 e2e/ 这类分层测试台）
+ * 新增收录面时**改这里**（以及 tests/baseline-integrity.ts 的形状断言）。
+ */
+export const INCLUDED_GLOBS = Object.freeze([
+  'src/*.ts',
+  'tests/*.ts',
+  'dsh-plugin/*.ts',
+  'plugin/*.ts',
+  'dsh-plugin/*.yml',
+  'tools/*.ts',
+  'e2e/**/*.ts',
+])
 /** 收录的根目录单个文件。 */
 export const INCLUDED_ROOT_FILES = Object.freeze(['autotest.ts', 'verify.cmd', 'run.cmd', 'testservice.cmd'])
 /** 排除的目录名（任意层级都排除；本清单的收录面是深度 1，这里仍做段级过滤以免范围被误改宽）。 */
@@ -68,20 +81,29 @@ const toPosix = (path) => path.split('\\').join('/')
 export function collectEntries() {
   const entries = []
   for (const glob of INCLUDED_GLOBS) {
-    const [dir, pattern] = glob.split('/')
-    // 收录面是"单层目录 + 固定后缀"；这里只支持 `*.<ext>` 这一种形状，遇到别的形状直接抛（不静默漏收）。
+    const recursive = glob.includes('/**/')
+    let dir, pattern
+    if (recursive) {
+      dir = glob.slice(0, glob.indexOf('/**/'))
+      pattern = glob.slice(glob.indexOf('/**/') + 4) // 去掉 '<dir>/**/'
+    } else {
+      ;[dir, pattern] = glob.split('/')
+    }
+    // 收录面是"目录 + 固定后缀"；只支持 `*.` 形状，遇到别的形状直接抛（不静默漏收）。
     if (!pattern.startsWith('*.')) throw new Error(`不支持的收录形状: ${glob}`)
     const suffix = pattern.slice(1)
     const absolute = join(REPO, dir)
     if (!existsSync(absolute)) continue
-    for (const name of readdirSync(absolute)) {
+    const names = recursive ? walkFiles(absolute) : readdirSync(absolute)
+    for (const rel of names) {
+      const name = recursive ? rel : rel
       if (!name.endsWith(suffix)) continue
-      const rel = `${dir}/${name}`
-      if (isExcluded(rel)) continue
-      const full = join(absolute, name)
+      const relPath = recursive ? `${dir}/${rel}` : `${dir}/${name}`
+      if (isExcluded(relPath)) continue
+      const full = recursive ? join(absolute, rel) : join(absolute, name)
       if (!statSync(full).isFile()) continue
       const buffer = readFileSync(full)
-      entries.push({ path: rel, sha256: sha256(buffer), bytes: buffer.length })
+      entries.push({ path: relPath, sha256: sha256(buffer), bytes: buffer.length })
     }
   }
   for (const name of INCLUDED_ROOT_FILES) {
@@ -94,6 +116,21 @@ export function collectEntries() {
   }
   entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
   return entries
+}
+
+/** 递归列出目录下所有文件的**相对路径**（相对给定 dir，使用 `/`）。 */
+function walkFiles(dir, prefix = '') {
+  const out = []
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name
+    if (entry.isDirectory()) {
+      if (EXCLUDED_DIRS.includes(entry.name)) continue
+      out.push(...walkFiles(join(dir, entry.name), rel))
+    } else {
+      out.push(rel)
+    }
+  }
+  return out
 }
 
 /** 段级排除（清单自身也排除）。 */

@@ -9,8 +9,8 @@
  *   2) 未跟踪文件被改动时 `git status` 依旧干净 ⇒ 漂移**看不见**。
  *   整理轮（测试套件入库）已把收录面全部纳入版本库，但封印仍是硬判据：它同时钉住
  *   **内容**（逐条哈希）与**覆盖面**（清单条数 == 磁盘受封印文件数），后者 `git diff` 给不出。
- *   本套件把 `docs/源码基线.sha256` 变成硬判据：受封印文件（`src/*.mjs`、`tests/*.mjs`、
- *   `dsh-plugin/*.mjs`、`tools/*.mjs` 与四个根入口）必须逐条与清单相符；一旦有人改了源码
+ *   本套件把 `docs/源码基线.sha256` 变成硬判据：受封印文件（`src/*.ts`、`tests/*.ts`、
+ *   `dsh-plugin/*.ts`、`plugin/*.ts`、`tools/*.ts` 与四个根入口）必须逐条与清单相符；一旦有人改了源码
  *   而没**有意识地**刷新清单，本套件立刻判红，并打印确切的修复指令。
  *
  * 检查项：
@@ -76,8 +76,8 @@ check('路径严格按字典序排序且无重复', sortedOk, sortedOk ? `${entr
 const excludedLeaks = entries.filter((entry) => isExcluded(entry.path) || entry.path === MANIFEST_REL)
 check('清单自身与被排除目录（.t/node_modules/shim/esc/filemod/retest/.dshstage）都不在收录里', excludedLeaks.length === 0, excludedLeaks.map((entry) => entry.path).join(', ') || `排除面生效（收录 ${entries.length} 条）`)
 
-const subDirLeaks = entries.filter((entry) => entry.path.split('/').length > 2)
-check('收录面是"深度 1"（tools/lib、tools/toolchain 这类子目录不收；根入口是单段路径）', subDirLeaks.length === 0, subDirLeaks.map((entry) => entry.path).join(', ') || '全部为 <文件> 或 <目录>/<文件> 形状')
+const subDirLeaks = entries.filter((entry) => !entry.path.startsWith('e2e/') && entry.path.split('/').length > 2)
+check('收录面形状（非 e2e 为"深度 1"；e2e 为递归收录面 e2e/**/*.ts）', subDirLeaks.length === 0, subDirLeaks.map((entry) => entry.path).join(', ') || '全部落在 <目录>/<文件> 或 e2e/ 递归面内')
 
 const mustSeal = ['src/limits.ts', 'tests/suite-wiring.ts', 'tools/baseline-sha256.ts', 'tools/dsh-patches.ts', 'verify.cmd']
 const sealedPaths = new Set(entries.map((entry) => entry.path))

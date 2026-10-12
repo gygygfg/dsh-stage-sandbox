@@ -11,7 +11,7 @@
  *   3. 在受控 `DSH_HOME/DSH_PROFILE/WINSTAGE_SHELL` + 受控 profile 文本下，
  *      断言**恰好一个** shell 提供方启用（不变量）。
  *
- * 跑法：node docs/dsh2-装配择一-验证.mjs
+ * 跑法：node tests/dsh2-select-shell-verify.ts
  * 退出码：0 = 全 PASS；1 = 有 FAIL
  */
 

@@ -566,7 +566,7 @@ export async function runRegistryConformanceChecks(harness, options = {}) {
             && /D-FIXTURE-STAGEROOT/.test(explicitError.message)
             && /别的 run/.test(explicitError.message)
             && explicitError.message.includes(`t4-probe-${runIdNow}`)
-            && /run-shim-closedloop\.mjs/.test(explicitError.message),
+            && /run-shim-closedloop\.ts/.test(explicitError.message),
           explicitError ? explicitError.message.split('\n')[2] ?? explicitError.message.split('\n')[0] : 'no error thrown',
         )
         /* 正例：显式指向合格树 ⇒ 原样返回（不因"显式"就一律拒绝）。 */

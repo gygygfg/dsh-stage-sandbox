@@ -50,9 +50,9 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "build": "node tools/build-plugin.mjs",
-    "prepack": "node tools/build-plugin.mjs",
-    "prepare": "node tools/build-plugin.mjs"
+    "build": "node tools/build-plugin.ts",
+    "prepack": "node tools/build-plugin.ts",
+    "prepare": "node tools/build-plugin.ts"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",

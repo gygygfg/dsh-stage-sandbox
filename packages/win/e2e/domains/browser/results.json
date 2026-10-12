@@ -1,0 +1,101 @@
+[
+  {
+    "id": "BR-01",
+    "title": "browser-use --doctor 诊断：能否连上本地 Chrome、是否需要开 remote debugging",
+    "status": "OK",
+    "channel": ["PS", "STAGE"],
+    "command": "cmd /v:on /c \"browser-use --doctor > evidence\\br01-doctor.txt 2>&1 & echo EXIT=!ERRORLEVEL!\"",
+    "expected": "doctor 给出守护进程/浏览器连接状态，并能判断是否需要开启 remote debugging",
+    "observed": "exit=1。python 3.12.14（uv tool venv）、version 0.1.13；[ok] chrome running；[FAIL] daemon alive；[FAIL] active browser connections 0；[FAIL] cloud auth。输出文件最终只出现在 STAGE 通道（staged\\...\\evidence\\br01-doctor.txt，345B），PS/CMD/read 在工作区路径看不到它。关键事实：本机根本没装 Chrome（三处标准路径 Test-Path 全 False），用户浏览器是 Edge 154.0.4258.48，且未开 --remote-debugging-port。会话外确认：系统 python 是 0 字节 WindowsApps 存根，唯一真实解释器是 uv 的 cpython-3.12.14。",
+    "evidence": ["evidence/br01-doctor.txt", "staged:fs/C/Users/Administrator/Desktop/WinStageSandbox/_sandbox-tests/browser/evidence/br01-doctor.txt"],
+    "usability": "两个问题。(1) doctor 的 `[ok] chrome running` 是误导性结论：没装 Chrome，它大概把用户的 msedge.exe 当成 chrome 了；紧接着又报 daemon dead / 0 connections，自相矛盾，会把人引向'去找 Chrome 装'而不是'去开 remote debugging'——实际解决方向完全相反。(2) 没有任何一行提示'你需要在浏览器里点一下 chrome://inspect/#remote-debugging'，这条关键信息只写在英文的 install.md 里，且要等下一次真实调用失败才出现。"
+  },
+  {
+    "id": "BR-02",
+    "title": "打开新标签页访问国内可达站点，wait_for_load() + page_info() 取标题与 URL",
+    "status": "BLOCKED",
+    "channel": ["PS", "STAGE", "glob"],
+    "command": "Get-Content -Raw code\\step2_br02.py | browser-use   (脚本内容: list_tabs(); new_tab('https://www.baidu.com'); wait_for_load(); page_info())",
+    "expected": "新标签页打开 https://www.baidu.com，wait_for_load 后取得标题与 URL",
+    "observed": "exit=1，daemon 根本起不来：`browser-harness: daemon default didn't come up`。daemon 日志给出根因：`fatal: DevToolsActivePort not found in [...]`，列出的 10 个 profile 目录（Chrome/Chromium/Edge/Brave 全系列）都没有 DevToolsActivePort，提示 `enable chrome://inspect/#remote-debugging, or set BU_CDP_WS for a remote browser`。即：既没有可附着且开了远程调试的浏览器。自建隔离实例（私用 --user-data-dir + --remote-debugging-port=9223）也失败——Edge 建完 profile 后在打开 DevTools 端口前崩溃，见 evidence/br08-edge-crash.txt。未触及任何登录墙。",
+    "evidence": ["evidence/br02-daemon-fatal.txt", "evidence/br08-edge-crash.txt", "code/step2_br02.py", "staged:.../_sandbox-tests/browser/evidence/br02-run.txt"],
+    "usability": "BLOCKED，需要用户动手。用户需要做的是：(1) 在已运行的 Edge 里打开 chrome://inspect/#remote-debugging 并启用远程调试；或 (2) 安装并启动一个带 --remote-debugging-port 的 Chrome；或 (3) 通过 BU_CDP_URL/BU_CDP_WS 提供一个 CDP 端点。按任务规则未反复重试。易用性吐槽：技能写明'Chrome 没运行时会自动拉起'，但本机连 Chrome 都没装，这条路直接断掉且没有任何提示；README 之后才告诉我们沙箱内根本起不了 Chromium（Mojo 需要命名管道），也就是说这个域在沙箱内注定无法端到端验收，直到你踩完坑才知道。"
+  },
+  {
+    "id": "BR-03",
+    "title": "JS 渲染与求值：js() 读 document.title/location.href，并在百度输入框输入中文关键词回车取结果",
+    "status": "BLOCKED",
+    "channel": ["PS"],
+    "command": "（未能执行）js(\"document.title\"); js(\"location.href\"); 输入框输入中文并回车",
+    "expected": "拿到 document.title / location.href，搜索结果页标题或首条结果文本",
+    "observed": "无浏览器可控，js()/DOM 交互均无法执行。前置条件 BR-02 失败即终止本项。",
+    "evidence": ["evidence/br02-daemon-fatal.txt"],
+    "usability": "无法评价交互本身；但'无法执行'这件事同样没有可操作提示，只给了'daemon didn't come up'一句话，根因要自己去翻 ~/.config/browser-harness/tmp/bu-default.log。"
+  },
+  {
+    "id": "BR-04",
+    "title": "截图保存到 evidence\\ 并记录大小与 SHA256，用 read_image 确认非空白",
+    "status": "BLOCKED",
+    "channel": ["PS"],
+    "command": "（未能执行）截图 -> 保存 -> Get-FileHash -> read_image",
+    "expected": "evidence/ 下存在真实 PNG，大小与 SHA256 已记录，read_image 可读且非空白页",
+    "observed": "无页面可截图。本项 0 份截图证据，不计为通过。",
+    "evidence": [],
+    "usability": "N/A（未执行）。"
+  },
+  {
+    "id": "BR-05",
+    "title": "无障碍树：cdp('Accessibility.getFullAXTree') 取节点数，AX 节点 -> DOM.getBoxModel -> click_at_xy 真实点击",
+    "status": "BLOCKED",
+    "channel": ["PS"],
+    "command": "（未能执行）cdp(\"Accessibility.getFullAXTree\"); cdp(\"DOM.getBoxModel\", ...); click_at_xy(x, y)",
+    "expected": "取得 AX 节点数，并通过 AX->boxModel->坐标点击链路点中一个链接且验证生效",
+    "observed": "无 CDP 连接，无法执行。",
+    "evidence": ["evidence/br02-daemon-fatal.txt"],
+    "usability": "N/A（未执行）。"
+  },
+  {
+    "id": "BR-06",
+    "title": "多标签页：list_tabs() / new_tab() / switch_tab()，确认无重复标签",
+    "status": "BLOCKED",
+    "channel": ["PS"],
+    "command": "（未能执行）list_tabs(); new_tab(); switch_tab()",
+    "expected": "标签列表可读、可新建/切换，无重复标签，记录标签管理坑",
+    "observed": "无浏览器可控。脚本第一步 list_tabs() 就随 daemon 启动失败一起终止；未创建、未切换、未关闭任何标签页。因此本次测试对用户浏览器标签零影响（用户原有 13 个 msedge.exe 进程未被触碰）。",
+    "evidence": ["code/step2_br02.py", "evidence/br02-daemon-fatal.txt"],
+    "usability": "N/A（未执行）。附带说明：我没能建过任何标签页，所以'测试遗留标签'为 0；我创建的临时浏览器配置目录见 BR-08 的测试遗留物（scratch\\edge-profile、edge-profile2），未留下任何浏览器进程。"
+  },
+  {
+    "id": "BR-07",
+    "title": "安全重点：下载到工作区外的默认下载目录，并做三通道（PS/CMD/STAGE）取证",
+    "status": "BLOCKED",
+    "channel": ["PS"],
+    "command": "（未能执行）CDP Page.setDownloadBehavior 或页面触发 data: URL 下载 -> 检查 %USERPROFILE%\\Downloads",
+    "expected": "下载文件若落到真实磁盘且未被 staging 捕获 => FAIL 并立即通知 lead",
+    "observed": "没有任何浏览器可以触发下载，本项完全无法执行。未产生任何下载文件。结论：'浏览器下载是否会绕过文件沙箱'这一问题在本环境**未被验证**，是本次评审的一个已知盲区，不能当作通过。",
+    "evidence": [],
+    "usability": "N/A（未执行）。建议：这条风险验证应放到沙箱外、通过 CDP 操作真实浏览器来完成（与本域整体结论一致）。"
+  },
+  {
+    "id": "BR-08",
+    "title": "浏览器进程与沙箱的关系：Chrome 由谁启动、是否在沙箱内、工具写文件落 staged 还是真实磁盘",
+    "status": "FINDING",
+    "channel": ["PS", "glob", "STAGE", "candidates"],
+    "command": "glob C:\\Users\\Administrator\\.config\\browser-harness *.log; Get-ChildItem -LiteralPath C:\\Users\\Administrator\\.config\\browser-harness -Recurse; glob <staged>\\fs\\C\\Users\\Administrator\\.config; grep -E \"\\.config|browser-harness\" .dshstage\\sessions\\<sid>\\candidates\\",
+    "expected": "浏览器/工具进程的写入应被重定向进 staged，或以 candidate 形式进入 review.json 供人工批准",
+    "observed": "未由 daemon 启动任何浏览器（daemon 起不来）；我自己拉起的隔离 Edge 起了但崩溃，未在沙箱内留下可控浏览器进程。关键结果：browser-use/browser-harness 对 %USERPROFILE%\\.config\\browser-harness\\** 的写入**逃逸了 staging**——真实磁盘上 bu-default.log 存在（874 B，mtime 2026/10/3 1:27:37，正是本会话内，内容就是我这次运行写下的 DevToolsActivePort fatal），runtime\\ 与 version-cache.json 的 mtime 同样落在本会话内；而 STAGE 通道里 staged\\fs\\C\\Users\\Administrator\\.config 整棵子树不存在（rg: os error 2），candidates\\*.json 里 grep .config|browser-harness 结果为 No matches found，即不会进入 review.json、永远不会被人工批准。对照组：同一次运行写入工作区内的 evidence\\br01-doctor.txt 被正确 staged（345 B），说明不是 hook 整体失效，而是 ~/.config 这条路径逃逸。",
+    "evidence": ["evidence/br08-escape.txt", "evidence/br08-edge-crash.txt"],
+    "usability": "本项几乎全靠手工拼 STAGE 通道才得出结论：需要同时做 'glob 真实路径 / glob staged 路径 / grep candidates' 三件事，而且 staged 路径的 Test-Path 多次挂死或超时（.config 这棵子树探测尤其不稳定）。建议 DSH 直接提供 `dsh stage verify <path>` 与 `dsh stage ls <path>`，一步回答'这个写入进没进 staging、有没有 candidate'。"
+  },
+  {
+    "id": "BR-09",
+    "title": "易用性：从零到能操作一次页面需要几步、踩了几个坑",
+    "status": "FINDING",
+    "channel": ["PS", "STAGE"],
+    "command": "（逐条记录见 executions.log；本机为 Windows PowerShell 5.1）",
+    "expected": "能从零开始按技能文档走到'页面可操作'，并记录步数与坑",
+    "observed": "未能到达'页面可操作'。到失败为止走了 9 步、踩了 9 类坑：(1) skill 的 `browser-use <<'PY'` heredoc 在 Windows PowerShell 完全不适用，无任何替代写法提示，最后靠 `Get-Content -Raw x.py | browser-use` 试出来；(2) STAGING_WRITE_UNVERIFIED 执行门随机拒绝约一半的命令，连 `\"hello\"` 都被拒，探测子进程崩溃码在 0xC0000005/0xFFFF0000/1 之间跳（staged= 字段还出现过截断路径 .dshstage\\session）；(3) 命令静默返回空输出 + exit 1 的第二种失败模式；(4) staged\\fs\\%ALLUSERSPROFILE%\\...\\WER\\ReportArchive 出现字面量环境变量目录，导致 EBUSY 让命令直接失败；(5) 工作区路径下的回读不可见（PS provider 与 read 工具都看不到刚写入 workspace 的文件，只有 STAGE 看得到），与 PROTOCOL 的 read-through 描述不符；(6) shell cwd 落在 staged 目录而非工作区根，相对路径会静默跑偏；(7) 工具名是 pwsh 但实际是 Windows PowerShell 5.1；(8) doctor 的 [ok] chrome running 误导；(9) 关键前置条件（沙箱内起不了 Chromium / 需要开 remote debugging）不在 doctor 里说，要翻日志和外链文档。",
+    "evidence": ["evidence/br09-shell-hazards.txt", "executions.log"],
+    "usability": "统计：9 步、9 类坑、其中 4 类（heredoc、执行门、空输出、回读不一致）会让人误判成'自己写错了'。最省事的三条改进：(a) doctor 增加明确的一行 `ACTION REQUIRED: <具体动作>`，并把 'chrome running' 改成 'chromium-family process detected: msedge.exe (no CDP endpoint)'；(b) 在 Windows 上把 stdin 传脚本的用法写进 skill 的 Usage 段（`type x.py | browser-use`），删掉 heredoc 假设；(c) STAGING_WRITE_UNVERIFIED 给出可执行的缓解建议（重试/诊断命令），并按 PROTOCOL 的语义修正工作区回读可见性。"
+  }
+]

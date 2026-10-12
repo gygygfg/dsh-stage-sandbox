@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "sessionId": "test-session",
+  "ownerToken": "3c4c08df-1df8-499e-ad70-929dace3ce70",
+  "workspaceRoot": "/root/code/dsh-sandbox-windows/C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\ws",
+  "createdAt": "2026-10-12T11:22:14.551Z",
+  "updatedAt": "2026-10-12T11:22:14.568Z",
+  "revision": 7,
+  "entries": {
+    "/root/code/dsh-sandbox-windows/C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\ws/a.txt": {
+      "path": "/root/code/dsh-sandbox-windows/C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\ws/a.txt",
+      "kind": "file",
+      "state": "file",
+      "baseHash": "2751a3a2f303ad21752038085e2b8c5f98ecff61a2e4ebbd43506a941725be80",
+      "baseKind": "file",
+      "baseFingerprint": {
+        "sha256": "2751a3a2f303ad21752038085e2b8c5f98ecff61a2e4ebbd43506a941725be80",
+        "size": 12,
+        "mtimeMs": 1791804134547.8455
+      },
+      "stagedHash": "9ea62a5736e89c58d7e4bf5f26f03324a2ffe806f4eb93bef590313419f17c09",
+      "symlink": false,
+      "baseRevision": 0,
+      "createdAt": "2026-10-12T11:22:14.555Z",
+      "updatedAt": "2026-10-12T11:22:14.563Z",
+      "changed": true,
+      "origin": "t",
+      "external": true,
+      "absPath": "/root/code/dsh-sandbox-windows/C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\ws/a.txt",
+      "size": 18
+    },
+    "/root/code/dsh-sandbox-windows/C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\ws/new/deep/x.js": {
+      "path": "/root/code/dsh-sandbox-windows/C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\ws/new/deep/x.js",
+      "kind": "file",
+      "state": "file",
+      "baseHash": "absent",
+      "stagedHash": "3879a5d930ae1999b278a3a498f7de3fd83ba8dae59330fcfa2db31c103ac21d",
+      "symlink": false,
+      "baseRevision": 3,
+      "createdAt": "2026-10-12T11:22:14.563Z",
+      "updatedAt": "2026-10-12T11:22:14.564Z",
+      "changed": true,
+      "origin": "t",
+      "external": true,
+      "absPath": "/root/code/dsh-sandbox-windows/C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\ws/new/deep/x.js",
+      "size": 15
+    },
+    "/root/code/dsh-sandbox-windows/C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\ws/b.txt": {
+      "path": "/root/code/dsh-sandbox-windows/C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\ws/b.txt",
+      "kind": "file",
+      "state": "deleted",
+      "baseHash": "c0cde77fa8fef97d476c10aad3d2d54fcc2f336140d073651c2dcccf1e379fd6",
+      "baseKind": "file",
+      "baseFingerprint": {
+        "sha256": "c0cde77fa8fef97d476c10aad3d2d54fcc2f336140d073651c2dcccf1e379fd6",
+        "size": 2,
+        "mtimeMs": 1791804134547.8455
+      },
+      "symlink": false,
+      "baseRevision": 5,
+      "createdAt": "2026-10-12T11:22:14.567Z",
+      "updatedAt": "2026-10-12T11:22:14.567Z",
+      "changed": true,
+      "origin": "tool",
+      "external": true,
+      "absPath": "/root/code/dsh-sandbox-windows/C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\ws/b.txt",
+      "deletedAt": "2026-10-12T11:22:14.567Z"
+    },
+    "/root/code/dsh-sandbox-windows/C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\ws/c.txt": {
+      "path": "/root/code/dsh-sandbox-windows/C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\ws/c.txt",
+      "kind": "file",
+      "state": "file",
+      "baseHash": "absent",
+      "stagedHash": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
+      "symlink": false,
+      "baseRevision": 6,
+      "createdAt": "2026-10-12T11:22:14.568Z",
+      "updatedAt": "2026-10-12T11:22:14.568Z",
+      "changed": true,
+      "origin": "t",
+      "external": true,
+      "absPath": "/root/code/dsh-sandbox-windows/C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\ws/c.txt",
+      "size": 6
+    }
+  },
+  "hostOperations": []
+}

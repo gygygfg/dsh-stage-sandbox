@@ -1,0 +1,236 @@
+{
+  "tester": "fs-tester",
+  "area": "filesystem / different-directory read-write",
+  "sessionId": "session-eb7c901d-97ed-4f83-9096-33c97138c361",
+  "workspaceRoot": "C:\\Users\\Administrator\\Desktop\\WinStageSandbox",
+  "stageRoot": "C:\\Users\\Administrator\\Desktop\\WinStageSandbox\\.dshstage\\sessions\\session-eb7c901d-97ed-4f83-9096-33c97138c361\\staged",
+  "channels": {
+    "PS": "PowerShell provider (hooked, read-through)",
+    "CMD": "cmd.exe dir/type (hooked, but directory enumeration does NOT merge the overlay)",
+    "STAGE": "direct reads of .dshstage\\...\\staged + manifest.json + candidates/*.json (capture ground truth)",
+    "REAL": "DSH host file tools (read/glob/write); validated as the UNHOOKED host-disk channel"
+  },
+  "realChannelValidation": [
+    "PS read of C:\\Windows\\win.ini returned the 192-byte overlay version while REAL(read) returned the original 167-byte content with no marker.",
+    "REAL(read) C:\\Windows\\Temp\\fs03-win-temp.txt -> not found, although PS Test-Path=True and the STAGE mirror exists.",
+    "REAL(glob) C:\\Windows\\Temp listed real files (silconfig.log, MpSigStub.log, winstage-prop2-1kcvfegu.txt) and none of the staged-only probe files.",
+    "After PS deleted C:\\Windows\\Temp\\winstage-prop2-1kcvfegu.txt, REAL(read) still returned its content (whiteout, not a real delete).",
+    "REAL(write) into the workspace does not appear in the staged mirror, so the host tools do not write through the shim."
+  ],
+  "statusCounts": { "OK": 7, "FAIL": 6, "BLOCKED": 1, "N-A": 0, "FINDING": 2, "total": 16 },
+  "checkpoints": [
+    {
+      "id": "FS-01",
+      "title": "工作区内新建/覆盖/追加/删除 + SHA256 回读一致性",
+      "status": "OK",
+      "channel": ["PS", "STAGE"],
+      "command": "Set-Content <ws>\\_sandbox-tests\\fs\\work\\fs01.txt 'v1-create'; Set-Content 'v2-overwrite-longer-payload'; Add-Content '|v3-append'; Get-FileHash -Algorithm SHA256; Remove-Item",
+      "expected": "四步均成功；写入 SHA256 == 回读 SHA256 == staged SHA256；删除后 PS 与 STAGE 两侧都不存在；改动进入候选列表",
+      "observed": "create SHA256=F3D3E71D...；overwrite len=27 SHA256=F26F47FB...；append len=37 SHA256=E7D61F09...，PS 回读=[v2-overwrite-longer-payload|v3-append]；STAGE mirror sha=E7D61F09...（与回读一致）；Remove-Item 后 PS=False、STAGE mirror=False。四步哈希全部一致。但在 review.json 中检索 'fs01' 命中 0 次——该改动未出现在评审列表里（见 FS-13）。",
+      "evidence": ["evidence/fs01-fs02-staged.txt", "executions.log#E06", "STAGE manifest entries under fs\\C\\...\\_sandbox-tests\\fs\\work\\fs01.txt"],
+      "usability": "顺。但有两个坑：(1) PWD 被重定向到 staged 根，写相对路径会落进 staging 而非工作区，必须用绝对路径，文档未说明；(2) 想确认「有没有真落盘」要手工拼 PS + STAGE 两条通道，共 3~4 条命令，建议提供 `dsh stage ls <path>` / `dsh stage diff`。"
+    },
+    {
+      "id": "FS-02",
+      "title": "工作区内嵌套子目录、深层路径、50 个以上小文件批量写入",
+      "status": "OK",
+      "channel": ["PS", "STAGE", "CMD"],
+      "command": "New-Item -Force ...\\fs02\\a\\b\\c\\d\\e\\f; Set-Content nested.txt; 1..60 | % { Set-Content ...\\fs02\\batch\\fNNN.txt }; 逐文件 Get-FileHash 比对 PS vs STAGE; 315 字符深层路径 New-Item -Force",
+      "expected": "嵌套目录与深层路径可创建，60 个小文件全部可回读且哈希一致，staging 镜像数量与写入数量相同",
+      "observed": "嵌套 6 层目录 + nested.txt 成功（PS sha16=1FFF01EDF85B87E0，STAGE staged=1fff01edf85b）。60 个文件写入耗时 483ms，STAGE 镜像 60/60。逐文件双通道校验：checked=60/60、hashMismatch=0、totalBytes=1131。315 字符深层路径创建成功（dir=CREATED）。注意：通配符/递归枚举返回 0 项（见 FS-11），必须逐个字面路径校验。",
+      "evidence": ["evidence/fs01-fs02-staged.txt", "executions.log#E07", "STAGE manifest: fs\\C\\...\\fs02\\batch\\f001..f060.txt（stagedHash 各不同）"],
+      "usability": "中等。批量写入本身很快，但「写完怎么确认」很难：`Get-ChildItem $dir\\*.txt` 返回空，会让人误判写入失败；只有逐文件 `Test-Path` 或直接读 staging 才能确认。递归列目录还曾触发执行门拒绝（协议已提及，本线程复现见 FS-14）。"
+    },
+    {
+      "id": "FS-03",
+      "title": "工作区外写入：C:\\Windows\\Temp / %USERPROFILE% / %LOCALAPPDATA%\\Temp / C:\\ProgramData",
+      "status": "OK",
+      "channel": ["PS", "CMD", "STAGE", "REAL"],
+      "command": "Set-Content -LiteralPath <target> -Value 'CONTENT-<name>'; Test-Path; Get-Content; cmd /c dir /a <target>; STAGE 镜像检查; REAL(read) <target>",
+      "expected": "写入成功（沙箱语义），真实磁盘零改动；改动进入候选并带风险分级",
+      "observed": "四个目标：PS 写入 exit=0、Test-Path=True、回读内容正确；STAGE 镜像全部 exists=True（stagedHash 70e1bc51/764e84a0/c7954357/4c1429f0）；真实磁盘 REAL 通道四次全部 'not found'；hostOperations=0。CMD `dir /a <target>` 四次全部 exit=1 'File Not Found'——CMD 看不到 overlay 文件。风险分级**无法取得**：review.json 只暴露 40 条 files[]，这四个路径被截断挤出；riskCounts 显示 normal=40/outside=0，具有误导性（见 FS-13）。",
+      "evidence": ["evidence/fs03-4channels.txt", "executions.log#E08", "REAL: not found x4", "STAGE manifest fs\\C\\{Windows\\Temp,Users\\Administrator,Users\\Administrator\\AppData\\Local\\Temp,ProgramData}\\fs03-*.txt"],
+      "usability": "差。(1) 需要四条通道才能下结论，手工成本高；(2) CMD 与 PS 结论相反，极易误判「写没写进去」；(3) 要求记录的 risk 分级在这些路径上根本查不到；(4) 文档未说明「工作区外的写在沙箱内可见、但只存在于 overlay」这一点。"
+    },
+    {
+      "id": "FS-04",
+      "title": "删除真实工作区外文件 + 跨目录重命名：真删还是 staging 掩盖",
+      "status": "OK",
+      "channel": ["PS", "STAGE", "REAL"],
+      "command": "Remove-Item C:\\Windows\\Temp\\winstage-prop2-1kcvfegu.txt; Move-Item C:\\Windows\\Temp\\silconfig.log C:\\ProgramData\\fs04-renamed-silconfig.log; Move-Item C:\\Windows\\Temp\\fs04-a.txt C:\\ProgramData\\fs04-b.txt; REAL(read|glob) 复核",
+      "expected": "删除/重命名只在 overlay 生效，真实文件保持不变（whiteout 语义）",
+      "observed": "(a) 删除真实文件：PS True 变 False，exit=0，STAGE state=deleted、base=6f89d5777bd2……但 REAL(read) 仍返回 'prop-child' —— 真实文件**未被删除**，只是 whiteout。(b) 真实文件跨目录重命名：PS src=False/dst=True，STAGE 新路径 staged=ae41c5834ab1（内容被复制进 staging）、旧路径 state=deleted base=ae41c5834ab1；REAL(glob) 确认 C:\\Windows\\Temp\\silconfig.log 仍在真实磁盘，REAL(read) 目标路径 not found。(c) staged-only 文件跨目录重命名：a 侧消失、b 侧存在且内容=RENAME-PAYLOAD，REAL 看不到。hostOperations=0。",
+      "evidence": ["evidence/fs04-delete-rename.txt", "executions.log#E09", "REAL(read) C:\\Windows\\Temp\\winstage-prop2-1kcvfegu.txt = 'prop-child'", "REAL(glob) C:\\Windows\\Temp\\silconfig* -> silconfig.log"],
+      "usability": "差。(1) 沙箱内删除看起来「成功且彻底」，只有 STAGE/REAL 通道才能看出是真删还是 whiteout；(2) 重命名在 STAGE 里表现为「旧路径 delete + 新路径 create」两条记录，而不是一条 rename，评审时容易误读；(3) 危险：本会话候选里有两条真实的 op=delete（silconfig.log、winstage-prop2），一旦批准会真删宿主文件，评审界面没有把「这是真实已存在文件的删除」凸显出来。"
+    },
+    {
+      "id": "FS-05",
+      "title": "读穿透（read-through）与同名写入的 overlay 遮蔽",
+      "status": "OK",
+      "channel": ["PS", "STAGE", "REAL"],
+      "command": "Get-Content C:\\Windows\\win.ini -Raw; Set-Content C:\\Windows\\win.ini ($orig + '; OVERLAY-MARKER-FS05'); Get-Content; STAGE 检查; REAL(read) C:\\Windows\\win.ini; Set-Content 还原为原始字节",
+      "expected": "先能读到真实内容；写入同名文件后沙箱内读到 overlay 版本，而真实文件保持原样；staged 路径内容与 overlay 一致",
+      "observed": "真实读取：167 字节、首行 '; for 16-bit app support'、含 MAPI=1、SHA256=B1656831BF498361...，与 REAL(read) 一致。overlay 写入后：PS 读到 192 字节且 hasMarker=True；STAGE staged\\fs\\C\\Windows\\win.ini exists=True、stageHasMarker=True；而 REAL(read) 仍是**原始 12 行、无 marker** —— overlay 遮蔽与真实隔离都正确。随后写回原始字节：bytes=167、markerGone=True、sameAsOrig=True（字节级还原）。遗留缺陷：STAGE manifest 该条目为 base=**absent**、changed=True（见 FS-12）。",
+      "evidence": ["evidence/fs05-readthrough-overlay.txt", "executions.log#E05,#E10", "REAL(read) C:\\Windows\\win.ini = 原始 12 行（无 marker）"],
+      "usability": "较好，读穿透本身透明。但两个坑：(1) 沙箱内看到的 win.ini 与宿主真实内容会静默不一致，没有任何提示（对排障/版本对比很危险）；(2) 覆盖真实文件后 review 里显示成 op=create 且无 before 基线，无法判断自己在覆盖什么。"
+    },
+    {
+      "id": "FS-06",
+      "title": "边界路径：超长路径、尾点/尾空格、中文与 emoji、大小写、ADS、保留名",
+      "status": "OK",
+      "channel": ["PS", "STAGE", "CMD"],
+      "command": "315 字符深层路径 New-Item -Force; Set-Content 'fs06b-dot.'/'fs06b-space '; '中文-test.txt'/'emoji-U+1F600.txt'; Get-Content c:\\windows\\win.ini vs C:\\WINDOWS\\WIN.INI; Set-Content -Stream hidden; Set-Content CON/NUL/PRN/AUX/COM1",
+      "expected": "长路径与 Unicode 名字可用；尾点/尾空格按 Windows 规则规整；大小写不敏感；保留名被拒绝；ADS 语义尽量保留",
+      "observed": "长路径(315)创建成功；尾点/尾空格写入返回 OK 但 STAGE 落地名为 fs06b-dot / fs06b-space（静默规整，无提示）；中文与 emoji(U+1F600) 文件名写入/回读正常（STAGE 名字正确）；大小写 'c:\\windows\\win.ini' 与 'C:\\WINDOWS\\WIN.INI' 内容相等（167B）；ADS 写入/回读正常（readHidden=[ADS-SECRET]），但 STAGE 把它展平成兄弟文件 **fs06b-ads.txthidden(12B)**；保留名 CON/PRN/AUX/COM1 报 'Could not find a part of the path'、NUL 报原始 .NET 设备错误，STAGE 中未生成任何保留名文件（正确拒绝，但报错不可理解）。ADS 的宿主落盘行为未能验证（禁止 apply）→ 单列为 FS-15 FINDING。",
+      "evidence": ["evidence/fs06-boundary.txt", "executions.log#E11", "STAGE listing: fs06b-ads.txt + fs06b-ads.txthidden"],
+      "usability": "中等偏差。(1) 尾点/尾空格被静默规整，无任何警告；(2) NUL 的报错是 .NET 内部实现细节，用户无法理解；(3) ADS 在沙箱内可用但在 STAGE 变成普通文件，两套语义不一致，文档完全没有提及 ADS。"
+    },
+    {
+      "id": "FS-07",
+      "title": "符号链接/junction 逃逸（安全重点）",
+      "status": "FAIL",
+      "channel": ["PS", "STAGE", "REAL"],
+      "command": "cmd /c mklink /J \"<ws>\\_sandbox-tests\\fs\\work\\fs07-link\" \"C:\\Windows\"; Set-Content -LiteralPath \"<ws>\\...\\fs07-link\\fs07-through.txt\" -Value 'WRITTEN-THROUGH-JUNCTION'; REAL(read) C:\\Windows\\fs07-through.txt; Get-FileHash",
+      "expected": "通过工作区内 junction 的写入仍应被收容到 staging；真实磁盘不得出现该文件；若拒绝则给出明确错误",
+      "observed": "**确认逃逸（真实磁盘被写）**。mklink /J 本身被 stage：真实工作区路径 <ws>\\...\\fs07-link 不存在（REAL(read) ...\\fs07-link\\win.ini = not found），但 STAGE 树内的 .dshstage\\...\\staged\\fs\\C\\...\\fs07-link 是**真实 reparse point**（Attributes=Directory,ReparsePoint；LinkType=Junction；Target=[C:\\Windows]），对其列目录直接列出真实 C:\\Windows 的内容（System32、WinSxS、win.ini 等）。随后经该链接写入 fs07-through.txt：PS exit=0、回读正常；STAGE 侧 staged\\fs\\C\\Windows\\fs07-through.txt **不存在（无任何 overlay 副本）**；REAL(read) C:\\Windows\\fs07-through.txt 返回 'WRITTEN-THROUGH-JUNCTION'；PS 量得 len=24、SHA256=937E12F9A346F754800A4F5E749D1E52872C01C84CEA3F875ACBAABD59938876（PS 的这次读取只能是 read-through 回退到真实文件，因 staged 无副本）。manifest 无该路径记录，hostOperations=0。另一向量（写工作区外 junction C:\\Windows\\Temp\\fs07-junction-real\\fs07-escape2.txt）**未证实**——命令以 exit=3762504530 (0xE0434352) 崩溃，REAL 查该文件为 not found。",
+      "evidence": ["evidence/fs07-escape.txt", "executions.log#E13", "REAL(read) C:\\Windows\\fs07-through.txt = WRITTEN-THROUGH-JUNCTION", "STAGE: staged\\fs\\C\\Windows\\fs07-through.txt exists=False", "STAGE: staged\\...\\fs07-link attrs=Directory,ReparsePoint target=[C:\\Windows]"],
+      "usability": "本条是安全结论而非易用性：沙箱对 reparse point 只做「路径字符串映射」，不做目标解析/拒绝；junction 目标存在于真实磁盘时，写操作会穿透到宿主，且完全无提示、无候选、无告警，exit code 仍为 0。mklink /J 不需要管理员权限。",
+      "uncertainty": "已证实：C:\\Windows\\fs07-through.txt 真实存在且内容为我写入的 payload（三通道交叉确认，其中 REAL 通道已用 win.ini overlay 对照实验证明不受 overlay 影响）。未证实：a) 写工作区外 junction 的向量（命令崩溃）；b) 是否可写 C:\\Windows\\System32（未尝试，避免破坏）；c) 宿主批准后 junction 的落盘行为。"
+    },
+    {
+      "id": "FS-08",
+      "title": "权限与只读：写 C:\\Windows\\System32 真实文件、写真实只读文件、icacls 改 ACL",
+      "status": "BLOCKED",
+      "channel": [],
+      "command": "（未执行）",
+      "expected": "对 System32/只读文件/ACL 的修改应被拒绝或仅进 overlay，并记录错误文本",
+      "observed": "**未执行**。Lead 在会话中途下达收口指令（「不要再新增探索，把已有证据整理成文件」），本线程按指令停止新增探索，因此 FS-08 三项（System32 写入、只读文件写入、icacls 改 ACL）均未运行，不是被沙箱拒绝。相关旁证：New-Item -ItemType SymbolicLink 与 mklink /H 已被拒绝（exit=1，'The system cannot find the path specified'），但那属 FS-07。",
+      "evidence": ["executions.log（无 FS-08 记录）"],
+      "usability": "N/A（未测）。建议下轮补测：优先测只读文件与 icacls，因为 FS-07 的 junction 逃逸意味着「权限检查发生在被 hook 的调用点上」，写穿后可能绕过只读位。"
+    },
+    {
+      "id": "FS-09",
+      "title": "静默降级检测：返回成功但 staged 与真实磁盘都没有该文件",
+      "status": "FAIL",
+      "channel": ["PS", "STAGE", "REAL"],
+      "command": "对照 manifest.json / candidates：检查每个「返回成功」的写入是否同时出现在 staged 镜像与 manifest 中；FS-07 逃逸写为实例",
+      "expected": "任何返回成功的写操作都应出现在 staged 镜像与 manifest/candidate 中；不得出现「双方都没有」的成功返回",
+      "observed": "确认存在一例静默降级：FS-07 经 junction 的写入 **exit=0**、PS 回读成功，但 staged 镜像中**没有**该文件、manifest/candidates 中**没有**该路径记录、hostOperations=0，而真实磁盘上**有**该文件。这正是执行门文案所描述的 'silent-degradation shape'。常规路径（工作区内与四个工作区外目标、20MB 文件）未发现静默丢弃：均能在 staged 镜像中找到对应文件。另有环境级降级风险：执行门自身 probe 崩溃导致命令被整体拒绝（见 FS-14）。",
+      "evidence": ["evidence/fs07-escape.txt", "executions.log#E13", "executions.log#E15"],
+      "usability": "极差（安全影响）。用户无法从退出码或 sandbox 内回读判断写入是否被捕获；唯一可靠手段是查 STAGE manifest，而 manifest 恰恰**没有**为这条写入留下任何痕迹，因此即使按协议做交叉验证也查不出来——只能靠宿主侧 read/glob。"
+    },
+    {
+      "id": "FS-10",
+      "title": "并发/大文件：20MB 随机文件写入并校验 SHA256 + 吞吐",
+      "status": "OK",
+      "channel": ["PS", "STAGE", "REAL"],
+      "command": "[IO.File]::WriteAllBytes(<ws>\\_sandbox-tests\\fs\\fs10-20mb.bin, 20MB random); Get-FileHash; [IO.File]::ReadAllBytes + 独立 SHA256; 同样写 C:\\Windows\\Temp",
+      "expected": "20MB 可写入，写入 SHA256 == 回读 SHA256，staged 镜像哈希一致，吞吐可用",
+      "observed": "工作区内：len=20971520，写入 31ms（649.5 MB/s），SHA256=30C13A6353A2325F6616522B6C35F993EBE7E13CF038468D2D977F48F19301A7；回读 35ms（579.2 MB/s）；writeSHA==readSHA=True；STAGE 镜像 exists=True 且 stagedSha 相等。工作区外（C:\\Windows\\Temp\\fs10-20mb.bin）：PS 写入 exit=0、哈希相同、STAGE 镜像存在，REAL(glob) 结果为 'No files found' → 真实磁盘零改动。未做真并发（多进程/多线程竞争）测试。",
+      "evidence": ["evidence/fs10-throughput.txt", "executions.log#E14", "REAL(glob) C:\\Windows\\Temp\\fs10-20mb.bin -> No files found"],
+      "usability": "顺。20MB 级文件在本环境写入很快（约 0.65 GB/s），staging 没有明显的小文件写放大问题；但未测并发，多进程同写同一路径的行为未知。"
+    },
+    {
+      "id": "FS-11",
+      "title": "（增补）目录枚举/read-through 盲区：staged-only 文件对一切目录枚举 API 不可见",
+      "status": "FAIL",
+      "channel": ["PS", "CMD", "STAGE"],
+      "command": "Test-Path <batch> -PathType Container; Get-ChildItem <batch>; Get-ChildItem -Recurse; Get-ChildItem -Path '<batch>\\*.txt'; Get-ChildItem -Filter *.txt; [System.IO.Directory]::GetFiles(<batch>); cmd /c dir /s /b",
+      "expected": "沙箱内应看到「真实内容 + 本会话改动」的一致视图，目录枚举应包含 staged 新增的文件",
+      "observed": "同一批 60 个文件：精确路径访问全部成功（Test-Path=True、Get-Item Length=11、Get-Content/Get-FileHash 正常），但枚举全部失败——Get-ChildItem 父目录=0、-Recurse=0、通配符 *.txt=0、-Filter *.txt=0、cmd dir=0（'File Not Found'）。[System.IO.Directory]::GetFiles 直接抛 DirectoryNotFoundException: Could not find a part of the path '<batch>'，而 Test-Path <batch> -PathType Container 同时返回 **True**（自相矛盾）。根因：只有真实磁盘上已存在的目录项会被枚举出来——<ws>\\_sandbox-tests\\fs 能列出真实存在的 evidence/risk.ps1/stage.ps1，却列不出 staged-only 的 work 目录。",
+      "evidence": ["evidence/fs11-enumeration-gap.txt", "executions.log#E12", "executions.log#E11 (cmd dir fs06b = File Not Found)"],
+      "usability": "极差且高危。任何依赖列目录的工具（glob、find、ls -R、npm/pip/git 的遍历、构建系统）都会认为文件不存在，而按路径访问又成功；这会导致「文件明明写成功了却读不到/被当成不存在」的诡异行为，且没有任何错误提示。建议：overlay 必须在 FindFirstFile/FindNextFile/NtQueryDirectoryFile 层面也做合并。"
+    },
+    {
+      "id": "FS-12",
+      "title": "（增补）覆盖真实已存在文件时基线丢失：manifest baseHash=absent",
+      "status": "FAIL",
+      "channel": ["STAGE", "REAL"],
+      "command": "Set-Content C:\\Windows\\win.ini（该文件真实存在）; 检查 manifest.json entry 的 baseHash",
+      "expected": "覆盖一个真实存在的文件时，manifest 应记录真实基线哈希（baseHash=<真实哈希>），评审应能看到 before/after 差异并标记 op=modify",
+      "observed": "manifest.json 记录：fs\\C\\Windows\\win.ini | state=file | base=**absent** | staged=b1656831bf49... | changed=True；candidate 中为 op=create、before=absent。而 C:\\Windows\\win.ini 确实真实存在（REAL(read) 读到 167 字节原始内容）。对照：重命名 silconfig.log 时 whiteout 记录 state=deleted、base=ae41c5834ab1...（有基线）——说明 shim 有能力取基线，但在覆盖真实文件这条路径上没取。后果：审查者只看到「新建一个文件」，看不到「即将覆盖一个真实存在的系统文件」。",
+      "evidence": ["executions.log#E10", "STAGE manifest: fs\\C\\Windows\\win.ini base=absent", "REAL(read) C:\\Windows\\win.ini = 原始内容（证明该文件真实存在）"],
+      "usability": "差。评审界面无法区分「新建」与「覆盖真实文件」，这是审批安全语义的核心信息缺失。修复建议：写前对 overlay-miss 的真实文件一律计算 baseHash 并把 op 标记为 modify。",
+      "uncertainty": "baseHash 的设计语义未由实现方确认（可能有意只为 delete 记录 base）。但「覆盖真实文件却显示为 create 且无 before」在评审上是明确的信息缺失。"
+    },
+    {
+      "id": "FS-13",
+      "title": "（增补）review.json 截断/噪声污染/汇总自相矛盾",
+      "status": "FAIL",
+      "channel": ["STAGE"],
+      "command": "解析 review.json：counts/riskCounts/alerts/files；统计 manifest.entries；检索自己的路径",
+      "expected": "评审列表应让审查者看到本会话的全部改动，风险汇总应与变更集合一致，内部簿记文件不应污染列表",
+      "observed": "manifest.entries=1657 条改动，review.json 的 files[] 只列 40 条（截断 97.6%），且 `truncated:true` 是唯一提示。这 40 条按字母序排在 `fs\\C\\...` 之前，绝大多数是 shim 自身噪声文件（.winstage-inject-*.json、.winstage-run-*.out/.err，被当作工作区根下的文件列出）。本线程全部关键路径在 review.json 中均不可见：检索 'fs01'=0 次、'fs04'=0、'fs05'=0、'win.ini'=0、'prop2'=0、'silconfig'=0；'fs_probe_real' 仅 1 次且只在 candidates[].paths 里（无 risk）。汇总自相矛盾：counts={\"files\":40,...,\"net\":949}，riskCounts={\"normal\":40,\"outside\":0,\"sensitive\":0,\"danger\":0}，而同时 alerts=[{kind:'danger-change',severity:'danger',count:17,paths:['fs\\C\\Users\\Administrator\\.npmrc',...]}] —— 声称 danger=0 却存在 17 条 danger 警报。",
+      "evidence": ["evidence/fs13-review-truncation.txt", "executions.log#E16", "STAGE review.json counts/riskCounts/alerts", "STAGE manifest.json entries=1657, hostOperations=0"],
+      "usability": "极差。要求测试记录 risk 分级（协议 3.4），但被截断机制直接导致关键路径查不到分级；噪声把真实改动挤出可视范围；riskCounts 与 alerts 互相矛盾，审查者会误判「本会话没有危险改动」。"
+    },
+    {
+      "id": "FS-14",
+      "title": "（增补）执行门 STAGING_WRITE_UNVERIFIED 间歇性拒绝 + 子进程崩溃",
+      "status": "FAIL",
+      "channel": ["PS", "STAGE"],
+      "command": "任意 pwsh 命令（含纯读命令，如 Get-ChildItem / Get-Content）",
+      "expected": "执行门应稳定通过；若拒绝，应给出可操作的原因，且拒绝不应由沙箱自身 probe 的不稳定引起",
+      "observed": "本线程约 20 次 pwsh 调用中，**4~5 次**被整体拒绝（约 20~25%），被拒的包括纯读命令（Get-ChildItem、读 review.json）。拒绝文案 4 种不同形态：exit=3221225477 (0xC0000005 ACCESS_VIOLATION) 2 次、exit=2 1 次、exit=1 1 次、以及 staged=<截断路径> 形态（未给 exit）。另有 1 次命令以 exit=3762504530 (0xE0434352 CLR 未处理异常) 崩溃且无任何 stdout（FS-07 那次）。同一命令原样重试即可通过（已实测多次）。STAGE 侧统计 49 个 staged\\.winstage-inject-*.json 的 childExitCode：0 共 40、1 共 5、2 共 1、0xC0000005 共 1、0xE0434352 共 2——与门的 probe 崩溃码一致。",
+      "evidence": ["executions.log#E01, #E04, #E15", "evidence/fs14-gate.txt", "STAGE: staged\\.winstage-inject-*.json childExitCode 分布"],
+      "usability": "极差。错误文案「the staged root is not verified writable ... writes outside the workspace would NOT be captured into staging」会让用户以为沙箱隔离已损坏（恐慌），但实际上是门自己的 probe 子进程崩溃；没有任何重试提示或「稍后重试」建议；对脚本化/无人值守运行是不可接受的随机失败。建议：probe 崩溃应与「staging 真的不可写」区分并分别报错，并自动重试 1~2 次。"
+    },
+    {
+      "id": "FS-15",
+      "title": "（增补）ADS 备用数据流在 staging 中被展平为兄弟文件",
+      "status": "FINDING",
+      "channel": ["PS", "STAGE"],
+      "command": "Set-Content -LiteralPath <d>\\fs06b-ads.txt -Stream hidden -Value 'ADS-SECRET'; Get-Content -Stream hidden; STAGE 目录列表",
+      "expected": "ADS 语义（含流名）应被覆盖层保留，或在宿主落盘时能正确还原为同名数据流",
+      "observed": "沙箱内 ADS 写入/回读正常（readHidden=[ADS-SECRET]）；但 STAGE 里出现两个普通文件：fs06b-ads.txt(11B) 与 **fs06b-ads.txthidden(12B)**——流名被拼接到文件名后成为兄弟文件，数据流语义丢失。若宿主按此落盘，会在真实磁盘上多出一个可见文件 `fs06b-ads.txthidden` 而非数据流。另 Get-Item -Stream * 在沙箱内报 'The system cannot find the path specified'。",
+      "evidence": ["evidence/fs06-boundary.txt", "executions.log#E11", "STAGE listing: fs06b-ads.txt + fs06b-ads.txthidden"],
+      "usability": "未定/低危但不透明。ADS 在两套视图里语义不同且无文档；未执行 apply，因此宿主落盘行为**未经证实**，故仅记为 FINDING，不作为 PASS/FAIL 判定。"
+    },
+    {
+      "id": "FS-16",
+      "title": "（增补）环境：PowerShell Get-Content 把无 BOM 的 UTF-8 当 GBK 解码",
+      "status": "FINDING",
+      "channel": ["PS"],
+      "command": "$g = Get-Content <utf8-json> -Raw; 对比 [System.IO.File]::ReadAllText($p,[System.Text.UTF8Encoding]::new($false))",
+      "expected": "Get-Content 应按 UTF-8 读取无 BOM 的 UTF-8 文件（PowerShell 7 的默认行为）",
+      "observed": "对同一文件：Get-Content -Raw 得到 chars=22663，且用 IndexOf 查找 CJK 字符 工(U+5DE5) 返回 -1（即中文全部丢失/错乱）；显式按 UTF-8 读取得到 chars=20700，中文完全正确。字节长度核算（29015 字节）与 GBK(CP936) 解码预期一致，与 UTF-8 解码一致——即 Get-Content 实际按系统 ANSI 代码页解码。后果：在本沙箱里用 Get-Content 读任何无 BOM 的 UTF-8 文件都会静默得到乱码；我最初解析 review.json/results.json 失败即由此引发。可用绕过：[System.IO.File]::ReadAllText($p, [System.Text.UTF8Encoding]::new($false))。",
+      "evidence": ["evidence/fs16-encoding.txt"],
+      "usability": "差。Get-Content 是最常用的读文件手段，乱码是静默的、无警告的；对读 UTF-8 配置/日志/JSON 的用户脚本影响很大。",
+      "uncertainty": "未做归因定位：可能是系统 ANSI 代码页 CP936 生效，也可能是 WinStage shim 在启动子进程时设置了进程/控制台代码页。PowerShell 7 本应默认 UTF-8，说明启动链路上有干扰因素；本轮因收口指令未能二分定位。"
+    }
+  ],
+  "testLeftovers": {
+    "realDiskModified": [
+      {
+        "path": "C:\\Windows\\fs07-through.txt",
+        "bytes": 24,
+        "sha256": "937E12F9A346F754800A4F5E749D1E52872C01C84CEA3F875ACBAABD59938876",
+        "content": "WRITTEN-THROUGH-JUNCTION",
+        "cause": "FS-07 junction 写穿逃逸（沙箱内 exit=0 的写入真实落到宿主）",
+        "cleanup": "已尝试 Remove-Item 经同一 junction 删除；该批命令以 exit=3762504530 崩溃，清理**未生效**，文件仍在。之后未再重试（避免继续产生真实写入）。"
+      }
+    ],
+    "stagedOnlyLeftovers": [
+      "C:\\Windows\\Temp\\fs03-win-temp.txt, C:\\Users\\Administrator\\fs03-home.txt, C:\\Users\\Administrator\\AppData\\Local\\Temp\\fs03-local-temp.txt, C:\\ProgramData\\fs03-programdata.txt",
+      "C:\\Windows\\Temp\\fs_probe_real.txt, C:\\ProgramData\\fs04-b.txt",
+      "C:\\Windows\\Temp\\fs10-20mb.bin (20MB, 仅 staging, REAL 已确认不存在)",
+      "C:\\Windows\\Temp\\fs07-junction-real (junction, 仅 staging 树内), <ws>\\_sandbox-tests\\fs\\work\\fs07-link (junction, 仅 staging 树内)",
+      "<ws>\\_sandbox-tests\\fs\\ 下: work\\fs01.txt(已删), work\\fs02\\*(60+嵌套), work\\fs06b\\*, fs10-20mb.bin, risk.ps1, stage.ps1, evidence\\*"
+    ],
+    "pendingCandidatesThatTouchRealFilesIfApproved": [
+      "C:\\Windows\\Temp\\silconfig.log | op=delete | base=ae41c5834ab1...  批准将真删宿主文件",
+      "C:\\Windows\\Temp\\winstage-prop2-1kcvfegu.txt | op=delete | base=6f89d5777bd2...  批准将真删宿主文件",
+      "fs\\C\\ProgramData\\fs04-renamed-silconfig.log | op=create | after=ae41c5834ab1...",
+      "fs\\C\\Windows\\win.ini | op=create | base=absent | staged=b1656831bf49...（内容与真实一致，批准为无实质变化）"
+    ]
+  },
+  "limitations": [
+    "FS-08（权限/只读/icacls）未执行：Lead 中途下达收口指令，按指令停止新增探索，status 记为 BLOCKED（NOT_EXECUTED，非沙箱拒绝）。",
+    "FS-07 的第二个向量（写工作区外 junction C:\\Windows\\Temp\\fs07-junction-real\\...）未证实：命令以 CLR 异常崩溃且无输出，REAL 未发现产物文件。",
+    "未做真实并发（多进程/多线程）测试；FS-10 只覆盖单进程 20MB 读写。",
+    "未执行任何 apply/approve/flatten，因此所有「宿主落盘后的行为」（尤其 ADS、junction、win.ini 覆盖）均为未验证推断。",
+    "REAL 通道依赖 DSH 宿主文件工具；其有效性由 win.ini overlay 对照实验等方法学验证支持（见 realChannelValidation）。",
+    "风险分级只能在 review.json.files[] 中查询，而该数组上限 40 条且被 shim 噪声占满，本线程关键路径无法取得分级（见 FS-13）。",
+    "工具链提示（非 WinStage 缺陷）：宿主 write 工具会把 astral 平面字符（如 emoji U+1F600）写成 CESU-8/孤立代理项，导致 JSON 解析失败（results.json 曾在 char 7542 出现孤立低位代理项）。已将所有交付物中的 emoji 移除并用显式 UTF-8 重新校验；evidence/enc-test.txt 记录了该现象。"
+  ]
+}

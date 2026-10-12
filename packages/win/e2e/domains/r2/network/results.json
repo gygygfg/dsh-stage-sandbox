@@ -1,0 +1,122 @@
+[
+  {
+    "id": "NET-01",
+    "title": "Outbound HTTPS via three clients (curl.exe / Invoke-WebRequest / node fetch) with content SHA256",
+    "status": "FAIL",
+    "channel": ["PS", "HOST"],
+    "command": "curl.exe -sS -o NUL -w 'code=%{http_code}' https://nodejs.org/dist/v24.21.0/ ; Invoke-WebRequest -Uri https://nodejs.org/dist/v24.21.0/SHASUMS256.txt -UseBasicParsing ; node -e \"fetch('https://nodejs.org/dist/v24.21.0/SHASUMS256.txt')\"",
+    "expected": "All three clients GET the URL, return HTTP 200, and the downloaded bytes hash to the value published in the remote SHASUMS256.txt",
+    "observed": "SPLIT RESULT. node fetch: status=200 bytes=3171 sha256=f410428039e2c922a14058df067a4482691c9304a5c01a75847f9f3f2d3307f6. curl.exe: exit=35, code=000, 0 bytes, 'schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030E) - no credentials available in the security package'. Invoke-WebRequest / Invoke-RestMethod(HTTPS): '基础连接已经关闭: 接收时发生错误'; .NET SslStream: 'No credentials are available in the security package'; .NET HttpClient: empty error. Forced --tlsv1.2 also fails with exit 35. Control: plain HTTP works everywhere (curl http://nodejs.org/... code=200 3171B ip=104.16.213.131; curl http://example.com/ code=200 577B).",
+    "hostTruth": "Content integrity verified end-to-end over node's OpenSSL path: downloaded node-v24.21.0-darwin-arm64.tar.gz = 52 909 993 bytes, SHA256 bed7eea5325e1108f32ce5228ddd6a5f0f08a499ee42aa7442aea583702f6057 == the remote SHASUMS256.txt entry. So packets are NOT modified in flight (no MITM, no corruption) even though every Schannel client is broken.",
+    "evidence": ["evidence/net01-curl-schannel.txt", "evidence/net01-content-integrity.txt"],
+    "usability": "Very bad. The failure text names a Windows SSPI security package, not the sandbox, so the user's first instinct is 'TLS certificates are broken' or 'the site is down'. It takes 4 extra commands (curl exit 35 vs Invoke-WebRequest vs node vs .NET SslStream) to establish that it is Schannel-specific and that the network itself is fine. A one-line hint ('Schannel unavailable in this session; node/python/git use their own TLS stacks and still work') would save all of it."
+  },
+  {
+    "id": "NET-02",
+    "title": "DNS resolution via Resolve-DnsName, nslookup and node dns.promises.resolve4, plus NXDOMAIN",
+    "status": "OK",
+    "channel": ["PS"],
+    "command": "Resolve-DnsName nodejs.org -Type A ; Resolve-DnsName example.com ; Resolve-DnsName this-domain-does-not-exist-r2test.example -Type A ; node -e \"require('dns').promises.resolve4('nodejs.org')\" ; nslookup nodejs.org",
+    "expected": "All three resolvers agree, resolution is fast, and a nonexistent name produces an understandable error",
+    "observed": "All agree. nodejs.org A 104.16.212.131 + 104.16.213.131 (TTL 60, 1117 ms first call, 8 ms via node). example.com A 104.20.23.154 + 172.66.147.243 and 2 AAAA (121 ms). nslookup: Server 'localhost' / Address 192.168.20.1 (the gateway). NXDOMAIN: Resolve-DnsName -> 'DNS name does not exist' (FullyQualifiedErrorId DNS_ERROR_RCODE_NAME_ERROR); node -> code=ENOTFOUND msg='queryA ENOTFOUND nope-r2test-invalid.example'. Both are clear. Resolve-DnsName -Server 8.8.8.8 also succeeds.",
+    "hostTruth": "Resolver is the real LAN gateway 192.168.20.1, same value visible in the HOST channel's ipconfig /all (DNS Suffix Search List 'lan'). No local stub resolver, no 127.0.0.1 hijack, no sandbox DNS interception.",
+    "evidence": ["evidence/net02-dns.txt"],
+    "usability": "Smooth - 2 commands to a confident answer. Only trap: nslookup prints Server: localhost because reverse lookup of the gateway fails, which reads like 'DNS is being hijacked locally'. A documented判据 ('resolver address == NIC gateway => not intercepted by the sandbox') removes the false alarm."
+  },
+  {
+    "id": "NET-03",
+    "title": "Outbound TCP connection surface: 443 / 80 / unusual ports, and firewall-refused error text",
+    "status": "OK",
+    "channel": ["PS"],
+    "command": "Test-NetConnection example.com -Port 443 ; TcpClient.BeginConnect('example.com', 443|80|8080|9000|25) ; TcpClient.Connect('127.0.0.1',59999)",
+    "expected": "Common ports connect; unusual/closed ports fail with a distinguishable error, not a sandbox block",
+    "observed": "443 CONNECTED 265 ms, 80 CONNECTED 178 ms, 8080 CONNECTED 182 ms (all from local 192.168.20.58:5468x). Unusual ports 9000 and 25 TIMEOUT after the full 8 s wait (silent drop, i.e. no RST). Closed local port gives the explicit refusal text: 'No connection could be made because the target machine actively refused it 127.0.0.1:59999'. Test-NetConnection also reported TcpTestSucceeded=True with PingSucceeded=False in the same call.",
+    "hostTruth": "Not separately testable - the WINSTAGE_SHIM_DISABLE escape hatch no longer restores an unconfined child (see NET-10/FAIL). The connection table evidence in NET-05/06 does confirm these sockets come from the real host interface 192.168.20.58 with no translator.",
+    "evidence": ["evidence/net03-04-tcp-udp-icmp.txt"],
+    "usability": "Smooth. Genuine trap: an 8 s silent timeout on 9000/25 looks identical to 'the sandbox blocked me' whereas it is ordinary upstream/ISP filtering (port 25 in particular). Recommend documenting 'timeout != block; look for RST/refusal to distinguish'."
+  },
+  {
+    "id": "NET-04",
+    "title": "UDP egress and ICMP",
+    "status": "FINDING",
+    "channel": ["PS"],
+    "command": "node -e \"dgram socket -> 8.8.8.8:53 DNS query\" ; Resolve-DnsName -Server 8.8.8.8 example.com ; ping.exe -n 3 8.8.8.8 ; [System.Net.NetworkInformation.Ping]::new().Send('127.0.0.1',2000)",
+    "expected": "UDP DNS answers; ICMP either answers or is filtered - and the two must be distinguishable",
+    "observed": "UDP is fully open: raw UDP DNS to 8.8.8.8 returned 44 bytes rcode=0 in 193 ms, and to the gateway 192.168.20.1 returned 61 bytes in 15 ms. ICMP is DENIED: ping.exe to 8.8.8.8, example.com, the gateway AND 127.0.0.1 all print 'PING: transmit failed.' with 100% loss, and the .NET Ping class returns Status=AccessDenied + 'Access is denied' for all three targets including loopback. A raw ICMP socket CAN be created ('RAW ICMP socket created OK'), so socket creation is permitted and the send/bind is what is refused.",
+    "hostTruth": "The identical failure on 127.0.0.1 proves the denial is local to this process token, not upstream filtering. The shim source proves it is not the shim: shim/src/ws_hook.c g_targets[] contains only file, process-creation and registry APIs - there is no Winsock/ICMP hook anywhere in the shim.",
+    "evidence": ["evidence/net03-04-tcp-udp-icmp.txt"],
+    "usability": "Confusing. 'PING: transmit failed. 一般故障' (General failure) is the classic message for 'raw socket not permitted', but the Chinese text gives no hint that it is a privilege matter, and the identical 100% loss on 127.0.0.1 makes it look like a total network outage. Documenting 'ICMP is unavailable in non-elevated sandbox sessions; use Test-NetConnection -Port or a TCP connect instead' would prevent a serious misdiagnosis."
+  },
+  {
+    "id": "NET-05",
+    "title": "Local listening and loopback callback inside the sandbox",
+    "status": "OK",
+    "channel": ["PS", "STAGE"],
+    "command": "node http.createServer(...).listen(28471,'127.0.0.1') ; node http.createServer(...).listen(28472,'0.0.0.0') ; [IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() ; spawnSync netstat.exe -ano with file-descriptor stdio",
+    "expected": "Both binds succeed, loopback callback works, and the listeners own their ports without residue afterwards",
+    "observed": "Both bind successfully in one process: 'LISTENING 127.0.0.1:28471' and 'LISTENING 0.0.0.0:28472'. In-process HTTP GET returned 200 on both. netstat.exe -ano (run as a grandchild with file-descriptor stdio so the listener was provably alive) listed BOTH: 'TCP 0.0.0.0:28472 0.0.0.0:0 LISTENING 2760' and 'TCP 127.0.0.1:28471 0.0.0.0:0 LISTENING 2760' - 8 matching lines including the client-side pairs. After every run, the listener table for 28471/28472 was empty: no residue.",
+    "hostTruth": "The listener appears in netstat.exe's system-wide table with its own PID, i.e. in the same table that shows 0.0.0.0:445 (PID 4), 0.0.0.0:5985 (PID 4) and 127.0.0.1:3080 (the DSH web GUI). There is one shared TCP stack and one shared connection table - the sandbox listener is not in a private namespace.",
+    "evidence": ["evidence/net05-06-isolation.txt"],
+    "usability": "Good once you know the prerequisite: a backgrounded listener does not survive between tool calls (each pwsh invocation is torn down, exit 124 at the 120 s cap), so the listener and the probe must live in ONE command. Discovering that costs several failed attempts. Also, any grandchild whose output you capture must be spawned with file-descriptor stdio - routing it through a PowerShell pipe fails with 'Access is denied'."
+  },
+  {
+    "id": "NET-06",
+    "title": "Cross-boundary inbound: can the host side reach a sandbox listener?",
+    "status": "FINDING",
+    "channel": ["PS", "STAGE"],
+    "command": "listener on 0.0.0.0:28472 + async spawn curl.exe to 127.0.0.1:28472 / 192.168.20.58:28472 / 169.254.83.107:28472 ; listener on 127.0.0.1:28471 + curl from a separate process",
+    "expected": "Determine whether anything outside the sandboxed process can deliver data INTO a sandbox listener",
+    "observed": "YES - fully reachable from every interface, with a completed HTTP response each time: curl http://127.0.0.1:28472 -> 'ok [code=200]' in 72 ms; curl http://192.168.20.58:28472 -> 'ok [code=200]' in 61 ms; curl http://169.254.83.107:28472 -> 'ok [code=200]' in 75 ms. The listener logged matching HIT lines with peer addresses 127.0.0.1:56887, 192.168.20.58:56888 and 169.254.83.107:56889. The 127.0.0.1-bound listener was likewise connected by a separate process (netstat CLOSE_WAIT/FIN_WAIT_2 pair, HIT from 127.0.0.1:57701). In the other direction the sandbox reached the DSH host process's own listener: GET http://127.0.0.1:3080/ -> HTTP 401 'dsh web authentication required'.",
+    "hostTruth": "The LAN address 192.168.20.58 is the real adapter address reported by the HOST channel's ipconfig /all and route print -4, and the sandbox listener received traffic addressed to it. A listener created inside the sandbox is therefore reachable from the host and from the LAN exactly as a host listener would be. Caveat stated honestly: a WINSTAGE_SHIM_DISABLE=1 child could not be used as a true out-of-sandbox prober this round (see NET-10), so 'host side' here means a genuinely separate OS process on the shared stack plus the HOST-process DSH GUI, not an unconfined process outside the shim.",
+    "evidence": ["evidence/net05-06-isolation.txt"],
+    "usability": "This is the checkpoint where a user is most likely to fool themselves. Binding 127.0.0.1 makes a service invisible on the LAN and looks like 'the sandbox isolated me', but the same process bound to 0.0.0.0 was reachable on the LAN address immediately. There is no isolation; only the bind address chose the exposure. Needs a prominent doc line."
+  },
+  {
+    "id": "NET-07",
+    "title": "Proxy configuration and TLS interception (MITM) check",
+    "status": "OK",
+    "channel": ["PS"],
+    "command": "netsh winhttp show proxy ; Get-ItemProperty 'HKCU:\\...\\Internet Settings' ; [System.Net.WebRequest]::DefaultWebProxy ; Get-ChildItem env: | ? Name -match proxy ; node tls.connect(...).getPeerCertificate(true) for example.com / pypi.tuna.tsinghua.edu.cn / registry.npmmirror.com",
+    "expected": "No proxy anywhere, and every TLS chain roots in a public CA with no unexpected issuing CA",
+    "observed": "No proxy: 'Direct access (no proxy server)'; WinINET ProxyEnable=0 with ProxyServer/ProxyOverride/AutoConfigURL/AutoDetect all empty; .NET DefaultWebProxy IsBypassed=True and GetProxy returns the URL unchanged; zero PROXY/HTTP_PROXY/HTTPS_PROXY env vars in the child process. No MITM: node's OpenSSL reports authorized=true with authError=null for all three hosts, on TLSv1.3. Chains: example.com <- Cloudflare TLS Issuing ECC CA 3 <- SSL.com TLS Transit ECC CA R2 <- SSL.com TLS ECC Root CA 2022 <- AAA Certificate Services; pypi.tuna.tsinghua.edu.cn <- YR2 <- Root YR <- ISRG Root X1; registry.npmmirror.com <- RapidSSL TLS RSA CA G1 <- DigiCert Global Root G2 <- DigiCert Global Root CA. All are public roots; no private/self-signed CA is injected.",
+    "hostTruth": "Cross-checked by the NET-01 content hash: the 52.9 MB payload matched the remote SHASUMS256.txt exactly, which is only possible without a decrypt-and-rewrite middlebox. Directory: no WinStage or DSH entry in AppInit_DLLs (AppInit_DLLs empty, LoadAppInit_DLLs=0) and no WinStage/DSH service, so there is no global injection point that could add one.",
+    "evidence": ["evidence/net07-proxy-tls.txt"],
+    "usability": "Three command families are needed (env vars / WinHTTP+WinINET / certificate chain). The certificate step is the one users skip, and it is the only one that actually proves no MITM - a proxy can be absent while a transparent interceptor is present. Note also that the Schannel breakage from NET-01 makes `curl -v` useless for this check here, so the chain had to be read through node instead; that workaround is not documented anywhere."
+  },
+  {
+    "id": "NET-08",
+    "title": "Firewall / WFP policy: are filters and layers really installed? (round-2 focus)",
+    "status": "FINDING",
+    "channel": ["PS", "HOST"],
+    "command": "Get-NetFirewallProfile ; Get-NetFirewallRule ; netsh advfirewall firewall show rule name=all ; netsh wfp show state file=... ; netsh wfp show filters file=... ; Get-ItemProperty HKLM:\\...\\FirewallPolicy\\FirewallRules ; Get-ItemProperty HKLM:\\...\\Windows (AppInit_DLLs) ; Get-Service WinStage* ; read shim/src/ws_hook.c g_targets[]",
+    "expected": "Determine whether the network plane actually enforces a policy (real WFP filters / firewall rules / a WinStage WFP layer) or whether the sandbox is file+registry-only with zero network control",
+    "observed": "The network plane is UNMANAGED - and this is provable rather than merely unobserved. (a) MSFT_NetFirewallProfile and MSFT_NetFirewallRule both fail with 拒绝访问 / HRESULT 0x80041003 from the root/standardcimv2 WMI provider, and netsh advfirewall / netsh wfp show state / show filters all return 'The requested operation requires elevation (Run as administrator)' with explicit error=5 (ERROR_ACCESS_DENIED) - i.e. the sandbox does not hide these, this session simply lacks elevation. (b) Working around that through the registry gives the real answer: all three profiles have EnableFirewall=1 with DefaultInboundAction='' and DefaultOutboundAction='' (NotConfigured), DisableNotifications=1. (c) There are 344 firewall rule values in HKLM, and ZERO of them match WinStage, DSH, DeepSeek, node.exe or winstage-shim. (d) No rule mentions the ports the sandbox listened on (28471/28472). (e) Empirically the 0.0.0.0 listener accepted inbound connections on 127.0.0.1, on the LAN address 192.168.20.58 and on the Tailscale address, each with an HTTP 200 - so no inbound filter is intercepting, and because the firewall is on by default the absence of a permit rule means there genuinely is no WinStage filter in the path. (f) No WinStage service and no driver exists; AppInit_DLLs is empty with LoadAppInit_DLLs=0. (g) Decisive source-level proof: shim/src/ws_hook.c g_targets[] lists exactly CreateFileW/A, CreateDirectoryW/A, DeleteFileW/A, MoveFileExW/A, MoveFileW/A, RemoveDirectoryW/A, CopyFileW/A, SetFileAttributesW, GetFileAttributesW/A, GetFileAttributesExW/A, NtOpenFile, NtSetInformationFile, MoveFileWithProgressW, CreateProcessW, CreateProcessAsUserW and 23 Reg* entry points. There is NO Winsock, WS2_32, WinHTTP, WinINet, DNS Client, IP Helper or WFP hook. shim/src/ contains only ws_file.c, ws_reg.c, ws_proc.c, ws_stage.c, ws_mask.c, ws_regstore.c, ws_t3reg.c, ws_hook.c, ws_util.c, ws_entry.c - there is no network module. The shim log contains no network API at all (its only 'socket'-adjacent text is a comment about Winsock *startup* failing because of registry read errors, i.e. a bug the shim caused in a different subsystem).",
+    "hostTruth": "CONCLUSION: the network plane is NOT governed by an executed policy - the sandbox is a file + registry (T3) overlay plus a process-injection transport, and the network is untouched. Nothing was found that the sandbox should have blocked; equally, there is no network isolation, no egress filtering, no DNS control, and no per-sandbox network attribution. An operator cannot tell sandbox-originated traffic from host traffic. All observed network restrictions trace to the ONE variable that did change between rounds - the process token, which is now UAC-filtered and non-elevated (WindowsIdentity IsAdminRole=False, SID ...-500) - not to WinStage. Fixing elevation would silently change every network result in this report.",
+    "evidence": ["evidence/net08-firewall-registry.txt", "evidence/net08-wfp-attempts.txt", "evidence/net08-shim-hook-targets.txt", "evidence/net08-elevation.txt"],
+    "usability": "Hard and trap-laden. Three specific traps, all of which produced a WRONG answer on the first attempt: (1) `Get-NetFirewallRule` with -ErrorAction SilentlyContinue returns 0 and looks exactly like 'this machine has no firewall rules', when the registry actually holds 344 - the access-denied error is invisible; (2) netsh invoked through a PowerShell pipe reports 'Access is denied', which reads as a sandbox block but is only the piped-stdio boundary, while the same netsh without a pipe reports the truth ('requires elevation'); (3) 'netsh wfp show state' is the canonical way to enumerate WFP filters and simply cannot run without elevation, so the single most direct piece of evidence for this checkpoint is unavailable by design. Answering 'is the network filtered?' requires 4 command families and reading C source. Recommend `dsh net doctor` printing: firewall profile actions from the registry, WFP layer/sublayer names, proxy state, whether the token is elevated, and a plain sentence 'network isolation: none'."
+  },
+  {
+    "id": "NET-09",
+    "title": "Reachability and throughput of package mirrors; is there throttling?",
+    "status": "OK",
+    "channel": ["PS"],
+    "command": "node https.get over registry.npmmirror.com/react, pypi.tuna.tsinghua.edu.cn/simple/pip/, mirrors.aliyun.com/pypi/simple/pip/, nodejs.org/dist/..., github.com, example.com ; node download of typescript-5.5.4.tgz and node-v24.21.0-darwin-arm64.tar.gz",
+    "expected": "Mirrors reachable and throughput consistent with the network rather than an artificial rate limit",
+    "observed": "npmmirror registry 200, 6 773 833 B, TTFB 332 ms, 4.754 MB/s. npmmirror typescript-5.5.4.tgz 200, 4 043 150 B, TTFB 38 ms, 770 ms total = 5.008 MB/s. nodejs.org headers tarball 200, 10 291 794 B, 1.586 MB/s. github.com 200, 576 687 B, 0.428 MB/s. example.com 200, 577 B. Tsinghua pypi 200, 73 764 B, TTFB 232 ms. Aliyun pypi 403 (site rejects the request; not a sandbox effect). Largest transfer: 52 909 993 B in one node fetch, hash-verified. No plateau, no stalls, no per-connection cap: throughput tracks each origin's own capability (npmmirror 4.8-5.0 MB/s, Cloudflare 1.6 MB/s, GitHub 0.43 MB/s).",
+    "hostTruth": "The sustained 5.008 MB/s figure and the absence of any ramp-up ceiling indicate no sandbox-side bandwidth limiter. Note the contrast that the same session's npm CLI cannot complete a fetch: `npm view react version` fails with EPERM on C:\\Users\\Administrator\\AppData\\Local\\npm-cache\\_cacache\\tmp\\*** (a filesystem-policy failure, domain = package managers, not network).",
+    "evidence": ["evidence/net09-mirrors.txt"],
+    "usability": "Smooth to measure reachability; measuring 'throttling' honestly needs a sustained multi-MB transfer, because single small requests are dominated by RTT (0.43 MB/s for GitHub versus 5.0 MB/s for npmmirror says more about the origins than about the sandbox). Recommend documenting a standard throughput probe so results are comparable between sessions."
+  },
+  {
+    "id": "NET-10",
+    "title": "Usability: how many steps and what insider knowledge does 'is the network isolated / throttled?' need?",
+    "status": "FAIL",
+    "channel": ["PS", "HOST"],
+    "command": "The full NET-01..NET-09 sequence, plus the WINSTAGE_SHIM_DISABLE=1 HOST-channel attempt",
+    "expected": "A user should be able to answer 'is my network sandboxed?' and 'can I trust my HTTPS client?' in one or two obvious commands",
+    "observed": "It takes 4 command families for isolation (firewall profile, firewall rules, WFP, a listener + netstat) and 3 more for proxy/TLS, and several of them silently lie. Worse, the previously documented HOST channel NO LONGER WORKS: a child launched with WINSTAGE_SHIM_DISABLE=1 still cannot write anywhere outside the stageRoot (writes to C:\\Windows\\Temp, to the workspace root and to .dshstage all returned EPERM in both the shim-enabled and shim-disabled runs), so the 'escape hatch' that protocol §3 relies on for ground truth produced no usable channel this round. The only working ground-truth channels left were the HOST-process read/write tools and the real-disk/registry views. Additionally, only paths under the stageRoot (the passthrough list) are writable by confined children; everything else is EPERM, and PowerShell writes into workspace paths hang rather than fail.",
+    "hostTruth": "Two substantive infrastructure findings: (1) WINSTAGE_SHIM_DISABLE=1 is not honoured for filesystem writes in this configuration - the variable is present in the child's environment (verified), so the hatch is either not implemented for the DSH confinement layer or is overridden by it; (2) confined children can only write under the single passthrough path, which makes 'write evidence to my own output directory' impossible from the PS channel and forces all raw evidence through the HOST write tool.",
+    "evidence": ["evidence/net10-usability-channels.txt"],
+    "usability": "Worst part of this domain. Concrete traps a user will hit: PowerShell pipes to native commands fail with a bare 'Access is denied' that looks like a sandbox network/filesystem denial (it is the piped-stdio boundary); grandchild processes spawned without file-descriptor stdio produce status=null and empty output with no error; Get-NetFirewallRule returns 0 under -ErrorAction SilentlyContinue when it actually failed; ICMP fails identically to loopback and reads as 'the network is down'; binding 127.0.0.1 reads as 'I am isolated'. Each of these is individually diagnosable but only with insider knowledge."
+  }
+]

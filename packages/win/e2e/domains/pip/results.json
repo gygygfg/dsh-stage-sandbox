@@ -1,0 +1,178 @@
+[
+  {
+    "id": "PIP-01",
+    "title": "是否存在任何可用 Python 解释器",
+    "status": "N-A",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "where.exe python|py|python3|pip|pip3 ; Get-Command python* ; Test-Path AppData\\Local\\Programs\\Python ; Test-Path C:\\Python3xx ; python --version ; python -c \"print(1)\"",
+    "expected": "至少找到一个真实 Python 解释器，可执行 python -m pip",
+    "observed": "真实 Python 完全不存在。python.exe/python3.exe = C:\\Users\\Administrator\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe|python3.exe，0 字节且 Attributes=Archive,ReparsePoint（Microsoft Store 别名存根）；python --version / -V / -c / python -m pip 全部 __EXIT=9009 且无任何输出；py / pip / pip3 均 \"Could not find files\"/不可识别；C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python、C:\\Python39..313、Anaconda3、miniconda3 全部 exists=False。判 N-A（环境完备性问题：沙箱里无法直接 pip 装包）。",
+    "evidence": ["evidence/pip01_recon_raw.txt", "evidence/runall.log", "staged:session-eb7c901d/staged/fs/C/Users/Administrator/Desktop/WinStageSandbox/_sandbox-tests/pip/evidence/pip01_recon_raw.txt"],
+    "usability": "坑：`where.exe python` 退出码 0 且确实列出 python.exe，看起来像“装了 Python”；只有真正执行 --version 才暴露 exit 9009。新手极易误判为“已安装”。建议 DSH 在环境自检里显式标注 0 字节 Store 别名存根，并给出“本机无可用 Python，pip 域不可测”的结论。"
+  },
+  {
+    "id": "PIP-02",
+    "title": "用 curl.exe 从国内镜像下载 get-pip.py（HTTP 状态/大小/SHA256/耗时）",
+    "status": "OK",
+    "channel": ["CMD", "STAGE"],
+    "command": "curl.exe -sS -L --max-time 60 -o dl/get-pip.py -w \"http=%{http_code} size=%{size_download} speed_bps=%{speed_download} ct=%{content_type}\" <url>",
+    "expected": "能从国内镜像稳定取到 get-pip.py，并记录状态码、字节数、SHA256、耗时",
+    "observed": "清华 https://pypi.tuna.tsinghua.edu.cn/get-pip.py → HTTP 404（153 字节 text/html）；中科大 https://mirrors.ustc.edu.cn/pypi/get-pip.py → 404；腾讯 https://mirrors.cloud.tencent.com/pypi/get-pip.py → 404。阿里云 https://mirrors.aliyun.com/pypi/get-pip.py → HTTP 200, size=1,908,226, 5.45s (~356 KB/s), ct=text/x-python, SHA256=40EE07EAC6674B8D60FCE2BBABC148CF0E2F1408C167683F110FD608B8D6F416, HEAD=\"#!/usr/bin/env python\"。链路可用，但需要落到阿里云。",
+    "evidence": ["evidence/runall.log", "evidence/pip02_pip03_raw.txt", "dl/get-pip.py"],
+    "usability": "坑 1：Lead 指定的清华镜像并不托管 get-pip.py（404），国内可用源实际是阿里云——文档/直觉与实际不符。坑 2：curl 对 HTTP 404 仍返回 exit=0，脚本若只看退出码会把 153 字节的错误页当成下载成功（必须校验 %{http_code} 和字节数）。坑 3：官方 bootstrap.pypa.io 的 get-pip.py 是 2,230,488 字节，阿里云镜像只有 1,908,226 字节，两者相差 ~322KB 且无官方摘要可比对，无法判定镜像副本是否等价/过期（见 FINDING-MIRROR-STALE）。"
+  },
+  {
+    "id": "PIP-03",
+    "title": "获取可用的独立解释器（winget/choco/embeddable 便携解释器）",
+    "status": "N-A",
+    "channel": ["CMD", "STAGE"],
+    "command": "curl.exe -o dl/py-embed-*.zip <mirror>/python/3.12.7/python-3.12.7-embed-amd64.zip  （未解压、未安装）",
+    "expected": "在工作区内得到一个可运行的便携解释器，用于后续 pip 验证",
+    "observed": "按 Lead 裁定 1 主动降级：不再追求真实 pip 安装，不落地便携解释器，未解压、未执行、未污染系统。旁证（同批镜像可达性）：清华 https://mirrors.tuna.tsinghua.edu.cn/python/3.12.7/python-3.12.7-embed-amd64.zip → HTTP 200, 11,062,583 B, 1.64s (~7.25 MB/s)；华为云 https://repo.huaweicloud.com/python/3.12.7/... → HTTP 200, 同 11,062,583 B, 1.35s (~8.67 MB/s)；python.org → HTTP 200, 同 11,062,583 B, 5.24s (~2.14 MB/s)。三者字节数完全一致，说明国内镜像副本一致且远快于官方源。",
+    "evidence": ["evidence/pip02_pip03_raw.txt", "dl/py-embed-tuna.zip", "dl/py-embed-hw.zip", "dl/py-embed-org.zip"],
+    "usability": "测试遗留物：dl/ 下 3 个 11MB 的 embeddable zip 仅下载未使用，留在 staging，未进真实磁盘、未安装。若将来要真做 PIP-03，需：解压 → 改 python312._pth 取消注释 import site → 在该目录内跑 get-pip.py。注意踩坑：staging 里的 python.exe 能否被 CreateProcess 直接加载尚未验证，很可能因“仅在 staging 存在”而无法启动——这会是一个更深的沙箱可用性天花板。"
+  },
+  {
+    "id": "PIP-04",
+    "title": "配置国内全局镜像 pip.ini 并回读校验",
+    "status": "OK",
+    "channel": ["PS", "STAGE"],
+    "command": "Set-Content %APPDATA%\\pip\\pip.ini ; Set-Content _sandbox-tests\\pip\\mirror-conf\\pip.ini ; Get-FileHash ; Get-Content -Raw",
+    "expected": "pip.ini 写入 %APPDATA%\\pip\\pip.ini（工作区外，应进 staging 并成为 outside 风险候选），内容含清华 index-url 与 trusted-host，写后回读哈希一致",
+    "observed": "两份 pip.ini 均写入成功（APPDATA=C:\\Users\\Administrator\\AppData\\Roaming）。%APPDATA%\\pip\\pip.ini：WRITE_SHA256 == READBACK_SHA256 == 47A20A5F888005D03BCBD058C42E3A4DAA8A823B2B7728689B57C18D05CF1D01；镜像副本 mirror-conf\\pip.ini 同哈希，WRITE_EQ_READBACK=True。内容=[global] / index-url = https://pypi.tuna.tsinghua.edu.cn/simple / trusted-host = pypi.tuna.tsinghua.edu.cn, mirrors.aliyun.com（143 字节）。STAGE 通道确认它确实进了 staging 而未落真实磁盘：glob 命中 session-eb7c901d/.../staged/fs/C/Users/Administrator/AppData/Roaming/pip/pip.ini，且真实磁盘路径未见（见 PIP-07）。",
+    "evidence": ["evidence/runall.log", "mirror-conf/pip.ini", "staged:session-eb7c901d/staged/fs/C/Users/Administrator/AppData/Roaming/pip/pip.ini"],
+    "usability": "顺：一次性写两份并回读哈希，两条通道（PS 哈希 + STAGE glob）互证，结论明确。坑：无法在本机证明 pip 会真的读它（见 PIP-04b）。"
+  },
+  {
+    "id": "PIP-04b",
+    "title": "验证 pip config list / pip config debug 确实读到该配置",
+    "status": "BLOCKED",
+    "channel": ["CMD"],
+    "command": "pip config list ; pip config debug ; python -m pip config list ; python -m pip debug --verbose",
+    "expected": "pip config debug 输出的 global 配置来自 %APPDATA%\\pip\\pip.ini，index-url 指向清华镜像",
+    "observed": "四条命令全部失败：pip / pip3 \"'pip' is not recognized as an internal or external command\", __EXIT=9009；python -m pip config list / python -m pip debug --verbose 无输出，__EXIT=9009。原因：无真实解释器（PIP-01）。该验收点在本机不可达——被环境阻塞，不是配置写错。",
+    "evidence": ["evidence/runall.log"],
+    "usability": "这是本域最实在的“验收缺口”：我把配置写对了、位置对了、哈希可复现，却没有任何本地手段证明 pip 会加载它。必须有解释器才能闭环。建议 DSH 提供不依赖解释器的配置审计（例如 `dsh env pip-config`），或明确提示“无解释器时该验收点不可达”。"
+  },
+  {
+    "id": "PIP-05",
+    "title": "实际从镜像安装一个包（six）",
+    "status": "N-A",
+    "channel": ["CMD", "STAGE"],
+    "command": "（未执行）pip install six -i https://pypi.tuna.tsinghua.edu.cn/simple",
+    "expected": "pip 从镜像解析并下载 six，输出解析到的下载 URL 为镜像域名，记录耗时与版本",
+    "observed": "无法执行：本机无解释器（PIP-01），所有 python/pip 调用 exit 9009。镜像侧已就绪（见 PIP-02/PIP-06：TUNA simple 索引与 wheel 均可下载），缺的只有解释器这一环。",
+    "evidence": ["evidence/runall.log"],
+    "usability": "若装了 Python，验收需要这几步：1) pip install six --index-url https://pypi.tuna.tsinghua.edu.cn/simple -v；2) 从 -v 输出里确认 \"Looking in indexes\" 与 \"Downloading https://pypi.tuna.tsinghua.edu.cn/...\" 而非 files.pythonhosted.org；3) pip show six 记录版本；4) 用 pip download --no-deps 单独计时。合计约 1 条命令 + 3 次核对，工作量不大——卡点是环境零 Python，不是流程复杂。"
+  },
+  {
+    "id": "PIP-06",
+    "title": "完整性校验：下载物 SHA256 与镜像/PyPI 发布哈希比对",
+    "status": "OK",
+    "channel": ["CMD", "STAGE"],
+    "command": "curl.exe TUNA /simple/six/ ; 解析 href 中的 #sha256= ; curl.exe 下载 wheel ; Get-FileHash -Algorithm SHA256 ; curl.exe https://pypi.org/pypi/six/json 取 digests",
+    "expected": "下载文件的 SHA256 与索引/API 发布的哈希一致",
+    "observed": "无需解释器即可完成。TUNA simple 索引 11,625 字节，解析到 six-1.10.0-py2.py3-none-any.whl，索引内联声明 #sha256=0ff78c403d9bccf5a425a6d31a12aa6b47f1c21ca4dc2573a7e2f32a97335eb1；下载（HTTP 200, 10,341 B, 288ms, 62 KB/s）后实测 SHA256=0ff78c403d9bccf5a425a6d31a12aa6b47f1c21ca4dc2573a7e2f32a97335eb1 → HASH_MATCH_MIRROR_INDEX=True。反向通道：PyPI JSON API 与 TUNA 镜像 JSON API 对最新版 six 一致给出 version=1.17.0、six-1.17.0-py2.py3-none-any.whl sha256=4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274 (11,050 B)、six-1.17.0.tar.gz sha256=ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81 (34,031 B) —— 两个独立 API 互证。注：我下载的是索引中第一个 href（1.10.0，非最新），因此 1.10.0 的哈希只与镜像索引比对成功，未与 1.17.0 的 JSON 摘要混用。",
+    "evidence": ["evidence/runall.log", "dl/six.whl", "dl/six_json_https___pypi_org_pypi_six_json.json", "dl/six_json_https___pypi_tuna_tsinghua_edu_cn_pypi_six_json.json"],
+    "usability": "顺：镜像索引自带 #sha256= 片段，无需解释器即可闭环校验，这一点做得好。坑：索引里同一包有几十个 href，正则取“第一个”会拿到 1.10.0 而不是 1.17.0——真实 pip 用 PEP 440/503 排序选最新，手工 curl 校验很容易误取旧版并误以为“校验通过”。建议脚本显式按版本排序。"
+  },
+  {
+    "id": "PIP-07",
+    "title": "安装产物落点取证（真实磁盘 / staged / review.json 风险分级）",
+    "status": "N-A",
+    "channel": ["STAGE"],
+    "command": "glob .dshstage/sessions/<sid>/staged/fs/** ; 读 candidates/*.json ; 读 review.json",
+    "expected": "site-packages 与 pip.ini 的落点可判定，且 %APPDATA%\\pip\\pip.ini 在 review.json 里带 outside 风险分级",
+    "observed": "因为没能安装任何包（PIP-01/PIP-05），不存在 site-packages 产物，故安装产物落点判 N-A。但配置类产物已完整取证：1) STAGE(glob) 确认 pip.ini 只存在于 staged（session-eb7c901d/staged/fs/C/Users/Administrator/AppData/Roaming/pip/pip.ini），本机真实磁盘 %APPDATA%\\pip 不存在；2) candidates/cs_0204..cs_0228*.json 中确有该条：{\"path\":\"fs\\\\C\\\\Users\\\\Administrator\\\\AppData\\\\Roaming\\\\pip\\\\pip.ini\",\"op\":\"create\",\"kind\":\"file\",\"before\":{\"hash\":\"absent\"},\"after\":{\"hash\":\"47a20a5f888005d03bcbd058c42e3a4daa8a823b2b7728689b57c18d05cf1d01\",\"bytes\":143},\"frozen\":true} —— after.hash 与我写入的 SHA256 逐字符相同，确证这条候选就是我写的那个文件，且 before=absent 证明真实磁盘原本没有该文件；3) review.json: candidateId=cs_0235_b355a022, revision=4688, pending=true, truncated=true, counts.totalFiles=1695, riskCounts={normal:1639, outside:29, sensitive:27, danger:20}。该路径位于 workspaceRoot 之外，按路径语义属 outside 桶（与 riskCounts.outside=29 相符）。",
+    "evidence": ["staged:session-eb7c901d/staged/fs/C/Users/Administrator/AppData/Roaming/pip/pip.ini", "staged:session-eb7c901d/candidates/cs_0204_51db918e.json#L14263-L14275", "staged:session-eb7c901d/review.json"],
+    "usability": "坑（重要）：candidates/*.json 的每条条目只有 path/op/kind/before/after/frozen，**没有逐条 risk 字段**；风险只在 review.json 里以聚合 riskCounts + alerts 形式出现，而 review.json 本次是 truncated=true、counts.listed=40 / totalFiles=1695。也就是说，用户无法针对“我这个文件到底是 outside 还是 sensitive”拿到逐条结论，只能靠路径语义自己推。建议 DSH 提供 `dsh stage explain <path>` 输出该文件的单条风险判定依据。"
+  },
+  {
+    "id": "PIP-08",
+    "title": "易用性：装一个包需要几步/多久、镜像是否一次生效、报错是否可理解",
+    "status": "FINDING",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "（汇总观察）",
+    "expected": "以最小步骤完成“配置国内镜像 + 装一个包”，报错可自解释",
+    "observed": "0) 环境完备性：本机零可用 Python，pip 链路从第一步就断，用户得到的提示是 cmd 的 \"'pip' is not recognized\"，完全不会告知“这是 Store 别名存根/需先装 Python”。1) 镜像配置：写 pip.ini 只需 1 步、1 次生效（两份、哈希可复现），但**无法自证生效**（PIP-04b 全 9009），用户只能“相信”。2) 镜像选择无提示：清华镜像不托管 get-pip.py（404），阿里云可用；官方与镜像副本还差 322KB 且无摘要可比。3) 报错可理解性差：curl 对 404 返回 exit 0；PowerShell 对未签名 .ps1 直接拒绝执行（见 FINDING-EXECPOL），错误指向“未数字签名”而非“沙箱策略/如何绕过”。4) 更大的坑：STAGING_WRITE_UNVERIFIED 门会把命令整个拒绝掉（见 FINDING-GATE），用户看到的是普通错误文本，极易误判为自己命令写错，实际是 harness 自检子进程崩溃。",
+    "evidence": ["evidence/pip01_recon_raw.txt", "evidence/pip02_pip03_raw.txt", "evidence/runall.log"],
+    "usability": "结论：本域“顺”的部分是镜像下载与哈希校验（自带 #sha256=，无需解释器即可闭环）；“不顺”的部分全部来自环境与平台层：零 Python、镜像选择无提示、脚本执行策略、以及会整条拒绝命令的 STAGING_WRITE_UNVERIFIED 门。建议 DSH: (a) 环境自检显式报告 Python 存根与“pip 域不可测”；(b) 默认内置一份可用的国内镜像模板（含 get-pip 可用源）；(c) 门拒绝时给出可操作指引与重试建议，而不是只抛 STAGING_WRITE_UNVERIFIED。"
+  },
+  {
+    "id": "FINDING-GATE",
+    "title": "STAGING_WRITE_UNVERIFIED 执行门间歇性整条拒绝命令（阻塞级）",
+    "status": "FAIL",
+    "channel": ["PS", "STAGE"],
+    "command": "任意 pwsh 命令（如 echo PROBE_OK / & script.ps1 / curl…）",
+    "expected": "命令被执行，或被明确拒绝并说明如何恢复；不应静默降级",
+    "observed": "多次被 harness 拒绝启动子进程，原文：STAGING_WRITE_UNVERIFIED: refusing to run: the staged root is not verified writable by the identity this run uses (measured as not writable). reason: 1 staging-write check(s) failed: outside-write-staged-not-real=fail (child-reported-ok=false real-disk-has-file=false staged=not-found exit=<N>)。观测到的 exit 值：3762504530 (0xE0434352, .NET CLR 未处理异常)、4294901760 (0xFFFF0000)、exit=1、exit=2；staged 字段还出现过被截断的 C:\\...\\WinStageSandbox\\.dshstage\\session 与 staged=not-found。间歇性：同一会话内 echo hi / Test-Path / Set-Content 曾成功，随后同类命令又被拒绝。",
+    "evidence": ["evidence/runall.log", "evidence/gate-probe-1.txt"],
+    "usability": "含义：门用来防止“工作区外写入未被 staging 捕获却仍返回 0”的静默降级，方向正确；但当前表现是**自检探针子进程自己崩了 → 全量拒绝命令 → 本线程几乎全部检查点无法执行**。可用性影响极大，且错误文本面向实现者而非用户。建议：自检失败时区分“探针基础设施故障”与“真实隔离失效”，前者应带退避重试并给出可操作提示；并在门拒绝时明确打印这是 harness 侧故障而非用户命令错误。"
+  },
+  {
+    "id": "FINDING-SHIM-ALLUSERSPROFILE",
+    "title": "shim 未展开 %ALLUSERSPROFILE%，在 staging 造出字面量目录 + powershell.exe 反复崩溃",
+    "status": "FAIL",
+    "channel": ["STAGE"],
+    "command": "glob .dshstage/sessions/<sid>/staged/fs/%ALLUSERSPROFILE%/** ; Get-ChildItem -LiteralPath <同上> -Recurse",
+    "expected": "环境变量路径应展开为真实路径（如 C:\\ProgramData\\...）后再映射进 staging",
+    "observed": "两个 session 的 staging 里都存在名为 `%ALLUSERSPROFILE%` 的**字面量目录**，其下为 Microsoft\\Windows\\WER\\ReportArchive\\Critical_powershell.EXE_*/Report.wer。session-eb7c901d 有 5 个，session-8b4a07b9 有 3 个，合计 8 个 powershell.exe 严重崩溃报告（Lead 独立复核为 6 个，我这边 glob 实测为 5+3；差异可能是统计时点不同）。session-8b4a07b9 的 3 个崩溃时间：2026-10-02T18:57:32、19:13:07、19:59:29。同一 session 内对照：WER 的 Temp 目录却被正确展开为 staged/fs/C/ProgramData/Microsoft/Windows/WER/Temp/WER.*.tmp.csv|txt —— 证明 shim 并非完全不展开环境变量，而是对 WER 用注册表配置的 ReportArchive 路径（值为 %ALLUSERSPROFILE%\\...）处理失败，把它当成普通相对路径拼进了 staging。真实磁盘 C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportArchive 存在且含大量 AppCrash_*（choco.exe/7z2408-x64.exe/cmd.exe 等），但 **不存在任何 Critical_powershell*** ——说明这 8 个 powershell 崩溃报告只进了 staging、从未落到宿主。隔离本身是有效的。",
+    "evidence": ["staged:session-eb7c901d/staged/fs/%ALLUSERSPROFILE%/Microsoft/Windows/WER/ReportArchive/*/Report.wer", "staged:session-8b4a07b9/staged/fs/%ALLUSERSPROFILE%/Microsoft/Windows/WER/ReportArchive/*/Report.wer", "staged:session-8b4a07b9/staged/fs/C/ProgramData/Microsoft/Windows/WER/Temp/WER.*.tmp.csv"],
+    "usability": "结论（严重度：中—高）：(a) shim 未展开环境变量路径，产生 %ALLUSERSPROFILE% 字面量目录——功能缺陷，且这种“看起来像路径的目录名”会污染候选列表与任何按路径分级的风险判定；(b) 同一环境下 powershell.exe 反复被 WER 记为 Critical 崩溃，共 8 次——这与本线程遇到的 STAGING_WRITE_UNVERIFIED 门整条拒绝命令高度相关（门自检子进程以 0xE0434352 CLR 异常退出），应视为同一根因的两个表现。建议优先修 shim 的 env-var 展开，并排查 shim 注入导致的 powershell.exe 崩溃。"
+  },
+  {
+    "id": "FINDING-FILEAPI-SPLIT",
+    "title": "harness 文件工具（write/edit）直接写真实磁盘，绕过 staging 与候选审批面",
+    "status": "FAIL",
+    "channel": ["PS", "STAGE"],
+    "command": "write-tool 写入 _sandbox-tests\\pip\\evidence\\write-tool-marker.txt ; 对比 pwsh Set-Content",
+    "expected": "沙箱内一切写入都应被 staging 捕获并出现在候选列表中，等待人工批准",
+    "observed": "两条通道不一致：pwsh 的 Set-Content 写入落到 staging（STAGE glob 命中 session-eb7c901d/.../pip/evidence/pip01_recon_raw.txt，且候选列表可见），而 harness 的 write 工具写入**只出现在真实磁盘**——真实磁盘 glob 命中 _sandbox-tests\\pip\\evidence\\write-tool-marker.txt，但两个 session 的 staged 树里都搜不到它，candidates/*.json 中也搜不到（grep 'write-tool-marker' 无命中）。即：同一会话内，进程写入受 WinStage 管治，而 agent 自身的文件工具写入不受管治、不进候选、无需批准。",
+    "evidence": ["_sandbox-tests/pip/evidence/write-tool-marker.txt (真实磁盘)", "staged:session-eb7c901d/candidates/*.json (无该文件记录)"],
+    "usability": "严重度：高（安全语义一致性）。用户以为“沙箱内所有改动都要人工勾选批准”，但 agent 通过 write/edit 工具做的改动其实已经真实落盘、且不出现在 review.json 里——审批面出现盲区。建议：让 harness 文件工具走同一条 staging 管治路径，或在文档中明确区分“进程写入=受管治 / agent 文件工具=直写真实磁盘”。"
+  },
+  {
+    "id": "FINDING-SESSION-SECOND",
+    "title": "磁盘上存在第二个 session 树（疑似嵌套会话），非本会话审批面",
+    "status": "FINDING",
+    "channel": ["STAGE"],
+    "command": "glob .dshstage/sessions/*/... ; 对比 eb7c901d 与 8b4a07b9",
+    "expected": "本会话只有一棵 staging 树，review.json 覆盖全部改动",
+    "observed": "存在两棵完整 session 树。本线程写入落在 session-eb7c901d-97ed-4f83-9096-33c97138c361（与 PROTOCOL 一致，且该树下同时可见 exe/node/network/browser 各线程文件，证明同会话共享 stageRoot）。另一棵 session-8b4a07b9-2dc4-412f-9714-cad55c37708f 有 11,052 条 staged 路径（versus eb7c901d 的 1,518 条），自带 registry/、staged/、candidates/、blobs/、review.json、manifest.json，并有多个按 PID 的 overlay.<pid>.hive（12568/1268/5540/9776/8356/8296/11868/708/12184），以及嵌套痕迹：staged/fs/C/Users/Administrator/Desktop/WinStageSandbox/.t/ws/.dshstage/manifest.json、.t/whiteout-candidate-capture/run-wo-*/ws/.dshstage/manifest.json、Temp/dsh-stage-temp/*/winstage-review-trunc-*/.dshstage/manifest.json。结论：它是另一个/嵌套会话的独立审批面，不参与本会话 review.json，但会在磁盘上长期残留。",
+    "evidence": ["staged:session-8b4a07b9-2dc4-412f-9714-cad55c37708f/review.json", "staged:session-8b4a07b9-2dc4-412f-9714-cad55c37708f/registry/overlay.*.hive"],
+    "usability": "坑：.dshstage 下会累积多棵历史 session 树且体积可观（单棵上万条目）。用户排查“我的改动在哪”时容易看错树。建议 DSH 提供 `dsh stage ls --session current` 并在文档中标注历史 session 的清理方式。"
+  },
+  {
+    "id": "FINDING-STAGE-READ-UNRELIABLE",
+    "title": "从沙箱内用 PS/CMD 读取 .dshstage 路径会被 shim 重新重定向，不能作为 STAGE 地面真值",
+    "status": "FINDING",
+    "channel": ["PS", "STAGE"],
+    "command": "Test-Path ..\\session-8b4a07b9-...\\staged\\fs\\C\\Users\\Administrator\\AppData\\Roaming\\pip\\pip.ini ; 对比 glob 结果",
+    "expected": "读 .dshstage 内的 staged 树属于“地面真值”通道，不经 hook",
+    "observed": "不一致证据：Test-Path 对 pip.ini 在 **两个** session 的 staged 树里都返回 True（包括我从未写入的 8b4a07b9），而 harness 侧 glob 只在 eb7c901d 命中；另一次 Get-ChildItem 对已存在的 pip/evidence 目录报 'Could not find a part of the path'，而同进程 Test-Path 返回 True。说明：进程访问的路径一旦包含 .dshstage\\sessions\\<任意 id>\\staged\\fs\\C\\...，shim 会把尾部 C\\... 重新解释并重定向到**本进程自己的 stageRoot**，于是“别的 session 里也有我的文件”这种假阳性出现。",
+    "evidence": ["evidence/runall.log", "staged:session-eb7c901d (glob 命中) vs Test-Path True in both sessions"],
+    "usability": "方法论坑（对本次全部结论都重要）：PROTOCOL 规定 STAGE 通道为地面真值，但**从沙箱内用 PS/CMD 读 .dshstage 会再次被 hook**，因此 PS/CMD 读 staged 树得到的不是地面真值，只有 harness 自身的文件工具（glob/read）才真正绕过 hook。建议在 PROTOCOL 中把 STAGE 通道限定为“仅 harness 文件工具”，或提供 `dsh stage cat`。"
+  },
+  {
+    "id": "FINDING-EXECPOL",
+    "title": "未签名 .ps1 无法直接执行，报错指向签名而非沙箱策略",
+    "status": "BLOCKED",
+    "channel": ["PS"],
+    "command": "& 'C:\\...\\_sandbox-tests\\pip\\runall.ps1'",
+    "expected": "能执行自己写的测试脚本",
+    "observed": "& : File ...\\runall.ps1 cannot be loaded. The file ... is not digitally signed. You cannot run this script on the current system. (PSSecurityException/UnauthorizedAccess, exit=1)。改用 Invoke-Expression (Get-Content -Raw <path>) 后脚本正常执行——同一内容、同样权限，只是绕过了“脚本文件”这条路径。",
+    "evidence": ["evidence/runall.log"],
+    "usability": "坑：报错把用户引向“数字签名/执行策略”，不会提到沙箱或“改用 iex/-ExecutionPolicy Bypass”。对自动化测试线程是常见硬阻塞（写脚本→跑脚本是最自然的流程）。建议文档给出标准写法。注意：这也会误导归因——我最初把两次“无输出 exit 1”误记为门的拒绝，实际是执行策略拒绝，两者必须区分。"
+  },
+  {
+    "id": "FINDING-MIRROR-STALE",
+    "title": "国内镜像 get-pip.py 与官方副本字节数不一致且无摘要可比",
+    "status": "FINDING",
+    "channel": ["CMD", "STAGE"],
+    "command": "curl.exe -o dl/get-pip_aliyun.py https://mirrors.aliyun.com/pypi/get-pip.py ; curl.exe -o dl/get-pip_official.py https://bootstrap.pypa.io/get-pip.py",
+    "expected": "镜像副本应与官方 get-pip.py 一致（或至少可通过官方发布的摘要校验）",
+    "observed": "阿里云 https://mirrors.aliyun.com/pypi/get-pip.py → 1,908,226 字节（SHA256=40EE07EA…）；官方 https://bootstrap.pypa.io/get-pip.py → 2,230,488 字节。两者差 322,262 字节，且 get-pip.py 没有像 PyPI 包那样的发布摘要可直接比对（官方未在固定 URL 旁发布 .sha256）。清华/中科大/腾讯的同类路径均 404。",
+    "evidence": ["evidence/pip02_pip03_raw.txt", "dl/get-pip_aliyun.py", "dl/get-pip_official.py"],
+    "usability": "坑：用户按文档从国内镜像取 get-pip.py，会拿到一个与官方不同字节数的副本，且缺少可校验的摘要——完整性无法闭环（对比之下 PyPI 包有 #sha256= 片段，做得很好）。建议 DSH 内置镜像模板时同时给出该 bootstrap 脚本的可信摘要，或直接改用“国内 PyPI 索引 + 官方 bootstrap”组合。"
+  }
+]

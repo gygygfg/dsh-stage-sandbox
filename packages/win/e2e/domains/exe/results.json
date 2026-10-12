@@ -1,0 +1,90 @@
+[
+  {
+    "id": "EXE-01",
+    "title": "侦察可用安装器：winget / choco / msiexec / curl",
+    "status": "OK",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "winget --version; winget source list; winget source update; winget search 7zip; choco --version; where.exe winget choco msiexec curl.exe 7z.exe",
+    "expected": "三个安装器渠道可用或给出明确不可用原因",
+    "observed": "winget v1.29.380 可用（退出码 0），source list 正常返回 msstore / winget / winget-font 三个源；但 'winget source update' 对 winget 与 winget-font 两个源输出『已取消』，'winget search 7zip' 报『尝试更新源失败： winget』，只剩 msstore 源返回一条 7zip解压缩软件（版本 Unknown）。choco 2.7.4 已安装于 C:\\ProgramData\\chocolatey，但 `choco --version` 直接崩溃：PATH 上的 shim C:\\ProgramData\\chocolatey\\bin\\choco.exe（147040 B）退出码 -532462766（0xE0434352，.NET CLR 未处理异常），stderr 为『由于 Exception.ToString() 失败，因此无法打印异常字符串。』；直接执行真实体 C:\\ProgramData\\chocolatey\\choco.exe（12013664 B, 2.7.4.0）则返回『Access is denied.』退出码 1。msiexec.exe 存在于 C:\\Windows\\System32\\msiexec.exe（`msiexec /?` 退出码 0，GUI 无 stdout）。curl.exe 存在。7z.exe 未安装。",
+    "evidence": ["evidence/exe01-winget.txt", "evidence/exe01-winget-sources.txt", "evidence/exe01-winget-source-update.txt", "evidence/exe01-winget-search.txt", "evidence/exe01-choco.txt", "evidence/exe01-choco-direct.txt"],
+    "usability": "3 条命令就能确认『有 winget』，但要判断『winget 能不能装东西』必须再跑 2 条才会看到『已取消』这种非标准中文措辞（不是 failed，也不是 error），极易被误判为成功。choco 更糟：报错是一句『无法打印异常字符串』，既不给出异常类型也不给人可行动信息，用户完全无法自救；没有任何提示指向『沙箱/hook 拦截』。整个 EXE-01 需要 6 步以上才拿到可用结论。"
+  },
+  {
+    "id": "EXE-02",
+    "title": "真实下载安装包（curl + 校验）",
+    "status": "OK",
+    "channel": ["PS", "STAGE"],
+    "command": "curl.exe -sSL -m 180 --retry 2 -o <file> -w \"http=%{http_code} size=%{size_download} time=%{time_total}\" <url>; Get-FileHash <file> -Algorithm SHA256",
+    "expected": "下载成功，记录 URL / HTTP 状态 / 体积 / SHA256",
+    "observed": "3 次下载成功。1) https://live.sysinternals.com/sigcheck.exe → HTTP 200，437536 B，SHA256 AB8B16649C4211AE6A954C9A614BFB2F97C2076228680F4B305E29885166E5BE，耗时 1.81 s。2) https://www.7-zip.org/a/7z2409-x64.exe → HTTP 200，1637343 B，SHA256 BDD1A33DE78618D16EE4CE148B849932C05D0015491C34887846D431D29F308E，耗时 2.66 s（302 重定向到 release-assets.githubusercontent.com）。3) 7zip-download-page.html → HTTP 200，19945 B。失败 1 次：https://www.7-zip.org/a/7z2409-extra.7z → HTTP 404（162 B 错误页）。额外探测可达性：registry.npmmirror.com 200、live.sysinternals.com 200、mirrors.tuna.tsinghua.edu.cn 200、mirrors.aliyun.com 200、api.github.com 200；github.com 直连 443 超时（curl 28），community.chocolatey.org 返回 503。",
+    "evidence": ["evidence/7zip-download-page.html", "downloads/sigcheck.exe", "downloads/7z2409-x64.exe"],
+    "usability": "下载本身很顺：curl + -w 一条命令就拿到状态码/体积/耗时。真正的坑在下一步——下载完的 exe 根本跑不起来（见 EXE-03/EXE-04），而 curl 和 PS 都不给任何提示。另外 github.com 不可达但 7-zip.org 的 302 目标（release-assets.githubusercontent.com）可达，两条通道结论相反，用户不容易判断『到底能不能下 GitHub 的东西』。"
+  },
+  {
+    "id": "EXE-02b",
+    "title": "真实安装尝试（执行安装器）",
+    "status": "BLOCKED",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "cmd /c \"<工作区绝对路径>\\sigcheck.exe -accepteula -nobanner\" ; cmd /c \"<工作区绝对路径>\\7z2409-x64.exe /S\"",
+    "expected": "从工作区运行下载来的安装器/工具，走完静默安装",
+    "observed": "安装器根本无法从工作区绝对路径启动。`& \"C:\\...\\_sandbox-tests\\exe\\downloads\\sigcheck.exe\"` → PowerShell 报 \"Program 'sigcheck.exe' failed to run: The system cannot find the file specified\"（NativeCommandFailed）。同一时刻 `Test-Path` 该文件为 True、`Get-Item` 能返回 437536 B。7-Zip 安装器因此未执行（也不愿在未确认 manifest 前触发 UAC，sigcheck -m 读 manifest 也因无法执行而失败）。改用 staged 相对路径后，.bat 与 .exe 可以执行（见 EXE-04），但 sigcheck.exe 从 staged 路径执行仍然 fail-fast：退出码 -1073740791（0xC0000409 STATUS_STACK_BUFFER_OVERRUN）。故『真实安装』未完成。",
+    "evidence": ["evidence/exe03-authenticode.txt", "downloads/sigcheck.exe", "downloads/7z2409-x64.exe"],
+    "usability": "这是最致命的一步：同一路径上 Test-Path=True 而 CreateProcess=file not found，报错只说『找不到文件』，会把用户引向『是不是我路径写错了 / 是不是下载没完成』的死胡同，完全想不到是沙箱路径映射问题。没有任何文档或错误信息提示『请用 staged 路径执行』。"
+  },
+  {
+    "id": "EXE-03",
+    "title": "发行包完整性：体积 / 数字签名 / SHA256 / 官方哈希比对",
+    "status": "FAIL",
+    "channel": ["PS", "STAGE"],
+    "command": "Get-AuthenticodeSignature <file>; Get-FileHash <file> -Algorithm SHA256; curl api.github.com/repos/ip7z/7zip/releases/tags/24.09",
+    "expected": "签名状态与签发者明确；SHA256 能与官方公布值或包内哈希比对",
+    "observed": "1) sigcheck.exe：Authenticode status=Valid，signer=CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US，issuer=CN=Microsoft Code Signing PCA 2024，thumbprint=AB172913A2960A224809EE8A0C371CD47A079B72，带 Microsoft Time-Stamp Service 时间戳。2) 7z2409-x64.exe：Authenticode status=NotSigned（无签名者），SHA256=BDD1A33DE78618D16EE4CE148B849932C05D0015491C34887846D431D29F308E，体积 1637343 B，与 GitHub 官方 release API 公布的 asset size 1637343 **逐字节一致**。3) 『与官方公布哈希比对』判定 N-A（不可行），理由是四处官方来源均无 SHA256：https://www.7-zip.org/download.html 不含哈希；GitHub release body 只有变更说明；GitHub API 的 16 个 asset 中 digest 字段全为空；SourceForge .sha256 sidecar 返回 404。故 7-Zip 24.09 只能做『官方体积精确匹配 + Agent 侧 TLS 下载』，无法做哈希比对。4) 严重：两个文件的 VersionInfo/ProductVersion/FileVersion/CompanyName/FileDescription 通过 PS 读出来**全部为空**（sigcheck.exe 事实上带完整版本资源），构成读取保真度缺陷。5) 主程序可执行性未达成：sigcheck.exe 以 fail-fast 0xC0000409 退出。",
+    "evidence": ["evidence/exe03-authenticode.txt", "evidence/gh-api-24.09.json", "evidence/gh-api-digests.txt", "evidence/gh-release-body.txt", "evidence/7zip-download-page.html"],
+    "usability": "『比对官方哈希』这件事在 7-Zip 上根本走不通，而工具链不会告诉你为什么——你得自己依次试 download.html、release body、API digest、SourceForge sidecar 四处才能确认『官方就没发布』。另外 Authenticode 报了 Valid/NotSigned 这种可用结论，但 VersionInfo 全空会让用户以为『下载的文件损坏了』。"
+  },
+  {
+    "id": "EXE-04",
+    "title": "沙箱隔离：安装产物落在哪（四通道取证）",
+    "status": "FAIL",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "Test-Path/Get-Item/Get-FileHash <工作区绝对路径>; cmd /c dir \"<工作区绝对路径>\"; cmd /c dir \"fs\\C\\...\\evidence\"; cmd /c \"fs\\C\\...\\hello.bat ARG1\"; cmd /c \"<工作区绝对路径>\\hello.bat ARG1\"",
+    "expected": "三条通道（PS / CMD / STAGE）对同一路径给出一致的存在性与内容视图；改动全部进 overlay，真实磁盘零改动",
+    "observed": "**通道结论互相矛盾，这是本次最严重的发现。** 写操作确实被捕获：STAGE 通道 `...\\.dshstage\\sessions\\session-eb7c901d-97ed-4f83-9096-33c97138c361\\staged\\fs\\C\\Users\\Administrator\\Desktop\\WinStageSandbox\\_sandbox-tests\\exe\\evidence\\` 下完整列出我全部 16 个产物（hello.bat 35 B、hello.ps1 31 B、where_copy.exe 65536 B、sigcheck.exe、7z2409-x64.exe 等），真实磁盘零改动（`cmd /c dir \"C:\\...\\_sandbox-tests\\exe\\evidence\"` → **File Not Found**；CreateProcess 也找不到 → 真实磁盘未写）。但通道间严重不一致：(a) PS 通道走 read-through，工作区绝对路径可见（Test-Path=True、Get-Item 返回 437536 B、Get-FileHash 正常）；(b) CMD 通道对**工作区绝对路径完全不认 overlay**（`dir` → File Not Found），只有喂给它的**内部 staged 路径**时才看得见——这与 PROTOCOL §3『CMD 也被 hook』的假设不符；(c) **CreateProcess 同样不认工作区路径**：`cmd /c \"<工作区绝对路径>\\hello.bat ARG1\"` → 『The system cannot find the path specified』退出码 1，`& \"<工作区>\\sigcheck.exe\"` → file not found；而 `cmd /c \"fs\\C\\...\\evidence\\hello.bat ARG1\"` → 正常输出 HELLO_FROM_BAT ARG1 退出码 0，`where_copy.exe cmd.exe` → 正常输出 C:\\Windows\\System32\\cmd.exe 退出码 0。**即：写进工作区的文件只存在于 staged overlay，PowerShell 能读，但 Windows 进程创建无法解析工作区路径——因此任何下载/写进工作区的 exe 都无法直接运行，必须手工拼出 staged 路径才能执行。** 另观察到 PS 自身通道也不稳定：同会话内 `Get-ChildItem <工作区 downloads 目录>` 曾一次性报 \"Could not find a part of the path\"，而同一进程内 `Test-Path` 同目录为 True。注册表方面：我这条线程没有完成任何安装，故未产生卸载项，未独立取证注册表 overlay（由 registry-tester 负责）。review.json 方面：`...\\sessions\\session-eb7c901d-...\\review.json` 聚合风险分级为 normal=1637 / outside=29 / sensitive=27 / **danger=20**，但 `truncated=true`、`listed=40` 而 `counts.files=1693`，且全文中 `_sandbox-tests\\exe` 出现次数为 **0**——**我这批产物的逐路径风险分级不可得**，无法确认是否被判 normal。",
+    "evidence": ["evidence/exe04-channel-diag.txt", "evidence/exe04-review-risk.txt", "staged:session-eb7c901d-97ed-4f83-9096-33c97138c361/staged/fs/C/Users/Administrator/Desktop/WinStageSandbox/_sandbox-tests/exe"],
+    "usability": "隔离语义本身是对的（真实磁盘零改动），但**通道不一致是巨大的易用性灾难**：用户用 PS 看到文件在，用 cmd 看不到，用 Start-Process 起不来，三条通道三个答案，且错误信息全是『找不到文件/找不到路径』，把人推向『自己写错了』。要执行自己下载的工具，用户必须知道 `.dshstage\\sessions\\<sessionId>\\staged\\fs\\C\\...` 这种内部路径并手工拼接——这不是文档缺失，是根本无法猜到。另外 review.json 只列 40/1693 条且不带我的路径，用户无法核对自己关心的产物被判什么风险。"
+  },
+  {
+    "id": "EXE-05",
+    "title": "安装后程序能否正常运行且写入被捕获",
+    "status": "BLOCKED",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "cmd /c \"<工作区路径>\\sigcheck.exe -accepteula -nobanner -m -q <file>\"; cmd /c \"fs\\C\\...\\sigcheck.exe -accepteula -nobanner -m -q <file>\"",
+    "expected": "工具能跑完一次真实操作，其输出文件落点与哈希可核对",
+    "observed": "未达成。sigcheck.exe 无论从工作区绝对路径（file not found）还是从 staged 相对路径（退出码 -1073740791 / 0xC0000409 fail-fast，无 stdout）都无法运行，因此没有产生任何输出文件可供核对落点与哈希。7zr.exe（原计划用作第二样本，593408 B 官方体积）的下载调用被中断且未完成（后续核对 downloads 目录：7zr.exe MISSING），故也未取得样本。作为可执行性的正向对照，本线程证实 staged 路径下的 hello.bat 与 where_copy.exe 均能正常执行（退出码 0，stdout 正确），说明『staged 路径可执行』成立，仅 sigcheck 这一下载二进制被 fail-fast 拦下。",
+    "evidence": ["evidence/exe05-sigcheck-manifest-7zip.txt", "evidence/exe04-channel-diag.txt"],
+    "usability": "fail-fast 0xC0000409 不给任何解释性输出（stdout/stderr 均空），用户只知道『程序没了』，既没有错误码含义说明，也没有『哪个 API 触发了拦截』的线索，排查成本极高。"
+  },
+  {
+    "id": "EXE-06",
+    "title": "卸载 / 清理与可逆性",
+    "status": "N-A",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "Get-ChildItem <工作区 downloads/evidence>; cmd /c dir \"<工作区路径>\"",
+    "expected": "执行卸载或删除安装产物，记录是否可逆、是否残留",
+    "observed": "环境不具备：EXE-02b/EXE-05 未能完成任何安装，真实磁盘上没有产生需要卸载的安装产物，也没有注册表 Uninstall 项。故无卸载流程可测。清理责任方面：我产生的全部测试产物（2 个下载样本 + 16 个 evidence 文件 + hello.bat/hello.ps1/where_copy.exe 三个执行性对照文件）**只存在于 staged overlay**，真实磁盘零残留；CMD 通道（不认 overlay 的真实磁盘视图）对工作区路径返回 File Not Found，可佐证宿主未被污染。对照文件 where_copy.exe（C:\\Windows\\System32\\where.exe 的副本）与 hello.* 属于测试遗留物，位于 _sandbox-tests\\exe\\evidence\\ 内，随本线程目录一并处置即可。",
+    "evidence": ["evidence/exe04-channel-diag.txt", "downloads/sigcheck.exe", "downloads/7z2409-x64.exe"],
+    "usability": "『装不上』反而让清理变成零成本——但也意味着用户得不到『卸载是否可逆』的任何结论，这条 checkpoint 在沙箱下天然无法验收。"
+  },
+  {
+    "id": "EXE-07",
+    "title": "易用性：装一个 exe 需要几步 / 交互 / 文档坑 / 报错可理解度",
+    "status": "FINDING",
+    "channel": ["PS", "CMD", "STAGE"],
+    "command": "（汇总 observation，无单条命令）",
+    "expected": "评估端到端安装流程的步数与可理解性",
+    "observed": "在本沙箱里『装一个 exe』实际需要 8 步以上且仍会失败：1) winget --version 确认存在 → 2) winget source update 才发现『已取消』 → 3) winget search 才确认源不可用 → 4) choco --version 崩溃且无可用报错 → 5) 改用 curl 下载 → 6) Get-FileHash 校验 → 7) 发现工作区路径无法执行 → 8) 反推出 staged 内部路径再执行，然后 sigcheck 仍 fail-fast。全程零交互、零 UAC（因为根本走不到安装器），但也因此**没有任何一步给出可行动的下一步**。交互性结论：安装器未被执行，未触发 UAC，未提权，符合安全约束。文档坑：PROTOCOL 声称『CMD 也被 hook』，实测 CMD 对工作区绝对路径完全不认 overlay，会误导测试者得出错误结论。",
+    "evidence": ["evidence/exe01-winget-source-update.txt", "evidence/exe01-choco.txt", "evidence/exe04-channel-diag.txt"],
+    "usability": "同上，详见 findings.md 的易用性表。"
+  }
+]

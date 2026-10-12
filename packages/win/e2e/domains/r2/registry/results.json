@@ -1,0 +1,202 @@
+{
+  "domain": "registry",
+  "round": "r2",
+  "session": "session-4c5d9889-7b7f-4132-931b-a26a3c1d924d",
+  "testThreadEnv": {
+    "note": "The evidence-gathering shell for THIS thread is a DSH-hosted powershell.exe ($PSVersionTable.PSVersion = 5.1.26100.33438), NOT pwsh. It is unelevated (Administrators group absent/deny-only in token) and is NOT shim-injected. This invalidates the protocol's assumption that PS/CMD channels are shim-covered.",
+    "harnessShell": "powershell.exe 5.1 (pwsh.exe NOT INSTALLED: Get-Command pwsh -> not found; C:\\Program Files\\PowerShell absent)",
+    "identity": "WIN-DV9KRECLBVS\\Administrator, token=2364, IsSystem=False, groups = None, Everyone, BUILTIN\\Users, INTERACTIVE, CONSOLE LOGON, Authenticated Users (Administrators is NOT enabled -> filtered/unelevated token)",
+    "shimInjectedInHarnessProcess": false,
+    "shimModuleProbe": "(Get-Process -Id $PID).Modules | ? ModuleName -like '*shim*' -> EMPTY",
+    "envVarsInLiveProcess": {
+      "DSH_SESSION_ID": "301dd4ca-1aff-49a7-a12c-ff915c9e9384 (DIFFERENT from the r2 session id session-4c5d9889-...)",
+      "WINSTAGE_STAGE_ROOT": null,
+      "DSH_REGSTAGE_ROOT": null,
+      "WINSTAGE_SHIM_LOG": null,
+      "WINSTAGE_SHIM_CONFIG": null,
+      "WINSTAGE_SHIM_DISABLE": null
+    },
+    "executionPolicy": "LocalMachine = RemoteSigned -> bare .ps1 invocation blocked ('is not digitally signed'); worked around with Get-Content -Raw | Invoke-Expression",
+    "childProcessSpawn": "ENTIRELY BLOCKED: reg.exe, cmd.exe, whoami.exe, hostname.exe, where.exe all fail with ApplicationFailedException 'Program X failed to run: Access is denied'",
+    "fileWritesFromPwsh": "ENTIRELY BLOCKED: Set-Content to workspace, to C:\\Windows\\Temp, to Desktop, to C:\\Users\\Administrator\\.dsh all fail UnauthorizedAccessException",
+    "fileWritesFromWriteTool": "WORK (DSH host process is privileged) - deliverables were written with it"
+  },
+  "results": [
+    {
+      "id": "REG-01",
+      "title": "HKCU write via PowerShell registry provider + immediate readback",
+      "status": "FAIL",
+      "channel": ["PS"],
+      "command": "New-Item -Path 'HKCU:\\Software\\WinStageR2Test' -Force ; New-ItemProperty -Path ... -Name Sz -Value 'winstage-r2' -PropertyType String -Force",
+      "expected": "Create key, write 6 typed values, read them back; change captured as a reviewable candidate",
+      "observed": "TWO CONTRADICTORY OUTCOMES IN THE SAME SESSION (same API call, same session): (a) at ~18:00 the key WAS created and 6 values (Sz/Dw/Qw/Bin/Multi/Exp) were written and read back correctly; (b) from 18:19 onward the identical call fails: 'System.UnauthorizedAccessException: Access to the registry key HKEY_CURRENT_USER\\Software\\WinStageR2Test is denied.' Also tested HKCU:\\Software\\WinStageR2SingleTest and HKCU:\\Software\\Microsoft\\WinStageR2Test -> same Access denied.",
+      "hostTruth": "Real HKCU hive C:\\Users\\Administrator\\NTUSER.DAT size=1310720 mtime=2026-09-30T11:23:39 (unchanged; test ran 2026-10-03T18:00-19:38) -> no HKCU write reached the real hive.",
+      "evidence": ["evidence/reg-write-attempts.txt", "evidence/reg00-recon.txt", "evidence/reg-static-analysis.txt"],
+      "usability": "CRITICAL usability failure: the SAME command in the SAME session both succeeds and fails with no explanation. In case (a) the write reported full success via an unelevated process on a path that normally requires no elevation - the user is given ZERO signal whether the write landed in a staged overlay or in the real registry. Steps needed to find out: not determinable from within the sandbox."
+    },
+    {
+      "id": "REG-02",
+      "title": "Cross-process visibility of a staged registry write (core re-verification)",
+      "status": "FAIL",
+      "channel": ["PS", "STAGE"],
+      "command": "procA: New-Item 'HKCU:\\Software\\WinStageR2Test' + 6 values (all read back OK in procA). procB (separate pwsh invocation): Test-Path 'HKCU:\\Software\\WinStageR2Test' / New-ItemProperty same key ; reg.exe query in procC",
+      "expected": "A write staged in one process should be visible to later processes (single shared overlay view)",
+      "observed": "(1) procB at 19:31 saw the key ABSENT and could not re-create or write to it. (2) procB at 18:19 got 'Access to the registry key ... is denied' when creating the very key that procA had just created successfully. DIRECT EVIDENCE OF PER-PROCESS ISOLATION in the same session, matching the round-1 parent/child conclusion. (3) reg.exe query could not be run at all: every child-process spawn is denied. (4) STAGE census: $DSH_REGSTAGE_ROOT\\registry contains 13 x overlay.<pid>.hive (pids 2476,3536,5168,5292,6068,6740,8552,8768,11072,11252,11712,12008,13064), ALL exactly 8192 bytes, plus overlay.hive (8192 B, mtime 17:40:33) and overlay.journal (2626 B, mtime 17:47:18 frozen). 0 of 13 hives contain any registry path string (binary scan for HKCU|HKLM|Software|WinStageR2).",
+      "hostTruth": "No cross-process leakage to the real registry: NTUSER.DAT/SOFTWARE hive mtimes unchanged. Staged state is fully process-scoped AND carries no readable payload.",
+      "evidence": ["evidence/reg-static-analysis.txt", "evidence/reg00-recon.txt"],
+      "usability": "Asking 'did my write take effect anywhere?' requires spanning >=3 processes plus a manual byte-level census of a hidden .dshstage directory; the sandbox gives no tool to answer it."
+    },
+    {
+      "id": "REG-03",
+      "title": "HKLM write attempt + HKLM services subkey write attempt",
+      "status": "BLOCKED",
+      "channel": ["PS"],
+      "command": "New-Item -Path 'HKLM:\\SOFTWARE\\WinStageR2Test' -Force ; New-Item -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\WinStageR2Svc' -Force",
+      "expected": "Either a staged success (as round 1 found) or an explicit elevation error; real HKLM must stay clean",
+      "observed": "Raw error text: 'System.UnauthorizedAccessException: Access to the registry key HKEY_LOCAL_MACHINE\\SOFTWARE\\WinStageR2Test is denied.' and for the services path 'Access to the registry key HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinStageR2Svc is denied.' No existing service or driver Start value was read or modified.",
+      "hostTruth": "HKLM real hives (C:\\Windows\\System32\\config\\{SOFTWARE,SYSTEM,DEFAULT,SAM}) are NOT readable from this unelevated shell, so mtime ground truth for HKLM could not be read; the denied write cannot have created the key. NTUSER.DAT mtime proves the HKCU analogue.",
+      "evidence": ["evidence/reg-static-analysis.txt", "executions.log"],
+      "usability": "Error text is clear here ('Access is denied'), but the user cannot distinguish 'the sandbox refused me' from 'I am not elevated' - both render identically, and round 1's behavior (silent staging success for the same call) makes prior reports untrustworthy."
+    },
+    {
+      "id": "REG-04",
+      "title": "Value types (REG_SZ/EXPAND_SZ/DWORD/QWORD/BINARY/MULTI_SZ) and reg.exe operation semantics (copy/export/import/delete /f/add /f)",
+      "status": "BLOCKED",
+      "channel": ["PS", "CMD"],
+      "command": "New-ItemProperty -PropertyType String/ExpandString/DWord/QWord/Binary/MultiString ; reg.exe copy/export/import/delete/j",
+      "expected": "Round-trip each type with correct kind and identical value; reg.exe ops behave consistently with the PS provider",
+      "observed": "PS-side type writes: succeeded once at ~18:00 (Sz=REG_SZ, Dw=DWORD, Qw=QWORD, Bin=REG_BINARY 0102feff, Multi=REG_MULTI_SZ [r2-a|r2-b|''], Exp=REG_EXPAND_SZ '%SystemRoot%\\r2exp' all read back) then DENIED on every later attempt. CMD-side (reg.exe copy/export/import/delete): NOT RUNNABLE - reg.exe cannot be spawned ('Program reg.exe failed to run: Access is denied'); LASTEXITCODE is $null and output is empty, which is itself a silent-degradation trap because a script reading the exit code sees no error.",
+      "hostTruth": "The single successful type round-trip was process-local only; no later process and no real hive sees it (NTUSER.DAT mtime unchanged).",
+      "evidence": ["evidence/reg-write-attempts.txt", "executions.log"],
+      "usability": "The injected pwsh wrapper suppresses stderr from native command launch failures; LASTEXITCODE comes back EMPTY rather than non-zero. A user script cannot detect that reg.exe did not run."
+    },
+    {
+      "id": "REG-05",
+      "title": "Sensitive-key risk grading: HKCU Run autostart probe",
+      "status": "BLOCKED",
+      "channel": ["PS", "STAGE"],
+      "command": "New-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name WinStageR2Probe -Value 'cmd /c exit 0' -PropertyType String -Force",
+      "expected": "Minimal harmless autostart value written to the overlay, then graded sensitive/danger with alerts, then deleted",
+      "observed": "Write REFUSED before any staging: 'System.Security.SecurityException: Requested registry access is not allowed.' (note: a DIFFERENT exception class from the UnauthorizedAccessException on other keys - the Run key path is additionally protected). No autostart entry was created anywhere, so there is nothing to delete.",
+      "hostTruth": "Real Run key unchanged; the value name WinStageR2Probe appears in NO session artifact: review.json contains 'WinStageR2' 0 times (379687 bytes), queue.json 0, manifest.json 0. No leftover autostart.",
+      "evidence": ["evidence/reg-static-analysis.txt", "evidence/reg00-recon.txt"],
+      "usability": "Cannot evaluate risk grading via an actual write, because writes are refused. The refusal message ('Requested registry access is not allowed') is at least honest."
+    },
+    {
+      "id": "REG-06",
+      "title": "WOW64 / registry view (WOW6432Node, reg query /reg:32|/reg:64)",
+      "status": "BLOCKED",
+      "channel": ["PS", "CMD"],
+      "command": "New-Item -Path 'HKLM:\\SOFTWARE\\WOW6432Node\\WinStageR2Test' -Force ; reg.exe query /reg:32 | /reg:64",
+      "expected": "Write under WOW6432Node and compare 32-bit vs 64-bit views",
+      "observed": "Write DENIED: 'System.UnauthorizedAccessException: Access to the registry key HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\WinStageR2Test is denied.' The /reg:32 and /reg:64 comparison is NOT RUNNABLE because reg.exe cannot be spawned (Access denied).",
+      "hostTruth": "Cannot be assessed; no write occurred. Sandbox is 64-bit (Is64BitProcess=True).",
+      "evidence": ["executions.log"],
+      "usability": "The view dimension is entirely unobservable in this thread; a user cannot tell whether a 32-bit vs 64-bit write would be separated."
+    },
+    {
+      "id": "REG-07",
+      "title": "Real-registry zero-modification verdict across all write paths",
+      "status": "OK",
+      "channel": ["HOST", "STAGE"],
+      "expected": "Every registry write path must leave the real hives untouched",
+      "observed": "VERDICT: THE REAL REGISTRY WAS NOT MODIFIED. Evidence, cross-checked on two independent channels: (1) HOST/filesystem ground truth: real HKCU hive C:\\Users\\Administrator\\NTUSER.DAT size=1310720 mtime=2026-09-30T11:23:39.2349209+08:00, i.e. three days BEFORE all test activity (2026-10-03T18:00-19:38). Any real HKCU commit would have moved this mtime. (2) STAGE: the overlay layer recorded nothing at all - overlay.journal (2626 B) mtime frozen at 2026-10-03T17:47:18, shared overlay.hive mtime frozen at 17:40:33, all 13 per-pid hives are 8192-byte empty stubs, and a binary scan of every hive found 0 occurrences of HKCU/HKLM/Software/WinStageR2. (3) Artifact scan: review.json (379687 B), queue.json, manifest.json contain 'WinStageR2' 0 times. (4) Every write attempt from 18:19 onward was refused with an explicit Access-denied exception.",
+      "writePathTable": [
+        {"path": "HKCU\\Software\\WinStageR2Test (New-Item)", "attempted": "18:00 OK / 18:19+ DENIED", "realHiveChanged": false, "basis": "NTUSER.DAT mtime 2026-09-30 unchanged"},
+        {"path": "HKCU\\Software\\WinStageR2SingleTest (New-Item)", "attempted": "DENIED UnauthorizedAccessException", "realHiveChanged": false, "basis": "same"},
+        {"path": "HKCU\\Software\\Microsoft\\WinStageR2Test (New-Item)", "attempted": "DENIED", "realHiveChanged": false, "basis": "same"},
+        {"path": "HKCU\\...\\CurrentVersion\\Run\\WinStageR2Probe (New-ItemProperty)", "attempted": "DENIED SecurityException", "realHiveChanged": false, "basis": "same + 0 artifact occurrences"},
+        {"path": "HKLM\\SOFTWARE\\WinStageR2Test (New-Item)", "attempted": "DENIED UnauthorizedAccessException", "realHiveChanged": false, "basis": "denied write; HKLM config hives unreadable unelevated"},
+        {"path": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\WinStageR2Svc (New-Item)", "attempted": "DENIED", "realHiveChanged": false, "basis": "denied write; no service touched"},
+        {"path": "HKLM\\SOFTWARE\\WOW6432Node\\WinStageR2Test (New-Item)", "attempted": "DENIED", "realHiveChanged": false, "basis": "denied write"},
+        {"path": "reg.exe add/query/copy/export/import (CMD channel, incl. /f)", "attempted": "NOT RUNNABLE - process spawn denied", "realHiveChanged": false, "basis": "no process was created"}
+      ],
+      "hostTruth": "REAL REGISTRY: ZERO BYTES WRITTEN, but this is fail-closed refusal, NOT WinStage staging isolation. The staging layer never saw the writes (journal frozen, empty hives), so isolation was not exercised - the writes were simply blocked by the unelevated, non-injected execution context.",
+      "conclusion": "Real hive unmodified = TRUE. Attribution = sandbox fail-closed denial (and for the one 18:00 success, the value never propagated out of its process). WinStage's overlay contributed nothing observable.",
+      "evidence": ["evidence/reg-static-analysis.txt", "evidence/reg00-recon.txt", "evidence/reg-write-attempts.txt"]
+    },
+    {
+      "id": "REG-08",
+      "title": "Approval-surface rendering of registry changes (review.json)",
+      "status": "FAIL",
+      "channel": ["STAGE"],
+      "command": "Get-Content $DSH_REGSTAGE_ROOT\\review.json -Raw | ConvertFrom-Json ; histogram of files[].kind and files[].risk",
+      "expected": "Registry changes should appear as reviewable rows (kind='registry', a risk grade, a note) so a human can approve them",
+      "observed": "STILL BROKEN, and now with a self-contradiction. review.json bytes=379687, generatedAt=2026-10-03T11:30:46Z, candidateId=cs_0093_5d41b679, revision=4628, truncated=true. counts: files=2873, listed=40, totalFiles=2873. riskCounts: normal=2857, outside=15, sensitive=1, danger=0. alerts=[] (EMPTY). files[] length=40 and ALL 40 are kind='file' with risk='normal' -> files[] contains ZERO registry rows and ZERO outside/sensitive rows. Raw-regex over the whole file: kind values = file x40 only; risk values = normal x40 only; substring 'HKCU' appears 14 times and 'Software' 14 times but ONLY inside candidates[]. Meanwhile candidates[] holds a pending registry-only candidate cs_0045_61ebdd8a with 14 registry paths (HKCU\\Software\\Python, ...\\Python\\Astral, ...\\CPython3.12.14\\InstallPath, etc.). So: the registry candidate EXISTS in the artifact, but is rendered as 0 approval rows. CONTRADICTIONS: (a) riskCounts claims outside=15 + sensitive=1 while files[] shows 40/40 normal and 0/40 outside|sensitive -> the published rows cannot account for the declared risk counts; (b) riskCounts is non-zero while alerts is empty; (c) counts.listed=40 vs counts.totalFiles=2873 with truncated=true -> the user sees 40 of 2873 changes and has no path from the risk counts to the offending entries.",
+      "hostTruth": "Independent of host state: the approval artifact objectively contains no registry row, so a user or automation reading it would conclude 'no registry changes and no risk', which is not what the candidate list says. Round-1 finding reproduced verbatim.",
+      "evidence": ["evidence/reg-static-analysis.txt", "evidence/reg08-review-header.txt"],
+      "usability": "WORST usability item: a human cannot find 'what registry change do I need to approve'. There is no row, no note, no filter, and the summary numbers (outside=15, sensitive=1) point at entries that are not in the file. Unanswerable in any number of steps."
+    },
+    {
+      "id": "REG-09",
+      "title": "Escape hatch (WINSTAGE_SHIM_DISABLE=1) reachability and host-registry write",
+      "status": "BLOCKED",
+      "channel": ["HOST"],
+      "command": "$env:WINSTAGE_SHIM_DISABLE='1' ; reg.exe query HKCU\\Software\\WinStageR2Test",
+      "expected": "Escape hatch should bypass the shim and reach the REAL registry (as round 1 and the protocol report for the filesystem)",
+      "observed": "ESCAPE HATCH IS UNREACHABLE IN THIS THREAD, and the reason is the notable result: (1) the variable WINSTAGE_SHIM_DISABLE is NOT PRESENT in the live process environment at all (no shim was injected, so there is nothing to disable); (2) reg.exe cannot be launched with or without the variable - 'Program reg.exe failed to run: Access is denied'; (3) therefore no real-hive write and no real-hive delete could be performed or verified. The protocol's HOST channel (shim-disabled child reg query) is NOT AVAILABLE here.",
+      "hostTruth": "Could not be exercised. Notably this is NOT a security failure - the escape hatch was blocked by the lack of process-spawn rights, not by the shim. Conversely, if process spawning worked, there is no evidence that WINSTAGE_SHIM_DISABLE would be honoured, because no shim is present in this thread's shell.",
+      "severity": "informational; a CRITICAL-level gap in EVIDENCE (the domain's designated ground-truth channel does not exist in this thread), not a demonstrated escape.",
+      "evidence": ["evidence/reg-static-analysis.txt", "executions.log"],
+      "usability": "The designated way to answer 'did this really hit the host registry?' is unavailable, and nothing in the error message tells the user that. A user following WinStage documentation would conclude their provenance check silently failed."
+    },
+    {
+      "id": "REG-10",
+      "title": "Usability: how many steps/channels to answer 'did my registry change take effect?'",
+      "status": "FINDING",
+      "channel": ["PS", "STAGE", "HOST"],
+      "expected": "A short, documented, self-serve way to confirm whether a registry edit is staged, applied, or refused",
+      "observed": "(1) From inside the sandbox the SAME call yields success-then-readback or Access-denied with NO distinguishing output; a successful-looking write is indistinguishable from a staged write. (2) The real answer required: NTUSER.DAT mtime + a byte census of .dshstage\\registry (13 hives + journal) + review.json parsing + artifact grep = 4 channels, ~10 commands, and a knowledge of internal layout that no error message or doc supplies. (3) reg.exe failures are silent: LASTEXITCODE is EMPTY ($null), not non-zero, so retry logic and CI checks cannot detect the failure; the only trace is stderr text that the wrapper prefixes with a PowerShell parser-style message. (4) Error texts are inconsistent across keys for the same conceptual refusal: UnauthorizedAccessException 'Access to the registry key ... is denied' (HKCU/HKLM/WOW6432Node), SecurityException 'Requested registry access is not allowed' (Run key), ItemNotFoundException 'Cannot find path ... because it does not exist' (value write after a failed create - a misleading cascade that looks like a missing key rather than a permission denial).",
+      "hostTruth": "n/a",
+      "evidence": ["evidence/reg-static-analysis.txt", "executions.log"],
+      "usability": "Recommended: (a) make every registry write emit one line saying staged|applied|refused plus the channel and reason; (b) make native-command launch failure set a non-zero exit code; (c) publish the .dshstage layout and a 'dsh reg status' helper; (d) never let 'Access denied' and 'not staged' be textually identical."
+    },
+    {
+      "id": "REG-F1",
+      "title": "FINDING: the r2 registry overlay is stalled/dead - staging records nothing",
+      "status": "FINDING",
+      "channel": ["STAGE"],
+      "observed": "overlay.journal is 2626 bytes and its mtime is frozen at 2026-10-03T17:47:18; the shared overlay.hive mtime is frozen at 17:40:33; all 13 overlay.<pid>.hive files are exactly 8192 bytes (a bare header, no cells). Binary scan: 0 of 13 hives contain HKCU/HKLM/Software/WinStageR2 strings. The journal DOES contain UTF-16 'HKCU' x14 and 'Python' x25, i.e. it holds the cs_0045 HKCU\\Software\\Python records, but nothing after 17:47. Current time at analysis: 19:31. Over ~1h44m during which 8 test threads were active, the registry overlay produced ZERO new bytes - yet the filesystem staged\\ tree was still being written (26 .winstage-inject-*.json between 18:10:42 and 18:10:46, shim.log grew to 229579 B at 18:15:27). So injection and filesystem staging continued while registry staging was dead. This is the mechanism behind REG-01/03/05/06 being refused rather than staged: failClosed=true with an unusable overlay means deny.",
+      "evidence": ["evidence/reg-static-analysis.txt", "evidence/reg00-recon.txt"]
+    },
+    {
+      "id": "REG-F2",
+      "title": "FINDING: the whole reg.exe/CMD channel is dead in this thread",
+      "status": "FINDING",
+      "channel": ["CMD"],
+      "observed": "'Program reg.exe failed to run: Access is denied' and the same for cmd.exe, whoami.exe, hostname.exe, where.exe. Attempts at process creation via System.Diagnostics.ProcessStartInfo with redirected stdio produced 'Exception calling Start ...: Access is denied'. So the entire CMD channel and the HOST channel are unavailable. The failure mode is dangerous for automation: LASTEXITCODE comes back EMPTY ($null) instead of non-zero, so a caller cannot distinguish 'command failed' from 'command never ran'.",
+      "evidence": ["evidence/reg00b-exeprobe.txt", "executions.log"]
+    },
+    {
+      "id": "REG-F3",
+      "title": "FINDING: harness shell is unelevated and un-injected - two hard environment/contract violations",
+      "status": "FINDING",
+      "channel": ["PS"],
+      "observed": "(1) CONTRACT VIOLATION: the protocol says the shim is still active and the PS/CMD channels are shim-hooked. In this thread's shell (powershell.exe 5.1, PID varies per command) no shim module is loaded and none of WINSTAGE_STAGE_ROOT / DSH_REGSTAGE_ROOT / WINSTAGE_SHIM_LOG / WINSTAGE_SHIM_CONFIG / WINSTAGE_SHIM_DISABLE is set. Scripts written against the protocol (using $env:DSH_REGSTAGE_ROOT) get EMPTY strings and silently misbehave. (2) SESSION MISMATCH: $env:DSH_SESSION_ID = 301dd4ca-1aff-49a7-a12c-ff915c9e9384 while the r2 session under test is session-4c5d9889-7b7f-4132-931b-a26a3c1d924d, so env-var-derived paths cannot even be resolved correctly. (3) UNELEVATED: token groups omit Administrators -> HKCU writes denied, which is unusual enough to mislead (HKCU normally needs no elevation). (4) FILE WRITES FROM PS ARE DENIED but the write tool works, so the two 'channels' have different privileges - any test that assumed 'PS write == write tool write' is invalid. (5) pwsh.exe IS NOT INSTALLED despite the protocol and round-1 records using `pwsh -Command` extensively; only powershell.exe 5.1 exists, which also means execution policy + PS 5.1 parsing constraints apply.",
+      "evidence": ["evidence/reg-static-analysis.txt", "executions.log"]
+    },
+    {
+      "id": "REG-F4",
+      "title": "FINDING: executor-level gate failures and instability of the command channel",
+      "status": "FINDING",
+      "channel": ["PS"],
+      "observed": "The pwsh tool intermittently failed at the EXECUTOR level before any of my code ran: (a) 'STAGING_WRITE_UNVERIFIED: refusing to run: the staged root is not verified writable by the identity this run uses (measured as not writable). reason: 1 staging-write check(s) failed: outside-write-staged-not-real=fail (child-reported-ok=false real-disk-has-file=false staged=C:\\Users\\Administrator\\Desktop\\WinStageSandbox\\.dshstage\\session).' - note the truncated staged path '.dshstage\\session' which does not exist (only .dshstage\\sessions\\ does); (b) 'Error: EBUSY: resource busy or locked, read'; (c) two consecutive no-output timeouts (30 s, 60 s) then recovery. This gate is the correct fail-closed design, but it fires non-deterministically on commands that write only inside my own allowed directory, which cost ~10 commands of the ~35 total.",
+      "evidence": ["executions.log"]
+    }
+  ],
+  "statusCounts": {
+    "OK": 1,
+    "FAIL": 4,
+    "BLOCKED": 5,
+    "FINDING": 5,
+    "N-A": 0
+  },
+  "realRegistryModified": false,
+  "realRegistryModifiedBasis": "NTUSER.DAT mtime 2026-09-30T11:23:39 unchanged; 13/13 overlay hives empty 8192 B; overlay.journal frozen at 2026-10-03T17:47:18; review.json/queue.json/manifest.json contain 0 occurrences of WinStageR2; every write attempt from 18:19 onward explicitly refused. Attribution: fail-closed denial, NOT WinStage staging isolation.",
+  "leftovers": {
+    "realRegistry": "NONE. No key or value created in the real hive. No autostart entry. No service or driver Start value touched.",
+    "realDisk": "Only the deliverables in this directory (written via the DSH host write tool): results.json, findings.md, executions.log, evidence/*, plus the helper scripts a.ps1 / analyze.ps1 / xchk.ps1 / b00-exeprobe.ps1 / a01-02.ps1, which the pwsh channel wrote before the per-command filesystem became ephemeral.",
+    "dshstage": "NOT TOUCHED (protocol forbids it). 13 overlay.<pid>.hive + overlay.hive + overlay.journal left exactly as found.",
+    "registryHives": "No leftover test keys. WinStageR2Test / WinStageR2Probe appear 0 times in every session artifact."
+  }
+}

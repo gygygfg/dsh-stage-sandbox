@@ -1,0 +1,101 @@
+[
+  {
+    "id": "BR-01",
+    "title": "轮2 复测 browser-use --doctor（danger-full-access）",
+    "status": "BLOCKED",
+    "channel": ["STAGE"],
+    "command": "browser-use --doctor   （未能执行）",
+    "expected": "在新策略下重跑 doctor，确认 daemon/浏览器连接状态",
+    "observed": "轮2 全程无法执行任何命令：pwsh 前台、run_in_background、指定 workdir 三种方式都在执行前失败于 `EBUSY: resource busy or locked, read`。轮1 的 doctor 输出仍然有效（evidence 见 browser/evidence/br01-doctor.txt）。",
+    "evidence": ["../browser/evidence/br01-doctor.txt", "evidence/round2-blocker-EBUSY.txt"],
+    "usability": "轮2 的阻塞点与轮1 完全不同：轮1 是 STAGING_WRITE_UNVERIFIED 门随机拒绝；轮2 是后端读取被 EBUSY 卡死，100% 拒绝，连 Write-Output 都不放过。"
+  },
+  {
+    "id": "BR-02",
+    "title": "轮2 用 Edge CDP 打开新标签页访问站点并 page_info()",
+    "status": "BLOCKED",
+    "channel": ["STAGE"],
+    "command": "（未能执行）new_tab('https://www.baidu.com'); wait_for_load(); page_info()",
+    "expected": "连上自建 Edge 实例后打开页面，取得标题与 URL",
+    "observed": "双重阻塞。(1) 无法启动浏览器：shell 全死。(2) 即使能启动，按 lead 已产出的日志，Edge 会在 DevTools 起来约 1.2 秒后因 GPU FATAL 退出（见 evidence/edge-crash-rootcause.txt）。但**关键进展**：Mojo 命名管道 FATAL 已消失、`DevTools listening on ws://127.0.0.1:9222/...` 已出现，说明 danger-full-access 解除了轮1 的根本限制；剩下的 GPU FATAL 已被定位为 profile 位于工作区导致 staged-only 的次生问题。",
+    "evidence": ["evidence/edge-crash-rootcause.txt"],
+    "usability": "无法评价。但已给出可执行的修复方案（见 findings.md 第 2 节），解除 shell 阻塞后应可在 1~2 步内跑通。"
+  },
+  {
+    "id": "BR-03",
+    "title": "轮2 JS 渲染与求值 + DOM 交互",
+    "status": "BLOCKED",
+    "channel": ["STAGE"],
+    "command": "（未能执行）js('document.title'); js('location.href'); 百度输入框中文检索",
+    "expected": "拿到标题/URL，并完成一次中文关键词搜索交互",
+    "observed": "无法执行。",
+    "evidence": [],
+    "usability": "N/A（未执行）"
+  },
+  {
+    "id": "BR-04",
+    "title": "轮2 截图 + SHA256 + read_image 验证",
+    "status": "BLOCKED",
+    "channel": ["STAGE"],
+    "command": "（未能执行）截图 -> Get-FileHash -> read_image",
+    "expected": "evidence/ 下有真实 PNG，哈希已记录，read_image 确认非空白",
+    "observed": "无法执行。本项 0 份截图证据，不计为通过。",
+    "evidence": [],
+    "usability": "N/A（未执行）"
+  },
+  {
+    "id": "BR-05",
+    "title": "轮2 无障碍树 + DOM.getBoxModel + click_at_xy",
+    "status": "BLOCKED",
+    "channel": ["STAGE"],
+    "command": "（未能执行）cdp('Accessibility.getFullAXTree'); cdp('DOM.getBoxModel'); click_at_xy",
+    "expected": "取得 AX 节点数并完成一次 AX->坐标真实点击",
+    "observed": "无法执行。",
+    "evidence": [],
+    "usability": "N/A（未执行）"
+  },
+  {
+    "id": "BR-06",
+    "title": "轮2 多标签页 list_tabs/new_tab/switch_tab",
+    "status": "BLOCKED",
+    "channel": ["STAGE"],
+    "command": "（未能执行）list_tabs(); new_tab(); switch_tab()",
+    "expected": "标签可读可新建可切换，无重复标签",
+    "observed": "无法执行。未创建/切换/关闭任何标签页；用户自有 msedge 进程未被触碰。",
+    "evidence": [],
+    "usability": "N/A（未执行）"
+  },
+  {
+    "id": "BR-07",
+    "title": "轮2 安全重点：浏览器下载落点判定（工作区外）",
+    "status": "BLOCKED",
+    "channel": ["STAGE"],
+    "command": "（未能执行）触发下载到 %USERPROFILE%\\Downloads 后做三通道取证",
+    "expected": "判定下载文件是否真实落盘、是否进候选/审批面",
+    "observed": "无法执行：没有可控浏览器。**仍然是未验证的盲区**，不能当作通过。不过轮2 顺带取得了对同一机制的强证据：Edge 写入工作区内的 profile **只存在于 staging、真实磁盘上不存在**（真实 `browser2\\` 只有 lead 的 launch-edge.mjs；141 个 profile 文件全在 `.dshstage\\...\\staged\\fs\\C\\...\\browser2\\edge-new\\`）。这直接印证了'子进程写入被导向 staging'的行为在 danger-full-access 下**依然存在**，因此浏览器下载落到工作区外的行为需要单独实测，不能推断。",
+    "evidence": ["evidence/edge-crash-rootcause.txt"],
+    "usability": "N/A（未执行）"
+  },
+  {
+    "id": "BR-08",
+    "title": "轮2 浏览器进程与沙箱关系 + Edge 崩溃根因定位",
+    "status": "FINDING",
+    "channel": ["STAGE", "glob", "read"],
+    "command": "read .dshstage/.../staged/fs/C/.../browser2/edge.err.txt; glob <ws>/_sandbox-tests/browser2 (real disk); glob <staged>/.../browser2",
+    "expected": "判定 Edge 为何在沙箱内无法维持运行，并给出可执行的修复参数",
+    "observed": "根因定位完成，且与'GPU 进程本身起不来'的初步假设不同。真实链条：Edge 的 --user-data-dir 落在工作区内 -> 其写入被重定向进 staging -> 真实磁盘上这些目录不存在 -> Edge 自己的子进程（GPU/network service，运行在 Edge 自有沙箱内、不经过 WinStage shim）在真实磁盘上解析同一路径时找不到目录（0x3 系统找不到指定的路径）-> GPU 缓存创建失败（gpu_disk_cache.cc:737 Gpu Cache Creation failed: -2）-> GPU 进程反复启动失败（gpu_process_host.cc:1179 error_code=18）-> FATAL GPU process isn't usable -> 浏览器退出。同时确认：旧日志（0928）中的 Mojo 命名管道 FATAL（platform_channel.cc:187 拒绝访问 0x5）在新日志（1003）中已消失，且新日志出现 `DevTools listening on ws://127.0.0.1:9222/...`，比 GPU FATAL 早约 1.2 秒。",
+    "evidence": ["evidence/edge-crash-rootcause.txt", "evidence/round2-blocker-EBUSY.txt"],
+    "usability": "本轮把'Edge 在沙箱内不可用'从一句结论细化成了一条可修的具体因果链，并给出首选修复：把 profile 移到工作区外的短路径。建议 DSH 在 doctor/文档中直接写明'被 hook 的进程其写入会进 staging，而 Chromium 系浏览器的子进程看不到 staging'，否则每个做浏览器自动化的使用者都会踩同一个坑。"
+  },
+  {
+    "id": "BR-09",
+    "title": "轮2 易用性：两类阻塞的代价",
+    "status": "FINDING",
+    "channel": ["STAGE"],
+    "command": "（逐条见 findings.md 第 4 节）",
+    "expected": "能从零走到页面可操作",
+    "observed": "轮2 遇到两个独立阻塞：(1) 执行后端 EBUSY 全面卡死，100% 命令被拒（轮1 是约 50% 的 STAGING_WRITE_UNVERIFIED，性质不同、危害更大：轮1 至少能重试，轮2 完全无出路）；(2) Edge 因 profile 被 staged-化而无法维持运行。轮2 未能产出任何浏览器交互结果。",
+    "evidence": ["evidence/round2-blocker-EBUSY.txt", "evidence/edge-crash-rootcause.txt"],
+    "usability": "关键教训：EBUSY 的触发条件（某个存活进程持有 staging 内文件的锁）会导致**整个 agent 线程失去执行能力**，且无法自救（杀进程需要 shell，shell 又需要先解除锁）。这形成死锁，必须由用户或宿主侧介入。建议后端在这种失败上给出'哪个路径被占用 + 建议操作'，并且不要让单个被占用的 staged 文件阻断所有命令。"
+  }
+]
