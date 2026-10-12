@@ -3,6 +3,11 @@
 本仓由两个独立仓库合并而成，**保留两者全部 git 历史**（`git-filter-repo --to-subdirectory-filter`
 把各自内容移入子目录后再 `merge --allow-unrelated-histories`）。因此 commit 哈希被重写。
 
+> 命名：合并时临时根目录为 `/root/code/dsh-sandbox`，随后统一更名为 **`dsh-stage-sandbox`**
+> （本地目录名 + 根 `package.json` name + GitHub 仓 `gygygfg/dsh-stage-sandbox`）。下方命令里的
+> `/root/code/dsh-sandbox` 为当时的历史记录。子包名保持不变（`dsh-winstage-sandbox` /
+> `dsh-sandbox-linux` / `dsh-sandbox-core`）。
+
 ## 源 → 合并后哈希映射
 
 | 源仓库 | 源 HEAD（合并前） | 合并后等价 HEAD |

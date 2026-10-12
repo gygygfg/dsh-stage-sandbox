@@ -1,4 +1,4 @@
-# dsh-sandbox — 跨平台 dsh 沙箱 monorepo
+# dsh-stage-sandbox — 跨平台 dsh 沙箱 monorepo
 
 本仓把两个**独立实现**的 dsh 沙箱插件合并为一个跨平台工作区，**保留两者各自的 git 历史**：
 
