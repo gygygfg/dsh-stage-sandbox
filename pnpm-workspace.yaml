@@ -1,2 +1,78 @@
 packages:
   - 'packages/*'
+
+# ── 允许运行的构建脚本（pnpm 10+ 默认禁用一切 postinstall）──────────────────────
+# 缺了这一段，`pnpm install` 会以 ERR_PNPM_IGNORED_BUILDS 失败：
+#   esbuild  —— 二进制落地；本仓 `tools/build-plugin.ts` 打包 dist 就靠它
+#   koffi    —— 原生 FFI。`@deepseek-ai/dsh-win32-process` 用它跑 Job Object /
+#               App Container 隔离探针；不构建 ⇒ 探针拿不到 koffi ⇒
+#               `tests/probe-selfkill-guard.ts` 按 fail-closed 变红（实测过）
+#   node-pty —— linux 包的终端依赖
+# ⚠ 审批 = 允许这三个包在安装时执行它自己的 postinstall。三者均为本仓/上游的既有依赖，
+#   不是新增引入；若不愿在此处放开，可改用交互式 `pnpm approve-builds` 仅本机生效。
+allowBuilds:
+  esbuild: true
+  koffi: true
+  node-pty: true
+
+# --- BEGIN LOCAL VENDOR OVERRIDES ---
+# ★ 为什么有这一段（2026-10-16）：
+#   本仓依赖的 `@deepseek-ai/dsh-*` 全部是**私有包**，实测 registry.npmjs.org 与
+#   registry.npmmirror.com 均 404 ⇒ `pnpm install` 在依赖图的第一步就失败，
+#   连带 `pnpm -r typecheck` / `prepare`（构建 dist）都无法执行。
+#
+#   而 DSH 桌面端安装目录自带一份完整的运行时依赖树：
+#     %LOCALAPPDATA%\Programs\DeepSeek Harness\resources\app.asar
+#     内部路径 dsh/node_modules/@deepseek-ai/ 共 289 个包。
+#   本段把依赖改指向从那里提取出来的 `.dsh-vendor/`（该目录已被 gitignore，不入库）。
+#
+# ⚠ 两个前提，二者任一失效请立刻删除本段：
+#   1) `.dsh-vendor/` 存在。它由 `tools`-级的提取脚本重建，见同目录下的 README。
+#   2) 其中 4 个包是**占位**：asar 与 unpacked 目录都没有实体，
+#      且本仓源码对它们 0 引用（grep 实测）—— 真被 import 时 tsc 会立刻报 TS2307，不会假绿。
+#
+# ✅ 若将来拿到内网 registry，删掉本段并在仓库根加 `.npmrc`（`@deepseek-ai:registry=...`），
+#    即可回到正常依赖来源。
+overrides:
+  '@deepseek-ai/cordis': 'file:.dsh-vendor/node_modules/@deepseek-ai/cordis'
+  '@deepseek-ai/cordis-plugin-include': 'file:.dsh-vendor/node_modules/@deepseek-ai/cordis-plugin-include'
+  '@deepseek-ai/cordis-plugin-loader': 'file:.dsh-vendor/node_modules/@deepseek-ai/cordis-plugin-loader'
+  '@deepseek-ai/cosmokit': 'file:.dsh-vendor/node_modules/@deepseek-ai/cosmokit'
+  '@deepseek-ai/dsh-agent': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-agent'
+  '@deepseek-ai/dsh-approval': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-approval'
+  '@deepseek-ai/dsh-attachment': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-attachment'
+  '@deepseek-ai/dsh-bash-local': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-local'
+  '@deepseek-ai/dsh-bash-sandbox': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-sandbox'
+  '@deepseek-ai/dsh-brand': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-brand'
+  '@deepseek-ai/dsh-commands': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-commands'
+  '@deepseek-ai/dsh-fs': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-fs'
+  '@deepseek-ai/dsh-fs-local': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-fs-local'
+  '@deepseek-ai/dsh-fs-sandbox': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-fs-sandbox'
+  '@deepseek-ai/dsh-http-proxy': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-http-proxy'
+  '@deepseek-ai/dsh-invariants': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-invariants'
+  '@deepseek-ai/dsh-lazy-require': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-lazy-require'
+  '@deepseek-ai/dsh-llm': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-llm'
+  '@deepseek-ai/dsh-pwsh-local': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-pwsh-local'
+  '@deepseek-ai/dsh-pwsh-sandbox': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-pwsh-sandbox'
+  '@deepseek-ai/dsh-sandbox': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-sandbox'
+  '@deepseek-ai/dsh-sandbox-policy': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-sandbox-policy'
+  '@deepseek-ai/dsh-scope': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-scope'
+  '@deepseek-ai/dsh-session': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-session'
+  '@deepseek-ai/dsh-session-persistence': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-session-persistence'
+  '@deepseek-ai/dsh-session-projection': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-session-projection'
+  '@deepseek-ai/dsh-shell': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-shell'
+  '@deepseek-ai/dsh-storage': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-storage'
+  '@deepseek-ai/dsh-storage-domain': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-storage-domain'
+  '@deepseek-ai/dsh-subprocess': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-subprocess'
+  '@deepseek-ai/dsh-subprocess-local': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-subprocess-local'
+  '@deepseek-ai/dsh-system-prompt': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-system-prompt'
+  '@deepseek-ai/dsh-timeout': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-timeout'
+  '@deepseek-ai/dsh-typert-protocol': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-typert-protocol'
+  '@deepseek-ai/dsh-util-crypto': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-util-crypto'
+  '@deepseek-ai/dsh-util-values': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-util-values'
+  '@deepseek-ai/dsh-web': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-web'
+  '@deepseek-ai/dsh-win32-process': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-win32-process'
+  '@deepseek-ai/dsh-workspace': 'file:.dsh-vendor/node_modules/@deepseek-ai/dsh-workspace'
+  '@deepseek-ai/node-addon-system': 'file:.dsh-vendor/node_modules/@deepseek-ai/node-addon-system'
+  '@deepseek-ai/schemastery': 'file:.dsh-vendor/node_modules/@deepseek-ai/schemastery'
+# --- END LOCAL VENDOR OVERRIDES ---

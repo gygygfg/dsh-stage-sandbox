@@ -29,7 +29,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import {
   REG_STAGE_KIND,
@@ -38,6 +38,8 @@ import {
   REG_STAGE_RECORD_OFFSETS,
   REG_STAGE_RECORD_SIZE,
   REG_STAGE_HOOKED_APIS,
+  REG_STAGE_UNHOOKED_APIS,
+  REG_STAGE_HARD_DENY_APIS,
   REG_STAGE_UNSUPPORTED_TYPES,
   REGISTERED_HARD_DENIALS,
   HARD_DENY_STATUS,
@@ -329,6 +331,73 @@ export function runRegistryStageChecks(harness) {
           REGISTERED_HARD_DENIALS.semantic.some((line) => /系统生效/.test(line)) &&
           REGISTERED_HARD_DENIALS.semantic.some((line) => /安全描述符/.test(line)),
         REGISTERED_HARD_DENIALS.semantic.length + ' 条',
+      )
+    }
+
+    // ─── R17：shim **真实**拦截面（ws_hook.c 的 WS_TARGET）與 TS 侧名单的交叉验证 ──
+    //
+    // 为什么必须有这一组（交叉验证实测出的假承诺）：
+    // `docs/T3-注册表暂存设计.md` §8.2 原话是"任何不在被 hook 的 8 个 API 之内的调用
+    // **同样硬拒**"。但 shim 是 **IAT 点钩**：`classifyRegistryOperation()` 是 TS 侧纯函数，
+    // 只对 shim 的 `ws_Reg*` 实现被调用；没进 `WS_TARGET` 的 API，调用方 IAT 项原样指向
+    // 系统 DLL ⇒ `classify` 一次都不会被调用 ⇒ "不 hook" 实际等于 **直落真实 hive**。
+    // 硬证据：`REG_STAGE_API_NOT_HOOKED` 在 `shim/` 全目录 0 命中。
+    // 因此"名单上有名字"绝不能被读成"已经拦住了" —— 这里把真值从 C 源码派生出来，
+    // 而不是手抄一份名单（手抄的清单会漂，这正是本项目反复记录的缺陷形态）。
+    section('S2R17. shim 真实拦截面（ws_hook.c 的 WS_TARGET）与 TS 侧名单不得漂移')
+    {
+      const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+      const hookSrcFile = join(repoRoot, 'shim', 'src', 'ws_hook.c')
+      const hookSrc = existsSync(hookSrcFile) ? readFileSync(hookSrcFile, 'utf8') : ''
+      const parseTargets = (src) => [...src.matchAll(/WS_TARGET\(([A-Za-z0-9_]+)\)/g)].map((m) => m[1])
+      const targets = parseTargets(hookSrc)
+
+      check(
+        '能从 ws_hook.c 解析出 WS_TARGET 名单（否则下面每条都会是空断言）',
+        targets.length > 0 && targets.some((t) => t.startsWith('Reg')),
+        `${targets.length} 个 target，其中注册表 ${targets.filter((t) => t.startsWith('Reg')).length} 个`,
+      )
+
+      // ① TS 侧说"被 hook" ≠ 真被 hook：逐个回 WS_TARGET 里核对
+      const notReallyHooked = REG_STAGE_HOOKED_APIS.filter((api) => !targets.includes(api))
+      check(
+        `TS 侧声称被 hook 的 ${REG_STAGE_HOOKED_APIS.length} 个 API 都真的在 WS_TARGET 名单里`,
+        notReallyHooked.length === 0,
+        notReallyHooked.length ? `不在名单：${notReallyHooked.join(', ')}` : REG_STAGE_HOOKED_APIS.join(', '),
+      )
+
+      // ② 盲区清单 ∩ 拦截面 必须为空：补了 hook 却没从盲区删掉 ⇒ 清单变成新的假承诺
+      const blindNow = REG_STAGE_UNHOOKED_APIS.filter((api) => targets.includes(api))
+      check(
+        '盲区清单与 WS_TARGET 无交集（补了 hook 却没从盲区删掉 ⇒ 立刻红）',
+        blindNow.length === 0,
+        blindNow.length ? `已 hook 却仍列盲区：${blindNow.join(', ')}` : REG_STAGE_UNHOOKED_APIS.join(', '),
+      )
+      check(
+        '盲区清单非空（"漏了什么"必须是可查数据，不是文档里的一句承诺）',
+        REG_STAGE_UNHOOKED_APIS.length > 0,
+        `${REG_STAGE_UNHOOKED_APIS.length} 条：${REG_STAGE_UNHOOKED_APIS.join(', ')}`,
+      )
+
+      // ③ 硬拒清单当下**全都未被真 hook** ⇒ 它们是意图声明，不是已拦截的证据
+      const denyApis = Object.keys(REG_STAGE_HARD_DENY_APIS)
+      const denyReallyHooked = denyApis.filter((api) => targets.includes(api))
+      check(
+        `硬拒清单的 ${denyApis.length} 条目前都不在 WS_TARGET 内（= 意图声明，当下直落真实 hive）`,
+        denyReallyHooked.length === 0,
+        denyReallyHooked.length
+          ? `已被真 hook ⇒ 硬拒现在生效，需重新分类：${denyReallyHooked.join(', ')}`
+          : '全部未 hook ⇒ 当下结局是直落真实 hive，不是硬拒',
+      )
+
+      // ④ 反向自证：往 WS_TARGET 名单里种一条，上面"无交集"的两条必须变红
+      //    （不做这一步，②③有可能是"永远为真"的空断言）
+      const planted = parseTargets(`${hookSrc}\n    WS_TARGET(RegSetKeyValueW),\n`)
+      const blindPlanted = REG_STAGE_UNHOOKED_APIS.filter((api) => planted.includes(api))
+      check(
+        '反向自证：给 ws_hook.c 种一条 RegSetKeyValueW 后，无交集断言必须变红',
+        blindPlanted.length > 0 && blindNow.length === 0,
+        `种植前交集=${blindNow.length} 种植后交集=${blindPlanted.length}（${blindPlanted.join(', ')}）`,
       )
     }
 

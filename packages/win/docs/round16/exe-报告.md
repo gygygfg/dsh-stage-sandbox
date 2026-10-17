@@ -121,7 +121,7 @@ node-v22.14.0-win-x64.zip / ripgrep…zip  Status=UnknownError（非 PE，预期
   `winstage-shim.dll`(golden)`63808F51…` / `installed-F544AE15.dll` / `r14-reconstruction-C6540A37.dll`
   三个**整件哈希全不同、`.text` 也全不同**（`6ec5a5da…` / `4446ed46…` / `9a23600f…`）⇒ 它们是**不同的代码**，不是"同源两次构建的元数据漂移"。
 * **诚实边界**：本轮**没有**测到"同源两次构建、整件哈希不同而 `.text` 相同"的样本对（本机没有可复现的双构建）；
-  该形态的证据仍是 R10 复核者文档 `docs/round10/verify/协议修正-哈希口径-D-R9.md`，本轮**未复测**（标 `not-run`）。
+  该形态的证据仍是 R10 复核者文档 `docs/archive/round10/verify/协议修正-哈希口径-D-R9.md`，本轮**未复测**（标 `not-run`）。
 * 跨构建哈希相等**未**被用作任何断言。
 
 ---

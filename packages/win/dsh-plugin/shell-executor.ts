@@ -691,7 +691,7 @@ function stringOption(raw, key) {
 /**
  * ── R14 修复 · D5-N5：网络档位的**唯一入口**（此前 `dsh-plugin/**` 从不传它）───────
  *
- * R11 实测（`docs/round11/network-报告.md`）：出站/入站全开、真实 WFP 过滤器 0 个、
+ * R11 实测（`docs/archive/round11/network-报告.md`）：出站/入站全开、真实 WFP 过滤器 0 个、
  * `sandbox-lane.json` 里**零网络字段**。代码侧的根因不是 `src/netpolicy.ts`（那套
  * 安装/回读/fail-closed 判定是齐的），而是**装配侧从没把 `networkTier` 交给执行器**：
  * `src/executor.ts:1985` 的默认值 `OBSERVED_ONLINE` 于是永远是唯一取值，
@@ -929,7 +929,13 @@ export function msiFamilyCommandVerdict(command) {
     return (cut >= 0 ? t.slice(cut + 1) : t).toLowerCase()
   }
   const tokenize = (s) => s.match(/"[^"]*"|'[^']*'|\S+/g) ?? []
-  const LAUNCHERS = new Set(['cmd', 'powershell', 'pwsh', 'start-process', 'iex', 'invoke-expression', 'start-job'])
+  // ★ 交叉验证：`start` 是 PowerShell 里 `Start-Process` 的**内建别名**，
+  //   `saps` 也是；旧表漏了它们 ⇒ 一行 `start msiexec /i a.msi` 就能绕过整道闸门
+  //   （扫描在 `start` 处停下，把它当成"有效程序名"，而它不是 `msiexec` ⇒ 不拦）。
+  const LAUNCHERS = new Set([
+    'cmd', 'powershell', 'pwsh', 'start-process', 'iex', 'invoke-expression', 'start-job',
+    'start', 'saps',
+  ])
   /* 旗标 vs 路径：`-x` / `/c` / `/?` 是旗标；`/usr/bin/msiexec` 是**路径**（basename 必须活下来）。
    * ⚠ 别拿 basename 去判旗标：`basename('/c')` 会按路径分隔符剥成 `c`
    *   （离线判据脚本 `.t/r16/exe/msi-gate-check.ts` 在准备阶段抓到的真实 bug）。 */
@@ -951,10 +957,19 @@ export function msiFamilyCommandVerdict(command) {
     const headToken = tokens[i]
     const head = basename(headToken)
     if (head === 'msiexec' || head === 'msiserver') return { matched: head, head: headToken }
-    for (let j = i; j + 2 < tokens.length; j++) {
-      const a = basename(tokens[j]); const b = basename(tokens[j + 1]); const c = basename(tokens[j + 2])
-      if ((a === 'sc' || a === 'net') && b === 'start' && c === 'msiserver') {
-        return { matched: `${a} start msiserver`, head: tokens[j] }
+    // ★ 交叉验证：旧判据要求 `sc|net` / `start` / `msiserver` 三个 token **紧邻** ⇒
+    //   `sc \\127.0.0.1 start msiserver`（远程，中间插了一个主机 token）与
+    //   `net1 start msiserver`（系统自带 `net1.exe`）都判不中。
+    //   改成"段内**顺序**出现 控制程序 → start → msiserver"，中间允许插入任意 token。
+    const CONTROLLERS = new Set(['sc', 'net', 'net1'])
+    let controller = null
+    let sawStart = false
+    for (let j = i; j < tokens.length; j++) {
+      const b = basename(tokens[j])
+      if (controller === null && CONTROLLERS.has(b)) { controller = b; continue }
+      if (controller !== null && !sawStart && b === 'start') { sawStart = true; continue }
+      if (controller !== null && sawStart && b === 'msiserver') {
+        return { matched: `${controller} start msiserver`, head: tokens[j] }
       }
     }
     if (depth < 2 && /^["']/.test(headToken)) {
@@ -2288,7 +2303,7 @@ export function createWinStageShellExecutor(options = {}) {
        * workspace: …)`、`[winstage] captured N change(s) …`、`CAPTURE FAILED` 与所有内部
        * 注记**追加进 stderr**。而 `dsh-tool-pwsh` 的 `renderPwshResult()` 会把 stdout 与
        * stderr 全文一起渲染进模型可见的结果 ⇒ 沙箱存在、暂存树路径、候选 id 全部暴露。
-       * 实测原始形态见 `docs/dsh2-shell-交还与降级-修复报告.md:86-88`。
+       * 实测原始形态见 `docs/archive/dsh2/shell-交还与降级-修复报告.md:86-88`。
        *
        * 现在：**一个字节都不注入**（连尾部换行都不补 —— 否则"零痕迹"就不成立）。
        * 同一份诊断仍在，但只在**人工侧**：

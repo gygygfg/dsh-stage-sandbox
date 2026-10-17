@@ -5,13 +5,16 @@
  * ============================================================================
  * 存在理由（对齐 NeoAI 的实践："已知残余要冻结为基线断言，任何漂移都要报警"）：
  *   本项目最危险的回归不是"某个函数写错了"，而是**声明面悄悄变宽** ——
- *   `docs/Windows功能开启清单.md` §13 的 R1–R12 被删掉几行、`summarise()` 的
+ *   `docs/Windows功能开启清单.md` §13 的 R1–R15 被删掉几行、`summarise()` 的
  *   `guaranteesNotProvided` 少了一条、或者某处开始把"代码存在"读成"网络上真的挡住了"。
+ *   （R13–R15 是 R17 交叉验证轮追加的**暂存/应用面**残余：32 位视图不入审批面 /
+ *   批量应用非原子 / 未 hook 的注册表 API 直落真实 hive。原来只钉了运行时隔离面。）
  *   这类漂移不会让任何既有套件变红，只会让**结论显得比实际更强**。
  *   所以这里把"残余还在不在"本身变成可执行断言：**报警，不迎合**。
  *
  * 检查分三段（每条一个 ✓/✗）：
- *   A. 文档基线：§13 残余表里 R1…R12 逐条仍在、无重复、每行都带证据标记（`[官方]`/`[实测]`/…）
+ *   A. 文档基线：§13 残余表里 R1…R15 逐条仍在、无重复、每行都带证据标记（`[官方]`/`[实测]`/…）；
+ *      且 R13–R15 必须**点名具体标识符**（只写"有些 API 没拦住"这种不可核对的印象也算漂移）
  *   B. 声明面基线：`src/testrunner.ts::summarise()` 的 `guaranteesNotProvided` 仍含
  *      读取面 R1 行、网络面 `[未实测]` 行、缓解策略 `[未实测]` 行、配额未端到端证明行；
  *      且**不再**沿用旧的笼统"网络硬阻断（受限令牌与 ACL 均不涉及网络…）"说法。
@@ -83,7 +86,12 @@ const short = (value, n = 200) => {
 
 // ══════════════════════ A. 文档基线：R1–R12 ══════════════════════
 
-const RESIDUAL_IDS = Object.freeze(Array.from({ length: 12 }, (_v, i) => `R${i + 1}`))
+// R13–R15 是 R17 交叉验证轮追加的三条**暂存/应用面**残余（此前 §13 只钉了运行时隔离面）：
+//   R13 32 位视图注册表写入不入审批面（透传 + UNSTAGED 记录）
+//   R14 候选批量应用非原子（单文件原子、跨文件不回滚）
+//   R15 未 hook 的注册表 API 直落真实 hive（IAT 点钩 ⇒ "不 hook" ≡ "不拦截"）
+// 它们都是"结论比实际更强"的典型来源，因此与 R1–R12 同等对待：消失即红。
+const RESIDUAL_IDS = Object.freeze(Array.from({ length: 15 }, (_v, i) => `R${i + 1}`))
 const DOC_REL = 'docs/Windows功能开启清单.md'
 
 /** 截出 `## 13.` 到下一个二级标题之间的正文（只认这一节，避免误抓正文里的 R 编号） */
@@ -99,10 +107,11 @@ const docText = readFileSync(join(REPO, DOC_REL), 'utf8')
 const section13 = section13Of(docText)
 const residualRows = section13.split(/\r?\n/).filter((line) => /^\|\s*R\d+\s*\|/.test(line))
 const documentedIds = residualRows.map((line) => /^\|\s*(R\d+)\s*\|/.exec(line)[1])
-const effectiveIds = PLANT ? documentedIds.filter((id) => id !== 'R7') : documentedIds
+// 变异体同时抽掉 R7（既有）与 R13（R17 新增），证明新增的残余断言同样**能红**
+const effectiveIds = PLANT ? documentedIds.filter((id) => id !== 'R7' && id !== 'R13') : documentedIds
 
-section(`A. 文档基线（${DOC_REL} §13）：R1–R12 逐条仍在`)
-check('§13 残余表可解析（找到二级标题且有表格行）', section13.length > 0 && residualRows.length >= 12, `rows=${residualRows.length}`)
+section(`A. 文档基线（${DOC_REL} §13）：R1–R15 逐条仍在`)
+check('§13 残余表可解析（找到二级标题且有表格行）', section13.length > 0 && residualRows.length >= 15, `rows=${residualRows.length}`)
 for (const id of RESIDUAL_IDS) {
   check(
     `残余边界 ${id} 仍记录在 §13`,
@@ -120,6 +129,35 @@ check(
   '§13 每一行残余都带证据标记（[官方]/[实测]/[推断]/[未实测]）',
   markerlessRows.length === 0,
   markerlessRows.length === 0 ? `${residualRows.length} 行全部带标记` : short(markerlessRows.join(' | ')),
+)
+
+// ── R17 追加：三条暂存/应用面残余必须**点名具体标识符** ──────────────────────────
+// 为什么还要这一层：只断言"R15 还在"是不够的 —— 有人把那一行改成
+// "某些注册表 API 可能拦不住"照样能通过，而那正是本项目最忌的"声明面变宽"：
+// 一句话从"可核对的事实"退成"不可核对的印象"，结论看起来更强，实际更弱。
+const rowOf = (id) => residualRows.find((line) => /^\|\s*(R\d+)\s*\|/.exec(line)?.[1] === id) ?? ''
+// `--plant` 再额外把具体标识符"笼统化"：证明下面这三条不是永远为真的空断言。
+// 两条路径覆盖**两种**不同的失效：
+//   · R13 走 `effectiveIds`（整行被删）⇒ 证明"残余消失"会被抓到；
+//   · R13/R14/R15 这里的替换 ⇒ 证明"残余还在但被改写成笼统说法"也会被抓到。
+// 只测第一种的话，"把 R13 改成一句不可核对的印象"这种稀释照样能蒙混过关。
+const r13 = PLANT ? rowOf('R13').replace(/KEY_WOW64_32KEY/g, '32 位视图位') : rowOf('R13')
+const r14 = PLANT ? rowOf('R14').replace(/partially-applied/g, '部分应用') : rowOf('R14')
+const r15 = PLANT ? rowOf('R15').replace(/WS_TARGET/g, 'hook 名单') : rowOf('R15')
+check(
+  'R13 点名 KEY_WOW64_32KEY 与 UNSTAGED（不得改写成笼统的"部分注册表写入不暂存"）',
+  r13.includes('KEY_WOW64_32KEY') && r13.includes('UNSTAGED'),
+  short(r13 || '(R13 行缺失)'),
+)
+check(
+  'R14 点名 partially-applied 与 writeFileAtomicReplacing（单文件原子 ≠ 跨文件原子）',
+  r14.includes('partially-applied') && r14.includes('writeFileAtomicReplacing'),
+  short(r14 || '(R14 行缺失)'),
+)
+check(
+  'R15 点名 WS_TARGET / REG_STAGE_UNHOOKED_APIS / RegSetKeyValueW（不得只说"有些 API 没拦住"）',
+  r15.includes('WS_TARGET') && r15.includes('REG_STAGE_UNHOOKED_APIS') && r15.includes('RegSetKeyValueW'),
+  short(r15 || '(R15 行缺失)'),
 )
 
 // ══════════════════════ B. 声明面基线：guaranteesNotProvided ══════════════════════

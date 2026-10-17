@@ -8,11 +8,13 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Workspace } from '../src/workspace.ts'
 import { renderCandidateDiff } from '../src/tools.ts'
 
-const ROOT = 'C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\e2e-flow'
+// ★ 同 selftest.ts：旧值是作者机器的绝对路径，换机器必然 EPERM ⇒ 改为从本文件位置推导。
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '.t', 'e2e-flow')
 rmSync(ROOT, { recursive: true, force: true })
 mkdirSync(join(ROOT, 'src'), { recursive: true })
 writeFileSync(join(ROOT, 'src', 'app.js'), 'export const x = 1\n')

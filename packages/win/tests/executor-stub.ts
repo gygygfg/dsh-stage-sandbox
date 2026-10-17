@@ -18,7 +18,8 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   WindowsStageExecutor,
   JOB_BASIC_ACCOUNTING_SIZE,
@@ -44,7 +45,8 @@ const check = (name, ok, detail) => {
 }
 const section = (t) => W(`\n── ${t} ──`)
 
-const ROOT = 'C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\stub'
+// ★ 同 selftest.ts：旧值是作者机器的绝对路径，换机器必然 EPERM ⇒ 改为从本文件位置推导。
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '.t', 'stub')
 rmSync(ROOT, { recursive: true, force: true })
 const STAGING = join(ROOT, 'staging')
 const TEMP = join(ROOT, 'temp')
@@ -620,7 +622,7 @@ async function main() {
     } catch (error) {
       err = error
     }
-    /* 2026-10-08 夹具定因（见 docs/round10/shim/报告.md §ACL-init）：
+    /* 2026-10-08 夹具定因（见 docs/archive/round10/shim/报告.md §ACL-init）：
      * 旧断言 `check('ACL init 失败向上抛出（不吞）', /OpenProcessToken/.test(err?.message))` 把
      * "诊断文本在哪儿"与"失败有没有被吞"混成一件事。产品契约（`src/executor.ts:979-1000`
      * `stageGrantError` 的注释 + 透明性硬约束）明确要求：**模型可见的 message 只写

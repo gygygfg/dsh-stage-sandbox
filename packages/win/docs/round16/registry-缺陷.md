@@ -1,6 +1,6 @@
 # R16 / D4：注册表修改与隔离 —— 缺陷清单
 
-> 责任：teammate `registry`（task-4）· 2026-10-11 · 装置：`docs\round10\env\scripts\sbx-thread.cmd`（`--profile sbx`，独立进程）
+> 责任：teammate `registry`（task-4）· 2026-10-11 · 装置：`docs\archive\round10\env\scripts\sbx-thread.cmd`（`--profile sbx`，独立进程）
 > 主报告：[registry-报告.md](./registry-报告.md) · 原始证据：`.t\r16\registry\**`
 > 产品代码**未改一行**（只报告）；`shim/out` golden 三件套未动（`63808F51…`/`07FE55DD…`/`8CF81F4F…`，mtime 2026-10-08/09）。
 > 判定标记：`[实测]` = 本轮真跑并留原始读数；`[引用]` = 只读源码/契约。

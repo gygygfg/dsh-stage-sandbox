@@ -96,7 +96,7 @@ typedef struct WsT3 {
      * is defect D-R1: process A (the one that actually wrote) exited, removed its
      * hive, and process B then loaded a brand new EMPTY one -- so "write in one
      * process, read in another" was a guaranteed miss (measured 12/12 failed
-     * reads across 4 independent runs; docs/round10/registry/修复-D-R1.md).
+     * reads across 4 independent runs; docs/archive/round10/registry/修复-D-R1.md).
      * A session-scoped name that survives Detach makes the fallback a real
      * shared object; the journal replay below then makes its CONTENT complete
      * regardless of which hive tier we won. */

@@ -208,6 +208,25 @@ check(
 )
 check('A3 子进程打印末端哨兵 SURVIVED-TO-END', probe.stdout.includes('SURVIVED-TO-END'), `输出=${excerpt(probe.stdout)}`)
 
+/**
+ * ── 套件分类（本轮补）：**FFI 后端缺失**是第三种"本环境测不了" ────────────────────
+ *
+ * `probeWin32Abi()` 在 `loadFfi()` 拿不到 koffi 时直接
+ * `return unknown('koffi FFI unavailable…')` —— 那是一个**状态对象**，里面**没有**
+ * `checks`，于是 `report.checks.jobObject` 天然是 undefined（`CHILD-PROBE null`）。
+ *
+ * 这不是产品缺陷（没有 FFI 就没有 Job 可测），但把它判成 FAIL 会让整个关口在一台
+ * 装不上 koffi 的机器上**永远红** —— 正是本仓反复记录的"运行器自己变成噪声"形态
+ * （`tests/meta-runner.ts` 那条纪律：一个永远不报失败的运行器比没有运行器更糟，
+ * 反过来，一个永远报失败的运行器同样把真信号淹掉）。
+ *
+ * 因此与 `requires-unconstrained-session` 同法：显式打印分类并 **SKIP** 掉**依赖实测**
+ * 的断言，静态断言（D6–D8 / F）照跑。`not-run` 仍然不得写成"通过"。
+ */
+const { loadFfi } = await import(pathToFileURL(join(REPO, 'src', 'capability.ts')).href)
+const FFI_UNAVAILABLE = !loadFfi()
+W(`SUITE-CLASS: ${FFI_UNAVAILABLE ? 'requires-ffi-backend (koffi unavailable)' : 'ffi-backend-available'}`)
+
 let probeJob
 const probeLine = probe.stdout.split('\n').find((l) => l.startsWith('CHILD-PROBE '))
 if (probeLine) {
@@ -217,7 +236,11 @@ if (probeLine) {
     probeJob = undefined
   }
 }
-check('A4 子进程回传的 jobObject 证据行可解析为 JSON', probeJob !== undefined && probeJob !== null, `行=${excerpt(probeLine ?? '(缺失)')}`)
+if (FFI_UNAVAILABLE) {
+  skip('A4 子进程回传的 jobObject 证据行', '本环境 koffi 不可用 ⇒ probeWin32Abi() 不产出 checks（没有 Job 可测）')
+} else {
+  check('A4 子进程回传的 jobObject 证据行可解析为 JSON', probeJob !== undefined && probeJob !== null, `行=${excerpt(probeLine ?? '(缺失)')}`)
+}
 W('')
 
 // ── 断言 B：装回旧形态后，同一观察方式必须变红（本测试"能失败"的证明）──────────
@@ -269,7 +292,11 @@ check(
   `tier=${JSON.stringify(report?.tier?.tier)} name=${JSON.stringify(report?.tier?.name)}`,
 )
 const cliJob = report?.win32?.checks?.jobObject
-check('C5 JSON 里 win32.checks.jobObject 存在', cliJob !== undefined && cliJob !== null, `jobObject=${excerpt(JSON.stringify(cliJob ?? null))}`)
+if (FFI_UNAVAILABLE) {
+  skip('C5 JSON 里 win32.checks.jobObject 存在', '本环境 koffi 不可用 ⇒ cli probe 的 win32.checks 为空（没有 Job 可测）')
+} else {
+  check('C5 JSON 里 win32.checks.jobObject 存在', cliJob !== undefined && cliJob !== null, `jobObject=${excerpt(JSON.stringify(cliJob ?? null))}`)
+}
 W('')
 
 // ── 断言 D：jobObject 判定必须来自子进程指派路径（tier 修复意图不得回退）────────
@@ -284,8 +311,13 @@ W('')
 W('=== D. jobObject 判定来源必须仍是"子进程指派 + 回读 accounting" ===')
 const judged = probeJob ?? cliJob
 const sessionBoundary = judged?.status === 'unknown' && judged?.boundary === 'open-process-denied'
-W(`SUITE-CLASS: ${sessionBoundary ? 'requires-unconstrained-session' : 'offline-deterministic'}`)
-if (sessionBoundary) {
+W(`SUITE-CLASS: ${FFI_UNAVAILABLE ? 'requires-ffi-backend' : sessionBoundary ? 'requires-unconstrained-session' : 'offline-deterministic'}`)
+if (FFI_UNAVAILABLE) {
+  skip(
+    'D jobObject 判定来源（子进程指派 + 回读 accounting）',
+    '本环境 koffi 不可用 ⇒ 建不了验证用 Job、也派生不了子进程去回读 accounting；需在装有 koffi 的未受限会话复跑',
+  )
+} else if (sessionBoundary) {
   check(
     'D1（需未受限会话）OpenProcess 被拒 ⇒ 必须记 unknown + boundary=open-process-denied（**不得**记 pass）',
     judged.status === 'unknown' &&
@@ -314,12 +346,20 @@ if (sessionBoundary) {
     `accounting=${JSON.stringify(judged?.accounting ?? null)}`,
   )
 }
-check(
-  'D3 证据里含真实派生出的子进程 pid',
-  Number.isInteger(judged?.childPid) && judged.childPid > 0 && judged?.childSpawned === true,
-  `childPid=${judged?.childPid} childKind=${judged?.childKind} childSpawned=${judged?.childSpawned}`,
-)
-check('D5 证据里没有自指派成功（selfAssigned 不为 true，也没有 self 分支）', judged?.selfAssigned !== true, `selfAssigned=${JSON.stringify(judged?.selfAssigned)}`)
+if (FFI_UNAVAILABLE) {
+  skip('D3 / D5 子进程 pid 与"无自指派"证据', '本环境 koffi 不可用 ⇒ 没有可检查的 jobObject 证据对象（同上）')
+} else {
+  check(
+    'D3 证据里含真实派生出的子进程 pid',
+    Number.isInteger(judged?.childPid) && judged.childPid > 0 && judged?.childSpawned === true,
+    `childPid=${judged?.childPid} childKind=${judged?.childKind} childSpawned=${judged?.childSpawned}`,
+  )
+  check(
+    'D5 证据里没有自指派成功（selfAssigned 不为 true，也没有 self 分支）',
+    judged?.selfAssigned !== true,
+    `selfAssigned=${JSON.stringify(judged?.selfAssigned)}`,
+  )
+}
 W('')
 
 // ── 断言 D（静态）：源码里不得再出现自指派语句与 0x2000 ─────────────────────
@@ -382,16 +422,23 @@ if (argv.includes('--static-only')) {
     r.status === 0 && r.stdout.includes('SURVIVED-TO-END'),
     `status=${r.status} 输出=${excerpt(r.stdout)}`,
   )
-  check(
-    'E2 拿不到指派证据时 jobObject 必须判 fail（fail-closed 未被放宽）',
-    noSpawnJob?.status === 'fail',
-    `status=${JSON.stringify(noSpawnJob?.status)} detail=${excerpt(noSpawnJob?.detail ?? '')}`,
-  )
-  check(
-    'E3 fail 的理由必须如实写明"无法证明进程树回收"',
-    typeof noSpawnJob?.detail === 'string' && noSpawnJob.detail.includes('cannot prove process-tree reclamation'),
-    `detail=${excerpt(noSpawnJob?.detail ?? '')}`,
-  )
+  if (FFI_UNAVAILABLE) {
+    skip(
+      'E2 / E3 拿不到指派证据时必须判 fail',
+      '本环境 koffi 不可用 ⇒ 变体里 loadFfi() 也返回 undefined，走到的是"FFI 不可达"而不是"派生失败"那条路径',
+    )
+  } else {
+    check(
+      'E2 拿不到指派证据时 jobObject 必须判 fail（fail-closed 未被放宽）',
+      noSpawnJob?.status === 'fail',
+      `status=${JSON.stringify(noSpawnJob?.status)} detail=${excerpt(noSpawnJob?.detail ?? '')}`,
+    )
+    check(
+      'E3 fail 的理由必须如实写明"无法证明进程树回收"',
+      typeof noSpawnJob?.detail === 'string' && noSpawnJob.detail.includes('cannot prove process-tree reclamation'),
+      `detail=${excerpt(noSpawnJob?.detail ?? '')}`,
+    )
+  }
 }
 W('')
 

@@ -118,6 +118,9 @@ export function installBaselineWatch(ctx, options = {}) {
       return stop
     }, 'winstage-sandbox: baseline watch')
   } else {
+    // ★ "失败必须响"：没有 `ctx.effect` 时定时器**永远不会随卸载停止**（`unref()` 只是
+    //   不把进程钉住，不是清理）。这条路径只应在自测桩里出现；真出现了必须看得见。
+    logError('基线漂移复核：本 ctx 没有 effect（非 cordis 上下文），定时器**不会**随插件卸载停止。')
     start()
   }
 

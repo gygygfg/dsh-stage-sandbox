@@ -4,7 +4,7 @@
 > 交付：本文件 + `docs/round16/usability-缺陷.md` + 原始证据 `.t\r16\usability/**`（`shots/` 11 张截图、`logs/` 逐字文本与轮询 JSONL、`scripts/` 可复跑脚本、`stage-root-a|b/` 宿主侧原始数据、`cli/` CLI 原始输出、`run-sbx/` headless 抽取物）。
 > 铁律遵守：**未改产品代码**（`src/**`、`dsh-plugin/**`、`tests/**`、`tools/**` 只读）；**未改 `%DSH_HOME%\profiles\web\**`**（前后 sha256 逐字相同，§1.3）；**未杀 3080 宿主**（全程 `3080 → pid 9144` LISTEN）；本会话**未加载沙箱**；只写 `.t\r16\usability/**` 与 `docs/round16/usability-*.md`。
 > 标签：`[实测]` = 本轮真实读数（截图 / DOM / HTTP / 磁盘 / 原始输出）；`[读码/推断]` = 只读代码或由读数推断；`not-run` = 未做。
-> 上一轮同域基线：`docs/round11/usability-报告.md`、`docs/round11/usability-缺陷.md`、`docs/round12/plugin-GUI-修复.md`、`docs/round13/GUI-复验.md`。
+> 上一轮同域基线：`docs/archive/round11/usability-报告.md`、`docs/archive/round11/usability-缺陷.md`、`docs/archive/round12/plugin-GUI-修复.md`、`docs/archive/round13/GUI-复验.md`。
 
 ---
 
@@ -181,7 +181,7 @@ L1  工作区内 (2)
 
 ---
 
-## 4. M1–M7 量化（沿用 `docs/round10/gui/评分表.md` §0 口径：优/可/差；"差"必须给改进项）
+## 4. M1–M7 量化（沿用 `docs/archive/round10/gui/评分表.md` §0 口径：优/可/差；"差"必须给改进项）
 
 | 指标 | R16 判定 | 实测值 / 依据 | 与 R11 对照 |
 |---|---|---|---|
@@ -268,7 +268,7 @@ JSON 有 `tier=T1 / tierRequested=T1 / tierEffective=T1 / launchMode=restricted-
 
 ## 6. GUI 面 vs headless(sbx) 面（任务第 5 项）
 
-**headless run**：`docs\round10\env\scripts\sbx-thread.cmd .t\r16\usability\ws-sbx .t\r16\usability\scripts\prompt-sbx.txt .t\r16\usability\run-sbx winstage`
+**headless run**：`docs\archive\round10\env\scripts\sbx-thread.cmd .t\r16\usability\ws-sbx .t\r16\usability\scripts\prompt-sbx.txt .t\r16\usability\run-sbx winstage`
 ⇒ `[sbx-extract] session=session-64b963fa-995e-4d33-82fc-fddd1ddbc438 stage_files=40 stage_bytes=15367515 ws_files=1 lane_ok=true`，`exit=0`。
 
 **四条判据（协议 §1.1）全绿**：

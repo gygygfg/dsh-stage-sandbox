@@ -1,14 +1,52 @@
-# ── 根工作区（pnpm monorepo）─────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# dsh-stage-sandbox 根工作区（pnpm monorepo）
+#
+# 本仓只放**跨包通用**的规则；各包自己的产物规则见
+# `packages/win/.gitignore` 与 `packages/linux/.gitignore`。
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── 依赖与包管理器 ────────────────────────────────────────────────────────────
 node_modules/
 .pnpm-store/
+.npmcache/
+# 本仓统一用 pnpm（见 pnpm-workspace.yaml）：npm 锁文件一律不入库
+package-lock.json
 pnpm-debug.log*
 
-# 根级运行时/测试产物（各包自己的 .gitignore 仍生效）
-.t/
-.dshstage/
-*.log
+# pnpm 锁文件：当前 `pnpm-workspace.yaml` 的 `overrides` 把 `@deepseek-ai/*` 指向
+# 本机 `.dsh-vendor/`（已忽略）的 `file:` 依赖，锁文件里因此带着 370+ 处本机路径。
+# 入库会产出一份"别人装不上"的锁文件，等拿到内网 registry、删掉 overrides 后再入库。
+pnpm-lock.yaml
 
-# 根级构建产物
+# ── 构建产物 ──────────────────────────────────────────────────────────────────
 /dist/
+/build/
 /coverage/
 *.tsbuildinfo
+
+# ── 运行时 / 测试产物 ─────────────────────────────────────────────────────────
+.t/
+.dshstage/
+.t-*.txt
+*.log
+*.tmp
+*.bak
+
+# ── 本地 vendor 与凭据（绝不入库）─────────────────────────────────────────────
+# `@deepseek-ai/*` 是私有包，公共 registry 404；本目录从 DSH 桌面端 app.asar 提取，
+# 配合 `pnpm-workspace.yaml` 的 `overrides`（file:.dsh-vendor/...）让安装能离线跑通。
+# 不入库：体积大、平台相关、可随时重新提取。
+.dsh-vendor/
+.env
+.env.*
+!.env.example
+*.token
+
+# ── 编辑器与操作系统 ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/

@@ -7,7 +7,7 @@
 // no Windows SDK, no .NET SDK, and no usable unzip/tar/7z guarantee. Node 24 is
 // present and can reach the network. Therefore: download the official Zig
 // distribution with node's built-in fetch, verify its published SHA256, and
-// unpack it with our own ZIP reader (tools/lib/zip.ts). No pipes around native
+// unpack it with our own ZIP reader (tools/lib/zip.mjs). No pipes around native
 // executables are used anywhere in this script.
 //
 // What it installs:
@@ -25,7 +25,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { extractZip, listZip } from './lib/zip.ts';
+import { extractZip, listZip } from './lib/zip.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..');

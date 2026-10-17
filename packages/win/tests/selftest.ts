@@ -18,13 +18,21 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Workspace } from '../src/workspace.ts'
 import { ToolSurface } from '../src/tools.ts'
 import { STATE } from '../src/store.ts'
 import { canonical } from '../src/paths.ts'
 
-const ROOT = process.env.WINSTAGE_TEST_ROOT || 'C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\ws'
+// ★ 交叉验证（环境可移植性）：旧默认值是**作者机器的绝对路径**
+//   `C:\Users\Administrator\Desktop\...` ⇒ 换一台机器（用户名不是 Administrator）时
+//   `mkdirSync` 直接 EPERM，整个离线关口在第 1 个套件就崩，**且没有任何一条断言说清原因**
+//   （崩在 freshWorkspace，测试还没开始）。改成从本文件位置推导 ⇒ 任意机器、任意盘符都能跑。
+//   `WINSTAGE_TEST_ROOT` 仍可覆盖。
+const ROOT =
+  process.env.WINSTAGE_TEST_ROOT ||
+  join(dirname(fileURLToPath(import.meta.url)), '..', '.t', 'ws')
 
 // WP0（2026-10-05）：暂存根已从工作区 `.dshstage` 迁到 **Windows 缓存**
 // （默认 `%LOCALAPPDATA%\Temp\winstage-stage\<会话键>\`）。但该缓存路径**对收窄档的命令行子进程只读**

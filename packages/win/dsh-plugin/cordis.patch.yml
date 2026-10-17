@@ -48,7 +48,7 @@
 # `staging-fs.mjs` 的 fail-closed 自校验使用（两键都给了且不一致 → 直接 throw）。
 #
 # ★ **shell 半边的根不再猜 `process.cwd()`**（那正是"两个根"的成因，实测见
-#   `docs/dsh2-越界与注册表-实测诊断.md` §1）：`shell-executor.mjs` 的
+#   `docs/archive/dsh2/越界与注册表-实测诊断.md` §1）：`shell-executor.mjs` 的
 #   `effectiveWorkspaceRoot()` 现读 loader 行表，取 **fs 行的 `cwd`** 作为权威根
 #   （它才是 fs 半边建 Store 用的那个值），并与 shell 行的 `workspaceRoot` 交叉校验；
 #   两处不一致 ⇒ error 级日志 + 以 fs 根为准（绝不按两个根分叉出两个单例）。
@@ -127,7 +127,7 @@
       name: 'dsh-winstage-sandbox'
       config:
         enabled: true
-        workspaceRoot: &winstageRoot C:\Users\Administrator\Desktop\dsh-winstage-sandbox
+        workspaceRoot: &winstageRoot C:\Users\12075\Desktop\dsh-stage-sandbox
         probeOnStart: true
         # ── R16 修复 · D5-R16-1：网络档位的入口**不在本行**，在下面的 `winstage-shell` 行 ──
         # R15（D5-N5）曾把 `networkTier` 写在本行，R16 实测证明那是**死键**：

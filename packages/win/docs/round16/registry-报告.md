@@ -1,7 +1,7 @@
 # R16 / D4：注册表修改与隔离 —— 域报告
 
 > 责任：teammate `registry`（task-4）· 窗口 2026-10-11 17:46 → 18:36 (+08:00)
-> 装置：`docs\round10\env\scripts\sbx-thread.cmd`（每次起**独立进程**的 `dsh --profile sbx`，`WINSTAGE_SHELL=1`，暂存根钉唯一）
+> 装置：`docs\archive\round10\env\scripts\sbx-thread.cmd`（每次起**独立进程**的 `dsh --profile sbx`，`WINSTAGE_SHELL=1`，暂存根钉唯一）
 > 判定标记：`[实测]` = 本轮真跑并留原始输出；`[引用]` = 只读源码/文档；未跑 = `not-run`
 > 写作用域：`.t\r16\registry\**`、`docs\round16\registry-报告.md`、`docs\round16\registry-缺陷.md`。**产品代码未改一行**；`shim/out` golden 三件套未动。
 > 缺陷清单：[registry-缺陷.md](./registry-缺陷.md)（D4-R16-1 … D4-R16-5）
@@ -292,7 +292,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$reg\host\regstate.ps1" -Ou
 # 1) 最小复现（先真实预建两个 victim 键，再起 TS run）
 New-Item "HKCU:\Software\WinstageR16Probe_$($t.v32)" -Force | Out-Null
 New-ItemProperty "HKCU:\Software\WinstageR16Probe_$($t.v32)" -Name Pre -Value 1 -Force | Out-Null
-cmd /c "$r\docs\round10\env\scripts\sbx-thread.cmd" "$reg\run-w3\ws" "$reg\run-w3\prompt.txt" "$reg\run-w3\out" winstage
+cmd /c "$r\docs\archive\round10\env\scripts\sbx-thread.cmd" "$reg\run-w3\ws" "$reg\run-w3\prompt.txt" "$reg\run-w3\out" winstage
 # 2) 宿主侧复核（不受限）：32 位视图用例应有键壳、默认视图用例应无、victim32 应消失
 powershell -NoProfile -ExecutionPolicy Bypass -File "$reg\host\regstate.ps1" -Out "$reg\host\repro-after.json" -Label after -Tokens $all
 # 3) 解码 WAL（应看到 UNSTAGED 与 CREATE_KEY 的对照）

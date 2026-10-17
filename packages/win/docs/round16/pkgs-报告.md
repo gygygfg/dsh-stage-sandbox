@@ -1,7 +1,7 @@
 # D2 实测报告：pip / node 包安装 + 全局国内镜像 + 保存后完整性（R16 · golden 三件套）
 
 > 会话域：`pkgs`（共享任务 `task-2`）· 实测窗口：2026-10-11 17:46 – 19:0x (+08:00)
-> 载体：**新开的带 WinStage 沙箱的 DSH 线程**（每次 `docs\round10\env\scripts\sbx-thread.cmd <ws> <prompt> <out> winstage`）
+> 载体：**新开的带 WinStage 沙箱的 DSH 线程**（每次 `docs\archive\round10\env\scripts\sbx-thread.cmd <ws> <prompt> <out> winstage`）
 > 沙箱件：`shim/out/winstage-shim.dll` = `63808F51…C8A99EB`（golden，与 R15 §5 一致）
 > 证据根：`.t/r16/pkgs/**` · 缺陷另列 `docs/round16/pkgs-缺陷.md`
 > 纪律：结论只写实测；没跑的写 `not-run`，推断标 `[推断]`；报告一律中文。
@@ -238,7 +238,7 @@ staged\fs\C\Windows\Temp\r16-pkgs-probe.txt           16 B  同上
 
 ## 6. 与 R11 同域结论的对照（复现 / 已修 / 变化）
 
-| R11 结论（`docs/round11/pkgs-报告.md`） | R16 实测 | 判定 |
+| R11 结论（`docs/archive/round11/pkgs-报告.md`） | R16 实测 | 判定 |
 |---|---|---|
 | npm 镜像 URL 级通（npmmirror，0 处 npmjs.org） | 复现：npmmirror×5 / cdn×2 / **npmjs.org×0** | **复现** |
 | **pip 镜像不生效**：`pip config set` 写成功但 pip 读不到（D2-1） | **形态加重**：R16 连"写"都失败（`PermissionError WinError 5`，2 run 复现），配置面根本不存在，pip 走官方源（pypi.org×354） | **复现且更靠前失败**（D2-R16-1） |

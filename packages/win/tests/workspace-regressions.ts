@@ -38,8 +38,8 @@
 
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { join, dirname } from 'node:path'
+import { pathToFileURL, fileURLToPath } from 'node:url'
 import { Workspace } from '../src/workspace.ts'
 import { hashAbsent, sha256Buffer } from '../src/store.ts'
 import { WINDOWS_HIDE, suppressWindowsCriticalErrorDialogs } from '../src/spawn-window.ts'
@@ -48,7 +48,8 @@ suppressWindowsCriticalErrorDialogs()
 
 const PLANT = process.argv.includes('--plant')
 const PROBE_REPARSE = process.argv.includes('--probe-reparse')
-const SCRATCH = 'C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\sbx3\\fix\\ws\\regressions'
+// ★ 同 selftest.ts：旧值是作者机器的绝对路径，换机器必然 EPERM ⇒ 改为从本文件位置推导。
+const SCRATCH = join(dirname(fileURLToPath(import.meta.url)), '..', '.t', 'sbx3', 'fix', 'ws', 'regressions')
 const W = (s) => process.stdout.write(`${s}\n`)
 let assertions = 0
 let failures = 0

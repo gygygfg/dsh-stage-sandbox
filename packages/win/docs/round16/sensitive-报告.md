@@ -1,7 +1,7 @@
 # R16 · 域六（D6）个人敏感文件保护（读 / 写 / 泄露面）+ 明文副本清理 — 实测报告
 
 > 执行：teammate `sensitive` / task-6 · 2026-10-11 17:46–18:12 +08:00
-> 方式：**新开的带 WinStage 沙箱的 DSH 线程**（`docs\round10\env\scripts\sbx-thread.cmd`，独立进程，`profile=sbx`）
+> 方式：**新开的带 WinStage 沙箱的 DSH 线程**（`docs\archive\round10\env\scripts\sbx-thread.cmd`，独立进程，`profile=sbx`）
 > 铁律遵守：报告与证据中**只有路径 / 字节数 / sha256 / 布尔标记**，无任何密钥原文或片段；
 > 真实敏感文件**零字节改动**（§6 宿主侧权威比对）；测试产生的明文副本**已全部删除并留痕**（§5）。
 > 同一域内跑了 6 个 run（≤ 协议 §1.2 上限）；其中 **4 个 lane 有效**（run1/1b/1c **执行失败**，见 §3）。

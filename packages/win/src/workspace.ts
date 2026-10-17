@@ -426,13 +426,34 @@ export function writeFileAtomicReplacing(target, content) {
       renameSync(tmp, target)
       return { strategy: 'rename', bytes: content.length }
     } catch (renameError) {
-      // 目标存在时的 Windows 覆盖式改名：先摘掉目标，再改名。此路径下临时文件已写好，
-      // 因此不存在"内容还没准备好就把原文件删了"的窗口。
+      // 目标存在时的 Windows 覆盖式改名：先把**原件挪到同目录备份名**，再把新件改上去。
+      //
+      // 为什么不能像旧实现那样 `rmSync(target)` 再 `renameSync`：
+      //   那两步之间目标**已不存在**；一旦第二次 rename 抛错（文件被占用 / 杀软 /
+      //   同卷判定失败），外层 catch 又会 `cleanupTemp(tmp)` 把新件删掉 ⇒
+      //   **原件没了、新件也没了**，与上方"失败时原文件一字节未动"的硬承诺直接矛盾。
+      //   改成"先备份再改名"后：第二次 rename 失败就把备份改回原位，
+      //   最坏情况是停在原内容（可重试），绝不会停在"什么都没有"。
       if (!existsSync(target)) {
         throw renameError
       }
-      rmSync(target, { force: true })
-      renameSync(tmp, target)
+      const backup = join(dir, `.${randomUUID()}.stage-bak`)
+      renameSync(target, backup)
+      try {
+        renameSync(tmp, target)
+      } catch (replaceError) {
+        try {
+          renameSync(backup, target)
+        } catch {
+          /* 还原失败也必须把"为什么替换失败"抛出去，不能吞成"文件没了" */
+        }
+        throw replaceError
+      }
+      try {
+        rmSync(backup, { force: true })
+      } catch {
+        /* 备份残留不改变结果（目标已是新内容） */
+      }
       return { strategy: 'replace', bytes: content.length }
     }
   } catch (error) {
@@ -1740,6 +1761,24 @@ export class Workspace {
         // "真实文件在暂存之后出现"（有内容丢失风险）而不是笼统的"基线已过期"。
         driftReason: driftReasonOf(expected, realNow),
       })
+    }
+
+    /**
+     * ── 缺陷（交叉验证实测）：`mkdir` 被"after.hash === absent"误判成删除 ────────────
+     *
+     * `diffEntries()` 产出的目录创建条目是
+     * `{op:'mkdir', kind:'dir', before:{hash:absent}, after:{hash:absent}}`
+     * （目录不是内容对象，两侧都必然是 absent）。而下面那条兜底判据是
+     * `change.op === 'delete' || change.after?.hash === hashAbsent()` ⇒ mkdir **命中删除分支** ⇒
+     *   · 该路径在真实盘上**真的存在**时（例如那里是个文件）会被 `rmSync(recursive)` 删掉；
+     *   · 不存在时是**静默 no-op**，目录从头到尾没被创建，而 `applyCandidate()` 事后把
+     *     `entry.baseKind` 写成 `'dir'`、`changed=false` ⇒ 这条"建目录"永远退出视图，
+     *     用户以为批了、盘上什么都没有。
+     * 因此 mkdir 必须**先于**那条兜底判据分流，并且显式 `mkdirSync`。
+     */
+    if (change.op === 'mkdir' || (change.kind === 'dir' && change.op !== 'delete')) {
+      mkdirSync(abs, { recursive: true })
+      return
     }
 
     if (change.op === 'delete' || change.after?.hash === hashAbsent()) {

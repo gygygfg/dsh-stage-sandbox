@@ -281,8 +281,8 @@ workspace.writeFile(abs, readFileSync(abs), { origin: 'run-capture' })   // ← 
 
 ```
 $ grep -rn "maskEnforcement|assertReadable" ws/
-docs\dsh2-发现记录.md:270:  - [引用] **`hard` 字段此前没有任何消费者**：全仓库 `grep` 只有 `workspace.mjs:141 assertReadable`
-docs\dsh2-冲突诊断-插件侧.md:951: | `dsh-plugin/staging-fs.mjs`（全文 835 行） | `maskOf`/`assertReadable`/`Workspace.readFile` **出现 0 次**（grep 复核） | ⇒ **`ctx.fs` 的读路径根本不走遮蔽** |
+docs\archive\dsh2\发现记录.md:270:  - [引用] **`hard` 字段此前没有任何消费者**：全仓库 `grep` 只有 `workspace.mjs:141 assertReadable`
+docs\archive\dsh2\冲突诊断-插件侧.md:951: | `dsh-plugin/staging-fs.mjs`（全文 835 行） | `maskOf`/`assertReadable`/`Workspace.readFile` **出现 0 次**（grep 复核） | ⇒ **`ctx.fs` 的读路径根本不走遮蔽** |
 src\workspace.mjs:369:    this.maskEnforcement = true
 src\workspace.mjs:445:  assertReadable(absolutePath) {
 src\workspace.mjs:446:    if (!this.maskEnforcement) return

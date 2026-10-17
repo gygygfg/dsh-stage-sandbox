@@ -1961,12 +1961,26 @@ export class ReviewService {
         failed.push({ path: entry.path, error: `${entry.status ?? ''} ${entry.reason ?? ''}`.trim() || 'parent-key-missing' })
       }
       const applied = result.applied ?? []
+      const stale = result.stale ?? []
+      // ★ 交叉验证（D4）：`stale` 单元**一个字节都不写**（registry-stage.ts:2577-2583），
+      //   旧实现 `ok = failed.length === 0` ⇒ 全部 stale 时也返回 `ok:true, approved:0` ——
+      //   "点了批准、回报成功、真实 hive 零改动"，正是本仓最忌讳的"报成功其实没写"。
+      //   stale 并入 failed 上报（可机读），并让它影响 ok。
+      for (const entry of stale) {
+        failed.push({
+          path: entry.path,
+          error: `stale: 冻结后真实注册表已被外部改动，本次未写入（先 /winstage rebase 或重新冻结）${entry.reason ? ` — ${entry.reason}` : ''}`,
+        })
+      }
       return {
         ok: failed.length === 0,
         approved: applied.length,
         failed,
-        stale: result.stale ?? [],
-        message: `注册表：已应用 ${applied.length} 项${failed.length ? `，失败 ${failed.length} 项` : ''}`,
+        stale,
+        message:
+          `注册表：已应用 ${applied.length} 项` +
+          `${failed.length ? `，失败/未写入 ${failed.length} 项` : ''}` +
+          `${stale.length ? `（其中 ${stale.length} 项因真实注册表已变化而未写入）` : ''}`,
       }
     } catch (error) {
       const detail = `${error?.code ?? error?.name ?? 'error'}: ${error?.message ?? error}`
@@ -2396,6 +2410,32 @@ export function listReviewServices(workspaceRoot) {
     out.push(service)
   }
   return out
+}
+
+/**
+ * ★ Cordis 卸载协议：清空本模块持有的**进程内单例与缓存**。
+ *
+ * 为什么必须有：`SERVICES` / `EFFECTIVE_STAGING` / `READ_VISIBILITY` 都是**模块级**
+ * Map，而 DSH 的 loader 按**模块 URL**缓存已导入的插件 —— 行被卸载/重挂时模块实例
+ * 仍在（不会重新求值），于是这些 Map 会带着整个 `Workspace` / `Store` / 会话 session
+ * 闭包常驻，**卸载即残留**。本函数由 `host-plugin.ts` 的 `ctx.effect()` 清理函数调用。
+ *
+ * ⚠ 只清**内存**：磁盘上的会话存储根（`%LOCALAPPDATA%\Temp\winstage-stage\<键>`）由
+ *   `src/stage-guard.ts` 在宿主进程退出时回收，这里**不**删盘 —— 卸载插件时删掉用户
+ *   还没批准的暂存内容是数据丢失，不是清理。
+ *
+ * @returns {{services: number, effectiveStaging: number, readVisibility: number}} 清掉的数量
+ */
+export function disposeReviewServices() {
+  const counts = {
+    services: SERVICES.size,
+    effectiveStaging: EFFECTIVE_STAGING.size,
+    readVisibility: READ_VISIBILITY.size,
+  }
+  SERVICES.clear()
+  EFFECTIVE_STAGING.clear()
+  READ_VISIBILITY.clear()
+  return counts
 }
 
 export function getReviewService(options = {}) {

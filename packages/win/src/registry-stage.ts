@@ -6,7 +6,7 @@
  * `src/registry-guard.ts` 的定位是**检测**：执行前快照、执行后差异、可选回滚**计划**。
  * 它**不阻止**写入（见该文件头注释）。`[实测]` 沙箱内
  * `New-Item HKCU:\Software\X` → `UnauthorizedAccessException`，归因见
- * `docs/dsh2-越界与注册表-实测诊断.md` §3：`HKCU:\Software` 的 SD 里
+ * `docs/archive/dsh2/越界与注册表-实测诊断.md` §3：`HKCU:\Software` 的 SD 里
  * `NT AUTHORITY\RESTRICTED` 只有 `ReadKey`，而受限令牌确含该 SID ——
  * **拒绝由受限令牌本身引入**，且发生在**内核**，不是"没捕获"。
  *
@@ -246,7 +246,49 @@ export const REG_STAGE_HOOKED_APIS = Object.freeze([
 ])
 
 /**
+ * ★ 交叉验证实测（R17）：**不在 shim 拦截面上**的注册表 API ⇒ 当前**直落真实 hive**。
+ *
+ * 这条清单终结一句**假承诺**（`docs/T3-注册表暂存设计.md` §8.2 原话）：
+ *     "任何不在被 hook 的 8 个 API 之内的调用**同样硬拒**（`REG_STAGE_API_NOT_HOOKED`）：
+ *      白名单比黑名单诚实 —— 新 API 默认是'不覆盖'，而不是'悄悄放过去写真实 hive'。"
+ * 实测不成立，原因在点-hook 的模型本身：
+ *   · shim 是 **IAT 点钩**：只有出现在 `shim/src/ws_hook.c` 的 `WS_TARGET(...)` 名单里的
+ *     符号才会被改写。没在名单里的 API，调用方的 IAT 项**原样指向系统 DLL**；
+ *   · `classifyRegistryOperation()` 是 **TS 侧纯函数**，它只被 shim 的 `ws_Reg*` 实现调用。
+ *     对未 hook 的 API，它**一次都不会被调用** ⇒ 它返回的 `REG_STAGE_API_NOT_HOOKED`
+ *     / 硬拒状态**永远没人执行**；
+ *   · 因此"不 hook"在 IAT 模型下等价于 **"不拦截"**，而"不拦截"= **写入直落真实 hive**，
+ *     既不暂存、也不产生任何 `HARD_DENY`/`UNSTAGED` 审计记录。
+ *   （`REG_STAGE_API_NOT_HOOKED` 在 `shim/` 全目录 **0 命中**，可作上述第二点的硬证据。）
+ *
+ * 涉及的两类 API（均为写入侧，即本插件声称要暂存的那一面）：
+ *   · `RegSetKeyValueW/A`：语义 = `RegCreateKeyEx` + `RegSetValueEx` + `RegCloseKey`。
+ *     .NET `Registry.SetValue` / `Microsoft.Win32` 与 PowerShell `New-ItemProperty`
+ *     走的就是它，**不经过**我们 hook 的那两个入口 ⇒ 直落真实 hive。
+ *   · `RegDeleteTreeW/A`：递归删子树。.NET `DeleteSubKeyTree` 走它 ⇒ 直落真实 hive。
+ * 要治本必须在 C 侧给它们写 `ws_` 实现并列入 `WS_TARGET`（本会话没有 MSVC，见 README §1.1）。
+ *
+ * 本清单的作用是让"漏了什么"成为**可查的数据**，而不是文档里的一句承诺：
+ * 只有当 API 真的进了 `WS_TARGET`，`classifyRegistryOperation()` 才会被调用、下面那条
+ * 硬拒清单才谈得上"生效"。`tests/registry-stage.ts` 直接从 `ws_hook.c` 解析 `WS_TARGET`
+ * 名单并与本清单求交集 ⇒ **补上 hook 而没从本清单删掉即红**（防清单漂成新的假承诺）。
+ */
+export const REG_STAGE_UNHOOKED_APIS = Object.freeze([
+  'RegSetKeyValueW',
+  'RegSetKeyValueA',
+  'RegDeleteTreeW',
+  'RegDeleteTreeA',
+])
+
+/**
  * 明确**不**支持、且必须 fail-closed 的 API。
+ *
+ * ⚠ 生效前提（交叉验证实测，R17）：本清单是**意图声明**，不是拦截生效的证据。
+ *   只有当某个 API **真的在** `WS_TARGET` 名单里（见 `REG_STAGE_UNHOOKED_APIS` 的说明），
+ *   shim 才会截获它、才会调用 `classifyRegistryOperation()`、本清单的硬拒才会被执行。
+ *   目前本清单里**没有一条**在 `WS_TARGET` 内 ⇒ 它们当下的真实结局是**直落真实 hive**，
+ *   而不是这里写的"硬拒"。把两者分开列（硬拒意图 vs 未 hook 盲区）正是为了
+ *   不再让"清单上有名字"被读成"已经拦住了"。
  *
  * 为什么不能"尽力而为"地放过：这些调用的语义覆盖层复现不了
  * （整棵 hive 的加载/保存/替换、事务、重命名、SD 改写、远程 hive），
@@ -1997,6 +2039,18 @@ export function createRegistryStage(options = {}) {
     writeJson(statePath, resolution)
   }
 
+  /**
+   * 把候选的终态同步进 `queue.json`（面板与 `listReviews()` 的真相来源）。
+   * `discard()` 一直有这一步，而 `apply()` 没有（D3）；两条路径必须同一口径。
+   */
+  function syncQueueStatus(id, status) {
+    if (!id) return
+    const queue = readJsonIfExists(queuePath)
+    if (!queue || queue.version !== 1 || !queue.candidates?.[id]) return
+    queue.candidates[id] = { ...queue.candidates[id], status }
+    writeJson(queuePath, queue)
+  }
+
   function appendRecord(record) {
     mkdirSync(stageRoot, { recursive: true })
     const buffer = encodeJournalRecord(record)
@@ -2615,6 +2669,12 @@ export function createRegistryStage(options = {}) {
     else if (applied.length > 0) resolution.status = CANDIDATE_STATUS.PARTIALLY_APPLIED
     else if (stale.length > 0 && failed.length === 0) resolution.status = CANDIDATE_STATUS.STALE
     saveResolution()
+    // ★ 交叉验证（D3）：只写 `resolution.status`（overlay.state.json）而**不动队列**，
+    //   面板读的是队列（`workspace.ts::listReviews()` 保留 PENDING/PARTIALLY_APPLIED/STALE）
+    //   ⇒ 批准后面板仍列出同一批注册表行、`review.json.pending` 恒 true，再点一次批准
+    //   会全命中 `already-applied` ⇒ `applied=0, failed=0` 却仍报成功。
+    //   对照 `discard()`（:2661-2669）本来就会同步队列 —— 应用侧漏了同一件事。
+    syncQueueStatus(resolution.candidateId, resolution.status)
     // 候选文件是审计对象：应用后把"已应用了什么 + 刷新后的 before"落盘，
     // 否则磁盘上的候选会长期停在冻结那一刻，与真实发生的应用不一致。
     if (candidate) writeJson(join(candidateDir, `${candidate.id}.json`), candidate)

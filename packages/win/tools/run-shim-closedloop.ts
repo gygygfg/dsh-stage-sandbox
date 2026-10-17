@@ -523,7 +523,7 @@ function main() {
   // sample therefore turned a ~20% transient crash into a deterministic-looking
   // red (E8.carrier-powershell, exit=null = 30s injector timeout) even though
   // the runtime starts fine on the next attempt. The flake stays a first-class
-  // product defect (docs/round10/shim/defects.md) and is RECORDED here; the gate
+  // product defect (docs/archive/round10/shim/defects.md) and is RECORDED here; the gate
   // only stops converting it into a false product verdict. A real regression
   // (runtime never starts) still fails every attempt and stays red.
   const CARRIER_ATTEMPTS = Math.max(1, Number(process.env.WINSTAGE_CARRIER_ATTEMPTS) || 3);
@@ -559,7 +559,7 @@ function main() {
       attemptDetail: attempts,
     });
     const flakeNote = flaked
-      ? ` FLAKE: ${attempts.length - 1} attempt(s) failed before a clean start (recorded in attemptDetail; product defect, see docs/round10/shim/defects.md)`
+      ? ` FLAKE: ${attempts.length - 1} attempt(s) failed before a clean start (recorded in attemptDetail; product defect, see docs/archive/round10/shim/defects.md)`
       : '';
     check(
       `E8.carrier-${c.id}`,

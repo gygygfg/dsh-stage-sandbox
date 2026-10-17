@@ -209,7 +209,7 @@ F5 只证明了"绕过"。F5b 追问"那插件到底发不发现"：
 | 文档 | 文档口径 | 本次实例侧实测 | 判定 |
 |---|---|---|---|
 | `docs\DSH集成.md` §5 **S1** | "shell 写入不经过暂存 —— 仍然存在，且本机不可能实现" | F5 完全复现（真实盘立即变、暂存不动、面板照旧） | **一致**（本次把它在 live 实例上钉死） |
-| `docs\dsh2-越界与注册表-实测诊断.md` | `ctx.fs` 工作区外写 → 外部条目 + `staged-ext` 物化；`ctx.shell` 越界写 / 注册表写 → **内核级硬拒** | F2 一致（`staged-ext\b8\b814e879557075dc\probe.txt`，真实盘连目录都没建）；F8 一致（`Access to the registry key … is denied.`） | **一致** |
+| `docs\archive\dsh2\越界与注册表-实测诊断.md` | `ctx.fs` 工作区外写 → 外部条目 + `staged-ext` 物化；`ctx.shell` 越界写 / 注册表写 → **内核级硬拒** | F2 一致（`staged-ext\b8\b814e879557075dc\probe.txt`，真实盘连目录都没建）；F8 一致（`Access to the registry key … is denied.`） | **一致** |
 | `src\paths.mjs`（`MASK_CLASSES` / T2 收敛） | 敏感路径**应当**被遮蔽；文档同时如实声明这是"检测/兜底"、非硬边界 | F6：`.npmrc`（`npmrc` 类）、`.dsh`（`dsh-home` 类）经 **`pwsh`** 原样可读 / 可枚举 | **一致**（文档已声明 R1 残余；本次确认该残余同样适用于 shell 面） |
 | `src\workspace.mjs` / `docs` 中关于 **STALE_BASELINE / `staleBaseline` / 基线过期可见** 的口径 | 基线被外部改动后应可见（`staleBaseline` 计数、`data-winstage-baseline-stale` 徽标、`STALE_BASELINE` 错误码） | F5b：真实盘被 shell 改成 `SHELL-VERSION`、基线 `absent` 时，`staleBaseline=0`、`alerts=[]`、无徽标、90 s 不重发布；「批准所选」**静默覆盖**为 `STAGED-VERSION` | ~~**出入（记 FAIL）**：文档描述的 stale 可见性**没有覆盖"基线 = absent（新增）而真实文件在暂存后出现"这一形状**；本报告只到现象定因，未做源码定因~~ → **修复后已一致（本轮复测）**：② 修复补齐了该形状（`baselineStaleCode=baseline-appeared`）并让批准 fail-closed；本报告的失败读数已成为历史口径，见 §9 |
 | 任务书 F9 的隐含假设 | "对单个条目点『拒绝』" | 面板**只有**「拒绝全部」（`/winstage reject`），**没有**逐项拒绝；逐项拒绝只能走 `/winstage reject <path>` 命令（`host-plugin.mjs:381-387` 已注册带可选路径的命令）。「批准所选」则确实存在（勾选后出现） | **需澄清**：UI 层"逐项拒绝"不存在，逐项批准存在 |

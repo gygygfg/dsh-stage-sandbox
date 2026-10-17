@@ -56,8 +56,8 @@ npm publish --registry=https://registry.npmjs.org --access public
   （`C:\Users\Administrator\Desktop\dsh-winstage-sandbox`）。**首次安装后请在设置里把它改成你的工作区**，
   或在 profile 覆盖层重述（`winstage-fs` 行要同时重述 `cwd` 与 `workspaceRoot`，二者必须一致）。
 - **shim 二进制**：发行包只带 shim 的 **C 源码**（`shim/src` 等），不含构建产物
-  （`shim/out/*.dll`）。需要透明模式时在本机执行 `node tools/build-shim.mjs`（需
-  `node tools/fetch-toolchain.mjs` 取得 zig）。未构建时插件退化为受限令牌档。
+  （`shim/out/*.dll`）。需要透明模式时在本机执行 `node tools/build-shim.ts`（需
+  `node tools/fetch-toolchain.ts` 取得 zig）。未构建时插件退化为受限令牌档。
 - **开关关闭时**：文件面立即退回平台 `SandboxedFileSystem`；命令面按 profile 开关在**装配期**交还
   平台 `pwsh-sandbox`（运行中切换需重启宿主）。见 `docs/插件启动-环境监测与开关保证.md` §2。
 

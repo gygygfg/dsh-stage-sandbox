@@ -68,7 +68,7 @@
 ### F6–F9
 - F6：`tools/win-gui/run.cmd`（已迁 `e2e/guest/run-win-gui.cmd`）非 ASCII ⇒ R11 判红；改为纯 ASCII 注释。
 - F7：`dsh-plugin/client.ts:1460/1465` 重复 `background`；删其一。
-- F8：`docs/round10/env/scripts/sbx-thread.cmd` 仍导出 `WINSTAGE_SBX_WORKSPACE`，而源码已用它作 profile 配置来源之外的死键。
+- F8：`docs/archive/round10/env/scripts/sbx-thread.cmd` 仍导出 `WINSTAGE_SBX_WORKSPACE`，而源码已用它作 profile 配置来源之外的死键。
 - F9：`tests/dsh2-shell-fallback-verify.ts`、`tests/registry-conformance.ts` 的 `.mjs` 断言改为 `.ts`。
 
 ## 3. 仍未提供的保证（如实声明）

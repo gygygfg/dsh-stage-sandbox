@@ -7,7 +7,8 @@
  */
 
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { resolveExecutable, buildChildEnvironment, ENV_ALLOWLIST } from '../src/executor.ts'
 
 const W = (s) => process.stdout.write(`${s}\n`)
@@ -17,7 +18,8 @@ const check = (name, ok, detail) => {
   W(`${ok ? '  ✓' : '  ✗'} ${name}${detail ? `\n      证据: ${detail}` : ''}`)
 }
 
-const ROOT = 'C:\\Users\\Administrator\\Desktop\\dsh-winstage-sandbox\\.t\\resolve'
+// ★ 同 selftest.ts：旧值是作者机器的绝对路径，换机器必然 EPERM ⇒ 改为从本文件位置推导。
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '.t', 'resolve')
 rmSync(ROOT, { recursive: true, force: true })
 const binA = join(ROOT, 'binA')
 const binB = join(ROOT, 'binB')

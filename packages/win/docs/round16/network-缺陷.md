@@ -28,7 +28,7 @@ run 内**没有任何效果**：lane 仍写 `requested=OBSERVED_ONLINE / state=n
 ```powershell
 # A) 宿主行 —— 无效
 $env:SBX_PATCH = "<repo>\.t\r16\network\overlay-offline.yml"   # 该 overlay 把 networkTier: OFFLINE 写在 id: winstage-sandbox 行
-cmd /c "docs\round10\env\scripts\sbx-thread.cmd <ws> <prompt> <out> winstage"
+cmd /c "docs\archive\round10\env\scripts\sbx-thread.cmd <ws> <prompt> <out> winstage"
 # ⇒ lane: requested=OBSERVED_ONLINE；prompt 里的 echo 命令写出的文件真实落在暂存树里
 
 # B) shell 行 —— 有效

@@ -43,7 +43,7 @@ import { WindowsStageExecutor, resolveDshModuleRoot } from '../src/executor.ts'
 import { compareKey } from '../src/paths.ts'
 import { renderCandidateDiff } from '../src/tools.ts'
 import { verifyStageRootAlive } from '../src/stage-guard.ts'
-import { REVIEW_BASENAME, getReviewService, resolveReviewStoreDir } from './review-service.ts'
+import { REVIEW_BASENAME, getReviewService, resolveReviewStoreDir, disposeReviewServices } from './review-service.ts'
 import { installBaselineWatch } from './baseline-watch.ts'
 import { createAuditMirror } from './audit-mirror.ts'
 import { createRunCapture } from './run-capture.ts'
@@ -1198,7 +1198,11 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
   ]
 
   for (const spec of SPECS) {
-    registered.push(
+    // ★ Cordis 卸载协议：`scope.commands.register()` 的**返回值就是 disposer**，
+    //   旧实现把它 push 进 `registered` 后只取 `.length` 就丢弃（host-plugin 调用处），
+    //   于是"卸载后 7 条命令仍在"没有归 cordis 持有的清理路径。这里显式交给 `scope.effect()`
+    //   （同仓 `plugin/commands.ts:173` 已经是这个写法，两条注册路径口径此前不一致）。
+    const registerOnce = () =>
       scope.commands.register({
         definitionId: `winstage-sandbox/${spec.name}`,
         name: spec.name,
@@ -1239,8 +1243,15 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
             return { kind: 'error', text: `/${spec.name} 失败：${error?.message ?? error}` }
           }
         },
-      }),
-    )
+      })
+    const disposer = registerOnce()
+    if (typeof scope?.effect === 'function') {
+      scope.effect(
+        () => (typeof disposer === 'function' ? disposer : () => {}),
+        `winstage-sandbox: command ${spec.name}`,
+      )
+    }
+    registered.push(disposer)
   }
   return registered
 }
@@ -1551,6 +1562,33 @@ export function apply(ctx, config = {}) {
     return service
   }
 
+  /**
+   * 1.5) ★ Cordis 卸载协议：**进程内单例的清理**。
+   *
+   * `review-service.ts` 的 `SERVICES` / `EFFECTIVE_STAGING` / `READ_VISIBILITY` 都是
+   * **模块级** Map，而 DSH loader 按模块 URL 缓存 ⇒ 行被卸载时模块不会重新求值，
+   * 这些 Map 会带着 Workspace / Store / 会话 session 闭包常驻（**卸载即残留**）。
+   * 这里把它们交给 cordis：卸载/重挂时一并清空。
+   *
+   * ⚠ 只清内存，**不删盘**：磁盘上的会话存储根由 `src/stage-guard.ts` 在宿主进程退出时
+   *   回收；卸载插件时删掉用户尚未批准的暂存内容是数据丢失，不是清理。
+   */
+  if (typeof ctx?.effect === 'function') {
+    ctx.effect(() => {
+      return () => {
+        try {
+          const counts = disposeReviewServices()
+          log.info(
+            `已卸载：清空进程内审阅服务 ${counts.services} 个 / 生效态缓存 ${counts.effectiveStaging} 条 / ` +
+              `读侧可见性 ${counts.readVisibility} 条（磁盘上的会话存储根保留，不随卸载删除）。`,
+          )
+        } catch (error) {
+          logError(`卸载清理失败（已忽略）：${error?.message ?? error}`)
+        }
+      }
+    }, 'winstage-sandbox: dispose review services')
+  }
+
   // 2) 命令面（可选服务：没有 commands 就不注册，绝不让加载失败）
   ctx.inject(['commands'], (scope) => {
     // 注册失败必须**响**：这个回调一旦抛错，`/winstage*` 会整族消失却毫无提示
@@ -1596,7 +1634,22 @@ export function apply(ctx, config = {}) {
       })
       const route = { kind: 'prefix', path: PANEL_ROUTE_PREFIX, handler }
       if (typeof webScope.effect === 'function') {
-        webScope.effect(() => webScope.webServer.register(route), 'winstage-sandbox: panel routes')
+        // ★ Cordis 卸载协议 + "失败必须响"：`register()` **是否返回 disposer 在本仓没有任何
+        //   证据**。旧实现把它直接当清理函数交给 `effect()` —— 若返回 undefined，`ctx.effect`
+        //   会静默接受（不报错、不清理）⇒ **卸载后 `/winstage-panel` 路由仍然可达**。
+        //   这里显式判定：拿不到函数就记 error 级日志，并在有 `unregister` 时退回它。
+        webScope.effect(() => {
+          const disposer = webScope.webServer.register(route)
+          if (typeof disposer === 'function') return disposer
+          logError(
+            `webServer.register() 未返回 disposer（返回 ${typeof disposer}）：面板路由无法在卸载时注销，` +
+              '若宿主提供 webServer.unregister 则退回它，否则本路由会残留到进程结束。',
+          )
+          if (typeof webScope.webServer.unregister === 'function') {
+            return () => webScope.webServer.unregister(route)
+          }
+          return () => {}
+        }, 'winstage-sandbox: panel routes')
       } else {
         webScope.webServer.register(route)
       }

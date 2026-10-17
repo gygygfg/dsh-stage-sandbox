@@ -1,13 +1,22 @@
-node_modules
-lib
-*.log
+# dsh-sandbox-linux 忽略规则
+#
+# 总原则：源码、脚本与单元测试入库；运行产物不入库。
+# 本包的 51 个 `tests/**/*.spec.ts` 是正式的单测入口（`vitest.config.ts` 收录），
+# 真机验证脚本在 `scripts/`（e2e / runtime-conformance / security-conformance /
+# test-in-container.sh），同样入库。
 
-# Build output
+# ── 依赖与构建 ────────────────────────────────────────────────────────────────
+node_modules/
+lib/
 dist/
 coverage/
 *.tsbuildinfo
+package-lock.json
 
-# Test / ebk packaging run outputs
+# ── 运行产物 ──────────────────────────────────────────────────────────────────
+*.log
+
+# ephemeral-build-kit / 容器套件的运行现场（由 scripts/test-in-container.sh 生成）
 ebk/container-artifacts/
 ebk/compose/
 ebk/storage/
@@ -15,7 +24,3 @@ ebk/linux-shared/
 /compose/
 /storage/
 /artifacts/
-
-# ebk run artifacts, except the committed host reference result
-ebk/artifacts/*
-!ebk/artifacts/RESULT_linux_host.json

@@ -1,7 +1,7 @@
 # 域五（network, task-5）· R16 网络服务与网络访问实测报告
 
 > 执行侧：域5 owner 线程（3080 web 会话，`WINSTAGE_SHELL=0`，**本会话未加载沙箱**），
-> 通过 `docs\round10\env\scripts\sbx-thread.cmd` 新起 **4 个独立的 `--profile sbx` 沙箱线程**（每 run 唯一 stage root），
+> 通过 `docs\archive\round10\env\scripts\sbx-thread.cmd` 新起 **4 个独立的 `--profile sbx` 沙箱线程**（每 run 唯一 stage root），
 > 外加 1 个**宿主未受限控制组**（`WINSTAGE_SHELL=0`，真实盘）。
 > 证据分层：`[实测]` = 有原始输出落盘；`[读码]` = 只读源码核对；`[推断]` = 由原始读数推导；`not-run` = 未执行。
 > 时间：2026-10-11 17:50–18:00（+08:00）。run 计数 **4/6**（协议上限 6）。
@@ -351,7 +351,7 @@ cmd /c "netsh wfp show state   file=<abs>\wfp\pre-state.xml"
 
 # 2) run n1（默认档，出站+入站主测）
 $env:SBX_STAGE_ROOT = "<abs>\run-n1\stage-root-r16n1"; Remove-Item Env:SBX_PATCH -EA 0
-cmd /c "docs\round10\env\scripts\sbx-thread.cmd <abs>\ws-n1 <abs>\prompt-n1.txt <abs>\run-n1 winstage"
+cmd /c "docs\archive\round10\env\scripts\sbx-thread.cmd <abs>\ws-n1 <abs>\prompt-n1.txt <abs>\run-n1 winstage"
 
 # 3) 与 n1 并行：宿主未受限侧轮询 ready.json 并连入（外部探针）
 powershell -NoProfile -File .t\r16\network\external-inbound.ps1 -RunOutDir <abs>\run-n1 -OutJson <abs>\external-n1.json -LanIp 10.81.126.50 -PollSeconds 420

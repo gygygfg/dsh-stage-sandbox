@@ -555,12 +555,12 @@ function applyLiteralEdit(text, edit, displayPath) {
  *       也**不产生候选**。模型面看到的是本插件自己的诚实文案（实测：`dsh-tool-fs` 的
  *       `mapError()` 在暂存面（`sandboxMode === undefined` ⇒ `policy === undefined`）
  *       **不会**把它换成 `[sandbox: …]` 标记 —— 见
- *       `docs/round10/fileio/修复-工具面.md` §1.3 的实测与读码）。
+ *       `docs/archive/round10/fileio/修复-工具面.md` §1.3 的实测与读码）。
  *     · `'direct'`：显式逃生口，直通真实磁盘。
  *   任何**其它**取值一律 fail-safe 归一为 `'stage'`（不静默变成拒绝，也不静默直写）。
  *   ⚠ 环境变量通路（`fs-entry.ts` 读 `WINSTAGE_STAGE_OUTSIDE`）当前只认 `direct`，
  *     **要经 env 启用 `deny` 必须改 `fs-entry.ts` 一行**；该文件不在本次写范围，
- *     处方见 `docs/round10/fileio/修复-工具面.md` §1.4。
+ *     处方见 `docs/archive/round10/fileio/修复-工具面.md` §1.4。
  */
 export function createStagingFileSystem(options = {}) {
   const rawStageOutside = options.stageOutside
@@ -1865,6 +1865,12 @@ export function createStagingFileSystem(options = {}) {
     }
 
     async statInner(target, signal) {
+      // ★ 交叉验证发现的漏网：`stat` 是**第五条**读入口，却完全没有遮蔽判定 ——
+      //   哪怕 `readPolicy:'block'` 也拦不住它，且它连"只记"那一条可见性记录都不产生。
+      //   后果：`.aws/credentials` 的存在性与文件大小可以被确认，而面板的
+      //   `readVisibility` 段对此**一无所知**（"没有记录"会被读成"没有敏感读"）。
+      //   放在所有早退之前，与 `listDirInner` 同一形态（无论走哪条分支都要登记）。
+      this.guardMaskedRead(target, 'stat')
       if (!this.stagingEnabled()) return super.stat(target, signal)
       if (!this.inConfiguredWorkspace()) {
         this.warnForeignWorkspace()
@@ -1895,6 +1901,8 @@ export function createStagingFileSystem(options = {}) {
       }
       const base = opts?.cwd || this.config?.cwd || process.cwd()
       const abs = canonical(isAbsolute(path) ? path : join(base, path))
+      // 与 `statInner` 同一理由：`lstat` 也是读入口，必须在早退之前过遮蔽判定。
+      this.guardMaskedRead({ targetKey: FsTargetKey(abs), displayPath: path }, 'lstat')
       const place = this.keyOf({ targetKey: FsTargetKey(abs), displayPath: path })
       if (place === undefined) return super.lstat(path, opts, signal)
       const ws = this.stagingFor(this.sessionIdOf()).fresh()

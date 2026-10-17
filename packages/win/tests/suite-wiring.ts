@@ -72,13 +72,6 @@ const KNOWN_UNREGISTERED = Object.freeze({
     '独立入口仅供定位；同一批断言已由 registry-guard（已登记）在既有关口内覆盖，重复登记只会加长关口',
   'tests/shim-artifact-integrity.ts':
     '第 6 节读取真实 shim/out 产物树（DLL/EXE 与 .stale-* 现状），判定随本机是否已构建而变化；需构建后单独跑，不进确定性关口',
-  'tests/dsh2-2a-outside-isolation.ts': 'dsh2 轮次一次性诊断脚本（越界写隔离不变式），结论已归档 docs/dsh2-*.md',
-  'tests/dsh2-2c-selftest.ts': 'dsh2 轮次一次性复核脚本（NO-DEFECT 复现），结论已归档 docs/dsh2-2c-NO-DEFECT.md',
-  'tests/dsh2-3-audit-mirror.ts': 'dsh2 轮次一次性诊断脚本（审批审计镜像），结论已归档 docs/dsh2-方向3-*.md',
-  'tests/dsh2-fix2-selftest.ts': 'dsh2 轮次一次性复核脚本（writeFileAtomic 负路径），结论已归档 docs/dsh2-修复报告.md',
-  'tests/dsh2-select-shell-feasibility.ts': 'dsh2 轮次一次性可行性脚本（装配层择一装载求值器），结论已归档 docs/dsh2-需求与验收.md',
-  'tests/dsh2-select-shell-verify.ts': 'dsh2 轮次一次性验证脚本（择一装载真实 yaml + !!js），结论已归档 docs/dsh2-需求与验收.md',
-  'tests/dsh2-shell-fallback-verify.ts': 'dsh2 轮次一次性静态验证脚本（交还与降级修复），结论已归档 docs/dsh2-shell-交还与降级-修复报告.md',
 })
 
 /**

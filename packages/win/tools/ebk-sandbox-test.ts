@@ -181,7 +181,7 @@ function buildPluginTgz(ctxWork: string): { tgz: string; sha: string } {
       '--exclude=shim/out', '--exclude=esc', '--exclude=filemod', '--exclude=retest',
       '--exclude=.lead', '--exclude=_sandbox-tests', '--exclude=_r3',
       '--exclude=tools/toolchain', '--exclude=.npmcache', '--exclude=.pnpm-store',
-      '--exclude=docs/round10', '--exclude=dist',
+      '--exclude=docs/archive', '--exclude=dist',
     ]
     const tar = spawnSync('tar', [...excludes, '-czf', tgz, '.'], { cwd: REPO, encoding: 'utf8' })
     if (tar.status !== 0) throw new Error(`tar failed: ${tar.stderr.slice(-400)}`)

@@ -43,15 +43,8 @@ It uses an isolated Debian image with `bubblewrap`/`python3`
 on the container's overlay root); the driver sets these. Host readiness and
 artifact collection use the ebk skills' `probe`/`collect` helpers when present.
 
-## Latest run results
+## Run results
 
-The Linux mechanism checks were run on the host with the plugin's exact bwrap profile
-(`artifacts/RESULT_linux_host.json`):
-
-| Check | Result |
-|---|---|
-| `bwrap-available` | pass |
-| `readonly-root-denies-write` | pass — write outside the workspace is denied (EROFS) |
-| `workspace-bind-writable` | pass |
-| `private-pid-namespace` | pass — visible pids=4, `/proc/1` is the sandbox |
-| `landlock-launcher` | absent — `landlock-run` not installed; bwrap rung selected |
+Results are run artifacts and are **not** committed: the container driver writes
+`RESULT_<runId>.json` plus per-stage logs into `ebk/container-artifacts/`
+(gitignored). Re-run `scripts/test-in-container.sh` to regenerate them.

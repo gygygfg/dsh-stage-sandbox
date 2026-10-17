@@ -50,6 +50,8 @@ export const MASK_REASON = Object.freeze({
   BINARY_LINE: 'binary-line',
   /** 已知密钥形态（`sk-…` / `Bearer …`）—— 保留标记、遮蔽随机段 */
   KNOWN_SECRET: 'known-secret',
+  /** 键名本身是凭据名（`token`/`password`/`secret`/`apiKey`…）⇒ 值无条件遮蔽 */
+  CREDENTIAL_KEY: 'credential-key',
 })
 
 /** `len=` 只报长度，不报内容 */
@@ -83,6 +85,23 @@ const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:(?:\/\/|\\\\)?[^\s]*$/
 
 /** 已知秘密形态：`sk-…`（OpenAI/DeepSeek 风格密钥前缀）与 `Bearer <token>`。 */
 const KNOWN_SECRET_RE = /\b(?:sk-[A-Za-z0-9_-]{6,}|Bearer\s+[A-Za-z0-9+/=_.-]{16,})/g
+
+/**
+ * **凭据键名**（分隔符之前那段，小写比较）。
+ *
+ * 为什么需要它（交叉验证实测出的漏报）：`valueNeedsMask()` 只能看**值的形状**，
+ * 于是 `token: abcdefghijklmnopqrst`（20 个纯小写字母）在形状上和一个 slug 无从区分，
+ * 整串明文留在 `review.json` 里。但**键名**已经说死了这一行是什么 —— 键名是凭据时
+ * 值就必须是秘密，不需要再赌形状。这与本模块"未知形状按秘密处理"是同一条 fail-closed
+ * 纪律，只是把判据从"值像不像"换成"这一行本来就写着它是凭据"。
+ */
+const CREDENTIAL_KEY_RE =
+  /(?:^|[^a-z0-9])(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|bearer|token|secret|password|passwd|pwd|credential|credentials|private[_-]?key|client[_-]?secret|session[_-]?key|encryption[_-]?key|signing[_-]?key)(?![a-z0-9])/i
+
+/** 键名形态判定（对**已去掉分隔符**的那一段求值）。 */
+export function isCredentialKey(key) {
+  return CREDENTIAL_KEY_RE.test(String(key ?? '').toLowerCase())
+}
 
 /**
  * 为**已知形态**生成"保留标记、遮蔽随机段"的占位文本。
@@ -155,8 +174,25 @@ export function valueNeedsMask(value) {
   //   · 有空格、且"不同字符/长度"足够高（≥0.55）⇒ 读起来像句子，不是秘密
   //   · **路径 / URI / 邮箱形态** ⇒ 是位置而不是秘密（`path: C:\…\x.txt`）
   //   · 其余（无空格的长串、低多样性的长串）= 未知形状 ⇒ **按秘密处理**（fail-closed）
-  if (text.length <= 24) return false
-  if (isLocationLike(text)) return false
+  //
+  // ★ 缺陷（交叉验证实测）：旧写法是裸的 `if (text.length <= 24) return false`
+  //   ⇒ **任何 ≤24 字符的高熵值都原样进 payload**。实测漏报：
+  //     `password: Abc123Xyz789Qwer2`（20 字符、大小写 + 数字）整串明文留在 review.json。
+  //   而 DSH 凭据里 `secret` 值的长度区间恰好是 17–44 字符 —— 短的那半段**整段漏**。
+  //   因此白名单只在"这段值本身不像秘密"时才生效（形状判定不受 24 字符门槛约束）。
+  if (text.length <= 24 && !looksSecretLike(text)) return false
+  if (isLocationLike(text)) {
+    // 位置形态豁免**只给真·路径 / URI / 邮箱**：它们不是秘密
+    // （路径本来就在 `item.path` 里逐字给出，遮掉会退化成"看不见改的是哪个文件"）。
+    if (isPathForm(text)) return false
+    if (SCHEME_RE.test(text)) return false
+    if (/^[^\s@]+@[^\s@]+\.[A-Za-z]{2,}$/.test(text)) return false
+    if (/^[A-Za-z0-9._-]+:\d{1,5}$/.test(text)) return false
+    // 剩下的是"含分隔符但不成路径形态"这一档。旧判据把它一律当路径放行，
+    // 于是 `1//0eXaMpLe-Of-A-VerY-Long-Token`（OAuth 刷新令牌）整串明文进 payload ——
+    // 它含 `/` 与 `-` 看着像路径，实际是秘密 ⇒ 再过一次形状判定。
+    return looksSecretLike(text)
+  }
   if (/\s/.test(text) && text.length <= 96) {
     const distinct = new Set(text.replace(/\s+/g, '')).size
     if (distinct / text.length >= 0.55) return false
@@ -190,6 +226,25 @@ export function isLocationLike(value) {
   if (/\\|\//.test(text) && !text.includes('=') && (!/\s/.test(text) || /^[A-Za-z]:/.test(text))) return true
   if (/^[^\s@]+@[^\s@]+\.[A-Za-z]{2,}$/.test(text)) return true
   if (/^[A-Za-z0-9._-]+:\d{1,5}$/.test(text)) return true
+  return false
+}
+
+/**
+ * 是否**真·路径形态**（盘符 / UNC / 前导分隔符 / `./` / `scheme:` 开头）。
+ *
+ * 为什么与 `isLocationLike()` 分开：`isLocationLike()` 里有一条很宽的
+ * "含 `\` 或 `/` 就算路径"分支，它把 `1//0eXaMpLe-Of-A-VerY-Long-Token` 这类
+ * **长得像路径的令牌**也豁免掉了。本函数只认"从第一个字符就能看出是路径"的形态，
+ * 因此 `1//0…`（数字开头、无盘符、无前导分隔符）**不**算路径。
+ */
+export function isPathForm(value) {
+  const text = String(value ?? '')
+  if (text.length === 0) return false
+  if (/^[A-Za-z]:[\\/]/.test(text)) return true // C:\… / C:/…
+  if (/^\\\\/.test(text)) return true // UNC \\server\share
+  if (/^[\\/]/.test(text)) return true // \foo / /foo
+  if (/^\.{1,2}[\\/]/.test(text)) return true // ./ ../ .\
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:[\\/]/.test(text)) return true // scheme:/…
   return false
 }
 
@@ -271,10 +326,13 @@ export function maskSensitiveLine(line) {
       let at = delim[0].length
       while (at < body.length && (body[at] === ' ' || body[at] === '\t')) at += 1
       const value = body.slice(at)
-      if (valueNeedsMask(value)) {
+      // ★ 键名已经是凭据名时**不再赌值的形状**：`token: abcdefghijklmnopqrst`
+      //   在形状上和 slug 无从区分（20 个纯小写字母），但键名说死了它就是凭据。
+      const keyIsCredential = isCredentialKey(body.slice(0, delim[0].length))
+      if (value.length > 0 && (keyIsCredential || valueNeedsMask(value))) {
         text = `${body.slice(0, at)}${redactedToken(value.length)}`
         segments += 1
-        reasons.push(MASK_REASON.STRUCTURED_VALUE)
+        reasons.push(keyIsCredential ? MASK_REASON.CREDENTIAL_KEY : MASK_REASON.STRUCTURED_VALUE)
       }
     } else {
       // 没有分隔符：逐个裸 token 判定（列表项、私钥主体、JWT 等）

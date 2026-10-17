@@ -1,6 +1,6 @@
 # 域1 · 文件读写 —— 缺陷清单（R16 / fileio）
 
-> 日期：2026-10-11 · 复现环境：`docs\round10\env\scripts\sbx-thread.cmd` 新开的 6 个独立 DSH 线程
+> 日期：2026-10-11 · 复现环境：`docs\archive\round10\env\scripts\sbx-thread.cmd` 新开的 6 个独立 DSH 线程
 > （5 个 winstage run 全部 `LANE_OK=true`、`tierEffective=TS`、`degraded=false`、`stderr.txt` 0 字节；
 > 1 个 platform 对照 `LANE_OK=false`）。
 > 全部证据路径相对仓库根 `C:\Users\Administrator\Desktop\dsh-winstage-sandbox`。
@@ -151,7 +151,7 @@ node -e "const fs=require('fs');const d=process.cwd()+'\\ndev';fs.mkdirSync(d,{r
 每个 run 用独立 `<outDir>`（§1）。但"后缀唯一性"这一层保护在同刻度并发下**失效**：若两个 run 共用 `<outDir>`
 （或将来改用固定 `<outDir>` 的重跑/重试），将直接指向**同一个**暂存根，可能撞 `StageGuardUnavailableError`
 或交叉污染；R10 §4.1 中"随机后缀保证分离"的说法在本轮读数下**需要修正为"靠 outDir 分离"**。
-**建议修复（属 `docs/round10/env/scripts/`，本轮不得改）**：后缀改用真正唯一的值，例如
+**建议修复（属 `docs/archive/round10/env/scripts/`，本轮不得改）**：后缀改用真正唯一的值，例如
 `for /f %%g in ('powershell -NoProfile -Command "[guid]::NewGuid().ToString(''N'')"') do set "SUF=%%g"`，
 或至少叠加 `%TIME%`/进程号；并在脚本注释里把"唯一性来自 outDir"写清。
 **验证方式**：同一刻并发两次，两个 `stage-root-path.txt` 叶子名应不同。

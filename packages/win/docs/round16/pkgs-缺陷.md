@@ -56,7 +56,7 @@ EXIT=1
 
 ```cmd
 rem 1) 起沙箱线程（golden 三件套、TS 档）
-cmd /c "<REPO>\docs\round10\env\scripts\sbx-thread.cmd" <wsDir> <promptFile> <outDir> winstage
+cmd /c "<REPO>\docs\archive\round10\env\scripts\sbx-thread.cmd" <wsDir> <promptFile> <outDir> winstage
 rem 2) 线程内（一次 pwsh 调用）：
 uv venv --python C:\Users\Administrator\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\python.exe --seed --index-url https://pypi.tuna.tsinghua.edu.cn/simple <outDir>\venv
 <outDir>\venv\Scripts\python.exe -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
@@ -118,7 +118,7 @@ rem 实测（TS 档）：Writing to …\pip.ini 然后 PermissionError [WinError
 ### 最小复现（命令级）
 
 ```cmd
-cmd /d /c "<REPO>\docs\round10\env\scripts\sbx-thread.cmd" <ws> <prompt> <out> winstage
+cmd /d /c "<REPO>\docs\archive\round10\env\scripts\sbx-thread.cmd" <ws> <prompt> <out> winstage
 rem 线程内：
 node -e "const fs=require('fs');const p=process.env.APPDATA+'\\r16-face-probe';fs.mkdirSync(p,{recursive:true});fs.writeFileSync(p+'\\m.txt','X');console.log('exists='+fs.existsSync(p),'stat='+(fs.statSync(p).size),'read='+fs.readFileSync(p+'\\m.txt','utf8'))"
 rem 实测：mkdir ok / write ok；exists=false、stat 抛 ENOENT；read 成功

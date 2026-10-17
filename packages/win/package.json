@@ -72,7 +72,8 @@
     "@deepseek-ai/dsh-web": "0.0.1-rc.1",
     "@deepseek-ai/schemastery": "^3.18.4",
     "@types/node": "^24.0.0",
-    "esbuild": "^0.28.2"
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.3"
   },
   "files": [
     "dist/",
@@ -83,10 +84,13 @@
     "shim/include/",
     "shim/injector/",
     "shim/probe/",
+    "patches/",
     "tools/build-shim.ts",
     "tools/pe-exports.ts",
     "tools/fetch-toolchain.ts",
     "tools/sandbox-audit.ts",
+    "tools/dsh-patches.ts",
+    "tools/uninstall-restore.ts",
     "README.md",
     "LICENSE",
     "PUBLISHING.md"

@@ -1,7 +1,7 @@
 # 域1 · 文件读写（多目录）与保存后完整性 + 隔离 —— R16 沙箱实测报告
 
 > 域：`fileio`（共享任务 `task-1`，owner=fileio） · 日期：2026-10-11 17:46–18:06 (+08:00)
-> 执行方式：**新开的 6 个带 WinStage 沙箱的独立 DSH 线程**（唯一入口 `docs\round10\env\scripts\sbx-thread.cmd`），
+> 执行方式：**新开的 6 个带 WinStage 沙箱的独立 DSH 线程**（唯一入口 `docs\archive\round10\env\scripts\sbx-thread.cmd`），
 > 宿主侧（本线程，**未加载沙箱**、`WINSTAGE_SHELL` 继承值为 0）做不受限的真实盘反证。
 > 所有结论均附原始文件路径；未跑项标 `not-run`；推断项标 `[推断]`。
 > 公共协议：`docs/round16/00-测试协议.md`（§1.1 四条判据逐 run 校验，见 §1）。
@@ -232,7 +232,7 @@ workspace-inventory: files=6 dirs=1（真实盘被写，对照有意如此）
 
 ```powershell
 # 每个 run 的启动唯一入口（winstall 模式；平台对照把第 4 参换成 platform）
-cmd /c "C:\Users\Administrator\Desktop\dsh-winstage-sandbox\docs\round10\env\scripts\sbx-thread.cmd" `
+cmd /c "C:\Users\Administrator\Desktop\dsh-winstage-sandbox\docs\archive\round10\env\scripts\sbx-thread.cmd" `
   "C:\Users\Administrator\Desktop\dsh-winstage-sandbox\.t\r16\fileio\run1\ws" `
   "C:\Users\Administrator\Desktop\dsh-winstage-sandbox\.t\r16\fileio\run1\prompt.txt" `
   "C:\Users\Administrator\Desktop\dsh-winstage-sandbox\.t\r16\fileio\run1\out" winstage

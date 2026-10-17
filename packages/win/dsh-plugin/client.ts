@@ -1273,7 +1273,8 @@ window.__ModuleLoader__.load({
               dismissed: store.dismissed,
               generatedAt,
               remembered: readStr(sessionStore, DISMISS_KEY),
-              defaultCollapsed: readStr(localStore, PREF_KEY) === '1',
+              // ★ 未设置偏好 ⇒ 收起（默认收起：开），见 `collapsedPref()` 的说明
+              defaultCollapsed: collapsedPref(),
               applied: store.defaultCollapseApplied,
               // β（V2-1）：同一条判据的**第 4 处出现**（喂 nextDismissed 的 `pending` 输入）。
               // 与 :323/:1319/:2030 收敛为同一写法；行为等价（见 winstageElection 处的恒等式说明）。
@@ -1852,6 +1853,17 @@ window.__ModuleLoader__.load({
     const STICKY_KEY = 'winstage.collapsedSticky'
     /** 「默认收起」偏好（设置行第 2 个开关；localStorage 长期记忆） */
     const PREF_KEY = 'winstage.defaultCollapsed'
+    /**
+     * ★ 「默认收起」的取值：**未设置 = 收起**（install 后的第一版快照即默认收起）。
+     *
+     * 旧口径是 `=== '1'` ⇒ 键不存在时**展开**。那是把"用户还没表达过偏好"解释成
+     * "偏好展开"，后果是插件刚装好、第一次出现待审就把面板**弹开**占住输入框上方。
+     * 现在反过来：只有用户**显式**关掉（写了 `'0'`）才展开；其余一切形态（键不存在 /
+     * 读不到 / 值异常）一律收起 —— 缺省值必须站在"少打扰"这一侧。
+     *
+     * 撤销方式不变：设置行里的开关点一下写 `'0'`，长期记忆随之生效。
+     */
+    const collapsedPref = () => readStr(localStore, PREF_KEY) !== '0'
     // C7：跨刷新保持粘性收起。sessionStorage 在页面重载后仍在、关标签即失效 —— 与
     // 「暂时收起」的语义一致（不是"永久偏好"，那才是 localStorage 的 defaultCollapsed）。
     if (readStr(sessionStore, STICKY_KEY) === '1') store.stickyCollapsed = true
@@ -3000,7 +3012,8 @@ window.__ModuleLoader__.load({
         }
       }, [readStaging])
       /** S3e：默认收起偏好（localStorage 持久化；纯客户端，不动 host Config schema） */
-      const [prefCollapsed, setPrefCollapsed] = React.useState(() => readStr(localStore, PREF_KEY) === '1')
+      // ★ 与 `collapsedPref()` 同一口径：未设置 = 收起
+      const [prefCollapsed, setPrefCollapsed] = React.useState(() => collapsedPref())
       /**
        * R12 修复 · D7-c：**这次点击的结果**（`null` = 还没点过 / `accepted` / `rejected` /
        * `threw:<原文>`）。它把"无声 no-op"变成"有结果的交互"：
@@ -3159,7 +3172,9 @@ window.__ModuleLoader__.load({
               style: styles.inlineToggle,
               title: t('defaultCollapsedHint'),
               onClick: () => {
-                const next = readStr(localStore, PREF_KEY) === '1' ? '0' : '1'
+                // 从**当前**开关状态取反（未设置按"开"算），写死 '1'/'0' 两个显式值 ——
+                // 点过之后键一定存在，缺省语义不再参与。
+                const next = prefCollapsed ? '0' : '1'
                 writeStr(localStore, PREF_KEY, next)
                 setPrefCollapsed(next === '1')
               },

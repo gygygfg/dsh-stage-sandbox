@@ -155,6 +155,28 @@ export const OFFLINE_SUITES = [
   //   `plugin/approval-hub.ts`、`plugin/review-state.ts`），零子进程/零 Win32 ⇒ 离线档。
   //   与 verify.cmd 清单必须逐字一致（tests/suite-wiring.ts 机器检查）。
   { id: 'plugin-approval-align', script: 'tests/plugin-approval-align.ts', title: '审批/策略对齐（DENY>NEEDS_CONFIRMATION>ALLOW / 约束交集 / L0–L3 硬拒绝 / 多页分流 / 双状态线）' },
+  // ★ 独立交叉验证轮追加：本套件**不复用**被测模块自己的判别入口 —— 每条断言都是
+  //   "给出攻击/故障形状 → 断言结局 → 反向对照"。覆盖四个重点面（危险命令拦截 /
+  //   敏感文件遮蔽读入口 / 注册表应用后的状态同步与"报成功其实没写" / Cordis 卸载协议
+  //   与卸载可恢复）＋ 审批悬浮窗默认收起。全部纯函数或源码接线断言：零子进程、
+  //   零注册表写、零系统状态 ⇒ 离线档。
+  //   与 verify.cmd 的清单必须逐字一致（两处同时改；tests/suite-wiring.ts 机器检查）。
+  { id: 'crosscheck-boundaries', script: 'tests/crosscheck-boundaries.ts', title: '交叉验证（四域边界失效 + Cordis 卸载协议 + 卸载可恢复 + 悬浮窗默认收起）' },
+  // ★ R17 独立交叉验证轮追加：**先跑真实代码拿到结局**，再把它钉成断言。
+  //   本轮实测出四条边界失效（都不是靠读代码发现的，是把输入喂进去跑出来的）：
+  //     ① 文件暂存→应用：`op:'mkdir'` 的 before/after 都是 absent ⇒ 被删除兜底判据
+  //        吞掉 ⇒ 批准"建目录"是静默 no-op（该路径若真有东西会被 rmSync(recursive) 删掉）；
+  //     ② 原子替换回退路径先 `rmSync(target)` ⇒ 第二次 rename 失败时原件与新件一起没了；
+  //     ③ 敏感遮蔽：`valueNeedsMask` 的 `length <= 24` 白名单让任何**短**高熵值原样进
+  //        payload（DSH 凭据 secret 的长度区间恰好是 17–44），且"含分隔符看着像路径"的
+  //        刷新令牌被 `isLocationLike` 整段放行；
+  //     ④ 危险命令拦截：带目录前缀的写类程序（`C:\…\reg.exe`、`.\reg.exe`）与粘在前一个
+  //        token 上的分隔符（`x;reg`）都判成 `read-only`，而降级档对 read-only 是
+  //        `bypassed:'read-only'` **一票放行** ⇒ 直写真实磁盘，既不暂存也不审批。
+  //   外加两节结构性要求：还原工具必须随包发布（卸载可恢复）、Client/Host 的每一样
+  //   注入都必须归 `ctx.effect` 所有。零子进程、零注册表写、零系统状态 ⇒ 离线档。
+  //   与 verify.cmd 的清单必须逐字一致（两处同时改；tests/suite-wiring.ts 机器检查）。
+  { id: 'crosscheck-r17', script: 'tests/crosscheck-r17.ts', title: '交叉验证 R17（暂存应用 mkdir/原子替换/敏感遮蔽/危险命令拦截 + 卸载可恢复 + Cordis 卸载协议）' },
 ]
 
 /** 需要未受限会话的套件 */
