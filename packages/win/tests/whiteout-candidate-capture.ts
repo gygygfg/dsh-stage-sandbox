@@ -35,6 +35,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const REPO = path.resolve(HERE, '..')
 const { Workspace } = await import(pathToFileURL(path.join(REPO, 'src', 'workspace.ts')).href)
+const { compareKey } = await import(pathToFileURL(path.join(REPO, 'src', 'paths.ts')).href)
 
 const stamp = `${Date.now().toString(36)}-${process.pid.toString(36)}`
 const RUN = path.join(REPO, '.t', 'whiteout-candidate-capture', `run-wo-${stamp}`)
@@ -67,7 +68,19 @@ function writeMarker(logical) {
   fs.writeFileSync(marker, '')
   return marker
 }
-const byPath = (changes) => new Map(changes.map((c) => [c.path, c]))
+/**
+ * ★ 为什么必须按 `compareKey` 建索引，而不是按原始字符串：
+ *   候选里"工作区外"的删除保留**绝对**路径，而它的盘符是**统一大写**的 ——
+ *   `paths.ts::lexical()` 与 `logicalFromWhiteoutMarker()` 都这么做（盘符归一，
+ *   其余大小写不动）。而测试手里的 `extDel` 来自 `path.join(REPO, …)`，
+ *   盘符大小写取决于**进程 cwd 的形态**：从 `verify.cmd` 进来时 cwd 可能是 `c:\…`，
+ *   于是 `map.get(extDel)` 精确匹配不到 `C:\…` ⇒ `ext-delete-candidate` 假红
+ *   （实测：直接 `node tests\…` 绿，`verify.cmd` 里红）。
+ *   Windows 路径本就不区分大小写，因此**比较层**必须用同一口径，
+ *   而不是去改 `src/` 让它吐小写盘符（那会让"同一份快照两次比较"再次漂移）。
+ */
+const byPath = (changes) => new Map(changes.map((c) => [compareKey(c.path), c]))
+const at = (map, logicalPath) => map.get(compareKey(logicalPath))
 
 function main() {
   fs.mkdirSync(EXT, { recursive: true })
@@ -108,16 +121,16 @@ function main() {
   const map = byPath(captured)
 
   check(!captured.some((c) => /^wo[\\/]/.test(c.path)), 'no-wo-pseudo-create', `paths=${JSON.stringify(captured.map((c) => c.path))}`)
-  const extChange = map.get(extDel)
+  const extChange = at(map, extDel)
   check(!!extChange && extChange.deleted === true && extChange.hash === 'absent',
     'ext-delete-candidate', JSON.stringify(extChange))
-  const inChange = map.get('in-del.txt')
+  const inChange = at(map, 'in-del.txt')
   check(!!inChange && inChange.deleted === true, 'internal-delete-uses-relative-key', JSON.stringify(inChange))
-  const stagedChange = map.get('staged-del.txt')
+  const stagedChange = at(map, 'staged-del.txt')
   check(!!stagedChange && stagedChange.deleted === true, 'staged-object-delete-candidate', JSON.stringify(stagedChange))
-  const uncChange = map.get('\\\\server\\share\\unc-del.txt')
+  const uncChange = at(map, '\\\\server\\share\\unc-del.txt')
   check(!!uncChange && uncChange.deleted === true, 'unc-delete-candidate', JSON.stringify(uncChange))
-  const plain = map.get('plain-new.txt')
+  const plain = at(map, 'plain-new.txt')
   check(!!plain && plain.created === true && plain.hash !== 'absent', 'plain-create-unchanged', JSON.stringify(plain))
   check(fs.existsSync(wo1) && fs.existsSync(wo2), 'markers-on-disk', path.relative(REPO, wo1))
   const deletions = captured.filter((c) => c.deleted === true)

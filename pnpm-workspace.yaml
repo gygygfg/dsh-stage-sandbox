@@ -16,23 +16,25 @@ allowBuilds:
   node-pty: true
 
 # --- BEGIN LOCAL VENDOR OVERRIDES ---
-# ★ 为什么有这一段（2026-10-16）：
+# ★ 为什么有这一段：
 #   本仓依赖的 `@deepseek-ai/dsh-*` 全部是**私有包**，实测 registry.npmjs.org 与
 #   registry.npmmirror.com 均 404 ⇒ `pnpm install` 在依赖图的第一步就失败，
-#   连带 `pnpm -r typecheck` / `prepare`（构建 dist）都无法执行。
+#   连带 `pnpm -r typecheck` 与 `prepare`（构建 dist）都无法执行。
 #
 #   而 DSH 桌面端安装目录自带一份完整的运行时依赖树：
 #     %LOCALAPPDATA%\Programs\DeepSeek Harness\resources\app.asar
 #     内部路径 dsh/node_modules/@deepseek-ai/ 共 289 个包。
-#   本段把依赖改指向从那里提取出来的 `.dsh-vendor/`（该目录已被 gitignore，不入库）。
+#   本段把依赖改指向从那里提取出来的 `.dsh-vendor/`（该目录 gitignore，不入库）。
 #
-# ⚠ 两个前提，二者任一失效请立刻删除本段：
-#   1) `.dsh-vendor/` 存在。它由 `tools`-级的提取脚本重建，见同目录下的 README。
-#   2) 其中 4 个包是**占位**：asar 与 unpacked 目录都没有实体，
-#      且本仓源码对它们 0 引用（grep 实测）—— 真被 import 时 tsc 会立刻报 TS2307，不会假绿。
+# ★ 这一段**由脚本生成、不要手改**：
+#     node scripts/vendor/bootstrap.mjs [--force]
+#   它挂在根 package.json 的 `preinstall` 上，因此 `pnpm install` 会自己备齐依赖。
 #
-# ✅ 若将来拿到内网 registry，删掉本段并在仓库根加 `.npmrc`（`@deepseek-ai:registry=...`），
-#    即可回到正常依赖来源。
+# ⚠ 前提：`.dsh-vendor/` 存在。它有 4 个**占位包**（asar 与 unpacked 里都没有实体，
+#   且本仓源码对它们 0 引用）—— 真被 import 时 tsc 会立刻报 TS2307，不会假绿。
+#
+# ✅ 若将来拿到内网 registry：删掉本段、删掉 `preinstall` 引导，并在仓库根加
+#    `.npmrc`（`@deepseek-ai:registry=...`）即可回到正常依赖来源。
 overrides:
   '@deepseek-ai/cordis': 'file:.dsh-vendor/node_modules/@deepseek-ai/cordis'
   '@deepseek-ai/cordis-plugin-include': 'file:.dsh-vendor/node_modules/@deepseek-ai/cordis-plugin-include'

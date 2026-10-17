@@ -8,6 +8,9 @@
     "packages/*"
   ],
   "scripts": {
+    "preinstall": "node scripts/vendor/bootstrap.mjs",
+    "vendor": "node scripts/vendor/bootstrap.mjs",
+    "vendor:force": "node scripts/vendor/bootstrap.mjs --force",
     "typecheck": "pnpm -r run typecheck",
     "typecheck:win": "pnpm -C packages/win run typecheck",
     "typecheck:linux": "pnpm -C packages/linux run typecheck",
@@ -16,12 +19,5 @@
   },
   "engines": {
     "node": ">=20"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild",
-      "koffi",
-      "node-pty"
-    ]
   }
 }

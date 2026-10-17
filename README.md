@@ -162,11 +162,35 @@ pnpm -C packages/linux exec tsx scripts/security-conformance.ts
 ./packages/linux/scripts/test-in-container.sh     # Docker 内跑全量并收集日志
 ```
 
-### 依赖来源说明
+### 依赖来源：安装时自动备齐
 
-本仓依赖的 `@deepseek-ai/*` 全部是**私有包**（公共 registry 404）。`pnpm-workspace.yaml`
-用 `overrides` 把依赖指向从本机 DSH 安装目录（`app.asar`）提取出来的 `.dsh-vendor/`
-（已 gitignore，不入库）。若将来拿到内网 registry：删掉 `overrides` 段，在仓库根加
+本仓依赖的 `@deepseek-ai/*` 全部是**私有包**（实测 `registry.npmjs.org` 与
+`registry.npmmirror.com` 均 404）。可用的实体在本机 DSH 安装目录的
+`resources/app.asar` 里，所以"能装成功"取决于两个磁盘上的东西是否齐备：
+`.dsh-vendor/`（提取出来的依赖树，不入库）与 `pnpm-workspace.yaml` 的 `overrides`
+（把依赖指过去）。
+
+这两样都由 `preinstall` 自动生成，因此**新机器上只要装过 DSH 桌面端，`pnpm install`
+一条命令就够**：
+
+```
+pnpm install
+  └─ preinstall: node scripts/vendor/bootstrap.mjs
+       ├─ .dsh-vendor 已有包？→ 跳过（幂等；--force 强制重建）
+       ├─ 否则 → asar-extract.mjs   从 app.asar 按依赖闭包提取
+       └─ make-overrides.mjs        建 4 个占位包 + 重写 overrides 段
+```
+
+- 手动触发：`pnpm vendor` ／ `pnpm vendor:force`。
+- 环境变量：`DSH_APP_ASAR=<路径>` 指定 asar 位置；`DSH_VENDOR_SKIP=1` 跳过引导。
+- 详见 [`scripts/vendor/README.md`](scripts/vendor/README.md)。
+
+**诚实声明**：`dsh-approval`、`dsh-bash-local`、`dsh-bash-sandbox`、`node-addon-system`
+这 4 个包在 asar 与 `app.asar.unpacked` 里都没有实体，引导脚本会建**占位包**。
+本仓源码对它们 0 引用（grep 实测），因此不影响类型检查与构建；**真被 import 时
+tsc 会立刻报 TS2307 —— 不会静默假绿**。
+
+若将来拿到内网 registry：删掉 overrides 段与 `preinstall`，在仓库根加
 `.npmrc`（`@deepseek-ai:registry=…`）即可回到正常依赖来源。
 
 ---

@@ -13,11 +13,6 @@ node_modules/
 package-lock.json
 pnpm-debug.log*
 
-# pnpm 锁文件：当前 `pnpm-workspace.yaml` 的 `overrides` 把 `@deepseek-ai/*` 指向
-# 本机 `.dsh-vendor/`（已忽略）的 `file:` 依赖，锁文件里因此带着 370+ 处本机路径。
-# 入库会产出一份"别人装不上"的锁文件，等拿到内网 registry、删掉 overrides 后再入库。
-pnpm-lock.yaml
-
 # ── 构建产物 ──────────────────────────────────────────────────────────────────
 /dist/
 /build/
