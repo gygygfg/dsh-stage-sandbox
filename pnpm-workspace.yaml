@@ -30,8 +30,8 @@ allowBuilds:
 #     node scripts/vendor/bootstrap.mjs [--force]
 #   它挂在根 package.json 的 `preinstall` 上，因此 `pnpm install` 会自己备齐依赖。
 #
-# ⚠ 前提：`.dsh-vendor/` 存在。它有 4 个**占位包**（asar 与 unpacked 里都没有实体，
-#   且本仓源码对它们 0 引用）—— 真被 import 时 tsc 会立刻报 TS2307，不会假绿。
+# ⚠ asar 里取不到实体的包会被建成**占位**（导出为空对象）：真实引用它时
+#   运行期立刻报错、tsc 报 TS2307 —— 不静默假绿。哪些是占位见引导脚本的输出。
 #
 # ✅ 若将来拿到内网 registry：删掉本段、删掉 `preinstall` 引导，并在仓库根加
 #    `.npmrc`（`@deepseek-ai:registry=...`）即可回到正常依赖来源。

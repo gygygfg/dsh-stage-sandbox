@@ -23,6 +23,7 @@ pnpm-debug.log*
 .t/
 .dshstage/
 .t-*.txt
+.tmp-*.txt
 *.log
 *.tmp
 *.bak

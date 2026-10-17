@@ -70,10 +70,10 @@ importers:
         version: file:.dsh-vendor/node_modules/@deepseek-ai/dsh-approval
       '@deepseek-ai/dsh-bash-local':
         specifier: file:../../.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-local
-        version: file:.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-local
+        version: file:.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-local(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)(@deepseek-ai/dsh-shell@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-shell(7c011c95adef9f425887e511f1e580e2))(@deepseek-ai/dsh-subprocess@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-subprocess(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)(@deepseek-ai/dsh-http-proxy@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-http-proxy(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)))(@deepseek-ai/dsh-timeout@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-timeout(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis))
       '@deepseek-ai/dsh-bash-sandbox':
         specifier: file:../../.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-sandbox
-        version: file:.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-sandbox
+        version: file:.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-sandbox(536b0c4262d0a10ebe8e33e999e9834a)
       '@deepseek-ai/dsh-brand':
         specifier: file:../../.dsh-vendor/node_modules/@deepseek-ai/dsh-brand
         version: file:.dsh-vendor/node_modules/@deepseek-ai/dsh-brand(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)
@@ -241,9 +241,20 @@ packages:
 
   '@deepseek-ai/dsh-bash-local@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-local':
     resolution: {directory: .dsh-vendor/node_modules/@deepseek-ai/dsh-bash-local, type: directory}
+    peerDependencies:
+      '@deepseek-ai/cordis': ~4.0.4
+      '@deepseek-ai/dsh-shell': 0.2.0-rc.2
+      '@deepseek-ai/dsh-subprocess': 0.2.0-rc.2
+      '@deepseek-ai/dsh-timeout': 0.2.0-rc.2
 
   '@deepseek-ai/dsh-bash-sandbox@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-sandbox':
     resolution: {directory: .dsh-vendor/node_modules/@deepseek-ai/dsh-bash-sandbox, type: directory}
+    peerDependencies:
+      '@deepseek-ai/cordis': ~4.0.4
+      '@deepseek-ai/dsh-bash-local': 0.2.0-rc.2
+      '@deepseek-ai/dsh-sandbox': 0.2.0-rc.2
+      '@deepseek-ai/dsh-sandbox-policy': 0.2.0-rc.2
+      '@deepseek-ai/dsh-shell': 0.2.0-rc.2
 
   '@deepseek-ai/dsh-brand@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-brand':
     resolution: {directory: .dsh-vendor/node_modules/@deepseek-ai/dsh-brand, type: directory}
@@ -450,8 +461,33 @@ packages:
       '@deepseek-ai/dsh-storage-domain': 0.2.0-rc.2
       '@deepseek-ai/dsh-typert-protocol': 0.2.0-rc.2
 
+  '@deepseek-ai/node-addon-system-darwin-arm64@0.1.2':
+    resolution: {integrity: sha512-IR0cx8um19mLCZaJ+H5PLblKr6Eg3PWvVo8eTQBr/SwH2nh5tM9CD9/5fHweNS9Pjt15UdFlGqnvLSd/w+O6Rw==}
+    engines: {node: '>=20'}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@deepseek-ai/node-addon-system-darwin-x64@0.1.2':
+    resolution: {integrity: sha512-XDbmquNapk9aT28y4EKn9lbONVr9YNs1NM/GKH1Gi5gUhjOT9wgRaTv72FJdNaVIInbPAYbPoyn7/y+MzQMNNg==}
+    engines: {node: '>=20'}
+    cpu: [x64]
+    os: [darwin]
+
+  '@deepseek-ai/node-addon-system-linux-arm64@0.1.2':
+    resolution: {integrity: sha512-Z/DQtqgEYzjBzb2ocHGjMzx51W7xDILkJKKj89nyErr8gZMNiLs+JNL1uKzJqc3VLZB+vYCPaHGyQ3oX6EzEmA==}
+    engines: {node: '>=20'}
+    cpu: [arm64]
+    os: [linux]
+
+  '@deepseek-ai/node-addon-system-linux-x64@0.1.2':
+    resolution: {integrity: sha512-S2aPVHvYCpNCppCFyNlooMYuTB7ucK5lvD9oXQQ42v5Z2s5AoaiCdjz9r2l+ED2rI5oS1x0cUZmKjJH2dxV0pg==}
+    engines: {node: '>=20'}
+    cpu: [x64]
+    os: [linux]
+
   '@deepseek-ai/node-addon-system@file:.dsh-vendor/node_modules/@deepseek-ai/node-addon-system':
     resolution: {directory: .dsh-vendor/node_modules/@deepseek-ai/node-addon-system, type: directory}
+    engines: {node: '>=20'}
 
   '@deepseek-ai/schemastery@file:.dsh-vendor/node_modules/@deepseek-ai/schemastery':
     resolution: {directory: .dsh-vendor/node_modules/@deepseek-ai/schemastery, type: directory}
@@ -1168,9 +1204,21 @@ snapshots:
       '@deepseek-ai/cordis': file:.dsh-vendor/node_modules/@deepseek-ai/cordis
       '@deepseek-ai/dsh-brand': file:.dsh-vendor/node_modules/@deepseek-ai/dsh-brand(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)
 
-  '@deepseek-ai/dsh-bash-local@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-local': {}
+  '@deepseek-ai/dsh-bash-local@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-local(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)(@deepseek-ai/dsh-shell@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-shell(7c011c95adef9f425887e511f1e580e2))(@deepseek-ai/dsh-subprocess@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-subprocess(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)(@deepseek-ai/dsh-http-proxy@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-http-proxy(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)))(@deepseek-ai/dsh-timeout@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-timeout(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis))':
+    dependencies:
+      '@deepseek-ai/cordis': file:.dsh-vendor/node_modules/@deepseek-ai/cordis
+      '@deepseek-ai/dsh-shell': file:.dsh-vendor/node_modules/@deepseek-ai/dsh-shell(7c011c95adef9f425887e511f1e580e2)
+      '@deepseek-ai/dsh-subprocess': file:.dsh-vendor/node_modules/@deepseek-ai/dsh-subprocess(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)(@deepseek-ai/dsh-http-proxy@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-http-proxy(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis))
+      '@deepseek-ai/dsh-timeout': file:.dsh-vendor/node_modules/@deepseek-ai/dsh-timeout(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)
+      '@deepseek-ai/schemastery': file:.dsh-vendor/node_modules/@deepseek-ai/schemastery
 
-  '@deepseek-ai/dsh-bash-sandbox@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-sandbox': {}
+  '@deepseek-ai/dsh-bash-sandbox@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-sandbox(536b0c4262d0a10ebe8e33e999e9834a)':
+    dependencies:
+      '@deepseek-ai/cordis': file:.dsh-vendor/node_modules/@deepseek-ai/cordis
+      '@deepseek-ai/dsh-bash-local': file:.dsh-vendor/node_modules/@deepseek-ai/dsh-bash-local(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)(@deepseek-ai/dsh-shell@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-shell(7c011c95adef9f425887e511f1e580e2))(@deepseek-ai/dsh-subprocess@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-subprocess(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)(@deepseek-ai/dsh-http-proxy@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-http-proxy(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)))(@deepseek-ai/dsh-timeout@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-timeout(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis))
+      '@deepseek-ai/dsh-sandbox': file:.dsh-vendor/node_modules/@deepseek-ai/dsh-sandbox(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)(@deepseek-ai/dsh-llm@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-llm(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis))(@deepseek-ai/dsh-session@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-session(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)(@deepseek-ai/dsh-scope@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-scope(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)(@deepseek-ai/dsh-invariants@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-invariants(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis))))
+      '@deepseek-ai/dsh-sandbox-policy': file:.dsh-vendor/node_modules/@deepseek-ai/dsh-sandbox-policy(f20e9a3b575515011fbbbeefdfb98b44)
+      '@deepseek-ai/dsh-shell': file:.dsh-vendor/node_modules/@deepseek-ai/dsh-shell(7c011c95adef9f425887e511f1e580e2)
 
   '@deepseek-ai/dsh-brand@file:.dsh-vendor/node_modules/@deepseek-ai/dsh-brand(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)':
     dependencies:
@@ -1383,7 +1431,24 @@ snapshots:
       '@deepseek-ai/dsh-typert-protocol': file:.dsh-vendor/node_modules/@deepseek-ai/dsh-typert-protocol(@deepseek-ai/cordis@file:.dsh-vendor/node_modules/@deepseek-ai/cordis)
       zod: 4.6.7
 
-  '@deepseek-ai/node-addon-system@file:.dsh-vendor/node_modules/@deepseek-ai/node-addon-system': {}
+  '@deepseek-ai/node-addon-system-darwin-arm64@0.1.2':
+    optional: true
+
+  '@deepseek-ai/node-addon-system-darwin-x64@0.1.2':
+    optional: true
+
+  '@deepseek-ai/node-addon-system-linux-arm64@0.1.2':
+    optional: true
+
+  '@deepseek-ai/node-addon-system-linux-x64@0.1.2':
+    optional: true
+
+  '@deepseek-ai/node-addon-system@file:.dsh-vendor/node_modules/@deepseek-ai/node-addon-system':
+    optionalDependencies:
+      '@deepseek-ai/node-addon-system-darwin-arm64': 0.1.2
+      '@deepseek-ai/node-addon-system-darwin-x64': 0.1.2
+      '@deepseek-ai/node-addon-system-linux-arm64': 0.1.2
+      '@deepseek-ai/node-addon-system-linux-x64': 0.1.2
 
   '@deepseek-ai/schemastery@file:.dsh-vendor/node_modules/@deepseek-ai/schemastery':
     dependencies:

@@ -43,9 +43,16 @@ pnpm install
 
 ## 诚实声明
 
-- **4 个包是占位**：`dsh-approval`、`dsh-bash-local`、`dsh-bash-sandbox`、`node-addon-system`
-  在 asar 与 `app.asar.unpacked` 里都没有实体。本仓源码对它们 **0 引用**（grep 实测），
-  所以占位不影响类型检查与构建。**真被 import 时 tsc 会立刻报 TS2307 —— 不会静默假绿。**
+- **占位是按需推导的，不是固定名单**：`make-overrides.mjs` 逐个检查 vendor 里的包
+  （`package.json` 存在、且其声明的入口文件确实在盘上），只有**确实没有实体**的才建占位。
+  目前只有 `dsh-approval` 一个 —— asar 与 `app.asar.unpacked` 里都没有它。
+  占位包被真实引用时，运行期立刻报错、tsc 报 TS2307，**不会静默假绿**。
+- ★ **不要用固定名单建占位**（实测教训）：旧版无条件把 4 个包写成占位，而其中
+  `dsh-bash-local` / `dsh-bash-sandbox` / `node-addon-system` 在 asar 里**有真实实体**，
+  于是它们的 `lib/index.js` 被占位内容覆盖，`packages/linux/src/shell/staged-shell.ts`
+  的 `class StagedShellExecutor extends SandboxBashExecutor` 拿到 `undefined`，
+  vitest 直接 `Class extends value undefined` 挂掉两个 spec。
+  占位是没有实体时的退路，**不能反过来销毁实体**。
 - **`.dsh-vendor/` 不入库**（gitignore）：体积大、平台相关、可随时重建。
 - `pnpm-workspace.yaml` 里 `# --- BEGIN/END LOCAL VENDOR OVERRIDES ---` 之间是**脚本生成区**，
   不要手改 —— 改了会在下次 `preinstall` 被覆盖。

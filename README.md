@@ -185,10 +185,16 @@ pnpm install
 - 环境变量：`DSH_APP_ASAR=<路径>` 指定 asar 位置；`DSH_VENDOR_SKIP=1` 跳过引导。
 - 详见 [`scripts/vendor/README.md`](scripts/vendor/README.md)。
 
-**诚实声明**：`dsh-approval`、`dsh-bash-local`、`dsh-bash-sandbox`、`node-addon-system`
-这 4 个包在 asar 与 `app.asar.unpacked` 里都没有实体，引导脚本会建**占位包**。
-本仓源码对它们 0 引用（grep 实测），因此不影响类型检查与构建；**真被 import 时
-tsc 会立刻报 TS2307 —— 不会静默假绿**。
+**诚实声明**：asar 里取不到实体的包会被建成**占位包**（导出空对象）。占位集合是
+**按需推导**的，不是固定名单 —— 目前只有 `dsh-approval` 一个（asar 与
+`app.asar.unpacked` 里都没有它）。占位包被真实引用时运行期立刻报错、tsc 报
+TS2307，**不会静默假绿**。
+
+> 这里踩过一次坑并已修：旧脚本按**固定名单**无条件建占位，把 asar 里其实**有真实实体**
+> 的 `dsh-bash-local` / `dsh-bash-sandbox` / `node-addon-system` 的 `lib/index.js`
+> 覆盖成了空对象，结果 `packages/linux/src/shell/staged-shell.ts` 继承的
+> `SandboxBashExecutor` 变 `undefined`，vitest 以 `Class extends value undefined`
+> 挂掉两个 spec。占位是"没有实体时的退路"，不能反过来销毁实体。
 
 若将来拿到内网 registry：删掉 overrides 段与 `preinstall`，在仓库根加
 `.npmrc`（`@deepseek-ai:registry=…`）即可回到正常依赖来源。

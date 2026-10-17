@@ -84,8 +84,8 @@ const ROOTS = [
   'cordis', 'dsh-commands', 'dsh-fs', 'dsh-fs-local', 'dsh-fs-sandbox', 'dsh-pwsh-sandbox',
   'dsh-sandbox', 'dsh-sandbox-policy', 'dsh-session', 'dsh-shell', 'dsh-storage',
   'dsh-subprocess', 'dsh-subprocess-local', 'dsh-util-values', 'dsh-web', 'schemastery',
-  // packages/linux 额外需要的（`@deepseek-ai/dsh-approval` 除外：见 make-overrides.mjs 的 STUBS）
-  'dsh-bash-local', 'dsh-bash-sandbox', 'dsh-brand', 'dsh-llm', 'node-addon-system',
+  // packages/linux 额外需要的
+  'dsh-approval', 'dsh-bash-local', 'dsh-bash-sandbox', 'dsh-brand', 'dsh-llm', 'node-addon-system',
 ]
 const closure = new Set()
 const missing = new Set()

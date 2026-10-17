@@ -36,8 +36,19 @@ import {
   selectLaunchMode,
   writeShimConfig,
 } from '../src/executor.ts'
+import { compareKey } from '../src/paths.ts'
 
 const W = (s) => process.stdout.write(`${s}\n`)
+/**
+ * ★ 路径相等必须走 `compareKey`，不能 `===`：
+ *   `src/` 里凡是经过 `paths.ts::lexical()` 的绝对路径，盘符会被**统一大写**
+ *   （`C:\…`）。而本文件的 `STAGING` 由 `import.meta.url` 推导，盘符大小写取决于
+ *   **进程 cwd 的形态** —— 从 `verify.cmd` 进来时是 `c:\…`，于是
+ *   `WINSTAGE_STAGE_ROOT === STAGING` 精确比较失败 ⇒ 两条断言假红
+ *   （实测：`node tests\executor-stub.ts` 绿，`verify.cmd` 里红）。
+ *   Windows 路径不区分大小写，比较层就该用同一口径，而不是让 `src/` 吐小写盘符。
+ */
+const samePath = (a, b) => typeof a === 'string' && a.length > 0 && compareKey(a) === compareKey(b)
 let failures = 0
 const check = (name, ok, detail) => {
   if (!ok) failures += 1
@@ -1068,9 +1079,9 @@ async function main() {
     check('注入器参数用 `--` 分隔目标命令', spawnCalls[0]?.args?.includes('--') === true, JSON.stringify(spawnCalls[0]?.args?.slice(0, 8)))
     const injectorEnv = spawnCalls[0]?.options?.env ?? {}
     check('注入器环境里没有任何 DSH_SANDBOX* 变量', !Object.keys(injectorEnv).some((name) => /^DSH_SANDBOX/i.test(name)), JSON.stringify(Object.keys(injectorEnv).filter((n) => /DSH/.test(n))))
-    check('注入器环境带上了 shim 契约变量 WINSTAGE_STAGE_ROOT', injectorEnv.WINSTAGE_STAGE_ROOT === STAGING, String(injectorEnv.WINSTAGE_STAGE_ROOT))
+    check('注入器环境带上了 shim 契约变量 WINSTAGE_STAGE_ROOT', samePath(injectorEnv.WINSTAGE_STAGE_ROOT, STAGING), String(injectorEnv.WINSTAGE_STAGE_ROOT))
     check('绝不设 WINSTAGE_SHIM_DISABLE（设了就等于裸跑）', injectorEnv.WINSTAGE_SHIM_DISABLE === undefined, String(injectorEnv.WINSTAGE_SHIM_DISABLE))
-    check('shim 配置里 passthrough 含暂存根（防自指递归）', (report.shimConfig?.passthrough ?? []).includes(STAGING), JSON.stringify(report.shimConfig?.passthrough))
+    check('shim 配置里 passthrough 含暂存根（防自指递归）', (report.shimConfig?.passthrough ?? []).some((p) => samePath(p, STAGING)), JSON.stringify(report.shimConfig?.passthrough))
     check('shim 配置 failClosed=true', report.shimConfig?.failClosed === true, JSON.stringify(report.shimConfig))
 
     const r = await ex.run({ command: 'faketool', cwd: STAGING })
