@@ -233,7 +233,7 @@ export const REG_STAGE_UNSUPPORTED_TYPES = Object.freeze([
   'REG_RESOURCE_REQUIREMENTS_LIST',
 ])
 
-/** 被 hook 的 8 个 API（T3 契约要求的最小集合） */
+/** 被 hook 的 API（T3 契约最小集合 + R18 KNOWN-09 补齐的 6 个写类入口） */
 export const REG_STAGE_HOOKED_APIS = Object.freeze([
   'RegCreateKeyExW',
   'RegOpenKeyExW',
@@ -243,6 +243,13 @@ export const REG_STAGE_HOOKED_APIS = Object.freeze([
   'RegDeleteValueW',
   'RegEnumKeyExW',
   'RegEnumValueW',
+  /* R18 / KNOWN-09：以前不在 WS_TARGET 的写类入口（直落真实 hive）。 */
+  'RegSetKeyValueW',
+  'RegSetKeyValueA',
+  'RegDeleteKeyValueW',
+  'RegDeleteKeyValueA',
+  'RegDeleteTreeW',
+  'RegDeleteTreeA',
 ])
 
 /**
@@ -274,10 +281,14 @@ export const REG_STAGE_HOOKED_APIS = Object.freeze([
  * 名单并与本清单求交集 ⇒ **补上 hook 而没从本清单删掉即红**（防清单漂成新的假承诺）。
  */
 export const REG_STAGE_UNHOOKED_APIS = Object.freeze([
-  'RegSetKeyValueW',
-  'RegSetKeyValueA',
-  'RegDeleteTreeW',
-  'RegDeleteTreeA',
+  /* R18：`RegSetKeyValueW/A`、`RegDeleteTreeW/A` 已补齐为 WS_TARGET（见
+   * REG_STAGE_HOOKED_APIS）；下面这些**仍然**不在 WS_TARGET 内 ⇒ 当下仍直落
+   * 真实 hive，只是本清单让"还漏了什么"保持可查。 */
+  'RegCreateKeyTransactedW',
+  'RegDeleteKeyTransactedW',
+  'RegOpenKeyTransactedW',
+  'RegCopyTreeW',
+  'RegRenameKey',
 ])
 
 /**
@@ -344,49 +355,57 @@ export const REG_STAGE_HARD_DENY_OPTIONS = Object.freeze([
 ])
 
 /**
- * `samDesired` 里**仍然是硬拒**的位 ⇒ **空集**（契约 v1.4）。
+ * `samDesired` 里**仍然是硬拒**的位（契约 v1.5 / R18 KNOWN-01）。
  *
- * 为什么空了：WOW64 视图位**不是**"我们不给你做"的权限问题，而是"这个位置覆盖层
- * 里不存在"的**表示问题**，两者必须分开（见 §8.3 与 `REG_STAGE_UNSTAGED_SAM`）。
- * 这个导出仍然保留（空数组），因此引用它的代码/文档不会断。
- */
-export const REG_STAGE_HARD_DENY_SAM = Object.freeze([])
-
-/**
- * `samDesired` 里**覆盖层无法复现**的视图位 ⇒ 记 `UNSTAGED` **透传真实 API**（契约 v1.4）。
+ * 语义变更（R17 → R18）：WOW64 视图位原本是"不可暂存 ⇒ 透传 + `UNSTAGED`"。
+ * 实测证明**写类**调用透传会改真实 hive（`reg delete /reg:32` 真删真实键；
+ * `RegCreateKeyExW /reg:32` 留下真实空壳键），而审批面既看不见也救不回 ⇒ 对
+ * **写/删类** API 改为 **fail-closed 硬拒**：`ERROR_ACCESS_DENIED` + `HARD_DENY`
+ * 记录（`type` = `REG_STAGE_HARD_DENY_REASON` 码），真实 hive 一个字节不动。
  *
- * 逐条理由（这是本条契约最容易想当然的地方）：
- *   · `KEY_WOW64_64KEY` 在 **64 位进程里是[官方]文档化的 no-op**（winreg.h：
- *     "this flag has no effect on a 64-bit process"）。把它当硬拒，会让任何
- *     "创建一个还不存在的键（`RegCreateKeyExW` + `KEY_WOW64_64KEY`）"的调用拿到
- *     `ERROR_ACCESS_DENIED(5)` —— 实测受害者是 CLR（`0x80070005` ⇒ "Starting the
- *     CLR failed"）与 node 的 Winsock 启动。因此默认进程模型（`wow64Process: false`，
- *     也就是本 x64 shim 唯一能加载的模型）下它是**弃位**：既不拒、也不是视图请求，
- *     走**正常暂存**路径。
- *   · `KEY_WOW64_32KEY` 指向的是**另一个 hive 位置**（32 位视图）。app hive 没有
- *     "视图"概念，混成一个会**写到错误的位置** ⇒ 不可暂存。但"不可暂存"≠"没权限"：
- *     真实 API 知道该去哪，所以**透传** + `UNSTAGED` 记录。
- *   · WOW64 进程里两个位都真的指向另一个视图 ⇒ 都按不可暂存处理。本 DLL 是 x64，
- *     不会被注入 WOW64 进程；这一条属于契约自身的完备性（`wow64Process: true`）。
+ * **读类**（`RegOpenKeyExW`/`RegQueryValueExW`/`RegEnumKeyExW`/`RegEnumValueW`）不受影响：
+ * 读没有副作用，仍走 `UNSTAGED` 透传（`READ_ONLY_APIS`）——否则 32 位消费者（部分
+ * COM/安装器/`reg query /reg:32`）会被无谓打断，而它们并不改任何东西。
  */
-export const REG_STAGE_UNSTAGED_SAM = Object.freeze([
-  {
-    flag: KEY_WOW64.KEY_WOW64_64KEY,
-    name: 'KEY_WOW64_64KEY',
-    appliesTo: 'wow64-process',
-    reason:
-      'KEY_WOW64_64KEY 在 64 位进程里是文档化的 no-op（不是视图请求 ⇒ 必须走正常暂存路径）；' +
-      '只有 WOW64 进程里它才真的指向另一个 hive 位置，那时按 unstaged 透传（x64 shim 不会被注入 WOW64 进程）',
-  },
+export const REG_STAGE_HARD_DENY_SAM = Object.freeze([
   {
     flag: KEY_WOW64.KEY_WOW64_32KEY,
     name: 'KEY_WOW64_32KEY',
     appliesTo: 'any',
+    hardDenyReason: 'WOW64_32KEY_WRITE_NOT_STAGEABLE',
     reason:
-      'KEY_WOW64_32KEY 指向**另一个 hive 位置**（32 位视图），覆盖层没有视图概念：暂存它会把值写到错的位置 ⇒ ' +
-      '不可暂存 ⇒ 透传真实 API 并记 UNSTAGED（不再是 ERROR_ACCESS_DENIED 硬拒）',
+      'KEY_WOW64_32KEY 指向**另一个 hive 位置**（32 位视图），覆盖层没有视图概念；' +
+      '写/删类调用若透传就会在 apply 之前改动真实 hive（实测：真删键 / 留空壳键）⇒ ' +
+      'fail-closed 硬拒（读类仍透传）',
+  },
+  {
+    flag: KEY_WOW64.KEY_WOW64_64KEY,
+    name: 'KEY_WOW64_64KEY',
+    appliesTo: 'wow64-process',
+    hardDenyReason: 'WOW64_VIEW_IN_WOW64_PROCESS_WRITE_NOT_STAGEABLE',
+    reason:
+      '只有 WOW64 进程里 KEY_WOW64_64KEY 才真的指向另一个 hive 位置（x64 shim 正常不会被注入 ' +
+      'WOW64 进程）；写/删类在那种进程里无法暂存 ⇒ fail-closed 硬拒',
   },
 ])
+
+/**
+ * **写/删类**判定：这些 API 会改真实 hive，因此 WOW64 视图位对它们必须 fail-closed。
+ * 其余被 hook 的注册表 API 是读/纯打开（无副作用）⇒ 仍按 `UNSTAGED` 透传。
+ */
+const READ_ONLY_REGISTRY_APIS = Object.freeze([
+  'RegOpenKeyExW',
+  'RegQueryValueExW',
+  'RegEnumKeyExW',
+  'RegEnumValueW',
+])
+
+/**
+ * 清空后的**透传类**（契约 v1.5）：WOW64 的写类已移入 `REG_STAGE_HARD_DENY_SAM`。
+ * 保留导出（空数组）以保持向后兼容；真正的"不可暂存 ⇒ 透传"情形（无法派生路径的
+ * 句柄、裸 hive 根上的值写入）列在 `REGISTERED_HARD_DENIALS.unstaged` 里。
+ */
+export const REG_STAGE_UNSTAGED_SAM = Object.freeze([])
 
 /**
  * `UNSTAGED` 记录的 `type` 字段 = 不可暂存的**原因码**（契约 v1.4，C 侧数值必须一致）。
@@ -402,6 +421,25 @@ export const REG_STAGE_UNSTAGED_REASON = Object.freeze({
 
 const UNSTAGED_REASON_NAME = Object.freeze(
   Object.fromEntries(Object.entries(REG_STAGE_UNSTAGED_REASON).map(([name, value]) => [value, name])),
+)
+
+/**
+ * `HARD_DENY` 记录的 `type` 字段 = **硬拒原因码**（契约 v1.5 / R18 KNOWN-01；
+ * C 侧 `WS_HARD_DENY_*` 数值必须一致）。`0` 表示"没有细分原因"（旧记录兼容）。
+ *
+ * 为什么需要它：v1.4 的硬拒只有 LSTATUS，审计无法区分"策略拒绝"与"表示不了"。
+ * R18 把 WOW64 写类改成硬拒后，"为什么拒"必须可查（否则面板只能说"拒绝"）。
+ */
+export const REG_STAGE_HARD_DENY_REASON = Object.freeze({
+  NONE: 0,
+  WOW64_32KEY_WRITE_NOT_STAGEABLE: 1,
+  WOW64_VIEW_IN_WOW64_PROCESS_WRITE_NOT_STAGEABLE: 2,
+  /** 递归删除（`RegDeleteTreeW/A`）没有 WAL 表示 ⇒ fail-closed（R18 KNOWN-09）。 */
+  RECURSIVE_DELETE_NOT_STAGEABLE: 3,
+})
+
+const HARD_DENY_REASON_NAME = Object.freeze(
+  Object.fromEntries(Object.entries(REG_STAGE_HARD_DENY_REASON).map(([name, value]) => [value, name])),
 )
 
 /** 暂存操作名（纯层用字符串，便于落盘与人类核对） */
@@ -449,6 +487,8 @@ function policyRejection(verdict) {
     status: verdict.status,
     api: verdict.api,
     path: verdict.canonical,
+    // R18：硬拒原因码透出给调用方/审计（C 侧 HARD_DENY.type 同源）
+    ...(verdict.hardDenyReason ? { hardDenyReason: verdict.hardDenyReason } : {}),
   })
 }
 
@@ -600,6 +640,16 @@ export function classifyRegistryOperation(operation = {}) {
 
   const knownDeny = REG_STAGE_HARD_DENY_APIS[api]
   if (knownDeny !== undefined) return deny('REG_STAGE_API_HARD_DENY', `${api}: ${knownDeny}`)
+  if (api === 'RegDeleteTreeW' || api === 'RegDeleteTreeA') {
+    /* R18 / KNOWN-09：递归删除没有 WAL 表示（覆盖层只有单键墓碑）⇒ fail-closed。
+     * 以前它不在 WS_TARGET，于是"答应拒绝"从未执行（直落真实 hive）；现在 shim 会
+     * 截获它并写一条 HARD_DENY（type = RECURSIVE_DELETE_NOT_STAGEABLE）。 */
+    return deny(
+      'REG_STAGE_API_HARD_DENY',
+      `${api}: 递归删除子树没有 WAL 表示（覆盖层只有单键墓碑）⇒ fail-closed，绝不假装删掉`,
+      { hardDenyReason: 'RECURSIVE_DELETE_NOT_STAGEABLE' },
+    )
+  }
   if (!REG_STAGE_HOOKED_APIS.includes(api)) {
     return deny(
       'REG_STAGE_API_NOT_HOOKED',
@@ -618,10 +668,26 @@ export function classifyRegistryOperation(operation = {}) {
   if (!Number.isInteger(samDesired) || samDesired < 0) {
     throw stageError('REG_STAGE_POLICY_INVALID', `samDesired must be a non-negative integer, got ${String(operation.samDesired)}`)
   }
-  for (const sam of REG_STAGE_HARD_DENY_SAM) {
-    if ((samDesired & sam.flag) !== 0) return deny('REG_STAGE_SAM_HARD_DENY', `${api}: ${sam.reason}`, { flag: sam.name })
-  }
   const wow64Process = operation.wow64Process === true
+  const readOnlyApi = READ_ONLY_REGISTRY_APIS.includes(api)
+  for (const sam of REG_STAGE_HARD_DENY_SAM) {
+    if ((samDesired & sam.flag) === 0) continue
+    if (sam.appliesTo === 'wow64-process' && !wow64Process) continue // 64 位进程里它是 no-op
+    if (readOnlyApi) {
+      // 读类没有副作用：仍透传（否则 32 位消费者被无谓打断，且它们不改任何东西）。
+      return unstaged(
+        'REG_STAGE_SAM_UNSTAGED',
+        `${api}: ${sam.reason}（读类无副作用 ⇒ 仍透传真实 API）`,
+        sam.name === 'KEY_WOW64_32KEY' ? 'WOW64_32KEY' : 'WOW64_VIEW_IN_WOW64_PROCESS',
+        { flag: sam.name, samDesired },
+      )
+    }
+    return deny('REG_STAGE_SAM_HARD_DENY', `${api}: ${sam.reason}`, {
+      flag: sam.name,
+      samDesired,
+      hardDenyReason: sam.hardDenyReason,
+    })
+  }
   for (const sam of REG_STAGE_UNSTAGED_SAM) {
     if ((samDesired & sam.flag) === 0) continue
     if (sam.appliesTo === 'wow64-process' && !wow64Process) continue // 64 位进程里它是 no-op，不构成视图请求
@@ -696,6 +762,13 @@ export const REGISTERED_HARD_DENIALS = Object.freeze({
   ),
   options: Object.freeze(REG_STAGE_HARD_DENY_OPTIONS.map((entry) => ({ name: entry.name, reason: entry.reason }))),
   sam: Object.freeze(REG_STAGE_HARD_DENY_SAM.map((entry) => ({ name: entry.name, reason: entry.reason }))),
+  /**
+   * 硬拒**原因码**（契约 v1.5）：写进 WAL `HARD_DENY.type`，让"哪个规则拒的"可查。
+   * 与 `REG_STAGE_HARD_DENY_REASON` 同源（同一个对象，避免两处漂移）。
+   */
+  hardDenyReasons: Object.freeze(
+    Object.entries(REG_STAGE_HARD_DENY_REASON).map(([name, code]) => ({ name, code })),
+  ),
   /**
    * **不可暂存 ⇒ 透传** 的清单（契约 v1.4）。与上面四类并列，因为它是**第三类结论**：
    * 既不是"暂存成功"，也不是"被拒"—— 调用被交给真实 API，只留一条 `UNSTAGED` 审计记录。
@@ -1610,18 +1683,31 @@ export function journalRecordForOperation(operation = {}) {
   return record
 }
 
-/** 硬拒记录（`kind = HARD_DENY`，保留原始 LSTATUS，供审计） */
-export function journalHardDenyRecord({ api, path, status = HARD_DENY_STATUS, reason }) {
+/**
+ * 硬拒记录（`kind = HARD_DENY`，保留原始 LSTATUS，供审计）。
+ *
+ * 契约 v1.5 / R18：`type` 现在可以携带**硬拒原因码**（`REG_STAGE_HARD_DENY_REASON`）。
+ * `0` 保持旧记录兼容（"没有细分原因"）；C 侧 `WS_HARD_DENY_*` 数值必须一致。
+ */
+export function journalHardDenyRecord({ api, path, status = HARD_DENY_STATUS, reason, hardDenyReason = 'NONE' }) {
+  if (REG_STAGE_HARD_DENY_REASON[hardDenyReason] === undefined) {
+    throw stageError(
+      'REG_STAGE_JOURNAL_INVALID',
+      `journalHardDenyRecord: unknown hardDenyReason ${JSON.stringify(hardDenyReason)} ` +
+        `(expected one of ${Object.keys(REG_STAGE_HARD_DENY_REASON).join('/')})`,
+    )
+  }
   const record = {
     kind: REG_STAGE_KIND.HARD_DENY,
     path: typeof path === 'string' && path.length > 0 ? path : `<unknown:${api ?? 'unknown'}>`,
     flags: REG_STAGE_FLAGS.HARD_DENY,
-    type: 0,
+    type: REG_STAGE_HARD_DENY_REASON[hardDenyReason],
     valueName: null,
     data: null,
     status: status >>> 0,
     api: api ?? null,
     reason: reason ?? null,
+    hardDenyReason,
   }
   return record
 }
@@ -1891,7 +1977,14 @@ export function replayJournal(records) {
   const unstaged = []
   for (const record of records) {
     if (record.kind === REG_STAGE_KIND.HARD_DENY) {
-      hardDenied.push({ path: record.path, status: record.status, api: record.api ?? null, reason: record.reason ?? null })
+      hardDenied.push({
+        path: record.path,
+        status: record.status,
+        api: record.api ?? null,
+        reason: record.reason ?? null,
+        reasonCode: record.type,
+        reasonName: HARD_DENY_REASON_NAME[record.type] ?? (record.type === 0 ? 'NONE' : null),
+      })
       continue
     }
     if (record.kind === REG_STAGE_KIND.UNSTAGED) {
@@ -1990,6 +2083,12 @@ export function createRegistryStage(options = {}) {
   let reader = options.reader ?? null
   let writer = options.writer ?? null
   let state = createOverlayState({ sessionId })
+  /**
+   * R18 / KNOWN-02：本会话 WAL 里**已到达真实系统**的透传记录（`replayJournal().unstaged`）。
+   * 落在这些路径上/之下的 overlay 值单元必须标 `appliable:false`（父键是真实 hive
+   * 在 apply 之前建出来的：再 apply 会写错视图/双重写入）。`open()` 时刷新。
+   */
+  let unstagedRecords = []
   let resolution = { version: REGISTRY_STAGE_VERSION, status: 'open', candidateId: null, appliedPaths: [], discardedAt: null, discardReason: null }
   let candidate = null
   let opened = false
@@ -2077,6 +2176,7 @@ export function createRegistryStage(options = {}) {
       hardDenied = replay.hardDenied
       rejected = replay.rejected
       unstaged = replay.unstaged
+      unstagedRecords = replay.unstaged
       resumedRecords = replay.state.ops.length
       torn = decoded.torn
     }
@@ -2201,23 +2301,26 @@ export function createRegistryStage(options = {}) {
   }
 
   /**
-   * 这次调用是否"覆盖层无法复现"（视图位等）⇒ 必须**透传真实 API**。
+   * 策略层是否**不允许暂存**这次调用（两种都要在覆盖层存在性检查**之前**分流）：
+   *   · `unstaged: true` ⇒ 透传真实 API（视图不可表示、句柄路径不可派生…），不抛错；
+   *   · 其余 `stageable: false`（硬拒，含 R18 的 WOW64 写类与 `RegDeleteTree*`）
+   *     ⇒ 交给 `persistOperation()` 抛 `REG_STAGE_HARD_DENY`（LSTATUS=5）。
    *
-   * 判定必须发生在任何覆盖层存在性检查**之前**：这类调用的目标根本不在覆盖层里，
-   * 拿覆盖层视图去判它"不存在"就是把一个我们无权回答的问题当成答案
-   * （正是 `RegDeleteKeyExW(HKLM\X, KEY_WOW64_32KEY)` 这类调用会被错判的场景）。
+   * 为什么不能只看 `unstaged`（R18 回归实测）：WOW64 写类改成硬拒后，旧判据返回 false，
+   * 于是 `stageDeleteKey()` 继续往下走 `effectiveExists()`，把"策略拒绝"误报成
+   * `REG_STAGE_KEY_NOT_FOUND(2)` —— 调用方看到的是"键不存在"，而不是"沙箱拒绝了这次写入"。
+   * 判定必须发生在任何覆盖层存在性检查之前（这类调用的目标根本不在覆盖层里）。
    */
   function isUnstageable(op, path, opts = {}, type) {
-    return (
-      classifyRegistryOperation({
-        api: API_BY_OP[op],
-        path: parseRegistryPath(path).canonical,
-        type,
-        dwOptions: opts.dwOptions,
-        samDesired: opts.samDesired,
-        wow64Process: opts.wow64Process,
-      }).unstaged === true
-    )
+    const policy = classifyRegistryOperation({
+      api: API_BY_OP[op],
+      path: parseRegistryPath(path).canonical,
+      type,
+      dwOptions: opts.dwOptions,
+      samDesired: opts.samDesired,
+      wow64Process: opts.wow64Process,
+    })
+    return policy.stageable === false || policy.unstaged === true
   }
 
   /** 暂存"创建/打开键"（对齐 `RegCreateKeyExW`：中间键一并创建） */
@@ -2391,6 +2494,25 @@ export function createRegistryStage(options = {}) {
   }
 
   /**
+   * R18 / KNOWN-02：某单元的父键是不是"由透传调用在真实 hive 建出来的"。
+   *
+   * 判据完全来自 WAL 数据（`replayJournal().unstaged[]`，不需要 shim 提供新产物）：
+   * 只要单元路径等于或位于某个 **UNSTAGED 记录的规范路径**之下，就认为它的祖先
+   * 可能已经真实存在。占位名（`<unstaged:…>`）不是可解析路径，**不参与**匹配。
+   */
+  function unstagedParentOf(unit) {
+    const target = fold(unit.registryPath ?? unit.keyPath ?? unit.path ?? '')
+    if (target.length === 0) return undefined
+    for (const record of unstagedRecords) {
+      const raw = typeof record?.path === 'string' ? record.path : ''
+      if (!/^(HKLM|HKCU|HKCR|HKU|HKCC)\\/i.test(raw)) continue
+      const prefix = fold(raw)
+      if (target === prefix || target.startsWith(`${prefix}\\`)) return record
+    }
+    return undefined
+  }
+
+  /**
    * 冻结候选：把当前覆盖层变更写成**与文件候选同构**的 `candidates/<id>.json`
    * 并登记进 `queue.json`（因此进同一个审批面板）。无净变化时**不**入队。
    */
@@ -2398,6 +2520,32 @@ export function createRegistryStage(options = {}) {
     requireOpen()
     const result = diff()
     const changes = overlayChangesToCandidateChanges(result)
+    /**
+     * ★ R18 / KNOWN-02：UNSTAGED 键上的 overlay 值**不可批准**。
+     *
+     * R17 实测形状：`RegCreateKeyExW(..., /reg:32)` 被透传到真实 hive（建出空壳键），
+     * 随后的 `RegSetValueExW` 用真实句柄反解出大写路径、把值写进 overlay ⇒ 候选里
+     * 出现 `create:<那个真实键>\@`。批准它会把值经 64 位视图再写一次（写错视图），
+     * 且完全无视"这次写入已经真实发生过一次"。这里按 WAL 数据 fail-closed 标注。
+     */
+    const warnings = [...(result.warnings ?? [])]
+    const unstagedBlocked = []
+    for (const unit of changes) {
+      const parent = unstagedParentOf(unit)
+      if (!parent) continue
+      unit.appliable = false
+      unit.unsupportedReason =
+        `unstaged-parent: 该单元的目标键位于一条 UNSTAGED（已透传到真实系统）记录之下 ` +
+        `(${parent.path}${parent.reasonName ? `, reason=${parent.reasonName}` : ''})；` +
+        '它的真实父键可能已经在 apply 之前被真实 API 建出 ⇒ 批准会在不同 hive 视图上再写一次（写错视图/双副作用）'
+      unstagedBlocked.push(unit.path)
+    }
+    if (unstagedBlocked.length > 0) {
+      warnings.push(
+        `${unstagedBlocked.length} 个单元被标为不可应用（unstaged-parent）：${unstagedBlocked.join(', ')} —— ` +
+          '它们的目标键位于"已经透传到真实系统"的调用之下；apply() 会跳过它们并留下机读原因。',
+      )
+    }
     if (changes.length === 0) {
       return {
         enqueued: false,
@@ -2405,7 +2553,7 @@ export function createRegistryStage(options = {}) {
         changes: [],
         unreadable: result.unreadable,
         subKeysUnknown: result.subKeysUnknown,
-        warnings: result.warnings,
+        warnings,
       }
     }
     const queue = readJsonIfExists(queuePath)
@@ -2433,10 +2581,11 @@ export function createRegistryStage(options = {}) {
       // WP12：这些路径的**子键维度**没能冻结（读取器没报枚举）。如实落盘，别让"没冻结"
       // 看起来像"冻结了一个空表"。
       unfrozenSubKeys: result.subKeysUnknown,
-      warnings: result.warnings,
+      warnings,
       note:
         '注册表候选：before 来自宿主令牌下的真实 hive 快照，after 来自覆盖层视图。' +
-        '应用前真实 hive 不会被本候选改动；丢弃即回到"什么都没发生"。',
+        '应用前真实 hive 不会被本候选改动；丢弃即回到"什么都没发生"。' +
+        '`appliable:false` 的单元（unstaged-parent）不会被 apply 写入。',
     }
     mkdirSync(candidateDir, { recursive: true })
     writeJson(join(candidateDir, `${id}.json`), frozen)
@@ -2450,7 +2599,7 @@ export function createRegistryStage(options = {}) {
       changes,
       unreadable: result.unreadable,
       subKeysUnknown: result.subKeysUnknown,
-      warnings: result.warnings,
+      warnings,
     }
   }
 
@@ -2538,6 +2687,8 @@ export function createRegistryStage(options = {}) {
     // 或写入与现值相同的值）。候选是从 diff 出来的**净变化**，因此应用时必须以候选为准：
     // 不能把没被审批过的空操作也重放到真实 hive 上。
     const approved = new Set((frozen.changes ?? []).map((change) => fold(change.path)))
+    /** R18 / KNOWN-02：冻结时标了 `appliable:false` 的单元，apply 必须跳过并留下原因。 */
+    const frozenUnitByPath = new Map((frozen.changes ?? []).map((change) => [fold(change.path), change]))
     const units = applyUnits()
     const applied = []
     const failed = []
@@ -2551,6 +2702,19 @@ export function createRegistryStage(options = {}) {
     for (const unit of units) {
       if (!approved.has(fold(unit.path))) {
         skipped.push({ path: unit.path, op: unit.op, reason: 'not-in-candidate' })
+        continue
+      }
+      const frozenUnit = frozenUnitByPath.get(fold(unit.path))
+      if (frozenUnit && frozenUnit.appliable === false) {
+        // 不是"没选中"，而是**冻结时就判定不可应用**（unstaged-parent）：跳过且不留在
+        // remaining 里，否则整批会永远停在 partially-applied。
+        skipped.push({
+          path: unit.path,
+          op: unit.op,
+          appliable: false,
+          reason: frozenUnit.unsupportedReason ?? 'unit was marked appliable:false when the candidate was frozen',
+        })
+        appliedSet.add(fold(unit.path))
         continue
       }
       if (selected && !selected.has(fold(unit.path))) {
@@ -3044,6 +3208,15 @@ export function validateJournalBuffer(buffer) {
       }
       if (record.status === 0) {
         addProblem(problems, 'HARD_DENY_STATUS_ZERO', 'a hard-denied call must carry the real non-zero LSTATUS', index)
+      }
+      // 契约 v1.5：`type` = 硬拒原因码；0 = 旧记录（无细分原因）。
+      if (record.type !== 0 && HARD_DENY_REASON_NAME[record.type] === undefined) {
+        addProblem(
+          problems,
+          'HARD_DENY_BAD_REASON',
+          `kind=HARD_DENY needs type = a REG_STAGE_HARD_DENY_REASON code (0..${Object.keys(REG_STAGE_HARD_DENY_REASON).length - 1}), got ${String(record.type)}`,
+          index,
+        )
       }
     }
     if (record.kind === REG_STAGE_KIND.UNSTAGED) {

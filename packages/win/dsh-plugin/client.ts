@@ -111,7 +111,7 @@ window.__ModuleLoader__.load({
          * 新文案把两条时延分开写清，并给出"怎么确认"。
          */
         description:
-          '启用 Windows 暂存—候选—选择性提交沙箱。关闭后：**文件工具（写文件）立即退回**平台自带的沙箱/审批模式；**命令（pwsh）需要重启宿主后**才交还平台 shell（命令面的提供方在加载期选定，不能热切换）。不确定当前生效哪一侧时，跑 /winstage status 看权威结论。',
+          '启用 Windows 暂存—候选—选择性提交沙箱。关闭后：文件工具（写文件）立即退回平台自带的沙箱/审批模式；命令（pwsh）需要重启宿主后才交还平台 shell（命令面的提供方在加载期选定，不能热切换）。不确定当前生效哪一侧时，跑 /winstage status 看权威结论。',
         on: '已启用',
         off: '已关闭',
         unavailable: 'Host 未提供该设置项',
@@ -148,7 +148,7 @@ window.__ModuleLoader__.load({
          * 并提示该 profile 可能被多个宿主共享（并发写风险）。
          */
         error:
-          '设置值未生效：已保留原值（本行 config 被覆盖层/环境变量固定）。注意：此次交互可能已把 profile 文件重新序列化写入（仅格式规范化，键值语义不变）——可核对 %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml 的修改时间与 sha256；同一 profile 若被多个宿主共用，请避免并发改动。**本插件无法回滚文件字节**：设置通道只送键值，客户端拿不到写前的文件内容，因此"写入前快照 + 失败回滚"必须由宿主侧设置层实现。',
+          '设置值未生效：已保留原值（本行 config 被覆盖层/环境变量固定）。注意：此次交互可能已把 profile 文件重新序列化写入（仅格式规范化，键值语义不变）——可核对 %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml 的修改时间与 sha256；同一 profile 若被多个宿主共用，请避免并发改动。本插件无法回滚文件字节：设置通道只送键值，客户端拿不到写前的文件内容，因此"写入前快照 + 失败回滚"必须由宿主侧设置层实现。',
         loading: '读取中…',
         reviewTitle: 'WinStage 暂存待审',
         reviewWaiting: '等待你批准后才写入真实工作区',
@@ -251,7 +251,7 @@ window.__ModuleLoader__.load({
         trustLabel: '可信性',
         trustTrusted: '沙箱可信（命令走去令牌化通道，写入先落暂存）',
         trustAttention: '沙箱可信，但有 {count} 类待处理事项（详见 /winstage status）',
-        trustDegraded: '⚠ 沙箱**不可信**：档位已掉档，写入只剩内核硬拒（详见 /winstage status）',
+        trustDegraded: '⚠ 沙箱不可信：档位已掉档，写入只剩内核硬拒（详见 /winstage status）',
         trustLost: '⚠ 会话工作根已不可用：写入会失败，不会静默改写真实文件',
         // ── R11-C 修复②：以下四条只在"证据成立"时出现，避免把正常说成坏 ──────────────
         // `trustDegradedAction`：降档的**可见且可操作**版本（旧 `trustDegraded` 只说"不可信"，
@@ -263,7 +263,7 @@ window.__ModuleLoader__.load({
         //   于是继续喊"写入会失败"。但同一时刻**写文件工具写出的候选完全正常**。
         //   ⇒ 判据不足时**不许断言**，只报可观察事实（"暂存写入此刻可用"）+ 自述判据不足。
         trustBaseUnverifiable:
-          '⚠ 沙箱档位信息不完整（面板拿到的卡片里没有档位字段）：**暂存写入此刻可用**（待审候选正常生成）；是否已降档无法据此判定，请跑 /winstage status 看权威结论。',
+          '⚠ 沙箱档位信息不完整（面板拿到的卡片里没有档位字段）：暂存写入此刻可用（待审候选正常生成）；是否已降档无法据此判定，请跑 /winstage status 看权威结论。',
         // `trustLossNoise`：计数是**探测次数**，不是失败次数（实测 6 s 内 +4 线性上涨）。
         trustLossNoise: '（"失根 {count}"是探测计数，不是写入失败次数，且每次查询都会 +1；本条不影响写入）',
         trustRootLostAction: '下一步：跑 /winstage status 看是哪一步丢了根；未确认写入 > 0 时先确认暂存内容再批准。',
@@ -277,12 +277,12 @@ window.__ModuleLoader__.load({
       en: {
         title: 'WinStage Sandbox',
         description:
-          'Enable the Windows staging–candidate–selective-commit sandbox. Turning it off: the **file tools switch back immediately** to the platform sandbox/approval mode; the **command side (pwsh) only hands back the platform shell after a host restart** (the shell provider is chosen at load time and cannot be hot-swapped). Run /winstage status to see which side is currently in effect.',
+          'Enable the Windows staging–candidate–selective-commit sandbox. Turning it off: the file tools switch back immediately to the platform sandbox/approval mode; the command side (pwsh) only hands back the platform shell after a host restart (the shell provider is chosen at load time and cannot be hot-swapped). Run /winstage status to see which side is currently in effect.',
         on: 'Enabled',
         off: 'Disabled',
         unavailable: 'This setting is not exposed by the Host',
         error:
-          'The setting value did NOT take effect; the previous value was kept (this row\'s config is pinned by a profile overlay or an environment variable). Note: this interaction may still have re-serialized the profile file (formatting normalization only, no key/value change) — check the mtime and sha256 of %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml; if several hosts share that profile, avoid concurrent edits. **This plugin cannot roll file bytes back**: the settings transport only carries key/values, so a "pre-write snapshot + rollback on failure" must be implemented by the host-side settings layer.',
+          'The setting value did NOT take effect; the previous value was kept (this row\'s config is pinned by a profile overlay or an environment variable). Note: this interaction may still have re-serialized the profile file (formatting normalization only, no key/value change) — check the mtime and sha256 of %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml; if several hosts share that profile, avoid concurrent edits. This plugin cannot roll file bytes back: the settings transport only carries key/values, so a "pre-write snapshot + rollback on failure" must be implemented by the host-side settings layer.',
         loading: 'Loading…',
         // R12 fix · D7-c/d: status words follow the EFFECTIVE tier (config vs effective split)
         effectivePrefix: 'Currently effective: ',
@@ -391,7 +391,7 @@ window.__ModuleLoader__.load({
         trustDegradedAction:
           '⚠ Sandbox lane degraded: commands no longer use the transparent-shim channel (lane {lane}); writes are down to kernel denial. Next: run /winstage status for the cause; if the injector was quarantined by security software, allowlist shim\\out\\winstage-inject.exe and restart the host.',
         trustBaseUnverifiable:
-          '⚠ Sandbox lane info is incomplete (the card this panel received has no lane fields): **staging writes work right now** (review candidates are being produced normally); whether the lane degraded cannot be decided from here — run /winstage status for the authoritative verdict.',
+          '⚠ Sandbox lane info is incomplete (the card this panel received has no lane fields): staging writes work right now (review candidates are being produced normally); whether the lane degraded cannot be decided from here — run /winstage status for the authoritative verdict.',
         trustLossNoise: '("root lost {count}" is a probe counter, not a write-failure count; it increments on every read and does not affect writes)',
         trustRootLostAction: 'Next: run /winstage status to see which step lost the root; when unconfirmed writes > 0, verify staged content before approving.',
         trustWriteUnconfirmed: '⚠ A write was not confirmed on disk (see /winstage status)',

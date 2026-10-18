@@ -216,6 +216,251 @@ static uint32_t ws_intent_of_create(DWORD access, DWORD disposition)
     }
 }
 
+/* ── R18-KNOWN-06：写意图 open 的"零写撤销"记账 ─────────────────────────────────
+ *
+ * 现场（round16 D6-1 / R17 KNOWN-06）：对一个**已存在**的真实文件做"写意图 open"
+ * （GENERIC_WRITE / FILE_WRITE_DATA…，一个字节都不写）时，`ws_create_file_core()`
+ * 为了让后续 `ReadFile` 能读到真实内容，必须 `CopyFileW` 做 CoW ⇒ 整份明文立刻落到
+ * 暂存树（敏感文件还有 blob，且 stage root 不随 run 销毁）。
+ *
+ * 修法（R18，Lead 授权方案 A）：copy 照做（否则 OPEN_ALWAYS 读回空的旧 bug 回归），
+ * 但把这次 copy 记进本表；`WriteFile/WriteFileEx/SetEndOfFile/SetFileInformationByHandle`
+ * 命中该句柄即置 `wrote`；`CloseHandle` 时若 `!wrote` **且暂存副本内容与真实文件逐字节相同**
+ * （逐字节比对是防线：绕过我们钩子的写路径（如 NtWriteFile 直调）改了内容 ⇒ 保留副本），
+ * 才删除暂存副本 —— host 的 `captureAfterExecution()` 按暂存树哈希差分捕获，
+ * 删掉副本即等于"本轮没有变化/不产生候选"。
+ *
+ * 为什么还要逐字节比对而不是只看 wrote：IAT 钩子覆盖不到所有写路径（ntdll 直调等）。
+ * 只按 wrote 删会把"绕过钩子的真实写入"静默丢弃；比对把方向锁在"内容确实没变"这一侧。
+ * 代价：只有"写意图 open 且此前无暂存副本"的句柄才进表/才比对，正常读写路径不受影响
+ * （`g_cowCount == 0` 时所有包装器都是纯转发）。 */
+#define WS_COW_MAX_ENTRIES 64
+
+typedef struct WsCowEntry {
+    HANDLE handle;
+    wchar_t staged[WS_PATH_MAX];
+    wchar_t real[WS_PATH_MAX];
+    int wrote;
+} WsCowEntry;
+
+static WsCowEntry g_cowEntries[WS_COW_MAX_ENTRIES];
+static WsLock g_cowLock;
+static INIT_ONCE g_cowOnce = INIT_ONCE_STATIC_INIT;
+static volatile LONG g_cowCount;
+static volatile LONG g_cowTableFullLogged;
+
+static BOOL CALLBACK ws_cow_lock_once(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once;
+    (void)param;
+    (void)ctx;
+    ws_lock_init(&g_cowLock, "cow");
+    return TRUE;
+}
+static void ws_cow_ready(void)
+{
+    InitOnceExecuteOnce(&g_cowOnce, ws_cow_lock_once, NULL, NULL);
+}
+
+/* 登记一次"为了写意图 open 而新做的 CoW 副本"。表满则**不登记**（副本保留：
+ * 方向是"多留一份"而不是"静默丢写"，并打一次日志）。 */
+static void ws_cow_track(HANDLE h, const wchar_t *staged, const wchar_t *real)
+{
+    if (!h || h == INVALID_HANDLE_VALUE || !staged || !staged[0]) {
+        return;
+    }
+    ws_cow_ready();
+    ws_lock_enter(&g_cowLock);
+    for (int i = 0; i < WS_COW_MAX_ENTRIES; i++) {
+        if (!g_cowEntries[i].handle) {
+            g_cowEntries[i].handle = h;
+            ws_strlcpy_w(g_cowEntries[i].staged, staged, WS_PATH_MAX);
+            ws_strlcpy_w(g_cowEntries[i].real, real ? real : L"", WS_PATH_MAX);
+            g_cowEntries[i].wrote = 0;
+            InterlockedIncrement(&g_cowCount);
+            ws_lock_leave(&g_cowLock);
+            return;
+        }
+    }
+    ws_lock_leave(&g_cowLock);
+    if (InterlockedExchange(&g_cowTableFullLogged, 1) == 0) {
+        ws_log("cow tracking table full (%d); the write-intent copy is kept", WS_COW_MAX_ENTRIES);
+    }
+}
+
+/* 该句柄被写入/截断 ⇒ 副本必须保留（标记后不再做零写撤销）。热点路径：
+ * `g_cowCount == 0` 直接返回，不取锁。 */
+static void ws_cow_mark_written(HANDLE h)
+{
+    if (!h || h == INVALID_HANDLE_VALUE || InterlockedCompareExchange(&g_cowCount, 0, 0) == 0) {
+        return;
+    }
+    ws_cow_ready();
+    ws_lock_enter(&g_cowLock);
+    for (int i = 0; i < WS_COW_MAX_ENTRIES; i++) {
+        if (g_cowEntries[i].handle == h) {
+            g_cowEntries[i].wrote = 1;
+            break;
+        }
+    }
+    ws_lock_leave(&g_cowLock);
+}
+
+/* 取出并移除该句柄的登记；返回 1 表示"这是需要做零写撤销判定的 CoW 句柄"。 */
+static int ws_cow_detach(HANDLE h, wchar_t *staged, DWORD stagedCch, wchar_t *real, DWORD realCch, int *wroteOut)
+{
+    if (!h || h == INVALID_HANDLE_VALUE || InterlockedCompareExchange(&g_cowCount, 0, 0) == 0) {
+        return 0;
+    }
+    int found = 0;
+    ws_cow_ready();
+    ws_lock_enter(&g_cowLock);
+    for (int i = 0; i < WS_COW_MAX_ENTRIES; i++) {
+        if (g_cowEntries[i].handle != h) {
+            continue;
+        }
+        ws_strlcpy_w(staged, g_cowEntries[i].staged, stagedCch);
+        ws_strlcpy_w(real, g_cowEntries[i].real, realCch);
+        if (wroteOut) {
+            *wroteOut = g_cowEntries[i].wrote;
+        }
+        memset(&g_cowEntries[i], 0, sizeof(g_cowEntries[i]));
+        InterlockedDecrement(&g_cowCount);
+        found = 1;
+        break;
+    }
+    ws_lock_leave(&g_cowLock);
+    return found;
+}
+
+/* 两个文件的**内容**是否逐字节相同（打开失败/读失败 ⇒ 视为"不同"，保留副本）。 */
+static int ws_cow_same_content(const wchar_t *a, const wchar_t *b)
+{
+    if (!a || !a[0] || !b || !b[0]) {
+        return 0;
+    }
+    HANDLE ha = ws_open_file_raw(a, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING);
+    if (ha == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    HANDLE hb = ws_open_file_raw(b, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING);
+    if (hb == INVALID_HANDLE_VALUE) {
+        CloseHandle(ha);
+        return 0;
+    }
+    int same = 1;
+    BYTE bufA[8192];
+    BYTE bufB[8192];
+    for (;;) {
+        DWORD readA = 0;
+        DWORD readB = 0;
+        BOOL okA = ReadFile(ha, bufA, sizeof(bufA), &readA, NULL);
+        BOOL okB = ReadFile(hb, bufB, sizeof(bufB), &readB, NULL);
+        if (!okA || !okB || readA != readB || (readA && memcmp(bufA, bufB, readA) != 0)) {
+            same = 0;
+            break;
+        }
+        if (readA == 0) {
+            break;
+        }
+    }
+    CloseHandle(hb);
+    CloseHandle(ha);
+    return same;
+}
+
+/* Delete a path through CAPTURED ORIGINALS, bypassing every shim hook.
+ *
+ * Measured 2026-10-18 (c4b): `g_orig.DeleteFileW(staged)` was re-interpreted by the
+ * shim's own `NtSetInformationFile` interception (kernelbase's DeleteFileW issues
+ * NtSetInformationFile internally, and ntdll's export is intercepted) ⇒ instead of
+ * removing the staged copy it wrote a **whiteout marker for the logical file**, so
+ * the next open failed ENOENT. Calling the captured ntdll original directly cannot
+ * re-enter the export interception: the staged copy disappears, no whiteout. */
+static int ws_cow_delete_raw(const wchar_t *path)
+{
+    if (!path || !path[0] || !g_orig.CreateFileW || !g_orig.NtSetInformationFile || !g_orig.CloseHandle) {
+        return 0;
+    }
+    HANDLE h = g_orig.CreateFileW(path, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                  OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    IO_STATUS_BLOCK iosb;
+    memset(&iosb, 0, sizeof(iosb));
+    BOOLEAN del = TRUE;
+    NTSTATUS st = g_orig.NtSetInformationFile(h, &iosb, &del, sizeof(del), 13 /* FileDispositionInformation */);
+    DWORD lastErr = GetLastError();
+    g_orig.CloseHandle(h);
+    SetLastError(lastErr);
+    return st >= 0;
+}
+
+/* Do not lose the failing call's error code (the zero-write revoke does file IO). */
+BOOL WINAPI ws_CloseHandle(HANDLE hObject)
+{
+    wchar_t staged[WS_PATH_MAX];
+    wchar_t real[WS_PATH_MAX];
+    int wrote = 0;
+    int tracked = ws_cow_detach(hObject, staged, WS_PATH_MAX, real, WS_PATH_MAX, &wrote);
+    BOOL ok = g_orig.CloseHandle ? g_orig.CloseHandle(hObject) : FALSE;
+    DWORD lastErr = GetLastError();
+    if (tracked && wrote == 0 && ws_cow_same_content(real, staged)) {
+        if (ws_cow_delete_raw(staged)) {
+            ws_log_w(L"CreateFileW zero-write revoke (deferred CoW copy removed)", staged);
+            WS_TRACE_FILE("zero-write revoke removed the plaintext copy of %ls", real);
+        }
+    }
+    SetLastError(lastErr);
+    return ok;
+}
+
+BOOL WINAPI ws_WriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite,
+                         LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)
+{
+    if (nNumberOfBytesToWrite > 0) {
+        ws_cow_mark_written(hFile);
+    }
+    if (!g_orig.WriteFile) {
+        return FALSE;
+    }
+    return g_orig.WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
+}
+
+BOOL WINAPI ws_WriteFileEx(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite,
+                           LPOVERLAPPED lpOverlapped, LPOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine)
+{
+    if (nNumberOfBytesToWrite > 0) {
+        ws_cow_mark_written(hFile);
+    }
+    if (!g_orig.WriteFileEx) {
+        return FALSE;
+    }
+    return g_orig.WriteFileEx(hFile, lpBuffer, nNumberOfBytesToWrite, lpOverlapped, lpCompletionRoutine);
+}
+
+BOOL WINAPI ws_SetEndOfFile(HANDLE hFile)
+{
+    ws_cow_mark_written(hFile);
+    if (!g_orig.SetEndOfFile) {
+        return FALSE;
+    }
+    return g_orig.SetEndOfFile(hFile);
+}
+
+BOOL WINAPI ws_SetFileInformationByHandle(HANDLE hFile, FILE_INFO_BY_HANDLE_CLASS FileInformationClass,
+                                          LPVOID lpFileInformation, DWORD dwBufferSize)
+{
+    /* 保守：任何 SetFileInformationByHandle（截断/分配/改名/删除…）都按"有写入"处理，
+     * 因此该句柄的 CoW 副本保留，绝不被零写撤销误删。 */
+    ws_cow_mark_written(hFile);
+    if (!g_orig.SetFileInformationByHandle) {
+        return FALSE;
+    }
+    return g_orig.SetFileInformationByHandle(hFile, FileInformationClass, lpFileInformation, dwBufferSize);
+}
+
 /* --------------------------------------------------------------- hooks */
 
 /* Write-intent opens of an EXISTING real file must copy the real content into
@@ -371,6 +616,10 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
         return INVALID_HANDLE_VALUE;
     }
     int stagedExists = ws_file_exists(staged);
+    /* R18-KNOWN-06: remember whether THIS open created the CoW copy. Only that
+     * shape is revocable at close (a pre-existing staged copy belongs to an
+     * earlier, possibly real, modification and must never be revoked here). */
+    int copiedForDeferredCoW = 0;
     if (dwCreationDisposition == CREATE_NEW && (realExists || stagedExists)) {
         SetLastError(ERROR_FILE_EXISTS);
         return INVALID_HANDLE_VALUE;
@@ -387,8 +636,7 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
      * already rejected above, so neither needs the copy. */
     if (!stagedExists && realExists && (!destructive || dwCreationDisposition == TRUNCATE_EXISTING)) {
         DWORD realAttrs = ws_real_attrs_w(norm);
-        if (realAttrs != INVALID_FILE_ATTRIBUTES && (realAttrs & FILE_ATTRIBUTE_DIRECTORY)) {
-            /* ★ round-4 修复：**目录不能 CoW** —— `CopyFileW` 对目录必然失败，旧代码于是把
+        if (realAttrs != INVALID_FILE_ATTRIBUTES && (realAttrs & FILE_ATTRIBUTE_DIRECTORY)) {            /* ★ round-4 修复：**目录不能 CoW** —— `CopyFileW` 对目录必然失败，旧代码于是把
              * "打开一个已存在的目录"误判成 `copy-on-write failed` 并 fail-closed 拒绝。
              * 实测受害路径：`C:\ProgramData\Microsoft\Windows\WER\Temp`（WER 注册自己的临时
              * 目录；真实文件系统允许这种打开，我们的拒绝让 .NET 的错误报告路径拿不到目录，
@@ -405,11 +653,17 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
             SetLastError(ERROR_ACCESS_DENIED);
             return INVALID_HANDLE_VALUE;
         } else {
+            copiedForDeferredCoW = 1;
             ws_log_w(L"CreateFileW copy-on-write", staged);
         }
     }
     HANDLE h = g_orig.CreateFileW(staged, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
                                   dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+    /* R18-KNOWN-06: register the copy so CloseHandle can revoke it when this open
+     * never writes/truncates anything (the plaintext-copy-up leak). */
+    if (copiedForDeferredCoW && h != INVALID_HANDLE_VALUE) {
+        ws_cow_track(h, staged, norm);
+    }
     if (g_ws.traceStagedOps && (writeAccess || destructive)) {
         /* Do not lose the failing call's error code while tracing it (see the
          * read branch above): the sandboxed caller must see the same error an

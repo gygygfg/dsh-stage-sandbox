@@ -1,5 +1,12 @@
 # R16 域七（易用性）缺陷台账：GUI 操作设计 + CLI 全链路
 
+> **修复状态（第三轮 · 见 [`修复记录-第三轮.md`](修复记录-第三轮.md)）**：
+> - ✅ **已修**：`U16-5`（`--help` 退出码 / 子命令真实参数）、`U16-6`（未知候选 id 不再抛栈）、
+>   `U16-7`（`--workspace` 校验 / 不静默读别的 store / `status` 打印 store 根）、
+>   `U16-8`（`exec` 文本补档位行）、`U16-9`（字典串 markdown `**`）。回归钉 = `tests/cli-contract.ts`。
+> - ⏳ **未修**：`U16-1`（产品决策）、`U16-2`/`U16-3` 在后续轮次已由 GUI 侧修复（`approveSelected` /
+>   `tierEffective` 进面板，见 `dsh-plugin/client.ts` 与 `shell-executor.ts`）；`U16-4`（web 宿主 `/health`）属平台侧。
+>
 > 执行者：teammate `usability`（`task-7`）。实测窗口：2026-10-11 17:46 – 18:26；**U16-1 口径于 18:28 按 Lead 裁定改写为"既定语义 + 安全缺口"**（+08:00）。
 > 报告：`docs/round16/usability-报告.md`；证据：`.t\r16\usability/**`（截图 `shots/`、逐字文本 `logs/`、可复跑脚本 `scripts/`、宿主侧原始数据 `stage-root-a|b/`、CLI 原始输出 `cli/`）。
 > 严重级：**P0 阻断 / P1 重要 / P2 次要**。每条标 `[实测]` / `[读码/推断]`。**本轮未改任何产品代码**（`src/**`、`dsh-plugin/**`、`tests/**` 只读）。

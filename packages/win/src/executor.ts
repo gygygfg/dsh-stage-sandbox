@@ -40,6 +40,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -53,6 +54,11 @@ import { fileURLToPath } from 'node:url'
 // 本文件不重写 `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` / `STARTUPINFOEXW.cb` /
 // cbSize 之类的常量：那正是"探测与执行漂移"（手册 #5.1）的入口。
 import { CREATE_NEW_CONSOLE } from './appcontainer-runtime.ts'
+// ── R18-KNOWN-05b：读遮蔽清单的**唯一**导出源（T2 的 `winstage.mask.v1`）─────────
+// 不在本文件重写一份"哪些路径算敏感"：shim 消费的是同一份 `MASK_CLASSES` 投影
+// （`exportMaskJson()` 的 entries/probes 与内部表逐条同源），因此工具层判定与
+// 进程级 read mask 不可能漂移。
+import { exportMaskJson } from './paths.ts'
 // ── 缺陷③：陈旧 AppContainer 包 SID ACE 的判据只从 `src/appcontainer.ts` 来 ──────
 // 不在本文件重写 SDDL 解析：判据漂移会让"修复"和"测量"对不上。
 // Phase 2 / WP1：暂存根授权的**回读判据**用同一个解析器（`parseSddlDaclAces`），
@@ -1950,6 +1956,10 @@ export class WindowsStageExecutor {
     this.api = undefined
     this.token = undefined
     this.tempDir = undefined
+    /** R18-KNOWN-05b：本次运行写出的读遮蔽清单（`{path, bytes}`，未接管 shim 时为 undefined） */
+    this.readDenyMask = undefined
+    /** R18-KNOWN-08c：最近一次 shim.log 轮转读数（可机检查询） */
+    this.shimLogRotation = undefined
     this.initReport = undefined
     this.job = undefined
     // ── BUG-3 / BUG-4：可查询的诊断状态（绝不只活在一条日志里）────────────────────
@@ -2507,11 +2517,46 @@ export class WindowsStageExecutor {
      * `<probe stageRoot>\shim.log`，而 shim 按这里的 env 写到别处 ⇒ `shim-log-observed`
      * 恒 BAD ⇒ 由于 `available = checks.every(ok)`，**整条档位回落**（本会话死档的机制）。 */
     const logPath = join(this.stagingRoot, 'shim.log')
-    const { configPath, config } = writeShimConfig({
+    /**
+     * ── R18-KNOWN-05b：把读遮蔽清单写进**会话目录**并交给 shim ───────────────────
+     *
+     * 清单来源是 `src/paths.ts::exportMaskJson()`（`winstage.mask.v1`，与
+     * `MASK_CLASSES` / `MASK_PROBES` 逐条同源）。落点选**会话存储根**
+     * （`options.registryStageDir`，CLI 与宿主 shell 都把它设为
+     * `<store.dir>`）而不是暂存树：① 暂存树里的文件会被 `captureAfterExecution`
+     * 当成用户改动摄取；② shim 的 `ws_mask_load_rules()` 用原始 API 读它，
+     * 与暂存布局无关。
+     *
+     * fail-closed：清单写不出来 ⇒ **拒绝启动 shim 档**（绝不"没声明 mask 就裸跑"）。
+     * 这与 shim 侧"声明了但加载不了 ⇒ 所有读被拒"同一条纪律的两半。
+     */
+    const maskSessionDir =
+      typeof this.options.registryStageDir === 'string' && this.options.registryStageDir.length > 0
+        ? this.options.registryStageDir
+        : tempDir
+    let readDenyFile
+    try {
+      mkdirSync(maskSessionDir, { recursive: true })
+      readDenyFile = join(maskSessionDir, 'read-deny.mask.json')
+      writeFileSync(readDenyFile, `${exportMaskJson({ pretty: false })}\n`, 'utf8')
+      this.readDenyMask = { path: readDenyFile, bytes: statSync(readDenyFile).size }
+    } catch (error) {
+      const maskError = fail(
+        'READ_MASK_UNAVAILABLE',
+        'the read-mask policy file (winstage.mask.v1) could not be written into the session directory; ' +
+          'refusing to start the transparent shim without a read mask (fail-closed): ' +
+          `${error.message}`,
+      )
+      maskError.maskSessionDir = maskSessionDir
+      throw maskError
+    }
+    const { configPath, config, logRotation } = writeShimConfig({
       stageRoot: this.stagingRoot,
       logPath,
       extraPassthrough: this.options.shimPassthrough ?? [],
+      readDenyFile,
     })
+    this.shimLogRotation = logRotation
     /* ★ Method A（主线）：结构化操作审计。shim 把**整条进程树**的每一次被 hook 的
      * 文件/注册表操作写成一个 JSONL（`WINSTAGE_AUDIT_LOG`），供宿主侧聚合/分类/呈现。
      * 路径**必须落在暂存树之外**：`shim.log`/`overlay.hive*` 已经教会我们，暂存层自己的
@@ -3804,10 +3849,12 @@ export const READ_ONLY_BARE_VERBS = Object.freeze([
   'findstr', 'find', 'more', 'tree', 'fc', 'comp', 'cd', 'chdir', 'pushd', 'popd', 'cls', 'clear',
   'sleep', 'sls', 'select', 'where', 'foreach', 'sort', 'measure', 'compare', 'diff', 'gci', 'gi',
   'gc', 'gl', 'gps', 'ps', 'gcm', 'gm', 'gv', 'gdr', 'gsv', 'gp', 'gal', 'gh', 'ft', 'fl', 'fw',
-  'oh', 'gcb', 'gjb', 'gwmi', 'gcim', 'curl', 'wget', 'ipconfig', 'systeminfo', 'where.exe',
+  'oh', 'gcb', 'gjb', 'gwmi', 'gcim', 'curl', 'wget', 'curl.exe', 'wget.exe', 'ipconfig', 'systeminfo',
+  'where.exe',
 ])
-// 注：`curl`/`wget` 出现在这里是因为它们**默认只写 stdout**；带 `-o`/`-O` 的写法会被
-//     WRITE_OPERATORS 的 `-o`/`-O` 判据拦下（见下），不会被这条误放行。
+// 注：`curl`/`wget`（含 `.exe` 形态，R18-KNOWN-09b 补齐）出现在这里是因为它们**默认只写
+//     stdout**；带 `-o`/`-O` 的写法会被 WRITE_OPERATORS 与
+//     `hasCurlWgetDownloadFlag()`（组合/粘连短旗标，如 `-sSo`/`-qO`/`-oout`）拦下。
 
 /** 已知只读可执行文件（裸名字，小写） */
 export const READ_ONLY_EXES = Object.freeze([
@@ -3910,6 +3957,104 @@ export const OPAQUE_PAYLOAD_OPERATORS = Object.freeze([
   { label: 'pwsh -File（载荷在文件里，本次判定看不到）', pattern: /(^|\s)-file\s+\S+/i },
 ])
 
+/**
+ * ── R17 安全审计（P1）：read-only 动词 + **带副作用的 API/方法调用** ──────────────
+ *
+ * 现场（独立复现，`.lead/logs/security-auditor/probe-red.log` B 段）：
+ *   `powershell -NoProfile -Command "Get-Date | % { [IO.File]::WriteAllText('…','X') }"`
+ *   ① 没有写入型操作符；② 没有写类动词；④ 首 token 是解释器；`Get-Date` 在只读表里
+ *   ⇒ 判成 READ_ONLY ⇒ `assertStagingWriteEnforceable()` 按 `bypassed:'read-only'`
+ *   **一票放行**。实测在降级/未测量档里命令**真的执行**：真实文件被创建、
+ *   真实文件被删除、真实 HKCU 临时键被创建（证据已留档并清理）。
+ *
+ * 修法：正向判定"只读"之前，先看载荷里有没有**确定的副作用 API/方法调用**；
+ * 命中即判 indeterminate（fail-closed，不是 hard-block：它仍然把"为什么判不出来"
+ * 逐条写进 reasons，且正常只读命令不受影响）。故意**不**用"任意 `.Method(`"
+ * 这种宽判据 —— 那会把 `$x.ToString()` / `.Add()` 这类纯内存调用也判成有风险，
+ * 把降级档的 gate 变成"全面阻断"。只收**名字本身就等于写**的那些。
+ */
+export const SIDE_EFFECT_API_OPERATORS = Object.freeze([
+  {
+    label: '.NET 写文件 API（WriteAllText / AppendAllText / OpenWrite …）',
+    pattern: /\b(writealltext|writealltextasync|writeallbytes|writealllines|writealllinesasync|appendalltext|appendalllines|appendtext|openwrite|createwrite)\s*\(/i,
+  },
+  {
+    label: '.NET 删除/移动/复制 API（Delete / Move / Copy）',
+    /**
+     * `::` 或 `.` 后接 Delete/Move/Copy —— 故意**不收**裸 `Replace`：
+     * `$s.Replace('a','b')` 是纯内存的字符串方法，收进来会把常见只读脚本误判。
+     */
+    pattern: /(?:::|\.)\s*(delete|move|copy)\s*\(/i,
+  },
+  {
+    /**
+     * R18-KNOWN-09b：`[IO.File]::Replace(` / `[System.IO.File]::Replace(` 是**真实文件替换**
+     * （原子替换目标文件），必须判 indeterminate。判据刻意**限定在 `[IO.File]` 类型限定符之后**，
+     * 因此 `$s.Replace('a','b')`（纯内存字符串方法）不会被误伤 —— 这正是 R17 当时
+     * "故意不收 Replace"的原因；R18 用限定作用域的方式把它收回来。
+     */
+    label: '.NET 文件替换 API（[IO.File]::Replace）',
+    pattern: /\[\s*(?:system\.)?io\.file\s*\]\s*::\s*replace\s*\(/i,
+  },
+  {
+    label: '.NET 注册表写 API（CreateSubKey / SetValue / DeleteSubKey …）',
+    pattern: /\b(createsubkey|deletesubkey|deletetree|setvalue|deletevalue|setvaluekind)\s*\(/i,
+  },
+  {
+    label: '.NET 环境/属性写 API（SetEnvironmentVariable / SetAttributes …）',
+    pattern: /\b(setenvironmentvariable|setattributes|setcreationtime|setlastwritetime|setlastaccesstime)\s*\(/i,
+  },
+  {
+    label: '.NET 目录/下载类副作用 API（CreateDirectory / DeleteDirectory / DownloadFile）',
+    pattern: /\b(createdirectory|deletedirectory|createsubdirectory|downloadfile|uploadfile|downloadstringasync)\s*\(/i,
+  },
+  {
+    label: 'Add-Type（编译并加载新类型 ⇒ 可执行任意副作用）',
+    pattern: /\badd-type\b/i,
+  },
+])
+
+/**
+ * 组合/粘连形态的下载落盘旗标（R17 修）。
+ *
+ * 旧 `WRITE_OPERATORS` 里那条 `-(o|O|output|…)\b` 只认"旗标是独立 token"，
+ * 于是 `curl -sSo out.exe url`、`wget -qO out.txt url`（Unix 习惯的组合短旗标）
+ * 一个都命中不了；而 `curl`/`wget` 在只读表里 ⇒ 判 READ_ONLY ⇒ 降级档一票放行。
+ * 判据**只在 curl/wget 程序之后**扫描，因此 `pwsh -NoProfile` 这类
+ * "组合旗标里恰好带 o"的写法不会被误伤。
+ */
+const DOWNLOAD_PROGRAMS = new Set(['curl', 'curl.exe', 'wget', 'wget.exe'])
+
+export function hasCurlWgetDownloadFlag(tokens) {
+  const list = Array.isArray(tokens) ? tokens : []
+  for (let i = 0; i < list.length; i += 1) {
+    const program = baseNameLower(list[i])
+    if (!DOWNLOAD_PROGRAMS.has(program)) continue
+    for (let j = i + 1; j < list.length; j += 1) {
+      const token = String(list[j] ?? '')
+      if (isCommandSeparator(token)) break
+      if (token.startsWith('--')) {
+        if (/^--(output|output-document|remote-name)(=|$)/.test(token)) return true
+        continue
+      }
+      if (token.startsWith('-') && token.length > 1) {
+        // `-sSo` / `-qO`（组合）与 `-oout.exe`（粘连）：短旗标簇里出现 o/O 即视为落盘
+        if (/^[a-z]*o/.test(token.slice(1).toLowerCase())) return true
+      }
+    }
+  }
+  return false
+}
+
+/** "只问版本/帮助"的旗标（`node --version` / `git --help` / `del /?`）—— 不可能有副作用 */
+const VERSION_HELP_FLAGS = new Set(['--version', '-v', '-V', '--help', '-h', '-?', '/?', '/h', '--usage'])
+
+export function isVersionOrHelpProbe(args) {
+  const list = Array.isArray(args) ? args : []
+  if (list.length === 0) return false
+  return list.every((token) => VERSION_HELP_FLAGS.has(String(token ?? '')))
+}
+
 function tokenizeCommandLine(text) {
   const out = []
   const re = /"([^"]*)"|'([^']*)'|(\S+)/g
@@ -3983,12 +4128,35 @@ export function classifyCommandRisk(command, args = [], options = {}) {
   const scannedTokens = splitCommandTokens(lowerTokens)
   const reasons = []
 
+  /**
+   * ⓪ "只问版本/帮助"的调用（R17 修）：`node --version` / `git --help` / `del /?`
+   * 的参数**全部**是版本/帮助旗标 ⇒ 不可能有副作用。
+   *
+   * 为什么必须单列：`node` 不在任何只读表里，旧实现会把 `node --version` 判成
+   * indeterminate（降级档里连查版本都拒）。这条判据只看**参数**，不看程序名，
+   * 因此不会放宽"未知程序"本身的判据（`node script.js` 仍然 indeterminate）。
+   */
+  if (isVersionOrHelpProbe(args)) {
+    return {
+      risk: COMMAND_RISK.READ_ONLY,
+      reasons: [`全部参数都是版本/帮助旗标（${(Array.isArray(args) ? args : []).join(' ')}），不可能产生副作用`],
+      evidence: { command: String(command ?? ''), args: Array.isArray(args) ? args.length : 0, versionOrHelpProbe: true },
+    }
+  }
+
   // ① 写入型操作符（重定向 / 落盘管道 / 下载落盘 / git 变更子命令）
   for (const operator of WRITE_OPERATORS) {
     const hit = operator.pattern.exec(joined)
     if (hit) {
       reasons.push(`写入型操作符「${operator.label}」命中：${JSON.stringify(hit[0]).slice(0, 40)}`)
     }
+  }
+  /**
+   * ①b 下载器**组合/粘连短旗标**（R17 修，见 `hasCurlWgetDownloadFlag` 注释）：
+   * `curl -sSo out.exe …` / `wget -qO out.txt …` 必须与 `--output` 同等对待。
+   */
+  if (hasCurlWgetDownloadFlag(scannedTokens)) {
+    reasons.push('写入型操作符「下载器组合/粘连短旗标（-sSo / -qO / -oout）」命中：落盘')
   }
   // ② 写类动词 / 别名（在**分隔符已劈开**的 `scannedTokens` 上判，理由见 ③c）
   //
@@ -4136,6 +4304,28 @@ export function classifyCommandRisk(command, args = [], options = {}) {
           `交互式解释器、或纯参数），因此无法证明它不会写`,
       ],
       evidence: { command: String(command ?? ''), tokens: lowerTokens, assumeInterpreterPayload: options.assumeInterpreterPayload === true },
+    }
+  }
+  /**
+   * ③d ★ R17 安全审计（P1）：**只读动词 + 副作用 API/方法调用**不得判成只读。
+   *
+   * 现场：`powershell -Command "Get-Date | % { [IO.File]::WriteAllText(…)、
+   * [IO.File]::Delete(…)、[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey(…) }"`
+   * 全部动词都在只读表里（`Get-Date`）⇒ 旧实现判 READ_ONLY ⇒ 降级档一票放行
+   * ⇒ 真实文件/真实注册表真的被改（独立复现在干净进程里拿到了前后读数）。
+   * 修法见 `SIDE_EFFECT_API_OPERATORS`：命中即 indeterminate（fail-closed）。
+   */
+  const sideEffectApis = SIDE_EFFECT_API_OPERATORS.filter((entry) => entry.pattern.test(joined))
+  if (sideEffectApis.length > 0) {
+    return {
+      risk: COMMAND_RISK.INDETERMINATE,
+      reasons: sideEffectApis.map((entry) => `无法判定副作用：载荷里出现 ${entry.label}`),
+      evidence: {
+        command: String(command ?? ''),
+        head,
+        sideEffectApis: sideEffectApis.map((entry) => entry.label),
+        tokens: lowerTokens,
+      },
     }
   }
   return {
@@ -5025,21 +5215,91 @@ export function probeShimDll(dllPath) {
  *
  * `passthrough` 必须包含暂存根本身：否则 shim 会把"往暂存树里写文件"这件事
  * 再暂存一次（自指递归）。
+ *
+ * ── R18-KNOWN-05b：`readDenyFile` ─────────────────────────────────────────────
+ * shim 的 `ws_mask_init()` 支持 `readDenyFile`（`winstage.mask.v1` JSON）且
+ * **fail-closed**：声明了但加载不了 ⇒ 所有读被拒。这里只负责把路径写进配置；
+ * 清单文件本身由 `initTransparent()` 在启动前用 `exportMaskJson()` 写出。
+ * 清单文件同时进 `passthrough`：shim 自己的策略文件不允许被它自己再暂存一次。
+ *
+ * ── R18-KNOWN-08c：日志有界轮转 ───────────────────────────────────────────────
+ * 每次写配置（= 每次起 shim 之前）先做一次有界轮转：`logPath` 超过 32 MiB 就
+ * 改名成 `<logPath>.old`（只保留 1 份）。现场实测 `shim.log` 本会话涨到 533 MB
+ * 且永不回收 —— shim 是用户态 hook，日志行数随进程树操作线性增长，没有上限。
  */
-export function writeShimConfig({ stageRoot, logPath, extraPassthrough = [] }) {
+export const SHIM_LOG_MAX_BYTES = 32 * 1024 * 1024
+export const SHIM_LOG_KEEP_OLD = 1
+
+/**
+ * shim.log 的有界轮转（纯文件操作，返回可机读读数；绝不抛错影响启动）。
+ *
+ * @param {string} logPath
+ * @param {number} [maxBytes]
+ * @returns {{rotated:boolean, before:number, after:number, method:string, error?:string}}
+ */
+export function rotateShimLog(logPath, maxBytes = SHIM_LOG_MAX_BYTES) {
+  const result = { rotated: false, before: -1, after: -1, method: 'none' }
+  try {
+    if (typeof logPath !== 'string' || logPath.length === 0) return { ...result, error: 'no-log-path' }
+    if (!existsSync(logPath)) return { ...result, before: 0, after: 0 }
+    const before = statSync(logPath).size
+    result.before = before
+    result.after = before
+    if (!(Number.isFinite(maxBytes) && maxBytes > 0) || before <= maxBytes) return result
+    const oldPath = `${logPath}.old`
+    // 只保留 1 份：先把上一份 .old 弄走（删不掉不致命，最多占位上界）
+    try {
+      if (existsSync(oldPath)) unlinkSync(oldPath)
+    } catch {
+      /* 旧 .old 可能被别的 shim 持有；继续尝试主文件轮转 */
+    }
+    try {
+      renameSync(logPath, oldPath)
+      result.rotated = true
+      result.method = 'rename'
+      result.after = existsSync(logPath) ? statSync(logPath).size : 0
+      return result
+    } catch (renameError) {
+      // rename 失败（文件被 shim 持有且未共享 delete）⇒ 退化为截断，仍在"有界"这一侧
+      try {
+        writeFileSync(logPath, '')
+        result.rotated = true
+        result.method = 'truncate'
+        result.after = 0
+        return result
+      } catch (truncateError) {
+        result.error = `rename:${renameError.message}; truncate:${truncateError.message}`
+        return result
+      }
+    }
+  } catch (error) {
+    return { ...result, error: error.message }
+  }
+}
+
+export function writeShimConfig({ stageRoot, logPath, extraPassthrough = [], readDenyFile, readDenyFailClosed = true }) {
   const configPath = join(stageRoot, 'winstage-shim.config.json')
-  const passthrough = [...new Set([stageRoot, ...extraPassthrough].filter((value) => typeof value === 'string' && value.length > 0))]
+  const effectiveLogPath = logPath ?? join(stageRoot, 'shim.log')
+  const rotation = rotateShimLog(effectiveLogPath)
+  const passthrough = [
+    ...new Set(
+      [stageRoot, readDenyFile, ...extraPassthrough].filter((value) => typeof value === 'string' && value.length > 0),
+    ),
+  ]
   const config = {
     stageRoot,
-    logPath: logPath ?? join(stageRoot, 'shim.log'),
+    logPath: effectiveLogPath,
     failClosed: true,
     readThrough: true,
     verbose: false,
     traceStagedOps: true,
+    ...(typeof readDenyFile === 'string' && readDenyFile.length > 0
+      ? { readDenyFile, readDenyFailClosed: readDenyFailClosed !== false }
+      : {}),
     passthrough,
   }
   writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8')
-  return { configPath, config }
+  return { configPath, config, logRotation: rotation }
 }
 
 /**

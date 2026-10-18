@@ -25,7 +25,7 @@
  *   - 遮蔽前先规范化，符号链接不能绕过（#16.6）；硬拒绝先于软遮蔽（#16.7）
  */
 
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, normalize, relative, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import {
@@ -118,6 +118,32 @@ function classifyEntry(item, dirent) {
 const WALK_MAX_DEPTH = 64
 
 /**
+ * KNOWN-03：物化真实工作区时的**排除集**与预算（默认值必须可辩护）。
+ *
+ * 排除的是"明确不是用户内容"的目录：VCS 元数据、依赖树、本工具自己的存储、
+ * 构建产物与缓存。它们要么巨大（node_modules）、要么不该被命令看到（.git/
+ * .dshstage/.t），要么是派生物（dist/coverage）。**不做**"全量拷贝"：单文件
+ * 8 MiB、总量 256 MiB、2 万文件封顶，超限如实记 `truncated` 并跳过。
+ */
+const MATERIALIZE_SKIP_DIRS = new Set([
+  '.git',
+  '.hg',
+  '.svn',
+  'node_modules',
+  '.dshstage',
+  '.t',
+  'dist',
+  'build',
+  'coverage',
+  '.cache',
+  '.turbo',
+  '.next',
+])
+const MATERIALIZE_MAX_FILE_BYTES = 8 * 1024 * 1024
+const MATERIALIZE_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+const MATERIALIZE_MAX_FILES = 20000
+
+/**
  * 白障（whiteout）标记子树的固定叶名 —— `<staging root>\wo\`。
  *
  * `[官方]` 与 shim 内置 provider 的布局同构（`shim\src\ws_stage.c:4-6` / `:84-91`）：
@@ -131,6 +157,50 @@ const WALK_MAX_DEPTH = 64
  * `docs\边界缺陷修复-①b-白障候选捕获.md`）。
  */
 const WHITEOUT_LEAF = 'wo'
+
+/**
+ * shim/shell 通道的**内容树**叶名 —— `<staging root>\fs\`（`ws_stage.c` 的 `ws_fs_map()`）。
+ *
+ *   `<staged>\fs\C\a\b`          ← 逻辑路径 `C:\a\b` 的暂存副本（**绝对路径**，含工作区内）
+ *   `<staged>\fs\_unc\server\share\x` ← 逻辑路径 `\\server\share\x`
+ *
+ * 为什么必须在这里解释：`Workspace` 的清单键空间是"工作区内 = 相对路径 / 工作区外 =
+ * 规范化绝对路径"（`keyOf()`，S3a）。把 `fs\…` 当普通内容对象遍历，会让 capture 产出
+ * **带 `fs\` 前缀的伪工作区相对路径**（`[实测]` 2026-10-17：live 会话 manifest 1221 条里
+ * 670 条是 `fs\C\…`）⇒ 候选里出现 `fs\C\Users\…`，apply 会在真实工作区里造出一棵 `fs\`
+ * 树，而"命令真正改了哪个文件"反而没有以真实路径出现。因此它与 `wo\` 一样**不是内容树**，
+ * 要反解成逻辑路径后再进 `hashes`/`realPaths`。
+ */
+const SHIM_FS_LEAF = 'fs'
+
+/**
+ * 暂存层**自身产物**的精确名单（只可能出现在 `<staging root>` 顶层）。
+ *
+ * `[实测]` 2026-10-17：`cli exec --tier TS` 之后 `captureAfterExecution()` 报
+ * `capturedChanges=2`，其中一条是 `shim.log`（10.5 MB 的垫片日志）⇒ 被 ingest 进清单
+ * 并冻结进候选，面板上"批准"它就会把垫片日志写进**真实工作区根**。live 会话的
+ * `review.json` 同样列出 40 个 `.winstage-inject-*.json`（591 个文件的一页）。
+ *
+ * 判定**只认精确名单 + 顶层**：用户在子目录里放同名文件（`docs\shim.log`）或工作区里
+ * 有普通文件 `winstage-shim.config.json` 的另一路径都不受影响。名字本身也不可能是
+ * 用户内容的合法落点：这些名字就是暂存层在**暂存根**写状态时用的。
+ */
+const STAGING_SELF_ARTIFACT_PATTERNS = [
+  /^shim\.log$/i,
+  /^winstage-shim\.config\.json$/i,
+  /^\.winstage-inject-[0-9a-f]+\.json$/i,
+  /^\.winstage-inject-report-[0-9a-f]+\.json$/i,
+  /^\.winstage-run-[a-z0-9]+-[0-9a-f]+\.(?:out|err)$/i,
+  /^\.winstage-selftest-[0-9a-f]+\.json$/i,
+  /^\.winstage-keeper(?:\.ready)?$/i,
+  /^\.winstage-guard$/i,
+]
+
+/** 顶层文件名是否是暂存层自身产物：是则返回可归因 reason（进 `skipped`），否则 undefined */
+function stagingSelfArtifactReason(name) {
+  if (typeof name !== 'string' || name.length === 0) return undefined
+  return STAGING_SELF_ARTIFACT_PATTERNS.some((pattern) => pattern.test(name)) ? 'staging-self-artifact' : undefined
+}
 
 /**
  * 白障标记 → 逻辑绝对路径（`ws_fs_map()` 的逆映射，`shim\src\ws_stage.c:34-73`）。
@@ -262,6 +332,61 @@ function walkStagedForHashes(stagedDir) {
    * 判据用"祖先链上的**解析后身份**"而不是字符串前缀：只有真成环才会命中，
    * 正常的深层目录（哪怕名字很长）不受影响；外加 `WALK_MAX_DEPTH` 的硬上限兜底。
    */
+  /**
+   * `fs\` 内容子树的独立遍历（见 `SHIM_FS_LEAF`）：把 shim 布局的物理文件反解成
+   * **逻辑绝对路径**，并仍以物理相对路径作为 `hashes` 的键（同一目标可能同时存在于
+   * 工具布局 `<rel>` 与 shim 布局 `fs\<盘>\…`，去重由 `captureAfterExecution()` 负责）。
+   *
+   * 与 `walkWhiteouts()` 共用同一套守卫（重解析点 / 环路 / 深度上限），因此执行前快照
+   * 与执行后捕获对"哪些是内容、它们对应哪个逻辑路径"永远不会漂移。
+   */
+  const walkShimContent = (fsRoot, dir, ancestors, depth) => {
+    if (depth > WALK_MAX_DEPTH) {
+      record(dir, 'depth-limit')
+      return
+    }
+    const key = identityOf(dir)
+    if (ancestors.has(key)) {
+      record(dir, 'cycle-detected')
+      return
+    }
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch (error) {
+      record(dir, `unreadable:${error.code ?? 'ERR'}`)
+      return
+    }
+    ancestors.add(key)
+    try {
+      for (const dirent of entries) {
+        const item = join(dir, dirent.name)
+        const reason = classifyEntry(item, dirent)
+        if (reason !== undefined) {
+          seen.add(item)
+          record(item, reason)
+          continue
+        }
+        if (dirent.isDirectory()) {
+          walkShimContent(fsRoot, item, ancestors, depth + 1)
+          continue
+        }
+        seen.add(item)
+        // 与白障标记**同一份**逆映射（`ws_fs_map()` 的逆）：`C:\a\b` ↔ `fs\C\a\b`。
+        const logical = logicalFromWhiteoutMarker(fsRoot, item)
+        if (logical === undefined) {
+          // 反解不出来（首段既不是盘符也不是 `_unc`）⇒ 如实记录，绝不猜一个工作区路径出来
+          record(item, 'shim-layout-unmappable')
+          continue
+        }
+        const physicalKey = relative(stagedDir, item)
+        hashes.set(physicalKey, hashFile(item))
+        realPaths.set(physicalKey, logical)
+      }
+    } finally {
+      ancestors.delete(key)
+    }
+  }
   const walk = (dir, ancestors, depth) => {
     if (depth > WALK_MAX_DEPTH) {
       record(dir, 'depth-limit')
@@ -291,6 +416,13 @@ function walkStagedForHashes(stagedDir) {
           continue
         }
         if (dirent.isDirectory()) {
+          // `fs\` 是 shim/shell 通道的**内容树**（见 `SHIM_FS_LEAF`）：按逻辑路径反解，
+          // 不能当普通工作区相对目录遍历（否则产出 `fs\C\…` 伪路径）。
+          if (depth === 0 && dirent.name.toLowerCase() === SHIM_FS_LEAF) {
+            seen.add(item)
+            walkShimContent(item, item, ancestors, 0)
+            continue
+          }
           // `wo\` 是删除标记子树（见 `WHITEOUT_LEAF`）：不作为内容树进入，
           // 单独按"标记 → 逻辑路径"解释成删除；否则标记会被报成 `create wo\…` 伪路径。
           if (depth === 0 && dirent.name.toLowerCase() === WHITEOUT_LEAF) {
@@ -302,6 +434,15 @@ function walkStagedForHashes(stagedDir) {
           continue
         }
         seen.add(item)
+        // 暂存层自身产物（`shim.log` / `.winstage-inject-*.json` …）在顶层时**不是**用户内容：
+        // 不 hash、不进 `realPaths`，因此永远不会进清单/候选/apply（见 STAGING_SELF_ARTIFACT_PATTERNS）。
+        if (depth === 0) {
+          const selfArtifact = stagingSelfArtifactReason(dirent.name)
+          if (selfArtifact !== undefined) {
+            record(item, selfArtifact)
+            continue
+          }
+        }
         const rel = relative(stagedDir, item)
         hashes.set(rel, hashFile(item))
         realPaths.set(rel, rel)
@@ -1533,7 +1674,10 @@ export class Workspace {
        */
       if (change.op === 'delete' || change.after?.hash === hashAbsent()) continue
       // 内容已经是它要写的样子 ⇒ 无需替换 ⇒ 不参与冲突判定（幂等重批不该被自己的旧基线挡住）
-      const current = existsSync(this.absolute(change.path)) ? hashFile(this.absolute(change.path)) : hashAbsent()
+      // R18 / KNOWN-04：**先判类型**再 hash。对目录调 hashFile 会抛未捕获 EISDIR
+      // （`readFileSync(dir)`），这正是"目录↔文件互换候选 apply 抛栈"的那条路径。
+      const currentKind = existsSync(this.absolute(change.path)) ? statKind(this.absolute(change.path))?.kind : undefined
+      const current = currentKind === 'file' ? hashFile(this.absolute(change.path)) : hashAbsent()
       if (current === change.after?.hash) continue
       pendingChanges.push(change)
     }
@@ -1776,7 +1920,47 @@ export class Workspace {
      *     用户以为批了、盘上什么都没有。
      * 因此 mkdir 必须**先于**那条兜底判据分流，并且显式 `mkdirSync`。
      */
+    /**
+     * ── R18 / KNOWN-04：目录 ↔ 文件互换必须**结构化、可应用** ─────────────────────
+     * 旧行为：候选说"这是文件"而真实盘上是目录时，`writeFileAtomicReplacing()` 的
+     * 回退路径先对目录 `rmSync` ⇒ 未捕获 `EISDIR`（两个方向都抛栈、真实盘不变但
+     * 调用方拿到的是异常而不是失败项）。
+     *
+     * 现在的规则（都保证"失败时真实盘零变更"）：
+     *   · 目标已是期望类型 ⇒ 普通路径（幂等）；
+     *   · 目标类型冲突 ⇒ 用**同目录备份 + 回滚**完成替换：
+     *       - 文件 → 目录：把文件改名到备份，建目录，成功后删备份；失败则改回；
+     *       - 目录 → 文件：只允许**空目录**（`rmdirSync` + 写文件，失败重建目录）。
+     *         非空目录 ⇒ `APPLY_TYPE_CONFLICT`（结构化错误 + 一个字节都不动）。
+     */
     if (change.op === 'mkdir' || (change.kind === 'dir' && change.op !== 'delete')) {
+      const nowKind = statKind(abs)?.kind
+      if (nowKind === 'dir') return
+      if (nowKind === 'file') {
+        const backup = `${abs}.winstage-dirswap-${randomUUID().slice(0, 8)}`
+        renameSync(abs, backup)
+        try {
+          mkdirSync(abs, { recursive: true })
+        } catch (error) {
+          try {
+            renameSync(backup, abs)
+          } catch {
+            /* 回滚失败会在错误详情里点明 */
+          }
+          throw new SandboxError('APPLY_TYPE_CONFLICT', `could not replace file with directory at ${change.path}: ${error.message}`, {
+            path: change.path,
+            foundKind: 'file',
+            desiredKind: 'dir',
+            rolledBack: existsSync(abs),
+          })
+        }
+        try {
+          rmSync(backup, { force: true })
+        } catch {
+          /* 备份清不掉只是残留，目录替换已经成功 */
+        }
+        return
+      }
       mkdirSync(abs, { recursive: true })
       return
     }
@@ -1812,6 +1996,62 @@ export class Workspace {
         hash: change.after.hash,
       })
     }
+    /**
+     * R18 / KNOWN-04（第二面）：候选的**合成父目录**未必有独立 `mkdir` 单元
+     * （`synthesizeParents()` 造的是 `synthetic` 条目，`diffEntries()` 不为它产出 mkdir）。
+     * 于是"真实盘上父路径是个文件"时，写文件会在 `mkdirSync(parent)` 处 EEXIST。
+     * 这里按**候选语义**把父链上的文件替换成目录（备份 + 回滚），失败则结构化报错、真实盘不变。
+     */
+    const ensureParentChainAsDirectories = () => {
+      const chain = []
+      const rootLex = lexical(this.root).toLowerCase()
+      let cursor = dirname(abs)
+      for (let depth = 0; depth < 64; depth += 1) {
+        const lex = lexical(cursor).toLowerCase()
+        if (lex === rootLex) break
+        if (lexicalInside(this.root, cursor) === undefined) break
+        chain.unshift(cursor)
+        const parent = dirname(cursor)
+        if (parent === cursor) break
+        cursor = parent
+      }
+      for (const dirAbs of chain) {
+        const kind = statKind(dirAbs)?.kind
+        if (kind === undefined || kind === 'dir') continue
+        if (kind !== 'file') {
+          throw new SandboxError('APPLY_TYPE_CONFLICT', `cannot create parent directory ${dirAbs}: it exists as a non-file, non-directory object`, {
+            path: change.path,
+            blocker: dirAbs,
+            foundKind: kind,
+            desiredKind: 'dir',
+          })
+        }
+        const backup = `${dirAbs}.winstage-dirswap-${randomUUID().slice(0, 8)}`
+        renameSync(dirAbs, backup)
+        try {
+          mkdirSync(dirAbs, { recursive: true })
+        } catch (error) {
+          try {
+            renameSync(backup, dirAbs)
+          } catch {
+            /* 回滚失败在错误详情里点明 */
+          }
+          throw new SandboxError('APPLY_TYPE_CONFLICT', `could not replace parent file with directory at ${dirAbs}: ${error.message}`, {
+            path: change.path,
+            blocker: dirAbs,
+            foundKind: 'file',
+            desiredKind: 'dir',
+            rolledBack: existsSync(dirAbs),
+          })
+        }
+        try {
+          rmSync(backup, { force: true })
+        } catch {
+          /* 备份残留不影响已完成的目录替换 */
+        }
+      }
+    }
+    ensureParentChainAsDirectories()
     const content = this.store.readBlob(change.after.hash)
     /**
      * ── WP8.2 逐条兜底：宿主原件指纹冲突 ⇒ 拒绝替换（`_r3/wp5-test.ts` 断言⑤）─────
@@ -1834,6 +2074,40 @@ export class Workspace {
     }
     // ── WP8.1 原子替换：同卷"临时文件 → 原子替换"（目标已存在时先摘再改，见函数注释）
     //    失败 ⇒ 抛错且**原文件一字节未动**（内容与临时文件都已提前备好，替换是最后一步）。
+    //    R18 / KNOWN-04：目标若是目录，先按"空目录才可替换"处理，避免 rmSync(dir) 的 EISDIR。
+    const targetKind = statKind(abs)?.kind
+    if (targetKind === 'dir') {
+      let empty = false
+      try {
+        empty = readdirSync(abs).length === 0
+      } catch {
+        empty = false
+      }
+      if (!empty) {
+        throw new SandboxError(
+          'APPLY_TYPE_CONFLICT',
+          `cannot replace non-empty directory ${change.path} with a file: the candidate freezes no content for the directory's children (refusing to delete them)`,
+          { path: change.path, foundKind: 'dir', desiredKind: 'file', changed: [] },
+        )
+      }
+      rmdirSync(abs)
+      try {
+        writeFileAtomicReplacing(abs, content)
+      } catch (error) {
+        try {
+          mkdirSync(abs, { recursive: true })
+        } catch {
+          /* 回滚失败会在错误详情里点明 */
+        }
+        throw new SandboxError('APPLY_TYPE_CONFLICT', `could not replace directory with file at ${change.path}: ${error.message}`, {
+          path: change.path,
+          foundKind: 'dir',
+          desiredKind: 'file',
+          rolledBack: existsSync(abs),
+        })
+      }
+      return
+    }
     writeFileAtomicReplacing(abs, content)
   }
 
@@ -1862,8 +2136,8 @@ export class Workspace {
     return { stagingRoot: this.store.stagedDir, ...result }
   }
   /** 执行前物化当前工作区版本到 staging root */
-  materializeForExecution() {
-    const report = { copied: 0, failed: [] }
+  materializeForExecution(options = {}) {
+    const report = { copied: 0, failed: [], fromManifest: 0, realFiles: 0, skipped: [], truncated: false }
     for (const [rel, entry] of Object.entries(this.manifest.entries)) {
       if (entry.state === STATE.DELETED) continue
       if (entry.kind === 'dir') {
@@ -1875,11 +2149,132 @@ export class Workspace {
         mkdirSync(dirname(target), { recursive: true })
         if (this.store.hasBlob(entry.stagedHash)) writeFileSync(target, this.store.readBlob(entry.stagedHash))
         report.copied += 1
+        report.fromManifest += 1
       } catch (error) {
         report.failed.push({ path: rel, message: error.message })
       }
     }
+    /**
+     * ── R18 / KNOWN-03：真实工作区里"init 之后才出现"的文件也要物化 ──────────────
+     * 旧实现只遍历 `manifest.entries`，于是 init 之后用户在真实盘新建的文件对沙箱内
+     * 命令**不可见**：相对路径 `del`/`type`/改写都 ENOENT（"删除从未暂存的文件"失败）。
+     * 修法：执行前把真实工作区**当前存在**的普通文件复制进 staged 树（有界浏览），
+     * 于是执行前快照能 hash 到它们、删除/修改都能被捕获并进入候选。
+     *
+     * 有界与"不误伤"的判据（必须一起读）：
+     *   · 排除集只放**明确不是用户内容**的目录（VCS/依赖/缓存/本工具自己的存储）；
+     *   · 清单里已有该路径 ⇒ **跳过**（暂存内容才是权威，不能用真实盘覆盖）；
+     *   · 存在白障标记 ⇒ 跳过（该路径在本次会话里"逻辑已删除"）；
+     *   · 重解析点（junction/symlink）不复制（不可跟随，理由同 D8）；
+     *   · 单文件 > `maxFileBytes` / 总字节或总文件数超预算 ⇒ 跳过并**如实记录**（`truncated`）。
+     */
+    if (options.realFiles !== false) this.materializeRealWorkspace(report, options)
     return report
+  }
+
+  /** KNOWN-03 的浏览/复制实现（`materializeForExecution()` 的第二段；判据见那里） */
+  materializeRealWorkspace(report, options = {}) {
+    const maxFileBytes = Number.isInteger(options.maxFileBytes) ? options.maxFileBytes : MATERIALIZE_MAX_FILE_BYTES
+    const maxTotalBytes = Number.isInteger(options.maxTotalBytes) ? options.maxTotalBytes : MATERIALIZE_MAX_TOTAL_BYTES
+    const maxFiles = Number.isInteger(options.maxFiles) ? options.maxFiles : MATERIALIZE_MAX_FILES
+    let totalBytes = 0
+    const budgetExceeded = () => {
+      if (report.realFiles >= maxFiles || totalBytes >= maxTotalBytes) {
+        report.truncated = true
+        return true
+      }
+      return false
+    }
+    const walk = (dir, depth) => {
+      if (depth > WALK_MAX_DEPTH || report.truncated) return
+      let entries
+      try {
+        entries = readdirSync(dir, { withFileTypes: true })
+      } catch (error) {
+        report.skipped.push({ path: relative(this.root, dir), reason: `unreadable:${error.code ?? 'ERR'}` })
+        return
+      }
+      for (const dirent of entries) {
+        const abs = join(dir, dirent.name)
+        const rel = relative(this.root, abs)
+        if (!rel || rel.startsWith('..')) continue
+        if (dirent.isDirectory()) {
+          if (MATERIALIZE_SKIP_DIRS.has(dirent.name.toLowerCase())) {
+            report.skipped.push({ path: rel, reason: 'ignored-dir' })
+            continue
+          }
+          const reason = classifyEntry(abs, dirent)
+          if (reason !== undefined) {
+            report.skipped.push({ path: rel, reason })
+            continue
+          }
+          walk(abs, depth + 1)
+          continue
+        }
+        const entry = this.manifest.entries[rel]
+        if (entry !== undefined) {
+          // 暂存条目是权威（staged 内容可能只是 Sandbox 内的修改）⇒ 不再用真实盘覆盖
+          report.skipped.push({ path: rel, reason: 'staged-entry' })
+          continue
+        }
+        if (this.hasWhiteoutFor(rel)) {
+          report.skipped.push({ path: rel, reason: 'whiteout' })
+          continue
+        }
+        const stagedTarget = this.staged(rel)
+        if (existsSync(stagedTarget)) {
+          report.skipped.push({ path: rel, reason: 'already-staged-object' })
+          continue
+        }
+        const reason = classifyEntry(abs, dirent)
+        if (reason !== undefined) {
+          report.skipped.push({ path: rel, reason })
+          continue
+        }
+        const info = statKind(abs)
+        if (info?.kind !== 'file') {
+          report.skipped.push({ path: rel, reason: 'not-a-regular-file' })
+          continue
+        }
+        if (info.size > maxFileBytes) {
+          report.skipped.push({ path: rel, reason: 'too-large' })
+          continue
+        }
+        if (budgetExceeded()) {
+          report.skipped.push({ path: rel, reason: 'budget' })
+          continue
+        }
+        try {
+          const content = readFileSync(abs)
+          mkdirSync(dirname(stagedTarget), { recursive: true })
+          writeFileSync(stagedTarget, content)
+          report.copied += 1
+          report.realFiles += 1
+          totalBytes += content.length
+        } catch (error) {
+          report.failed.push({ path: rel, message: error.message })
+        }
+      }
+    }
+    walk(this.root, 0)
+    return report
+  }
+
+  /** 逻辑相对键在该会话里是否有白障（删除标记）：`<staged>/wo/<盘>/…` 或 `_unc` */
+  hasWhiteoutFor(rel) {
+    const abs = this.absolute(rel)
+    const normalized = normalize(abs)
+    const match = /^([a-zA-Z]):\\(.*)$/.exec(normalized)
+    const marker = match
+      ? join(this.store.stagedDir, WHITEOUT_LEAF, match[1].toUpperCase(), ...match[2].split(sep).filter(Boolean))
+      : undefined
+    if (marker !== undefined && existsSync(marker)) return true
+    if (normalized.startsWith('\\\\')) {
+      const parts = normalized.slice(2).split(/[\\/]+/).filter(Boolean)
+      const unc = join(this.store.stagedDir, WHITEOUT_LEAF, '_unc', ...parts)
+      if (existsSync(unc)) return true
+    }
+    return false
   }
 
   /**
@@ -1897,25 +2292,65 @@ export class Workspace {
    * 两条来源都要报删除，并按逻辑路径去重（同一次删除在两个面上都留痕时只报一次）。
    */
   captureAfterExecution(beforeSnapshot) {
-    const changes = []
     const { hashes, realPaths, seen, whiteouts } = walkStagedForHashes(this.store.stagedDir)
+    /**
+     * 执行前快照里的"物理键 → 逻辑路径"映射。文件被命令删除后本次 walker 已经看不到它，
+     * 只有快照还记得它原本是哪个逻辑目标（shim 布局的 `fs\C\…` 尤其如此）。
+     */
+    const beforeRealPaths = beforeSnapshot && beforeSnapshot.realPaths instanceof Map ? beforeSnapshot.realPaths : undefined
+    const logicalOf = (key) => realPaths.get(key) ?? beforeRealPaths?.get(key) ?? key
+    /**
+     * 逻辑路径 → 清单**键**口径：工作区内用相对路径，工作区外用规范化绝对路径（S3a）。
+     * 与 `keyOf()` 同一判据（词法包含，不解析链接），因此 `fs\` 反解出来的
+     * `C:\…\ws\note.txt` 会落成 `note.txt`，工作区外的落成 `C:\Users\…\Desktop\x.txt`。
+     */
+    const keyOfLogical = (logical) => {
+      const rel = lexicalInside(this.root, logical)
+      return rel === undefined ? logical : rel
+    }
+    /**
+     * 同一逻辑目标去重（shim 布局与工具布局可能各留一份内容对象）：
+     * 优先**工具布局**（它的物理相对键本身就是清单键形状），其次物理键字典序最小
+     * —— 保证同一棵树两次捕获给出同一读数，不受 `readdir` 顺序影响。
+     */
+    const merged = new Map()
+    const put = (logical, change, isShimLayout, physicalKey) => {
+      const dedupeKey = compareKey(this.absolute(change.path))
+      const prior = merged.get(dedupeKey)
+      if (prior === undefined) {
+        merged.set(dedupeKey, { change, isShimLayout, physicalKey })
+        return
+      }
+      const replace = prior.isShimLayout === true && isShimLayout !== true
+        ? true
+        : prior.isShimLayout === isShimLayout
+          ? String(physicalKey) < String(prior.physicalKey)
+          : false
+      if (replace) merged.set(dedupeKey, { change, isShimLayout, physicalKey })
+    }
     /** 已由"内容对象消失"报过删除的逻辑路径（compareKey），白障标记据此去重 */
     const deletedLogical = new Set()
     for (const [key, now] of hashes) {
       const before = beforeSnapshot.get(key)
       if (before === now) continue
-      const change = { path: realPaths.get(key) ?? key, hash: now, previous: before }
+      const logical = logicalOf(key)
+      const change = { path: keyOfLogical(logical), hash: now, previous: before }
       if (before === undefined) change.created = true
-      changes.push(change)
+      // 物理暂存对象的位置：`ingestCapturedChanges()` 在"内容尚未进 blob"时要按**真实落点**
+      // 读回内容（shim 布局 `fs\C\…` 与清单键 `C:\…` / 相对键的物理位置不同，硬拼会 ENOENT）。
+      change.stagedPhysical = join(this.store.stagedDir, key)
+      put(logical, change, realPaths.get(key) !== key, key)
     }
     // 被命令删除的文件：快照里有、现在没有
     for (const [key, previousHash] of beforeSnapshot) {
       if (hashes.has(key)) continue
       // 仍以重解析点形态存在 → 不是删除（walker 的 seen 里含它）
       if (seen.has(this.store.stagedPath(key))) continue
-      const logical = realPaths.get(key) ?? key
-      changes.push({ path: logical, hash: hashAbsent(), previous: previousHash, deleted: true })
+      const logical = logicalOf(key)
+      if (deletedLogical.has(compareKey(this.absolute(logical)))) continue
+      const change = { path: keyOfLogical(logical), hash: hashAbsent(), previous: previousHash, deleted: true }
       deletedLogical.add(compareKey(this.absolute(logical)))
+      put(logical, change, beforeRealPaths !== undefined && beforeRealPaths.get(key) !== key, key)
     }
     // 新出现的白障标记 `wo\C\a\b` → 删除逻辑路径 `C:\a\b`
     const beforeWhiteouts = beforeSnapshot.whiteouts instanceof Map ? beforeSnapshot.whiteouts : new Map()
@@ -1926,10 +2361,10 @@ export class Workspace {
       // 不能变成待审候选；这里用词法判定（不解析链接），与 `keyOf()` 同一口径。
       if (lexicalInside(this.store.dir, logical) !== undefined) continue
       // 工作区**内**的路径用相对键（与工具面同一键空间），工作区外保留绝对键（S3a）
-      const rel = lexicalInside(this.root, logical)
-      changes.push({ path: rel === undefined ? logical : rel, hash: hashAbsent(), deleted: true })
+      const change = { path: keyOfLogical(logical), hash: hashAbsent(), deleted: true }
+      put(logical, change, false, `<whiteout:${whiteoutKey}>`)
     }
-    return changes
+    return [...merged.values()].map((entry) => entry.change)
   }
 
   /**
@@ -1961,10 +2396,13 @@ export class Workspace {
    * 上一次运行留下的标记既不会被当成暂存内容对象，也不会被当成"暂存对象消失"。
    */
   snapshotStagedTree() {
-    const { hashes, whiteouts, skippedReparsePoints, skipped } = walkStagedForHashes(this.store.stagedDir)
+    const { hashes, realPaths, whiteouts, skippedReparsePoints, skipped } = walkStagedForHashes(this.store.stagedDir)
     hashes.skippedReparsePoints = skippedReparsePoints
     hashes.skipped = skipped
     hashes.whiteouts = whiteouts
+    // 物理键 → 逻辑路径（`fs\` 布局反解）：`captureAfterExecution()` 靠它在文件被删除后
+    // 仍能报出**真实**逻辑路径（而不是把 `fs\C\…` 当成工作区相对路径）。
+    hashes.realPaths = realPaths
     return hashes
   }
 
@@ -2013,7 +2451,10 @@ export class Workspace {
         result.ingested += 1
         continue
       }
-      const stagedPath = this.store.stagedPath(change.path)
+      const stagedPath =
+        typeof change.stagedPhysical === 'string' && existsSync(change.stagedPhysical)
+          ? change.stagedPhysical
+          : this.store.stagedPath(change.path)
       if (!existsSync(stagedPath)) {
         result.skipped.push({ path: change.path, reason: 'staged object missing; not ingesting' })
         continue

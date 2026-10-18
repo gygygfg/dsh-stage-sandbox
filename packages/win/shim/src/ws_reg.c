@@ -34,11 +34,36 @@
 /* UNSTAGED reason codes: they travel in the WAL record's `type` field and must
  * equal REG_STAGE_UNSTAGED_REASON in src/registry-stage.mjs (and DSH_UNSTAGED_*
  * in ws_t3reg.c). The shared header is not ours to extend, so the provider entry
- * point is declared locally. */
+ * point is declared locally.
+ *
+ * ★ R18 / KNOWN-01: the two WOW64 codes stay defined for READING OLD JOURNALS
+ * (decode must still name them), but write paths no longer emit them: a 32-bit
+ * hive view cannot be represented by the overlay and passing the write through
+ * changed the REAL hive before approval (`reg delete /reg:32` really deleted a
+ * real key; `reg add /reg:32` left real empty shell keys). Writes on that view
+ * are now HARD_DENY (fail-closed) with the reason codes below. Reads still pass
+ * through -- a read has no side effect. */
 #define WS_UNSTAGED_WOW64_32KEY              1u
 #define WS_UNSTAGED_WOW64_VIEW_IN_WOW64_PROC 2u
 #define WS_UNSTAGED_UNRESOLVABLE_BASE_HANDLE 3u
 #define WS_UNSTAGED_BARE_HIVE_ROOT           4u
+
+/* HARD_DENY reason codes (WAL kind=5 `type` field; must equal
+ * REG_STAGE_HARD_DENY_REASON in src/registry-stage.ts). */
+#define WS_HARD_DENY_WOW64_32KEY_WRITE_NOT_STAGEABLE 1u
+#define WS_HARD_DENY_WOW64_VIEW_WRITE_NOT_STAGEABLE  2u
+#define WS_HARD_DENY_RECURSIVE_DELETE_NOT_STAGEABLE  3u
+
+/* ── R18 / KNOWN-01（审计补洞）：写意图 open 上的 32KEY 拒绝也必须留痕 ──────────
+ * `reg delete /reg:32` 的形态是：先 `RegOpenKeyExW(HKCU, sub, 0, DELETE|KEY_WOW64_32KEY)`
+ * （写意图 open），拿到句柄后才 `RegDeleteKeyExW`。旧实现里这条 open 走 read_ctx ⇒
+ * **透传真实 API** ⇒ 真实 API 拒绝/找不到时调用方直接失败，**根本没走到 delete 分支的
+ * journal 点** ⇒ WAL 里没有任何 `HARD_DENY`（审计缺口：用户看不到"沙箱拒绝了这次写入"）。
+ * 修法：写意图（非纯读）且视图不可表示时，在 **open 处就 fail-closed** 并写 `HARD_DENY`
+ * （kind=5, type=1|2, status=5, path=键）；纯读 open 仍透传（读无副作用）。 */
+#define WS_SAM_WRITE_INTENT                                                                     \
+    (KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER | \
+     GENERIC_WRITE | GENERIC_ALL)
 
 extern LSTATUS ws_rstore_unstaged(const wchar_t *pathOrPlaceholder, UINT16 reason);
 
@@ -286,6 +311,55 @@ static void ws_reg_journal_unstaged(const wchar_t *api, UINT16 reason, const wch
     ws_rstore_unstaged(label, reason);
 }
 
+/* ── HARD_DENY with a reason code (R18 / KNOWN-01) ─────────────────────────────
+ * `ws_rstore_hard_deny()` (ws_regstore.c) writes kind=5 with `type=0`; the reason
+ * MUST be observable ("which rule refused this?") and the only free field on a
+ * HARD_DENY record is `type`. The append primitive is the documented C ABI
+ * (`DshRegStageJournalAppend`), so build the same 32-byte record the T3 layer
+ * builds (layout pinned by tests/registry-stage.ts). Never turn a failed append
+ * into success: the caller still sees ERROR_ACCESS_DENIED. */
+#pragma pack(push, 4)
+typedef struct WsRegHardDenyRecord {
+    UINT32 magic;      /*  0 'DSRG' */
+    UINT16 version;    /*  4 = 1 */
+    UINT16 kind;       /*  6 = 5 HARD_DENY */
+    UINT16 type;       /*  8 hard-deny reason code (WS_HARD_DENY_*) */
+    UINT16 flags;      /* 10 = 0x0001 HARD_DENY */
+    UINT32 pathChars;  /* 12 */
+    UINT32 nameChars;  /* 16 = 0 */
+    UINT32 dataBytes;  /* 20 = 0 */
+    UINT32 status;     /* 24 = the LSTATUS handed back (non-zero) */
+    UINT32 reserved;   /* 28 = 0 */
+} WsRegHardDenyRecord;
+#pragma pack(pop)
+
+#define WS_REG_WAL_MAGIC      0x47525344u /* 'DSRG' */
+#define WS_REG_WAL_VERSION    1u
+#define WS_REG_KIND_HARD_DENY 5u
+#define WS_REG_FLAG_HARD_DENY 0x0001u
+
+static void ws_reg_hard_deny_reason(const wchar_t *pathOrPlaceholder, UINT16 reason)
+{
+    const wchar_t *path = (pathOrPlaceholder && pathOrPlaceholder[0]) ? pathOrPlaceholder : L"<hard-deny>";
+    WsRegHardDenyRecord rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.magic = WS_REG_WAL_MAGIC;
+    rec.version = (UINT16)WS_REG_WAL_VERSION;
+    rec.kind = (UINT16)WS_REG_KIND_HARD_DENY;
+    rec.type = reason;
+    rec.flags = (UINT16)WS_REG_FLAG_HARD_DENY;
+    rec.pathChars = (UINT32)wcslen(path);
+    rec.status = ERROR_ACCESS_DENIED;
+    rec.reserved = 0;
+    LSTATUS st = DshRegStageJournalAppend(&rec, path, NULL, NULL, NULL);
+    if (st != ERROR_SUCCESS) {
+        ws_log("hard deny (reason=%u) append failed: %lu (%ls)", (unsigned)reason,
+               (unsigned long)st, path);
+    } else {
+        ws_log("hard deny (reason=%u): %ls", (unsigned)reason, path);
+    }
+}
+
 static int ws_reg_disallowed_value_type(DWORD type)
 {
     switch (type) {
@@ -374,10 +448,20 @@ static WsWriteVerdict ws_reg_write_ctx(HKEY hKey, LPCWSTR lpSubKey, REGSAM samDe
         return WS_WRITE_FAIL_CLOSED;
     }
     if (ws_reg_wow64_unrepresentable(samDesired)) {
-        UINT16 reason = (UINT16)((samDesired & KEY_WOW64_32KEY) ? WS_UNSTAGED_WOW64_32KEY
-                                                               : WS_UNSTAGED_WOW64_VIEW_IN_WOW64_PROC);
-        ws_reg_journal_unstaged(api, reason, canonical);
-        return WS_WRITE_PASSTHROUGH;
+        /* ★ R18 / KNOWN-01: a 32-bit hive view CANNOT be represented by the app
+         * hive, and passing the WRITE through changed the real hive before any
+         * approval existed (`reg delete /reg:32` really deleted a real key;
+         * `reg add /reg:32` left real empty shell keys -- measured 3x in R17).
+         * "Cannot be staged" is still not "you lack permission", but for a WRITE
+         * the only honest outcomes are "stage it" or "refuse and record it".
+         * → fail-closed: ERROR_ACCESS_DENIED + HARD_DENY carrying the reason code.
+         * Reads keep their passthrough (ws_reg_read_ctx), because a read has no
+         * side effect and blocking it would break every 32-bit consumer. */
+        UINT16 reason = (samDesired & KEY_WOW64_32KEY) ? WS_HARD_DENY_WOW64_32KEY_WRITE_NOT_STAGEABLE
+                                                       : WS_HARD_DENY_WOW64_VIEW_WRITE_NOT_STAGEABLE;
+        ws_reg_hard_deny_reason(canonical[0] ? canonical : L"<wow64-view>", reason);
+        WS_TRACE("%ls: WOW64 view write refused (fail-closed) %ls", api, canonical);
+        return WS_WRITE_FAIL_CLOSED;
     }
     if (isBareHiveRoot && *isBareHiveRoot) {
         /* A value written straight onto a predefined root (`RegSetValueExW(HKCU,
@@ -525,28 +609,21 @@ static LONG ws_create_key_inner(HKEY hKey, LPCWSTR lpSubKey, DWORD Reserved, LPW
         return ws_create_key_open_only(hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired, sa,
                                        phkResult, lpdwDisposition, resolvable, hive, canonical);
     }
-    if (!resolvable || ws_reg_wow64_unrepresentable(samDesired)) {
-        /* ── The two defects this branch exists to kill (contract v1.4) ──────────
-         * 1. `KEY_WOW64_64KEY` is a **documented no-op in a 64-bit process**. The
-         *    old code tested the RAW mask here, so a `RegCreateKeyExW` with that
-         *    flag on a key that did not exist yet took the refusal path and
-         *    returned ERROR_ACCESS_DENIED(5). That is the "cannot create my own
-         *    key" failure (CLR 0x80070005 / node WSAStartup 10107).
-         * 2. "The overlay cannot represent this" is NOT "you lack permission".
-         *    When the path is underivable (a foreign/native handle) the real API
-         *    is the only thing that can judge the call; when it is the 32-bit
-         *    hive view the app hive has no equivalent location at all. Both go to
-         *    the real API with an UNSTAGED journal record instead of a fabricated
-         *    denial. */
-        UINT16 reason;
-        if (!resolvable) {
-            reason = WS_UNSTAGED_UNRESOLVABLE_BASE_HANDLE;
-        } else if (samDesired & KEY_WOW64_32KEY) {
-            reason = WS_UNSTAGED_WOW64_32KEY;
-        } else {
-            reason = WS_UNSTAGED_WOW64_VIEW_IN_WOW64_PROC;
-        }
-        ws_reg_journal_unstaged(L"RegCreateKeyExW", reason, resolvable ? canonical : NULL);
+    if (ws_reg_wow64_unrepresentable(samDesired)) {
+        /* ★ R18 / KNOWN-01: `RegCreateKeyExW` is CREATE-or-open. Forwarding it for a
+         * 32-bit hive view really created empty shell keys in the REAL hive before
+         * approval (R17: real32=true / real64=true). Refuse + record instead.
+         * Reads/opens keep their passthrough: an open alone cannot create. */
+        UINT16 reason = (samDesired & KEY_WOW64_32KEY) ? WS_HARD_DENY_WOW64_32KEY_WRITE_NOT_STAGEABLE
+                                                       : WS_HARD_DENY_WOW64_VIEW_WRITE_NOT_STAGEABLE;
+        ws_reg_hard_deny_reason(canonical[0] ? canonical : L"<RegCreateKeyExW:wow64-view>", reason);
+        return ERROR_ACCESS_DENIED;
+    }
+    if (!resolvable) {
+        /* "The overlay cannot represent this" is NOT "you lack permission". A path
+         * underivable from a foreign/native handle can only be judged by the real
+         * API, so pass the ORIGINAL call through with an UNSTAGED audit record. */
+        ws_reg_journal_unstaged(L"RegCreateKeyExW", WS_UNSTAGED_UNRESOLVABLE_BASE_HANDLE, NULL);
         return g_orig.RegCreateKeyExW(hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired,
                                       sa, phkResult, lpdwDisposition);
     }
@@ -676,6 +753,21 @@ static LONG ws_open_key_inner(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGS
     wchar_t hive[64], canonical[WS_PATH_MAX];
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
+    /* R18 / KNOWN-01 审计补洞（见 WS_SAM_WRITE_INTENT 的说明）：写意图 open 在 32 位视图上
+     * 无法暂存 ⇒ 在 open 处就拒绝并记 HARD_DENY，而不是把失败留给真实 API（那样 WAL 无记录）。
+     * 纯读（无写意图位）仍走下面的透传，不影响 `reg query /reg:32` 等消费者。 */
+    if (ws_reg_wow64_unrepresentable(samDesired) && (samDesired & WS_SAM_WRITE_INTENT) != 0) {
+        UINT16 reason = (samDesired & KEY_WOW64_32KEY) ? WS_HARD_DENY_WOW64_32KEY_WRITE_NOT_STAGEABLE
+                                                       : WS_HARD_DENY_WOW64_VIEW_WRITE_NOT_STAGEABLE;
+        const wchar_t *label = NULL;
+        if (ws_rstore_canonical(hKey, lpSubKey, hive, 64, canonical, WS_PATH_MAX, &isPseudo, &isBareRoot)) {
+            label = canonical;
+        }
+        ws_reg_hard_deny_reason(label && label[0] ? label : L"<RegOpenKeyExW:wow64-write>", reason);
+        WS_TRACE("RegOpenKeyExW: WOW64 write-intent open refused (fail-closed, HARD_DENY) %ls",
+                 label ? label : L"<unresolvable>");
+        return ERROR_ACCESS_DENIED;
+    }
     if (!ws_reg_read_ctx(hKey, lpSubKey, samDesired, hive, 64, canonical, WS_PATH_MAX,
                          &isPseudo, &isBareRoot) || isBareRoot) {
         WS_TRACE("RegOpenKeyExW: passthrough (unresolvable/bare-root/wow64)");
@@ -1551,6 +1643,139 @@ LONG WINAPI ws_RegDeleteValueA(HKEY hKey, LPCSTR lpValueName)
     name[0] = 0;
     if (lpValueName) MultiByteToWideChar(CP_ACP, 0, lpValueName, -1, name, WS_PATH_MAX);
     LONG rc = ws_delete_value(hKey, name);
+    SetLastError(ws_saved_last_error);
+    return rc;
+}
+
+/* ─────────── R18 / KNOWN-09: the unhooked-registry-API gap ─────────────────────
+ * The IAT point-hook only rewrites symbols listed in ws_hook.c's WS_TARGET, so a
+ * registry write API missing from that list went STRAIGHT to the real hive with
+ * no staging and no audit record (matrix R15; `REG_STAGE_UNHOOKED_APIS`). The two
+ * families below are now covered:
+ *   · RegSetKeyValueW/A, RegDeleteKeyValueW/A are STAGED by reusing the exact
+ *     constituent primitives (create-key + set-value / open + delete-value) --
+ *     no second implementation of the overlay rules;
+ *   · RegDeleteTreeW/A is FAIL-CLOSED (ERROR_ACCESS_DENIED + HARD_DENY): a
+ *     recursive delete has no WAL representation (the overlay records single-key
+ *     tombstones), so "pretend to delete a subtree" would be a lie. */
+
+static LONG ws_set_key_value_inner(HKEY hKey, LPCWSTR subW, LPCWSTR nameW, DWORD dwType,
+                                   const void *lpData, DWORD cbData, int isAnsi)
+{
+    if (!subW || !subW[0]) {
+        return ws_set_value_ex(hKey, nameW, NULL, 0, dwType, (const BYTE *)lpData, cbData, isAnsi);
+    }
+    HKEY sub = NULL;
+    DWORD disposition = 0;
+    LONG rc = ws_create_key(hKey, subW, 0, NULL, 0, KEY_SET_VALUE | KEY_QUERY_VALUE, NULL, &sub, &disposition);
+    if (rc != ERROR_SUCCESS) {
+        return rc;
+    }
+    if (!sub) {
+        return ERROR_ACCESS_DENIED;
+    }
+    LONG rc2 = ws_set_value_ex(sub, nameW, NULL, 0, dwType, (const BYTE *)lpData, cbData, isAnsi);
+    ws_RegCloseKey(sub);
+    return rc2;
+}
+
+LONG WINAPI ws_RegSetKeyValueW(HKEY hKey, LPCWSTR lpSubKey, LPCWSTR lpValueName, DWORD dwType,
+                               const void *lpData, DWORD cbData)
+{
+    DWORD ws_saved_last_error = GetLastError();
+    ws_audit_reg("reg.setKeyValue", hKey, lpSubKey, lpValueName);
+    LONG rc = ws_set_key_value_inner(hKey, lpSubKey, lpValueName, dwType, lpData, cbData, 0);
+    SetLastError(ws_saved_last_error);
+    return rc;
+}
+
+LONG WINAPI ws_RegSetKeyValueA(HKEY hKey, LPCSTR lpSubKey, LPCSTR lpValueName, DWORD dwType,
+                               const void *lpData, DWORD cbData)
+{
+    DWORD ws_saved_last_error = GetLastError();
+    wchar_t sub[WS_PATH_MAX];
+    wchar_t name[WS_PATH_MAX];
+    sub[0] = 0;
+    name[0] = 0;
+    if (lpSubKey) MultiByteToWideChar(CP_ACP, 0, lpSubKey, -1, sub, WS_PATH_MAX);
+    if (lpValueName) MultiByteToWideChar(CP_ACP, 0, lpValueName, -1, name, WS_PATH_MAX);
+    LONG rc = ws_set_key_value_inner(hKey, sub[0] ? sub : NULL, lpValueName ? name : NULL, dwType, lpData, cbData, 1);
+    SetLastError(ws_saved_last_error);
+    return rc;
+}
+
+static LONG ws_delete_key_value_inner(HKEY hKey, LPCWSTR subW, LPCWSTR nameW)
+{
+    if (!subW || !subW[0]) {
+        return ws_delete_value(hKey, nameW);
+    }
+    HKEY sub = NULL;
+    LONG rc = ws_RegOpenKeyExW(hKey, subW, 0, KEY_SET_VALUE | KEY_QUERY_VALUE, &sub);
+    if (rc != ERROR_SUCCESS) {
+        return rc;
+    }
+    if (!sub) {
+        return ERROR_ACCESS_DENIED;
+    }
+    LONG rc2 = ws_delete_value(sub, nameW);
+    ws_RegCloseKey(sub);
+    return rc2;
+}
+
+LONG WINAPI ws_RegDeleteKeyValueW(HKEY hKey, LPCWSTR lpSubKey, LPCWSTR lpValueName)
+{
+    DWORD ws_saved_last_error = GetLastError();
+    ws_audit_reg("reg.deleteKeyValue", hKey, lpSubKey, lpValueName);
+    LONG rc = ws_delete_key_value_inner(hKey, lpSubKey, lpValueName);
+    SetLastError(ws_saved_last_error);
+    return rc;
+}
+
+LONG WINAPI ws_RegDeleteKeyValueA(HKEY hKey, LPCSTR lpSubKey, LPCSTR lpValueName)
+{
+    DWORD ws_saved_last_error = GetLastError();
+    wchar_t sub[WS_PATH_MAX];
+    wchar_t name[WS_PATH_MAX];
+    sub[0] = 0;
+    name[0] = 0;
+    if (lpSubKey) MultiByteToWideChar(CP_ACP, 0, lpSubKey, -1, sub, WS_PATH_MAX);
+    if (lpValueName) MultiByteToWideChar(CP_ACP, 0, lpValueName, -1, name, WS_PATH_MAX);
+    LONG rc = ws_delete_key_value_inner(hKey, sub[0] ? sub : NULL, lpValueName ? name : NULL);
+    SetLastError(ws_saved_last_error);
+    return rc;
+}
+
+/** Fail-closed for recursive delete (no WAL representation). */
+static LONG ws_fail_closed_delete_tree(HKEY hKey, LPCWSTR lpSubKey)
+{
+    wchar_t hive[64];
+    wchar_t canonical[WS_PATH_MAX];
+    canonical[0] = 0;
+    int isPseudo = 0, isBareRoot = 0;
+    if (!ws_rstore_canonical(hKey, lpSubKey, hive, 64, canonical, WS_PATH_MAX, &isPseudo, &isBareRoot) ||
+        !canonical[0]) {
+        ws_strlcpy_w(canonical, L"<RegDeleteTreeW:unresolvable>", WS_PATH_MAX);
+    }
+    ws_reg_hard_deny_reason(canonical, WS_HARD_DENY_RECURSIVE_DELETE_NOT_STAGEABLE);
+    return ERROR_ACCESS_DENIED;
+}
+
+LONG WINAPI ws_RegDeleteTreeW(HKEY hKey, LPCWSTR lpSubKey)
+{
+    DWORD ws_saved_last_error = GetLastError();
+    ws_audit_reg("reg.deleteTree", hKey, lpSubKey, NULL);
+    LONG rc = ws_fail_closed_delete_tree(hKey, lpSubKey);
+    SetLastError(ws_saved_last_error);
+    return rc;
+}
+
+LONG WINAPI ws_RegDeleteTreeA(HKEY hKey, LPCSTR lpSubKey)
+{
+    DWORD ws_saved_last_error = GetLastError();
+    wchar_t sub[WS_PATH_MAX];
+    sub[0] = 0;
+    if (lpSubKey) MultiByteToWideChar(CP_ACP, 0, lpSubKey, -1, sub, WS_PATH_MAX);
+    LONG rc = ws_fail_closed_delete_tree(hKey, sub[0] ? sub : NULL);
     SetLastError(ws_saved_last_error);
     return rc;
 }

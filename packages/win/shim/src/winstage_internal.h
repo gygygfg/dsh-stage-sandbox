@@ -83,6 +83,13 @@ typedef struct WsOriginals {
     BOOL(WINAPI *GetFileAttributesExW)(LPCWSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
     BOOL(WINAPI *GetFileAttributesExA)(LPCSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
 
+    /* --- R18-KNOWN-06: deferred CoW bookkeeping (zero-write revoke) --- */
+    BOOL(WINAPI *CloseHandle)(HANDLE);
+    BOOL(WINAPI *WriteFile)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
+    BOOL(WINAPI *WriteFileEx)(HANDLE, LPCVOID, DWORD, LPOVERLAPPED, LPOVERLAPPED_COMPLETION_ROUTINE);
+    BOOL(WINAPI *SetEndOfFile)(HANDLE);
+    BOOL(WINAPI *SetFileInformationByHandle)(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD);
+
     /* --- process / directive-level file APIs (defect ① fix, see ws_file.c/ws_proc.c) --- */
     NTSTATUS(NTAPI *NtOpenFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
     NTSTATUS(NTAPI *NtSetInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
@@ -129,6 +136,13 @@ typedef struct WsOriginals {
     LONG(WINAPI *RegQueryInfoKeyW)(HKEY, LPWSTR, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, PFILETIME);
     LONG(WINAPI *RegEnumValueW)(HKEY, DWORD, LPWSTR, LPDWORD, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
     LONG(WINAPI *RegEnumKeyExW)(HKEY, DWORD, LPWSTR, LPDWORD, LPDWORD, LPWSTR, LPDWORD, PFILETIME);
+    /* R18 / KNOWN-09: originals of the formerly-unhooked registry write APIs. */
+    LONG(WINAPI *RegSetKeyValueW)(HKEY, LPCWSTR, LPCWSTR, DWORD, const void *, DWORD);
+    LONG(WINAPI *RegSetKeyValueA)(HKEY, LPCSTR, LPCSTR, DWORD, const void *, DWORD);
+    LONG(WINAPI *RegDeleteKeyValueW)(HKEY, LPCWSTR, LPCWSTR);
+    LONG(WINAPI *RegDeleteKeyValueA)(HKEY, LPCSTR, LPCSTR);
+    LONG(WINAPI *RegDeleteTreeW)(HKEY, LPCWSTR);
+    LONG(WINAPI *RegDeleteTreeA)(HKEY, LPCSTR);
     /* task-18: ntdll!NtQueryValueKey -- reg.exe reads values without going through advapi32. */
     NTSTATUS(NTAPI *NtQueryValueKey)(HANDLE, const void * /*PUNICODE_STRING*/, ULONG, PVOID, ULONG, PULONG);
     /* task-18c: the rest of the ntdll query family (same policy as NtQueryValueKey). */
@@ -368,6 +382,12 @@ DWORD WINAPI ws_GetFileAttributesW(LPCWSTR);
 DWORD WINAPI ws_GetFileAttributesA(LPCSTR);
 BOOL WINAPI ws_GetFileAttributesExW(LPCWSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
 BOOL WINAPI ws_GetFileAttributesExA(LPCSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
+/* R18-KNOWN-06: deferred CoW (write-intent open that never writes is revoked on close). */
+BOOL WINAPI ws_CloseHandle(HANDLE);
+BOOL WINAPI ws_WriteFile(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
+BOOL WINAPI ws_WriteFileEx(HANDLE, LPCVOID, DWORD, LPOVERLAPPED, LPOVERLAPPED_COMPLETION_ROUTINE);
+BOOL WINAPI ws_SetEndOfFile(HANDLE);
+BOOL WINAPI ws_SetFileInformationByHandle(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD);
 
 /* --- ws_reg.c ----------------------------------------------------------- */
 LONG WINAPI ws_RegCreateKeyExW(HKEY, LPCWSTR, DWORD, LPWSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD);
@@ -393,6 +413,14 @@ LONG WINAPI ws_RegFlushKey(HKEY);
 LONG WINAPI ws_RegQueryInfoKeyW(HKEY, LPWSTR, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, PFILETIME);
 LONG WINAPI ws_RegEnumValueW(HKEY, DWORD, LPWSTR, LPDWORD, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
 LONG WINAPI ws_RegEnumKeyExW(HKEY, DWORD, LPWSTR, LPDWORD, LPDWORD, LPWSTR, LPDWORD, PFILETIME);
+/* R18 / KNOWN-09: formerly unhooked write APIs (they went straight to the real
+ * hive because they were missing from WS_TARGET). */
+LONG WINAPI ws_RegSetKeyValueW(HKEY, LPCWSTR, LPCWSTR, DWORD, const void *, DWORD);
+LONG WINAPI ws_RegSetKeyValueA(HKEY, LPCSTR, LPCSTR, DWORD, const void *, DWORD);
+LONG WINAPI ws_RegDeleteKeyValueW(HKEY, LPCWSTR, LPCWSTR);
+LONG WINAPI ws_RegDeleteKeyValueA(HKEY, LPCSTR, LPCSTR);
+LONG WINAPI ws_RegDeleteTreeW(HKEY, LPCWSTR);
+LONG WINAPI ws_RegDeleteTreeA(HKEY, LPCSTR);
 
 /* --- ws_file.c: directive-level deletion + the non-Win32 exports ---------- */
 NTSTATUS NTAPI ws_NtOpenFile(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);

@@ -177,6 +177,16 @@ function freshWorkspace(tag) {
 }
 
 /**
+ * R18 回归用：每个 fixture 用**独立的暂存根**（`WINSTAGE_STAGE_ROOT`）。
+ * 共用同一个根会把前一节的清单/候选带进下一节（实测：KNOWN-03 的候选里出现 D10 fixture
+ * 的 `a.txt`/`deep\nested\new.txt`，apply 因 `BLOB_MISSING` 失败 —— 那是测试隔离缺陷，
+ * 不是产品缺陷）。
+ */
+function isolateStage(tag) {
+  process.env.WINSTAGE_STAGE_ROOT = join(SCRATCH, `stage-${tag}-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6)}`)
+}
+
+/**
  * 建好 D8 的现场并跑一遍关键动作（普通模式与 `--plant` 变异体**共用同一份现场**，
  * 避免"测试为绿色单独写一套"那种替身失真）。
  *
@@ -487,6 +497,141 @@ W('=== 3. D8：暂存树里的重解析点不得被跟随（junction 逃逸 / �
       JSON.stringify(p4Caught),
     )
   }
+}
+
+W('')
+W('=== 4. R18/KNOWN-03：init 之后真实盘新建的文件必须被物化（相对删除/修改可见）===')
+{
+  const root = freshWorkspace('known03-materialize')
+  writeFileSync(join(root, 'seed.txt'), 'seed\n')
+  isolateStage('known03')
+  const ws = new Workspace({ workspaceRoot: root }).init({ sessionId: 'reg-known03' })
+  // init 之后才在真实盘上出现的文件（旧实现只遍历 manifest ⇒ 沙箱内不可见）
+  writeFileSync(join(root, 'late.txt'), 'late-content\n')
+  writeFileSync(join(root, 'late-mod.txt'), 'v1\n')
+  // 排除集必须真的被排除（不拷贝巨型/非用户内容目录）
+  mkdirSync(join(root, '.git'), { recursive: true })
+  writeFileSync(join(root, '.git', 'HEAD'), 'ref: refs/heads/main\n')
+  mkdirSync(join(root, 'node_modules', 'pkg'), { recursive: true })
+  writeFileSync(join(root, 'node_modules', 'pkg', 'index.js'), 'module.exports=1\n')
+
+  const materialized = ws.materializeForExecution()
+  check(
+    '新文件被物化进 staged 树（内容逐字节一致）',
+    existsSync(ws.staged('late.txt')) && readFileSync(ws.staged('late.txt'), 'utf8') === 'late-content\n',
+    JSON.stringify({ realFiles: materialized.realFiles, copied: materialized.copied }),
+  )
+  check('`.git` 被排除（不拷贝 VCS 元数据）', !existsSync(ws.staged(join('.git', 'HEAD'))), 'no .git/HEAD in staged')
+  check(
+    '`node_modules` 被排除（不拷贝依赖树）',
+    !existsSync(ws.staged(join('node_modules', 'pkg', 'index.js'))),
+    'no node_modules/** in staged',
+  )
+  check(
+    '跳过项结构化记录（忽略目录不静默）',
+    (materialized.skipped ?? []).some((entry) => entry.reason === 'ignored-dir'),
+    JSON.stringify((materialized.skipped ?? []).slice(0, 4)),
+  )
+
+  // 模拟沙箱命令：相对路径删除 late.txt（删 staged 副本）→ capture 必须报删除
+  const before = ws.snapshotStagedTree()
+  rmSync(ws.staged('late.txt'), { force: true })
+  const captured = ws.captureAfterExecution(before)
+  check(
+    '相对删除被捕获（"删除从未暂存的文件"不再 ENOENT/静默）',
+    captured.some((change) => change.deleted === true && change.path === 'late.txt'),
+    JSON.stringify(captured),
+  )
+  const ingest = ws.ingestCapturedChanges(captured)
+  check('捕获结果并入清单（删除计数=1）', ingest.deletions === 1 && ingest.skipped.length === 0, JSON.stringify(ingest))
+  const frozen = ws.freezeIfNeeded({ source: 'exec' })
+  check(
+    '删除进入候选并可被批准',
+    frozen.frozen === true && (frozen.candidate?.changes ?? []).some((change) => change.op === 'delete' && change.path === 'late.txt'),
+    JSON.stringify((frozen.candidate?.changes ?? []).map((change) => `${change.op}:${change.path}`)),
+  )
+  const applied = ws.applyCandidate(frozen.candidate.id)
+  check(
+    'apply 真的删掉了真实盘上的 late.txt（候选/apply 链路正确）',
+    applied.failed.length === 0 && !existsSync(join(root, 'late.txt')),
+    JSON.stringify({ failed: applied.failed, status: applied.status }),
+  )
+}
+
+W('')
+W('=== 5. R18/KNOWN-04：目录↔文件互换 apply 必须结构化/可应用，绝不未捕获抛栈 ===')
+{
+  // (a) 文件 → 目录：候选说"这是目录"，真实盘上是文件 ⇒ 备份+替换（可应用）
+  const rootA = freshWorkspace('known04-dir-over-file')
+  writeFileSync(join(rootA, 'swap'), 'real-file-content\n')
+  isolateStage('known04a')
+  const wsA = new Workspace({ workspaceRoot: rootA }).init({ sessionId: 'reg-known04a' })
+  // 自然产生方式：写 swap/child.txt ⇒ 合成父目录 `swap`（真实盘上它是文件）
+  wsA.writeFile(join(rootA, 'swap', 'child.txt'), 'child\n', { origin: 'test' })
+  const frozenA = wsA.freezeIfNeeded({ source: 'test' })
+  const changesA = (frozenA.candidate?.changes ?? []).map((change) => `${change.op}:${change.path}`)
+  check(
+    '文件→目录：候选包含 `swap\\child.txt` 的创建（父目录由合成/apply 处理）',
+    changesA.some((entry) => entry.startsWith('create:') && /swap\\child\.txt$/i.test(entry)),
+    JSON.stringify(changesA),
+  )
+  let appliedA
+  let threwA = null
+  try {
+    appliedA = wsA.applyCandidate(frozenA.candidate.id)
+  } catch (error) {
+    threwA = error
+  }
+  check(
+    '文件→目录：apply **不抛栈**，真实盘上父路径变成目录且子文件内容正确（按候选 after 类型替换）',
+    threwA === null &&
+      appliedA.failed.length === 0 &&
+      lstatSync(join(rootA, 'swap')).isDirectory() === true &&
+      readFileSync(join(rootA, 'swap', 'child.txt'), 'utf8') === 'child\n',
+    threwA ? `${threwA.code}: ${threwA.message}` : JSON.stringify({ failed: appliedA?.failed, status: appliedA?.status }),
+  )
+
+  // (b) 目录 → 文件（非空目录）：结构化 APPLY_TYPE_CONFLICT + 真实盘零变更
+  const rootB = freshWorkspace('known04-file-over-dir')
+  mkdirSync(join(rootB, 'swap2'), { recursive: true })
+  writeFileSync(join(rootB, 'swap2', 'keep.txt'), 'keep\n')
+  isolateStage('known04b')
+  const wsB = new Workspace({ workspaceRoot: rootB }).init({ sessionId: 'reg-known04b' })
+  wsB.writeFile(join(rootB, 'swap2'), 'now-a-file\n', { origin: 'test' })
+  const frozenB = wsB.freezeIfNeeded({ source: 'test' })
+  let appliedB
+  let threwB = null
+  try {
+    appliedB = wsB.applyCandidate(frozenB.candidate.id)
+  } catch (error) {
+    threwB = error
+  }
+  const conflictB = appliedB?.failed?.find((item) => item.code === 'APPLY_TYPE_CONFLICT')
+  check(
+    '目录→文件（非空）：结构化 `APPLY_TYPE_CONFLICT`，未捕获异常为零，真实盘零变更',
+    threwB === null && conflictB !== undefined && lstatSync(join(rootB, 'swap2')).isDirectory() === true && readFileSync(join(rootB, 'swap2', 'keep.txt'), 'utf8') === 'keep\n',
+    threwB ? `${threwB.code}: ${threwB.message}` : JSON.stringify({ failed: appliedB?.failed }),
+  )
+
+  // (c) 目录 → 文件（空目录）：可应用（rmdir + 原子写，失败可回滚）
+  const rootC = freshWorkspace('known04-file-over-empty-dir')
+  mkdirSync(join(rootC, 'swap3'), { recursive: true })
+  isolateStage('known04c')
+  const wsC = new Workspace({ workspaceRoot: rootC }).init({ sessionId: 'reg-known04c' })
+  wsC.writeFile(join(rootC, 'swap3'), 'empty-dir-replaced\n', { origin: 'test' })
+  const frozenC = wsC.freezeIfNeeded({ source: 'test' })
+  let appliedC
+  let threwC = null
+  try {
+    appliedC = wsC.applyCandidate(frozenC.candidate.id)
+  } catch (error) {
+    threwC = error
+  }
+  check(
+    '目录→文件（空）：apply 成功且真实盘现在是内容正确的文件',
+    threwC === null && appliedC?.failed?.length === 0 && lstatSync(join(rootC, 'swap3')).isFile() === true && readFileSync(join(rootC, 'swap3'), 'utf8') === 'empty-dir-replaced\n',
+    threwC ? `${threwC.code}: ${threwC.message}` : JSON.stringify({ failed: appliedC?.failed, status: appliedC?.status }),
+  )
 }
 
 W('')

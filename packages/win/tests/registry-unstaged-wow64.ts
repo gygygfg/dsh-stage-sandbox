@@ -40,12 +40,15 @@ import {
   OVERLAY_JOURNAL_NAME,
   REGISTERED_HARD_DENIALS,
   REG_STAGE_FLAGS,
+  REG_STAGE_HARD_DENY_REASON,
   REG_STAGE_KIND,
   REG_STAGE_UNSTAGED_REASON,
+  HARD_DENY_STATUS,
   classifyRegistryOperation,
   createRegistryStage,
   decodeJournalRecords,
   encodeJournalRecord,
+  journalRecordForOperation,
   journalUnstagedRecord,
   replayJournal,
   validateJournalBuffer,
@@ -260,90 +263,157 @@ function main() {
       )
     }
 
-    // ── (b) 32KEY 是另一个视图：不可暂存 ⇒ 透传 + UNSTAGED ─────────────────────
-    section('B. KEY_WOW64_32KEY（覆盖层复现不了的视图）⇒ 透传真实 API + UNSTAGED 记录（不是硬拒）')
+    // ── (b) 32KEY 写/删类 ⇒ fail-closed 硬拒（R18 / KNOWN-01）────────────────────
+    section('B. KEY_WOW64_32KEY（覆盖层复现不了的视图）上的写/删 ⇒ fail-closed 硬拒（真实 hive 不变）')
     {
       cleanupRealKey(K32)
       const setup = runNative(REG, ['add', K32, '/v', 'T4W32', '/t', 'REG_SZ', '/d', 'real', '/f'], 'w32-setup')
       const seeded = realKeyExists(K32)
-      check('前置：真实 hive 里先建好这个键（用未注入的 reg.exe）', setup.status === 0 && seeded.exists === true, `exit=${setup.status} exists=${seeded.exists}`)
+      /**
+       * 前置"用**未注入**的 reg.exe 在真实 hive 预建键"需要宿主能写真实 hive。
+       * 受限/低完整性会话里这一步必然失败（no-write-up），但它**不是**被测产品的行为：
+       * 按纪律 SKIP 该前置（打印原因），后面的"返回码 / WAL HARD_DENY / 无 UNSTAGED"
+       * 断言仍然执行 —— 那些才是本门要钉的东西。真机（Medium IL）重跑时该前置会真的跑。
+       */
+      const canSeedRealHive = setup.status === 0 && seeded.exists === true
+      if (canSeedRealHive) {
+        check('前置：真实 hive 里先建好这个键（用未注入的 reg.exe）', true, `exit=${setup.status} exists=${seeded.exists}`)
+      } else {
+        skip(
+          '前置：真实 hive 里先建好这个键（用未注入的 reg.exe）',
+          `宿主无法写真实 hive（低完整性/受限会话：exit=${setup.status}）⇒ 真机前置未验证，不是 PASS；返回码/WAL 断言仍执行`,
+        )
+      }
 
       const res = runInjected(launcher, 'w32-delete', [REG, 'delete', K32, '/reg:32', '/f'])
       check(
-        'reg delete /reg:32（RegDeleteKeyExW + KEY_WOW64_32KEY）返回 0 —— 旧行为是 ACCESS_DENIED(5)',
-        res.status === 0,
-        `exit=${res.status} stdout=${JSON.stringify(res.stdout.slice(0, 200))}`,
+        'reg delete /reg:32（RegDeleteKeyExW + KEY_WOW64_32KEY）**返回非 0**（fail-closed 硬拒，不再是 exit=0 的真删）',
+        res.status !== 0,
+        `exit=${res.status} stdout=${JSON.stringify(res.stdout.slice(0, 200))} stderr=${JSON.stringify(res.stderr.slice(0, 200))}`,
       )
 
-      const gone = realKeyExists(K32)
-      check(
-        '真实 hive 里的键**真的消失了**（字节级证据：透传确实到达了真实系统）',
-        gone.exists === false,
-        `exists=${gone.exists}${gone.path ? ` at ${gone.path}` : ''}`,
-      )
+      const stillThere = realKeyExists(K32)
+      if (canSeedRealHive) {
+        check(
+          '真实 hive 里的键**仍然存在且值完好**（旧行为：被真删 —— R17 P0；R18 必须不变）',
+          stillThere.exists === true && /T4W32/.test(stillThere.stdout) === true,
+          `exists=${stillThere.exists}${stillThere.path ? ` at ${stillThere.path}` : ''} stdout=${JSON.stringify(String(stillThere.stdout).slice(0, 160))}`,
+        )
+      } else {
+        skip(
+          '真实 hive 里的键**仍然存在且值完好**',
+          '前置键本就没建成（宿主不能写真实 hive）⇒ 该真机断言 SKIP（Medium IL 重跑必跑）',
+        )
+      }
 
       const journal = fs.existsSync(JOURNAL) ? fs.readFileSync(JOURNAL) : Buffer.alloc(0)
       const decoded = journal.length ? decodeJournalRecords(journal) : { records: [] }
-      const unstaged = decoded.records.filter((record) => record.kind === REG_STAGE_KIND.UNSTAGED)
+      const hardDenied = decoded.records.filter((record) => record.kind === REG_STAGE_KIND.HARD_DENY)
+      const forK32 = hardDenied.filter((record) => parseRegistryPathSafe(record.path) === K32)
+      if (canSeedRealHive) {
+        check(
+          `WAL 里有 HARD_DENY 记录且点名了这个键（kind=5，type=${REG_STAGE_HARD_DENY_REASON.WOW64_32KEY_WRITE_NOT_STAGEABLE}=WOW64_32KEY_WRITE_NOT_STAGEABLE，status=${REG_STATUS.ERROR_ACCESS_DENIED}）`,
+          forK32.some(
+            (record) =>
+              record.type === REG_STAGE_HARD_DENY_REASON.WOW64_32KEY_WRITE_NOT_STAGEABLE &&
+              record.status === REG_STATUS.ERROR_ACCESS_DENIED &&
+              (record.flags & REG_STAGE_FLAGS.HARD_DENY) !== 0,
+          ),
+          hardDenied.map((record) => `${record.kindName}:${record.path}(type=${record.type},status=${record.status})`).join(' ') || '(none)',
+        )
+      } else {
+        // reg.exe 对"不存在的键"会在**调用 RegDeleteKeyEx 之前**自行报错（前置键没建成）
+        // ⇒ 这里没有可归因的 HARD_DENY；创建用例（下一段）已覆盖同一条硬拒路径。
+        skip(
+          'WAL 里有 HARD_DENY 记录且点名了这个键（delete 用例）',
+          '前置键未建成 ⇒ reg.exe 未调用 RegDeleteKeyEx；HARD_DENY 由下一段"创建被拒"断言覆盖',
+        )
+      }
       check(
-        'WAL 里有 UNSTAGED 记录（kind=6）',
-        unstaged.length > 0,
-        decoded.records.map((record) => `${record.kindName}:${record.path}`).join(' ') || '(journal empty)',
-      )
-      const forK32 = unstaged.filter((record) => parseRegistryPathSafe(record.path) === K32 || record.path.startsWith('<unstaged:'))
-      check(
-        'UNSTAGED 记录点名了这个键（审计必须能回答"哪个键去了真实 hive"）',
-        forK32.some((record) => record.path === K32),
-        unstaged.map((record) => record.path).join(' | ') || '(none)',
-      )
-      check(
-        `UNSTAGED 的 type = 原因码 WOW64_32KEY(${REG_STAGE_UNSTAGED_REASON.WOW64_32KEY})，status = 0（没有被拒），带 UNSTAGED 标志`,
-        forK32.some(
-          (record) => record.type === REG_STAGE_UNSTAGED_REASON.WOW64_32KEY && record.status === 0 && (record.flags & REG_STAGE_FLAGS.UNSTAGED) !== 0,
+        'WAL 里**没有**这个键的 UNSTAGED/DELETE_KEY（旧的行为指纹：透传 + UNSTAGED）',
+        !decoded.records.some(
+          (record) =>
+            parseRegistryPathSafe(record.path) === K32 &&
+            (record.kind === REG_STAGE_KIND.UNSTAGED || record.kind === REG_STAGE_KIND.DELETE_KEY),
         ),
-        forK32.map((record) => `type=${record.type} status=${record.status} flags=0x${record.flags.toString(16)}`).join(' | ') || '(none)',
+        decoded.records.filter((record) => parseRegistryPathSafe(record.path) === K32).map((record) => record.kindName).join(' ') || '(none)',
       )
       check(
-        'WAL 里**没有**这个键的 DELETE_KEY/HARD_DENY 记录（透传不是删除，硬拒不是结论）',
-        !decoded.records.some((record) => parseRegistryPathSafe(record.path) === K32 && (record.kind === REG_STAGE_KIND.DELETE_KEY || record.kind === REG_STAGE_KIND.HARD_DENY)),
-        decoded.records.filter((record) => record.path === K32).map((record) => record.kindName).join(' ') || '(none)',
-      )
-      check(
-        '真实 WAL 字节通过契约校验（validateJournalBuffer.ok = true，含 UNSTAGED 的字段组合）',
+        '真实 WAL 字节通过契约校验（含 HARD_DENY 的 type=原因码）',
         validateJournalBuffer(journal).ok === true,
         JSON.stringify(validateJournalBuffer(journal).problems),
       )
+
+      // 32KEY **创建**同族：真实 hive 必须不出现空壳键（R17 P0 的另一半）
+      const k32new = `${K32}New`
+      cleanupRealKey(k32new)
+      const created = runInjected(launcher, 'w32-create', [REG, 'add', `${k32new}\\shell`, '/reg:32', '/f'])
+      const createdReal = realKeyExists(k32new)
+      check(
+        'reg add /reg:32 创建键 ⇒ 返回非 0 且真实 hive 不出现空壳键',
+        created.status !== 0 && createdReal.exists === false,
+        `exit=${created.status} real=${createdReal.exists}${createdReal.path ? ` at ${createdReal.path}` : ''}`,
+      )
+      const journal2 = fs.existsSync(JOURNAL) ? fs.readFileSync(JOURNAL) : Buffer.alloc(0)
+      const decoded2 = decodeJournalRecords(journal2)
+      check(
+        '创建被拒也有 HARD_DENY(type=1) 审计记录（不是静默失败）',
+        decoded2.records.some(
+          (record) =>
+            record.kind === REG_STAGE_KIND.HARD_DENY &&
+            record.type === REG_STAGE_HARD_DENY_REASON.WOW64_32KEY_WRITE_NOT_STAGEABLE &&
+            String(record.path).toLowerCase().includes(k32new.toLowerCase()),
+        ),
+        decoded2.records.filter((record) => String(record.path).toLowerCase().includes(k32new.toLowerCase())).map((record) => `${record.kindName}:${record.type}`).join(' ') || '(none)',
+      )
     }
 
-    // ── (c) 候选/应用面必须忽略 UNSTAGED ──────────────────────────────────────
-    section('C. UNSTAGED 记录不得进入候选或应用单元（它描述的是"已经到达真实系统"的调用）')
+    // ── (c) 32KEY 写类已是硬拒；真正的 UNSTAGED 透传仍不得进候选/应用 ────────────
+    section('C. 32KEY 写类=HARD_DENY；UNSTAGED 记录不得进入候选或应用单元')
     {
+      // (c1) 真实 WAL：32KEY 写类产生 HARD_DENY（不进状态），K64 的暂存记录仍在
       const journal = fs.readFileSync(JOURNAL)
       const decoded = decodeJournalRecords(journal)
       const replay = replayJournal(decoded.records)
-      check('replayJournal 把 UNSTAGED 收进 `unstaged[]`', replay.unstaged.length > 0, JSON.stringify(replay.unstaged.slice(0, 2)))
       check(
-        'replayJournal 的状态里**没有**那个透传路径的任何 op（state.ops 只装覆盖层操作）',
-        !replay.state.ops.some((entry) => parseRegistryPathSafe(entry.path) === K32),
-        replay.state.ops.map((entry) => `${entry.op}:${entry.path}`).join(' ') || '(no ops)',
+        '真实 WAL 里 32KEY 只有 HARD_DENY、没有 UNSTAGED（透传已被 fail-closed 取代）',
+        !decoded.records.some((record) => record.kind === REG_STAGE_KIND.UNSTAGED) && decoded.records.some((record) => record.kind === REG_STAGE_KIND.HARD_DENY),
+        decoded.records.map((record) => record.kindName).join(' '),
       )
       check(
-        '同一个 WAL 里的**暂存**记录仍然正常进状态（忽略 UNSTAGED 不等于整份日志失效）',
+        'replayJournal().hardDenied 带原因码 reasonName=WOW64_32KEY_WRITE_NOT_STAGEABLE',
+        replay.hardDenied.some(
+          (entry) =>
+            entry.reasonCode === REG_STAGE_HARD_DENY_REASON.WOW64_32KEY_WRITE_NOT_STAGEABLE &&
+            entry.reasonName === 'WOW64_32KEY_WRITE_NOT_STAGEABLE' &&
+            entry.status === HARD_DENY_STATUS,
+        ),
+        JSON.stringify(replay.hardDenied.slice(0, 3)),
+      )
+      check(
+        '硬拒路径不进 state.ops（覆盖层里什么都没发生）',
+        !replay.state.ops.some((entry) => [K32, `${K32}New`].some((key) => String(parseRegistryPathSafe(entry.path) ?? '').startsWith(key))),
+        replay.state.ops.map((entry) => `${entry.op}:${entry.path}`).join(' '),
+      )
+      check(
+        '同一个 WAL 里的**暂存**记录仍然正常进状态（K64）',
         replay.state.ops.some((entry) => parseRegistryPathSafe(entry.path) === K64),
-        replay.state.ops.map((entry) => `${entry.op}:${entry.path}`).join(' ') || '(no ops)',
+        replay.state.ops.map((entry) => `${entry.op}:${entry.path}`).join(' '),
       )
       check(
-        'UNSTAGED 的原因码在清单里（C/TS 两侧同一套 1..4）',
+        'UNSTAGED 原因码清单仍在（1..4：读类透传 + 旧日志解码必须继续可读）',
         Object.values(REG_STAGE_UNSTAGED_REASON).every((code) => Number.isInteger(code) && code >= 1 && code <= 4),
         JSON.stringify(REG_STAGE_UNSTAGED_REASON),
       )
       check(
-        'REGISTERED_HARD_DENIALS.sam 为空 + unstaged 清单非空（视图位不再是权限问题）',
-        REGISTERED_HARD_DENIALS.sam.length === 0 && REGISTERED_HARD_DENIALS.unstaged.length > 0,
-        `sam=${REGISTERED_HARD_DENIALS.sam.length} unstaged=${REGISTERED_HARD_DENIALS.unstaged.length}`,
+        'REGISTERED_HARD_DENIALS：sam 非空（WOW64 写类）+ hardDenyReasons 非空 + unstaged 清单非空',
+        REGISTERED_HARD_DENIALS.sam.length > 0 &&
+          (REGISTERED_HARD_DENIALS.hardDenyReasons?.length ?? 0) >= 3 &&
+          REGISTERED_HARD_DENIALS.unstaged.length > 0,
+        `sam=${REGISTERED_HARD_DENIALS.sam.length} reasons=${REGISTERED_HARD_DENIALS.hardDenyReasons?.length ?? 0} unstaged=${REGISTERED_HARD_DENIALS.unstaged.length}`,
       )
 
-      // 纯层：宿主侧门面（参考实现）遇到不可暂存的调用，必须"不抛错、不写覆盖层、留审计"。
+      // (c2) 纯层：32KEY 写类抛 REG_STAGE_HARD_DENY(status=5)；读类仍是 unstaged 透传
       const pureDir = path.join(STAGE, 'pure')
       const stub = createStubRegistry()
       const stage = createRegistryStage({ sessionDir: pureDir, sessionId: 'a2-pure', reader: stub.reader, writer: stub.writer })
@@ -353,9 +423,15 @@ function main() {
 
       const denyVerdict = classifyRegistryOperation({ api: 'RegDeleteKeyExW', path: 'HKCU\\Software\\PureB', samDesired: 0x0200 })
       check(
-        'classifyRegistryOperation：32KEY ⇒ { stageable:false, unstaged:true, status:0 }',
-        denyVerdict.stageable === false && denyVerdict.unstaged === true && denyVerdict.status === 0 && denyVerdict.code === 'REG_STAGE_SAM_UNSTAGED',
+        '经典层：32KEY 写类 ⇒ { stageable:false, status:5, hardDenyReason=WOW64_32KEY_WRITE_NOT_STAGEABLE }',
+        denyVerdict.stageable === false && denyVerdict.unstaged === undefined && denyVerdict.status === HARD_DENY_STATUS && denyVerdict.hardDenyReason === 'WOW64_32KEY_WRITE_NOT_STAGEABLE',
         JSON.stringify(denyVerdict),
+      )
+      const readVerdict = classifyRegistryOperation({ api: 'RegQueryValueExW', path: 'HKCU\\Software\\PureB', samDesired: 0x0200 })
+      check(
+        '经典层：32KEY **读类** ⇒ 仍 unstaged 透传（无副作用）',
+        readVerdict.stageable === false && readVerdict.unstaged === true && readVerdict.status === 0,
+        JSON.stringify(readVerdict),
       )
       const noopVerdict = classifyRegistryOperation({ api: 'RegCreateKeyExW', path: 'HKCU\\Software\\PureC', samDesired: 0x0100 })
       check(
@@ -364,68 +440,65 @@ function main() {
         JSON.stringify(noopVerdict),
       )
 
-      let unstagedResult = null
       let threw = null
       try {
-        unstagedResult = stage.stageDeleteKey('HKCU\\Software\\PureB', { samDesired: 0x0200 })
+        stage.stageDeleteKey('HKCU\\Software\\PureB', { samDesired: 0x0200 })
       } catch (error) {
         threw = error
       }
       check(
-        'stageDeleteKey(samDesired=32KEY) **不抛错**（抛错就会被上游当成"被拒"）',
-        threw === null,
-        threw ? `${threw.code}: ${threw.message}` : 'no throw',
+        'stageDeleteKey(samDesired=32KEY) 抛 REG_STAGE_HARD_DENY 且 status=5（fail-closed 硬拒）',
+        threw !== null && threw.code === 'REG_STAGE_HARD_DENY' && threw.status === HARD_DENY_STATUS,
+        threw ? `${threw.code}: status=${threw.status}` : 'no throw',
       )
       check(
-        '返回值如实标注 unstaged（net:false / staged:false / bytes>0 的审计记录）',
-        unstagedResult !== null && unstagedResult.unstaged === true && unstagedResult.net === false && unstagedResult.staged === false && unstagedResult.record?.kind === REG_STAGE_KIND.UNSTAGED,
-        JSON.stringify(unstagedResult && { unstaged: unstagedResult.unstaged, net: unstagedResult.net, kind: unstagedResult.record?.kind, bytes: unstagedResult.bytes }),
-      )
-      check(
-        '覆盖层状态里没有 PureB（不可暂存 ⇒ 覆盖层里什么都不该发生）',
+        '覆盖层状态里没有 PureB（硬拒 ⇒ 覆盖层里什么都不该发生）',
         stage.getState().ops.every((entry) => parseRegistryPathSafe(entry.path) !== 'HKCU\\Software\\PureB'),
-        stage.getState().ops.map((entry) => `${entry.op}:${entry.path}`).join(' ') || '(no ops)',
+        stage.getState().ops.map((entry) => `${entry.op}:${entry.path}`).join(' '),
       )
       check('前置：PureA 的暂存确实进了状态（否则下面的"候选里有 A 没 B"就没有判定力）', stagedWrite.net === true && stage.getState().ops.some((entry) => parseRegistryPathSafe(entry.path)?.startsWith('HKCU\\Software\\PureA')), JSON.stringify(stagedWrite).slice(0, 200))
 
       const frozen = stage.freezeCandidate({ enqueue: false })
       const changePaths = (frozen.changes ?? []).map((change) => change.path)
-      check(
-        '候选里没有 PureB（UNSTAGED 不进候选）',
-        !changePaths.some((p) => p.includes('PureB')),
-        changePaths.join(' ') || '(no changes)',
-      )
-      check('候选里有 PureA（正面判定力）', changePaths.some((p) => p.includes('PureA')), changePaths.join(' ') || '(no changes)')
+      check('候选里没有 PureB（硬拒不进候选）', !changePaths.some((p) => p.includes('PureB')), changePaths.join(' '))
+      check('候选里有 PureA（正面判定力）', changePaths.some((p) => p.includes('PureA')), changePaths.join(' '))
 
       stub.writes.length = 0
       const applied = stage.apply({ force: true })
-      check(
-        'apply() 的 writer 从未收到 PureB 的单元（不双重写入）',
-        !stub.writes.some((entry) => String(entry[1]).includes('PureB')),
-        JSON.stringify(stub.writes),
-      )
-      check(
-        'apply() 也没把 PureB 记成 applied',
-        !applied.applied.some((unit) => unit.path.includes('PureB')),
-        JSON.stringify({ applied: applied.applied, status: applied.status }),
-      )
-      const pureJournal = fs.readFileSync(path.join(pureDir, 'registry', OVERLAY_JOURNAL_NAME))
-      const pureDecoded = decodeJournalRecords(pureJournal)
-      check(
-        '纯层的 WAL 里也留了 UNSTAGED 审计记录（宿主侧参考实现与 DLL 同协议）',
-        pureDecoded.records.some((record) => record.kind === REG_STAGE_KIND.UNSTAGED),
-        pureDecoded.records.map((record) => record.kindName).join(' '),
-      )
-      check('纯层 WAL 通过契约校验', validateJournalBuffer(pureJournal).ok === true, JSON.stringify(validateJournalBuffer(pureJournal).problems))
+      check('apply() 的 writer 从未收到 PureB 的单元', !stub.writes.some((entry) => String(entry[1]).includes('PureB')), JSON.stringify(stub.writes))
+      check('apply() 也没把 PureB 记成 applied', !applied.applied.some((unit) => unit.path.includes('PureB')), JSON.stringify({ applied: applied.applied, status: applied.status }))
 
-      // 单条 UNSTAGED 记录的编解码必须自洽（不依赖上面那次真实运行），
-      // 且**混进一份日志后不得进状态**：这是 (c) 的最小可复现形态。
-      const lone = journalUnstagedRecord({ api: 'RegSetValueExW', path: 'HKLM\\Software\\X', reason: 'test', unstagedReason: 'WOW64_32KEY' })
+      // (c3) 真正的 UNSTAGED（路径不可派生 ⇒ 透传）仍不得进候选/应用；其路径下的
+      //      overlay 值必须 appliable:false（R18 KNOWN-02，由候选一致性保证）。
+      const handDir = path.join(STAGE, 'handwal')
+      const handJournal = path.join(handDir, 'registry', OVERLAY_JOURNAL_NAME)
+      fs.mkdirSync(path.dirname(handJournal), { recursive: true })
+      const handRecords = [
+        journalUnstagedRecord({ api: 'RegCreateKeyExW', path: 'HKCU\\Software\\Wsa', unstagedReason: 'UNRESOLVABLE_BASE_HANDLE' }),
+        journalRecordForOperation({ op: 'create-key', path: 'HKCU\\Software\\Wsa' }),
+        journalRecordForOperation({ op: 'set-value', path: 'HKCU\\Software\\Wsa', valueName: 'V', type: 'REG_SZ', value: 'x' }),
+      ]
+      const handBuffer = Buffer.concat(handRecords.map((record) => encodeJournalRecord(record)))
+      fs.writeFileSync(handJournal, handBuffer)
+      const handStage = createRegistryStage({ sessionDir: handDir, sessionId: 'a2-hand', reader: stub.reader, writer: stub.writer })
+      handStage.open()
+      const handFrozen = handStage.freezeCandidate({ enqueue: false })
+      const handPaths = (handFrozen.candidate?.changes ?? []).map((change) => change.path)
+      check(
+        '手工 WAL：UNSTAGED 路径下的 overlay 值进候选但标 appliable:false（KNOWN-02 fail-closed）',
+        handPaths.some((p) => /Wsa\\V$/i.test(p)) &&
+          (handFrozen.candidate?.changes ?? []).find((change) => /Wsa\\V$/i.test(change.path))?.appliable === false,
+        JSON.stringify(handPaths),
+      )
+      check('手工 WAL 通过契约校验', validateJournalBuffer(handBuffer).ok === true, JSON.stringify(validateJournalBuffer(handBuffer).problems))
+
+      // 单条 UNSTAGED 记录的编解码必须自洽，且**混进一份日志后不得进状态**。
+      const lone = journalUnstagedRecord({ api: 'RegSetValueExW', path: 'HKLM\\Software\\X', reason: 'test', unstagedReason: 'UNRESOLVABLE_BASE_HANDLE' })
       check(
         'journalUnstagedRecord 的形状：kind=6 / UNSTAGED 位 / type=原因码 / status=0 / 无 payload',
         lone.kind === REG_STAGE_KIND.UNSTAGED &&
           lone.flags === REG_STAGE_FLAGS.UNSTAGED &&
-          lone.type === REG_STAGE_UNSTAGED_REASON.WOW64_32KEY &&
+          lone.type === REG_STAGE_UNSTAGED_REASON.UNRESOLVABLE_BASE_HANDLE &&
           lone.status === 0 &&
           lone.valueName === null &&
           lone.data === null,
@@ -435,10 +508,10 @@ function main() {
       const loneRound = decodeJournalRecords(loneBuffer)
       const loneReplay = replayJournal(loneRound.records)
       check(
-        '单条 UNSTAGED 记录可编解码（kindName=UNSTAGED），replay 后 state.ops 为空、unstaged[] 有 1 条',
+        '单条 UNSTAGED 记录可编解码，replay 后 state.ops 为空、unstaged[] 有 1 条',
         loneRound.records.length === 1 &&
           loneRound.records[0].kindName === 'UNSTAGED' &&
-          loneRound.records[0].type === REG_STAGE_UNSTAGED_REASON.WOW64_32KEY &&
+          loneRound.records[0].type === REG_STAGE_UNSTAGED_REASON.UNRESOLVABLE_BASE_HANDLE &&
           loneReplay.state.ops.length === 0 &&
           loneReplay.unstaged.length === 1,
         JSON.stringify({ records: loneRound.records.length, ops: loneReplay.state.ops.length, unstaged: loneReplay.unstaged.length }),
@@ -453,6 +526,15 @@ function main() {
           return verdict.ok === false && verdict.problems.some((problem) => problem.code === 'UNSTAGED_STATUS_NONZERO')
         })(),
         'mutation: status 0 -> 5',
+      )
+      check(
+        '契约校验有判定力：HARD_DENY 的 type 塞一个不存在的原因码必须判红',
+        (() => {
+          const bad = Buffer.from(encodeJournalRecord({ ...journalRecordForOperation({ op: 'create-key', path: 'HKLM\\X' }), kind: REG_STAGE_KIND.HARD_DENY, flags: REG_STAGE_FLAGS.HARD_DENY, type: 999, status: 5, valueName: null, data: null }))
+          const verdict = validateJournalBuffer(bad)
+          return verdict.ok === false && verdict.problems.some((problem) => problem.code === 'HARD_DENY_BAD_REASON')
+        })(),
+        'mutation: hard-deny type -> 999',
       )
       const diff = diffSnapshots(normalizeSnapshot({ root: 'HKLM\\Software\\X', exists: false }), normalizeSnapshot({ root: 'HKLM\\Software\\X', exists: false }))
       check('（自检）空 diff 为空 —— 证明上面的"候选里没有 B"不是靠 diff 恒空', diff.changes.length === 0, JSON.stringify(diff.summary))

@@ -1449,6 +1449,32 @@ export function installRunCapture(ctx, options = {}) {
 
 // ==================== 插件入口 ====================
 
+/**
+ * 从 **loader 行表**读设置开关（`id: winstage-sandbox` 行的 `config.enabled`）。
+ *
+ * 这是本插件"开关唯一真源"的**行表读法**，与 `staging-fs.ts::stagingEnabledRaw()` 逐条同义
+ * （那边读 `rootEntry.parent.data`）：
+ *   · 行表是 patch 组合后的那份（bundle 默认 + profile 覆盖层）；设置页改动经
+ *     configEditor → reconcileProfilePatches → `EntryGroup.update()` **把整份 data 换新**
+ *     （group 对象不变）⇒ 每次现读都能看到最新值；
+ *   · 找不到该行/没有 config ⇒ `true`（维持历史"接管"行为，与 fs 面一致）；
+ *   · 传入的 rows 不是数组（离线自测 / 非 cordis ctx）⇒ `undefined`，调用方回退到 apply 参数。
+ *
+ * 为什么不能读 apply 参数：部署入口 `plugin/index.ts` 的 `normalizeConfig()` 把 volatile
+ * 引用解成普通布尔**快照一次**，而 cordis 的 volatile 更新只原地刷新引用、不重跑 apply
+ * ⇒ 闭包里的布尔永远是启动值（R17 审计实测，见 `apply()` 内 `isEnabled` 的注释）。
+ *
+ * @param {unknown} rows `ctx.fiber.entry.parent.data`
+ * @returns {boolean|undefined}
+ */
+export function switchEnabledFromRows(rows) {
+  if (!Array.isArray(rows)) return undefined
+  const row = rows.find((item) => item && item.id === 'winstage-sandbox')
+  if (!row) return undefined
+  if (!row.config || typeof row.config !== 'object') return true
+  return row.config.enabled !== false
+}
+
 export function apply(ctx, config = {}) {
   const log = makeLog(ctx)
   /**
@@ -1475,15 +1501,33 @@ export function apply(ctx, config = {}) {
   const workspaceRoot = config.workspaceRoot || new URL('..', import.meta.url).pathname.replace(/^\//, '')
 
   /**
-   * 开关的**唯一读法**：每次现读 `config.enabled`，绝不在这里冻结成常量。
+   * 开关的**唯一读法**：每次现读，绝不在这里冻结成常量。
    *
-   * `enabled` 在 `schema.js` 里是 volatile 字段，设置页改它**不会重挂本行**
-   * （loader 的 volatile 通道把新值原地写回 apply 收到的这个 config 对象）。
-   * 所以"关闭"必须靠**调用时判断**生效，而不是 apply 早退：早退会让"关掉再打开"
-   * 永远回不来（apply 不会重跑）。变更面的卸载由 `fs-entry.ts`/`staging-fs.ts`
-   * 按同一个开关现读完成 —— 关 = 退回平台沙箱/审批模式。
+   * ── R17 审计修复（P1）：为什么不能只读 `config.enabled` ──────────────────────
+   * 部署入口是 `plugin/index.ts`（→ `dist/index.mjs`），它的 `apply()` 先
+   * `normalizeConfig(config)` 再委托到本文件。真 schemastery 对 volatile 字段的校验输出是
+   * **Volatile 引用对象**（`schemastery/src/index.ts:480-482` 的 `.volatile()` 只是
+   * `.extra('volatile', true)`；`:521` 在 `meta.volatile` 时一律 `createVolatile()` 包装），
+   * 而 `normalizeConfig()` 用 `boolOf()` 把它们**解成普通布尔快照一次**。
+   * ⇒ 设置页把开关关掉时，cordis 的 volatile 通道只 `updateVolatile()` 原地刷新引用，
+   * **不会重跑 apply**；于是本文件闭包里的 `config` 是启动那一刻的快照，永远看不到热写。
+   * 实测（干净进程 + 真 Cordis Loader；`.lead/logs/cordis-auditor/cordis-audit.log` C 段）：
+   *   · 行表 `config.enabled` → false（组合层权威值已换新）；
+   *   · `fiber.config.enabled.get()` → false（框架的引用是活的）；
+   *   · 但 apply 收到的普通布尔快照仍是 true，且 apply 不会被重跑。
+   * 后果：运行中关掉开关后 `/winstage*` 仍执行、面板路由仍放行、关闭态启动后打开也不恢复
+   * （直到重启宿主）—— 与 "命令面始终注册 + 执行时现读" 的承诺不符。
+   *
+   * 所以开关的唯一真源改为**loader 行表里 `winstage-sandbox` 行的 `config.enabled`**
+   * （与 `staging-fs.ts::stagingEnabledRaw()` **同一处真值**、同一读法），apply 参数只作
+   * 拿不到行表时（离线自测/桩 ctx）的回退。
+   * 行表在 `EntryGroup.update()` 里被**换整份**（`parent.data = config`），group 对象不变
+   * ⇒ 每次现读都能看到新值，不需要重挂行。
    */
-  const isEnabled = () => config.enabled !== false
+  const isEnabled = () => {
+    const fromRows = switchEnabledFromRows(ctx?.fiber?.entry?.parent?.data)
+    return typeof fromRows === 'boolean' ? fromRows : config.enabled !== false
+  }
 
   if (isEnabled()) {
     log.info(`已启用；工作区根 = ${workspaceRoot}`)
@@ -1680,16 +1724,25 @@ export function apply(ctx, config = {}) {
   //      完全不可见（F5b 实测 90 s、`staleBaseline=0`），随后点「批准所选」还会静默覆盖。
   //      本定时器按 Client 的轮询节拍（1500 ms）跑 `ReviewService.reviewDrift()` —— 那是
   //      **纯读**：指纹没变立刻返回、不写盘；只有事实变了才重发布 review.json。
-  //      关闭态（设置里把沙箱关掉）不装配：那时本插件不接管任何东西，不该有后台读盘。
-  if (isEnabled()) {
-    installBaselineWatch(ctx, {
-      workspaceRoot,
-      log: (message) => log.info(message),
-      // 漂移诊断走**人工侧**通道（error 级日志），绝不进模型可见的 stdout/stderr
-      logError,
-    })
-    log.info('基线漂移复核已装配（只读轮询；外部写入会在一个节拍内出现在面板上）。')
-  }
+  //
+  // ★ R18 · KNOWN-08a：**装配不再由 apply 期的开关决定**（旧实现只在开态装配 ⇒ ①运行中
+  //   关掉开关后定时器继续只读扫描；②关闭态启动后再打开永远不恢复，直到重启宿主）。
+  //   现在恒装配，把 `isEnabled`（每次现读 loader 行表的同一真值）交给 watcher：
+  //   开 ⇒ 正常轮询；关 ⇒ `clearInterval` 停轮询（零 IO）并挂轻量恢复检查；重新打开
+  //   ⇒ 自动恢复轮询。两个定时器都由 `ctx.effect` 持有（卸载对称清理）。
+  installBaselineWatch(ctx, {
+    workspaceRoot,
+    // 与命令面/面板/fs 面**同一个真值**（现读 loader 行表；apply 参数只作回退）
+    isEnabled,
+    log: (message) => log.info(message),
+    // 漂移诊断走**人工侧**通道（error 级日志），绝不进模型可见的 stdout/stderr
+    logError,
+  })
+  log.info(
+    isEnabled()
+      ? '基线漂移复核已装配（只读轮询；外部写入会在一个节拍内出现在面板上）。'
+      : '基线漂移复核已装配：设置里当前为关闭 ⇒ 不轮询、零 IO，只保留开关恢复检查（重新打开后自动恢复）。',
+  )
 
   // 3) 启动探测（如实报告受限令牌能力；与暂存面无关）
   if (config.probeOnStart === false) {

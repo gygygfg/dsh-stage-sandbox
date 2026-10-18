@@ -192,6 +192,81 @@ function main() {
   check(!fs.existsSync(inDel), 'apply-removed-real-in-file', inDel)
   check(!fs.existsSync(inStagedDel), 'apply-removed-real-staged-file', inStagedDel)
   check(fs.existsSync(path.join(WS, 'plain-new.txt')), 'apply-created-plain-file', 'plain-new.txt')
+
+  /* ---- 7. R17 fsreg-auditor 回归：shim 内容布局 `fs\` 反解 + 暂存层自产物排除 ---------------
+   * 两条 `[实测]` 边界失效（2026-10-17，干净进程 `cli exec --tier TS`）：
+   *   (a) `staged\fs\<盘>\…` 被当成**工作区相对路径** `fs\C\…` 摄取 ⇒ 候选里出现伪路径，
+   *       apply 会在真实工作区造出一棵 `fs\` 树；而命令真正改了哪个文件没有以真实路径出现。
+   *   (b) `shim.log` / `.winstage-inject-*.json` 等**暂存层自产物**被当成用户内容冻结进候选
+   *       ⇒ 批准它就把 10 MB 的垫片日志写进真实工作区根。
+   * 断言两侧都钉：`fs\` 必须反解成逻辑绝对路径（工作区内→相对键），自产物必须**不出现**；
+   * 同时保留负例：普通工具布局文件（`plain-2.txt`）不得被反解。 */
+  const before7 = ws.snapshotStagedTree()
+  const shimFsPath = (logical) => {
+    const norm = logical.replace(/\//g, '\\')
+    const drive = norm.slice(0, 2)
+    const rest = norm.slice(2).replace(/^\\/, '')
+    return path.join(STAGED, 'fs', drive[0], ...rest.split('\\'))
+  }
+  const extShimNew = path.join(EXT, 'ext-shim-new.txt')
+  const inShimNew = path.join(WS, 'in-shim-new.txt')
+  for (const [logical, body] of [
+    [extShimNew, 'ext-shim-content\n'],
+    [inShimNew, 'in-shim-content\n'],
+  ]) {
+    const mirror = shimFsPath(logical)
+    fs.mkdirSync(path.dirname(mirror), { recursive: true })
+    fs.writeFileSync(mirror, body)
+  }
+  const selfArtifacts = [
+    'shim.log',
+    'winstage-shim.config.json',
+    '.winstage-inject-abc123.json',
+    '.winstage-run-mvcabc-123abc.out',
+    '.winstage-run-mvcabc-123abc.err',
+    '.winstage-selftest-abc123.json',
+  ]
+  for (const name of selfArtifacts) fs.writeFileSync(path.join(STAGED, name), 'staging-layer-own-artifact\n')
+  /* 负例：工具布局的普通文件（键就是相对路径）不得被当成 shim 布局反解 */
+  fs.writeFileSync(path.join(STAGED, 'plain-2.txt'), 'plain2\n')
+
+  const cap7 = ws.captureAfterExecution(before7)
+  const map7 = byPath(cap7)
+  check(!cap7.some((c) => /^fs[\\/]/i.test(c.path)), 'no-fs-pseudo-paths', JSON.stringify(cap7.map((c) => c.path)))
+  const ext7 = at(map7, extShimNew)
+  check(!!ext7 && ext7.created === true, 'shim-external-maps-to-absolute', JSON.stringify(ext7))
+  const in7 = at(map7, 'in-shim-new.txt')
+  check(!!in7 && in7.created === true, 'shim-internal-maps-to-relative', JSON.stringify(in7))
+  const plain7 = at(map7, 'plain-2.txt')
+  check(!!plain7 && plain7.created === true, 'tool-layout-negative-not-remapped', JSON.stringify(plain7))
+  const leaked7 = cap7.filter((c) => selfArtifacts.some((name) => compareKey(c.path) === compareKey(name)))
+  check(leaked7.length === 0, 'staging-self-artifacts-excluded', JSON.stringify(leaked7.map((c) => c.path)))
+  const snap7 = ws.snapshotStagedTree()
+  check(
+    snap7.skipped.some((s) => s.reason === 'staging-self-artifact'),
+    'self-artifact-skip-recorded',
+    JSON.stringify(snap7.skipped.filter((s) => s.reason === 'staging-self-artifact').map((s) => s.path).slice(0, 3)),
+  )
+
+  const ingest7 = ws.ingestCapturedChanges(cap7)
+  check(ingest7.skipped.length === 0, 'ingest7-no-skips', JSON.stringify(ingest7))
+  const frozen7 = ws.freezeIfNeeded({ source: 'exec' })
+  check(frozen7.frozen === true, 'candidate7-frozen', `reason=${frozen7.reason}`)
+  const candPaths7 = (frozen7.candidate?.changes ?? []).map((c) => c.path)
+  const polluted7 = candPaths7.filter(
+    (p) =>
+      /^fs[\\/]/i.test(p) ||
+      /(^|[\\/])shim\.log$/i.test(p) ||
+      /winstage-shim\.config\.json$/i.test(p) ||
+      /\.winstage-(?:inject|run|selftest)-/i.test(p),
+  )
+  check(polluted7.length === 0, 'candidate-no-staging-self-artifacts', JSON.stringify(candPaths7))
+  const applied7 = ws.applyCandidate(frozen7.candidate.id)
+  check(applied7.failed.length === 0, 'apply7-no-failures', JSON.stringify(applied7.failed))
+  check(fs.existsSync(inShimNew), 'apply7-wrote-real-workspace-file', inShimNew)
+  check(fs.existsSync(extShimNew), 'apply7-wrote-real-external-file', extShimNew)
+  check(!fs.existsSync(path.join(WS, 'fs')), 'apply7-no-fs-tree-in-workspace', path.join(WS, 'fs'))
+  check(!fs.existsSync(path.join(WS, 'shim.log')), 'apply7-no-shim-log-in-workspace', path.join(WS, 'shim.log'))
 }
 
 try {

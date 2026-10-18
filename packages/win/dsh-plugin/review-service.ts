@@ -162,6 +162,16 @@ export const DANGER_MASK_IDS = Object.freeze([
   'kube',
   'git-credentials',
   'npmrc',
+  /**
+   * R17 安全审计补：DSH **凭据文件本身**必须进 danger 档。
+   *
+   * 旧清单漏了它：`maskReason()` 里 `dsh-credentials`（窄规则）排在 `dsh-home`
+   * （宽规则）之前，因此 `.dsh/.credentials.yaml` 实际命中的是**窄规则**，
+   * 而窄规则不在本清单里 ⇒ `safety:'risk'`。再叠加"值级启发式掩码会漏"，
+   * 就出现了 P0：明文进 review.json 且条目自称已掩码。
+   * 补进本清单后，它和 ssh/npmrc 一样走"内容不进 payload"。
+   */
+  'dsh-credentials',
   'dsh-home',
   'dpapi',
   'dpapi-user',
@@ -524,6 +534,17 @@ export function classifyChange(change, options = {}) {
       risk: 'sensitive',
       safety: isDangerMask(mask, dangerIds) ? 'danger' : 'risk',
       riskReason: mask.reason ?? null,
+      /**
+       * R17 安全审计补：命中的遮蔽类 id（**新增字段，老调用方忽略即可**）。
+       *
+       * 为什么必须给出来：`renderChange()` 要区分"内置遮蔽表命中"与"调用方自定义 mask"。
+       * 内置表里每一类都是**按对象类枚举出来的敏感对象**（凭据/私钥/令牌/转储…），
+       * 对它们的展示文本做"值级启发式掩码"在 R17 被实测证明会漏
+       * （缩进 YAML / 列表项 / 单行 JSON / 同一行第二个凭据都留下明文，
+       * 而条目同时声称 `contentMasked=true` —— 那是"安全声明与实际相反"）。
+       * 因此内置命中一律**整份省略**；自定义规则仍保留值级掩码（用户显式声明的窄规则）。
+       */
+      maskId: mask.id ?? null,
     }
   }
 
@@ -1484,14 +1505,25 @@ export class ReviewService {
       workspaceRoot: this.workspaceRoot,
       masks: ws.extraMasks,
     })
-    const sensitiveOmitted = verdict.safety === 'danger'
     /**
-     * R12 修复 · D2：**命中敏感遮蔽表但不是 danger id** 的条目（`safety === 'risk'`
-     * 且 `risk === 'sensitive'`）也要掩码 —— 只掩**值**，保留结构与长度。
+     * ── R17 安全审计（P0）：内置遮蔽表命中 ⇒ **内容整份省略**，不再做"值级启发式掩码"──
      *
-     * 为什么必须在这一档也做：`.dsh/.credentials.yaml` 命中的是 `MASK_CLASSES` 里
-     * 更早的宽规则 `dsh-home`（不在 `DANGER_MASK_IDS` 里）⇒ `safety === 'risk'`，
-     * R11 实测它的**整份 10 行明文**（含 `sk-` 值）就是从这里进 `review.json` 的。
+     * 现场（独立复现，证据 `.lead/logs/security-auditor/probe-red.log` A3 段）：
+     * `~/.dsh/.credentials.yaml` 的候选 diff 经 `maskSensitiveLines()` 后**仍有 5 个
+     * 明文 marker 进了 `review.json`**（缩进 YAML、YAML 列表项、单行 JSON、行内注释、
+     * 同一行第二个凭据），而条目同时写着 `contentMasked: true` + 掩码 note
+     * ⇒ 不只是泄漏，是"安全声明与实际相反"的信任问题。
+     *
+     * 判定（Lead 2026-10-17 口径）：**内置遮蔽类**（`MASK_CLASSES` 里的 id）
+     * 一律走 danger 档的"内容不进 payload"；只有**调用方自定义 mask** 才保留
+     * "保留结构、遮蔽值"的展示（那是用户显式声明的窄规则）。
+     * 这样"没有明文"不依赖启发式有多聪明 —— 它是结构性成立的。
+     */
+    const maskIsBuiltin = verdict.risk === 'sensitive' && verdict.maskId != null && BUILTIN_MASK_IDS.has(verdict.maskId)
+    const sensitiveOmitted = verdict.safety === 'danger' || maskIsBuiltin
+    /**
+     * R12 修复 · D2 的值级掩码路径：**只**保留给调用方自定义 mask（不在 `MASK_CLASSES` 里）。
+     * 内置命中已经在上一行并入 `sensitiveOmitted`，因此它们的 `diff` 永远是空数组。
      */
     const sensitiveMasked = !sensitiveOmitted && verdict.risk === 'sensitive'
 

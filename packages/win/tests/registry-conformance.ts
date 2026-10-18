@@ -394,7 +394,14 @@ export async function runRegistryConformanceChecks(harness, options = {}) {
           REG_STAGE_CONFORMANCE.runnerRequirements.some((line) => line.includes('新')),
         `${REG_STAGE_CONFORMANCE.runnerRequirements.length} 条`,
       )
-      check('被 hook 的 8 个 API 也在契约数据里（DLL 与宿主对同一批入口负责）', REG_STAGE_CONFORMANCE.hookedApis.length === 8, REG_STAGE_CONFORMANCE.hookedApis.join(','))
+      check(
+        '被 hook 的 API 全部登记在契约数据里（DLL 与宿主对同一批入口负责）',
+        REG_STAGE_CONFORMANCE.hookedApis.length >= 8 &&
+          ['RegQueryValueExW', 'RegSetValueExW', 'RegDeleteKeyExW', 'RegCreateKeyExW'].every((api) =>
+            REG_STAGE_CONFORMANCE.hookedApis.includes(api),
+          ),
+        REG_STAGE_CONFORMANCE.hookedApis.join(','),
+      )
     }
 
     section('S1. WAL 校验器的判定力（变异体自证：正例必过，七个变异体必须各自报出预期问题码）')

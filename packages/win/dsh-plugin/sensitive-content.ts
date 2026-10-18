@@ -10,10 +10,17 @@
  *
  * 根因**不是**"没写掩码"，而是"掩码的门太窄"：
  * `review-service.renderChange()` 只对 `safety === 'danger'` 的条目清空 `diff`，
- * 而 `.dsh/.credentials.yaml` 命中的是 `MASK_CLASSES` 里**更早**的宽规则
- * `dsh-home`（`\\\.dsh(\\|$)`，排在更窄的 `dsh-credentials` 之前 ⇒
- * `maskReason()` 返回第一个命中项），而 `dsh-home` **不在**
- * `DANGER_MASK_IDS` 里 ⇒ `safety === 'risk'` ⇒ 整份明文照写进 `diff`。
+ * 而 `.dsh/.credentials.yaml` 命中的是更窄的 `dsh-credentials`
+ * （它在 `MASK_CLASSES` 里排在宽规则 `dsh-home` **之前**，`maskReason()` 返回第一个命中项），
+ * 而 `dsh-credentials` **不在** `DANGER_MASK_IDS` 里 ⇒ `safety === 'risk'` ⇒ 走值级掩码。
+ *
+ * ── R17 安全审计（P0，独立复现后修）───────────────────────────────────────────
+ * 值级掩码本身**不可靠**：缩进 YAML、YAML 列表项、单行 JSON、行内注释、
+ * 同一行第二个凭据这五类形态都实测留下明文进 `review.json`，而条目同时声称
+ * `contentMasked: true` —— "安全声明与实际相反"。因此现在的口径是：
+ *   · **内置遮蔽类命中 ⇒ 内容整份省略**（见 `review-service.renderChange()`）；
+ *   · 本模块的值级掩码只服务**调用方自定义 mask**（用户显式声明的窄规则），
+ *     并已按 R17 复现的形态补强（缩进/列表/JSON 前缀、行内注释、同段多凭据、块标量）。
  *
  * ── 本模块的契约（Lead 口径）──────────────────────────────────────────────────
  *   1. **保留结构**：键名 / 缩进 / 分隔符 / 行数与原文一致；
@@ -52,6 +59,11 @@ export const MASK_REASON = Object.freeze({
   KNOWN_SECRET: 'known-secret',
   /** 键名本身是凭据名（`token`/`password`/`secret`/`apiKey`…）⇒ 值无条件遮蔽 */
   CREDENTIAL_KEY: 'credential-key',
+  /**
+   * YAML 块标量（`secret: |`）的**后续缩进行**整体遮蔽（R17 修）。
+   * 单行判定看不到"上一行说这是凭据正文"这个上下文，因此由跨行状态机补上。
+   */
+  BLOCK_SCALAR: 'block-scalar',
 })
 
 /** `len=` 只报长度，不报内容 */
@@ -63,13 +75,25 @@ export function redactedToken(length) {
 /**
  * 结构化行的分隔符（**值从分隔符之后开始**）。
  *
- * 四种形态，按"键的引号/括号风格"区分；`m[0]` 是分隔符本身：
- *   1. `"key":`  → 键是 JSON 字符串（闭合引号必须先吃掉，否则它会被当成值的一部分）
- *   2. `key:`    → YAML / 对象字面量
- *   3. `key=`    → .env / .ini / properties
- *   4. `key =`   → 允许等号两侧空白
+ * 五种形态，按"键的前缀形状"区分；`m[0]` 是分隔符本身（含前缀）：
+ *   1. `"key":`     → 键是 JSON 字符串（闭合引号必须先吃掉，否则它会被当成值的一部分）
+ *   2. `key:`       → YAML / 对象字面量
+ *   3. `key=`       → .env / .ini / properties
+ *   4. `key =`      → 允许等号两侧空白
+ *   5. **带前缀的键**（R17 实测补）：
+ *      · 行首缩进（YAML 嵌套 `  password: …`）；
+ *      · YAML 列表项 `- password: …` / `* token: …`；
+ *      · 单行 JSON 的对象/数组起始 `{"token":…}` / `,{"auth":…}`。
+ *
+ * ── 为什么必须允许前缀（R17 独立复现的真实泄漏）────────────────────────────────
+ * 旧模式以 `^(?:…)` **锚定行首**且不允许任何前缀，于是 `  password: hunter2`
+ * （缩进）、`- password: hunter2`（列表项）、`{"token":"hunter2"}`（单行 JSON）
+ * 一条都不命中结构化分支；退到"裸 token"分支后又因为值的长度 <16 而放行
+ * ⇒ 明文进 review.json。这三类形态在 YAML/JSON 凭据文件里是**常态**，不是构造。
  */
-const DELIMITER_RE = /^(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|"[^"]*|[A-Za-z_][\w.\-[\]]*)\s*(?::|=)/
+const DELIMITER_RE =
+  /^\s*(?:[-*]\s+|\{\s*|,\s*)?(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[A-Za-z_][\w.\-[\]]*)\s*(?::|=)/
+
 
 /**
  * 裸 token 的候选形状：连续 16+ 个"像 base64/hex/JWT 片段"的字符。
@@ -275,6 +299,73 @@ export function looksBinaryLine(text) {
 }
 
 /**
+ * 把**行内注释**从正文里切出去（`key: value # comment` → `{core:'key: value', suffix:' # comment'}`）。
+ *
+ * 为什么必须切（R17 独立复现）：旧实现把注释当值的一部分去判形状，
+ * `note: hunter2 # rotate later` 因为"含空格、字符多样性高"被判成"像句子"⇒ 不遮
+ * ⇒ 明文留在 payload 里。注释是**展示结构**，不参与值的秘密判定，但注释里
+ * 也可能写着凭据（`db_user: admin # password: hunter2`），那条走 `maskInlineComment()`。
+ *
+ * 引号内的 `#` 不算注释：用朴素但保守的"前面出现了奇数个引号 ⇒ 在字符串里"判据；
+ * 判不准时**不切**（交给值级判定，方向是 fail-closed）。
+ */
+function splitInlineComment(text) {
+  const value = String(text ?? '')
+  const at = value.search(/(?:^|\s)#/)
+  if (at < 0) return { core: value, suffix: '' }
+  const hashAt = value[at] === '#' ? at : at + 1
+  const before = value.slice(0, hashAt)
+  const quotes = (before.match(/"/g) ?? []).length + (before.match(/'/g) ?? []).length
+  if (quotes % 2 !== 0) return { core: value, suffix: '' }
+  return { core: value.slice(0, hashAt).replace(/\s+$/, ''), suffix: value.slice(value.slice(0, hashAt).replace(/\s+$/, '').length) }
+}
+
+/**
+ * 注释里若出现"凭据键名 + 分隔符"或已知密钥形态 ⇒ **整段注释内容**换成占位。
+ *
+ * 为什么注释也要遮：R17 复现 `db_user: admin # password: MARK08secret` 时，
+ * 值级判定只看 `admin`（不是秘密）⇒ 注释里的凭据原样进 payload。
+ * 方向是 fail-closed：命中一个凭据键名形态就整段遮，不做"只遮那一小段"的精细拆分。
+ */
+function maskInlineComment(comment) {
+  const text = String(comment ?? '')
+  // 注释前缀允许**前导空白**：`splitInlineComment()` 把 ` # …` 连前面的空白一起交出来
+  const match = /^(\s*#\s*)([\s\S]*)$/.exec(text)
+  if (!match) return { text, masked: false }
+  const head = match[1]
+  const body = match[2]
+  if (body.length === 0) return { text, masked: false }
+  KNOWN_SECRET_RE.lastIndex = 0
+  const hasKnown = KNOWN_SECRET_RE.test(body)
+  KNOWN_SECRET_RE.lastIndex = 0
+  const hasCredentialPair = CREDENTIAL_KEY_RE.test(body) && /[:=]/.test(body)
+  if (!hasKnown && !hasCredentialPair) return { text, masked: false }
+  return { text: `${head}${redactedToken(body.length)}`, masked: true }
+}
+
+/** YAML 块标量起始值：`|` / `>` 及其 chomping/indent 指示符。 */
+const BLOCK_SCALAR_VALUE_RE = /^[|>][+-]?\d?$/
+
+/**
+ * 识别块标量开头（`secret: |`）并返回其缩进，供 `maskSensitiveLines()` 的跨行状态机使用。
+ *
+ * 为什么必须跨行：块标量的**内容在下一行**（`  MARK14hunter2`），单行掩码没有键名上下文，
+ * 值短于 16 字符时裸 token 判据放行 ⇒ 整段明文进 payload（R17 复现）。
+ */
+function blockScalarOpenerOf(line) {
+  const text = String(line ?? '')
+  const body = text.endsWith('\r') ? text.slice(0, -1) : text
+  const { core } = splitInlineComment(body)
+  const delim = DELIMITER_RE.exec(core)
+  if (!delim) return undefined
+  let at = delim[0].length
+  while (at < core.length && (core[at] === ' ' || core[at] === '\t')) at += 1
+  const value = core.slice(at).trim()
+  if (!BLOCK_SCALAR_VALUE_RE.test(value)) return undefined
+  return { indent: (/^[ \t]*/.exec(body) ?? [''])[0].length }
+}
+
+/**
  * **单行**值级掩码。
  *
  * @param {string} line 原始展示行（来自候选 blob，**可能含秘密**）
@@ -303,6 +394,14 @@ export function maskSensitiveLine(line) {
   let segments = 0
 
   /**
+   * ★ **注释先切出去**，正文与注释分别处理（两个泄漏形态，见两个 helper 注释）。
+   * 注释最后原样拼回（需要遮时换成占位），因此结构与行尾字节不被破坏。
+   */
+  const split = splitInlineComment(body)
+  const core = split.core
+  const suffix = split.suffix
+
+  /**
    * ★ **已知形态优先**（顺序不可颠倒）。
    *
    * 先把 `sk-…` / `Bearer …` 这类**确定是密钥**的片段换成占位（保留 `sk-` 标记），
@@ -310,56 +409,81 @@ export function maskSensitiveLine(line) {
    * `secret: sk-abcdefghijklmnop` 里的值只有 20 字符、多样性低，
    * 启发式判成"可读标量"⇒ **整串明文留在 payload 里**。
    */
-  let text = body
+  let text = core
   KNOWN_SECRET_RE.lastIndex = 0
-  text = text.replace(KNOWN_SECRET_RE, (match) => {
-    segments += 1
-    if (!reasons.includes(MASK_REASON.KNOWN_SECRET)) reasons.push(MASK_REASON.KNOWN_SECRET)
+  let knownHits = 0
+  const knownMaskedCore = core.replace(KNOWN_SECRET_RE, (match) => {
+    knownHits += 1
     return maskKnownSecret(match)
   })
+  KNOWN_SECRET_RE.lastIndex = 0
+  if (knownHits > 0) {
+    text = knownMaskedCore
+    segments += knownHits
+    if (!reasons.includes(MASK_REASON.KNOWN_SECRET)) reasons.push(MASK_REASON.KNOWN_SECRET)
+  }
 
-  if (segments === 0) {
-    // 没有已知形态 ⇒ 走结构 / 裸 token 两条启发式
-    const delim = DELIMITER_RE.exec(body)
-    if (delim) {
-      // `valueStart` = 分隔符 + 其后的空白：空白留在外面，让 `key: <REDACTED>` 读起来正常
-      let at = delim[0].length
-      while (at < body.length && (body[at] === ' ' || body[at] === '\t')) at += 1
-      const value = body.slice(at)
-      // ★ 键名已经是凭据名时**不再赌值的形状**：`token: abcdefghijklmnopqrst`
-      //   在形状上和 slug 无从区分（20 个纯小写字母），但键名说死了它就是凭据。
-      const keyIsCredential = isCredentialKey(body.slice(0, delim[0].length))
-      if (value.length > 0 && (keyIsCredential || valueNeedsMask(value))) {
-        text = `${body.slice(0, at)}${redactedToken(value.length)}`
-        segments += 1
-        reasons.push(keyIsCredential ? MASK_REASON.CREDENTIAL_KEY : MASK_REASON.STRUCTURED_VALUE)
-      }
-    } else {
-      // 没有分隔符：逐个裸 token 判定（列表项、私钥主体、JWT 等）
-      const parts = []
-      let cursor = 0
-      BARE_TOKEN_RE.lastIndex = 0
-      let match
-      while ((match = BARE_TOKEN_RE.exec(body)) !== null) {
-        const token = match[0]
-        if (!looksSecretLike(token)) continue
-        parts.push(body.slice(cursor, match.index))
-        parts.push(redactedToken(token.length))
-        cursor = match.index + token.length
-        segments += 1
-        if (!reasons.includes(MASK_REASON.BARE_TOKEN)) reasons.push(MASK_REASON.BARE_TOKEN)
-      }
-      parts.push(body.slice(cursor))
-      if (segments > 0) text = parts.join('')
+  /**
+   * ★ **结构与已知形态同时生效**（R17 修：旧实现 `segments === 0` 才走结构分支）。
+   *
+   * 旧实现的漏洞：`api_key: sk-… password: hunter2` 中 `sk-…` 先命中已知形态，
+   * 于是整个结构分支被跳过 ⇒ 同一行第二个凭据明文留在 payload。
+   * 现在：结构分支**总是**执行；值里出现过已知密钥时，整段值直接换成占位
+   * （比"保留 sk- 标记"更保守，但一个字节的剩余值都不留）。
+   */
+  const delim = DELIMITER_RE.exec(core)
+  if (delim) {
+    // `valueStart` = 分隔符 + 其后的空白：空白留在外面，让 `key: <REDACTED>` 读起来正常
+    let at = delim[0].length
+    while (at < core.length && (core[at] === ' ' || core[at] === '\t')) at += 1
+    const value = core.slice(at)
+    // ★ 键名已经是凭据名时**不再赌值的形状**：`token: abcdefghijklmnopqrst`
+    //   在形状上和 slug 无从区分（20 个纯小写字母），但键名说死了它就是凭据。
+    const keyIsCredential = isCredentialKey(core.slice(0, delim[0].length))
+    if (value.length > 0 && (keyIsCredential || knownHits > 0 || valueNeedsMask(value))) {
+      text = `${core.slice(0, at)}${redactedToken(value.length)}`
+      segments += 1
+      reasons.push(keyIsCredential ? MASK_REASON.CREDENTIAL_KEY : MASK_REASON.STRUCTURED_VALUE)
     }
+  } else if (knownHits === 0) {
+    // 没有分隔符：逐个裸 token 判定（列表项、私钥主体、JWT 等）
+    const parts = []
+    let cursor = 0
+    BARE_TOKEN_RE.lastIndex = 0
+    let match
+    while ((match = BARE_TOKEN_RE.exec(core)) !== null) {
+      const token = match[0]
+      if (!looksSecretLike(token)) continue
+      parts.push(core.slice(cursor, match.index))
+      parts.push(redactedToken(token.length))
+      cursor = match.index + token.length
+      segments += 1
+      if (!reasons.includes(MASK_REASON.BARE_TOKEN)) reasons.push(MASK_REASON.BARE_TOKEN)
+    }
+    parts.push(core.slice(cursor))
+    if (segments > 0) text = parts.join('')
+  }
+
+  // 注释：已知密钥 / 凭据键名形态 ⇒ 整段注释内容换成占位
+  let tail = suffix
+  const commented = maskInlineComment(suffix)
+  if (commented.masked) {
+    tail = commented.text
+    segments += 1
+    if (!reasons.includes(MASK_REASON.CREDENTIAL_KEY)) reasons.push(MASK_REASON.CREDENTIAL_KEY)
   }
 
   if (segments === 0) return { text: original, masked: false, segments: 0, reasons: [] }
-  return { text: `${text}${trailing}`, masked: true, segments, reasons }
+  return { text: `${text}${tail}${trailing}`, masked: true, segments, reasons }
 }
 
 /**
  * 多行掩码（`renderChange` 的入口）。
+ *
+ * 除逐行掩码外，还带一个**块标量状态机**（R17 修）：
+ * `secret: |` 的内容在后续**缩进行**里，单行掩码看不到键名 ⇒ 需要跨行上下文。
+ * 进入块标量后，所有缩进大于起始行的非空行整行内容换成占位（保留缩进），
+ * 遇到缩进 ≤ 起始行的行（或空行后的下一个同级行）即退出。
  *
  * @param {Array<{type:string,line?:number,text?:string}>} lines
  * @returns {{lines:Array<object>, masked:boolean, segments:number, reasons:string[]}}
@@ -368,12 +492,31 @@ export function maskSensitiveLines(lines) {
   const out = []
   let segments = 0
   const reasons = new Set()
+  let block = null
   for (const item of Array.isArray(lines) ? lines : []) {
     if (!item || typeof item !== 'object') {
       out.push(item)
+      block = null
       continue
     }
-    const result = maskSensitiveLine(item.text ?? '')
+    const raw = String(item.text ?? '')
+    if (block) {
+      const leading = (/^[ \t]*/.exec(raw) ?? [''])[0]
+      const blank = raw.trim().length === 0
+      if (!blank && leading.length > block.indent) {
+        const core = raw.slice(leading.length)
+        const trailing = core.endsWith('\r') ? '\r' : ''
+        const body = trailing ? core.slice(0, -1) : core
+        out.push({ ...item, text: `${leading}${redactedToken(body.length)}${trailing}`, redacted: true })
+        segments += 1
+        reasons.add(MASK_REASON.BLOCK_SCALAR)
+        continue
+      }
+      if (!blank) block = null
+    }
+    const result = maskSensitiveLine(raw)
+    const opener = blockScalarOpenerOf(raw)
+    if (opener) block = opener
     segments += result.segments
     for (const reason of result.reasons) reasons.add(reason)
     out.push(result.masked ? { ...item, text: result.text, redacted: true } : item)

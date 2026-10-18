@@ -177,6 +177,15 @@ export const OFFLINE_SUITES = [
   //   注入都必须归 `ctx.effect` 所有。零子进程、零注册表写、零系统状态 ⇒ 离线档。
   //   与 verify.cmd 的清单必须逐字一致（两处同时改；tests/suite-wiring.ts 机器检查）。
   { id: 'crosscheck-r17', script: 'tests/crosscheck-r17.ts', title: '交叉验证 R17（暂存应用 mkdir/原子替换/敏感遮蔽/危险命令拦截 + 卸载可恢复 + Cordis 卸载协议）' },
+  // ★ round16 缺陷修复轮追加：CLI 对外契约（U16-5/6/7/8/9）。
+  //   全部是把命令/输入**真喂给 CLI 子进程**再断言退出码与文本：--help 是成功路径、
+  //   子命令 help 覆盖真实参数、未知候选 id 走 `CODE: message` 而不是未捕获堆栈、
+  //   `--workspace` 不存在/与 store 属主不一致时 fail-fast、status 打印解析后的 store 根、
+  //   exec 文本包含档位行、字典串不再输出 markdown `**`。
+  //   子进程用文件描述符重定向（不用命名管道，见 R10）；在无法建立 stage guard 的受限
+  //   会话里如实 SKIP（不是 PASS），与"缺能力宿主的用例 SKIP"同口径。
+  //   与 verify.cmd 的清单必须逐字一致（两处同时改；tests/suite-wiring.ts 机器检查）。
+  { id: 'cli-contract', script: 'tests/cli-contract.ts', title: 'CLI 契约（--help 退出码/子命令真实参数/候选未找到/workspace 校验/store 根/档位行/字典 markdown）' },
 ]
 
 /** 需要未受限会话的套件 */

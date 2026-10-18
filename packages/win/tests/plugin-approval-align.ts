@@ -308,6 +308,215 @@ process.stdout.write('\n[7] wire 快照→依赖\n')
   ok(calls.some((c) => c.startsWith('reject:')), 'discard 委派到 service.reject')
 }
 
+// ── 8. R17 安全审计回归：敏感遮蔽 / review payload 泄露（P0） ─────────────────
+//
+// 为什么放在本套件：`tests/paths-masks.ts` 归 T2 管（避让），`crosscheck-*` 不在
+// T3 的写范围；本套件已经是"面板/审批事实"的离线集合，加一节纯函数 + 端到端断言
+// 不需要新增套件接线（`OFFLINE_SUITES` / `verify.cmd` 都不用动）。
+process.stdout.write('\n[8] R17 敏感遮蔽 / review payload 泄露\n')
+{
+  const { mkdtempSync, mkdirSync: mkdir, readFileSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { maskSensitiveLine, maskSensitiveLines } = await import('../dsh-plugin/sensitive-content.ts')
+  const { ReviewService, DANGER_MASK_IDS, SENSITIVE_OMIT_NOTE, classifyChange } = await import('../dsh-plugin/review-service.ts')
+
+  // 8.1 值级掩码：R17 独立复现过漏明的五类形态（缩进/列表/JSON/注释/同段第二凭据）
+  for (const [line, marker] of [
+    ['  password: R17INDENT01', 'R17INDENT01'],
+    ['- token: R17LIST01', 'R17LIST01'],
+    ['{"token":"R17JSON01"}', 'R17JSON01'],
+    ['db_user: admin # password: R17COMMENT01', 'R17COMMENT01'],
+    ['api_key: sk-R17FIRST01abc password: R17SECOND01', 'R17SECOND01'],
+  ]) {
+    const r = maskSensitiveLine(line)
+    ok(r.masked === true && !r.text.includes(marker), `值级掩码必须遮住：${line}`, r.text)
+  }
+  // 8.2 块标量（`secret: |` 的后续缩进行）由跨行状态机遮蔽
+  {
+    const r = maskSensitiveLines([
+      { type: 'add', line: 1, text: 'secret: |' },
+      { type: 'add', line: 2, text: '  R17BLOCK01' },
+    ])
+    ok(!r.lines.map((l) => l.text).join('\n').includes('R17BLOCK01'), '块标量正文必须遮蔽', JSON.stringify(r.lines))
+    ok(r.reasons.includes('block-scalar'), '块标量遮蔽必须给出机读理由 block-scalar', r.reasons)
+  }
+  // 8.3 反向对照：路径/URI/短标量不得被遮蔽（否则掩码退化成"看不见改了什么"）
+  for (const line of ['path: C:\\Users\\x\\a.txt', 'url: https://example.com/a', 'enabled: true']) {
+    ok(maskSensitiveLine(line).masked === false, `对照：不该遮蔽的仍不遮蔽：${line}`)
+  }
+
+  // 8.4 判级：`.dsh/.credentials.yaml` 必须进 danger 档（旧清单漏了窄规则 dsh-credentials）
+  ok(DANGER_MASK_IDS.includes('dsh-credentials'), 'DANGER_MASK_IDS 必须包含 dsh-credentials')
+  {
+    const root = mkdtempSync(join(tmpdir(), 'r17-sec-classify-'))
+    try {
+      const v = classifyChange({ path: join(root, '.dsh', '.credentials.yaml') }, { workspaceRoot: root })
+      ok(v.risk === 'sensitive' && v.safety === 'danger', '凭据文件判级 = sensitive/danger', JSON.stringify(v))
+      ok(v.maskId === 'dsh-credentials', '判级保留命中 id（供 renderChange 区分内置/自定义）', v.maskId)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
+
+  // 8.5 端到端：review.json 一个明文 marker 都不能有；凭据条目内容整份省略；
+  //     非敏感文件仍是正常可见（负例：不得把普通文件也省略掉）
+  {
+    const base = mkdtempSync(join(tmpdir(), 'r17-sec-review-'))
+    try {
+      const wsRoot = join(base, 'ws')
+      const storeDir = join(base, 'store')
+      mkdir(wsRoot, { recursive: true })
+      const svc = new ReviewService({ workspaceRoot: wsRoot, sessionId: 'r17-sec-review', storeDir })
+      // `ReviewService` 的实现文件是 @ts-nocheck（JS→TS 过渡），类体没有 workspace 字段声明；
+      // 这里只做端到端取用，按运行时真实形状显式放宽类型，不改产品源码的类型面。
+      const ws: any = (svc as any).workspace
+      const SECRETS = [
+        'DEEPSEEK_API_KEY: sk-R17LIVE01abcdefghij',
+        '  password: R17INDENT02',
+        '- token: R17LIST02',
+        '{"token":"R17JSON02"}',
+        'db_user: admin # password: R17COMMENT02',
+        'api_key: sk-R17MIX01abcdef password: R17SECOND02',
+        'secret: |',
+        '  R17BLOCK02',
+      ].join('\n')
+      ws.writeFile(join(wsRoot, '.dsh', '.credentials.yaml'), SECRETS, { origin: 'test' })
+      ws.writeFile(join(wsRoot, 'notes.txt'), 'plain-project-note\n', { origin: 'test' })
+      ws.freezeCandidate({ source: 'test' })
+      svc.publish()
+      const reviewText = readFileSync(join(storeDir, 'review.json'), 'utf8')
+      const markers = ['R17LIVE01', 'R17INDENT02', 'R17LIST02', 'R17JSON02', 'R17COMMENT02', 'R17SECOND02', 'R17BLOCK02']
+      const leaked = markers.filter((marker) => reviewText.includes(marker))
+      ok(leaked.length === 0, 'review.json 里不得出现任何敏感明文 marker', JSON.stringify(leaked))
+      const snap = JSON.parse(reviewText)
+      const credRow = (snap.files ?? []).find((f) => String(f.path ?? '').includes('.credentials.yaml')) ?? null
+      ok(
+        credRow !== null && Array.isArray(credRow.diff) && credRow.diff.length === 0 && credRow.note === SENSITIVE_OMIT_NOTE,
+        '凭据条目内容整份省略（fail-closed），不是部分遮蔽',
+        JSON.stringify({ diff: credRow?.diff?.length, note: credRow?.note, safety: credRow?.safety }),
+      )
+      const plainRow = (snap.files ?? []).find((f) => String(f.path ?? '').includes('notes.txt')) ?? null
+      ok(
+        plainRow !== null && plainRow.risk === 'normal' && Array.isArray(plainRow.diff) && plainRow.diff.length > 0,
+        '负例：非敏感文件仍是正常可见（未被误省略）',
+        JSON.stringify({ risk: plainRow?.risk, diff: plainRow?.diff?.length }),
+      )
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  }
+}
+
+// ── 9. 重复 apply 显式幂等（R18 · KNOWN-08d）────────────────────────────────────
+// 缺陷：重复提交同一候选时，旧实现靠下层碰巧返回 0/丢候选，命令层不是"没有可应用项"
+// 的歧义 error 就是"已应用 0 个文件"的模糊 success；既没有结构化结论，也无法从返回值
+// 判断"到底有没有再次写盘"。本节把三条判据钉死：
+//   ① 已 APPLIED 的单元 ⇒ `already-applied`（success / 零写盘 / 不调 deps.apply）；
+//   ② 调用方的"已应用账本" ⇒ 同样是 `already-applied`；
+//   ③ 下层 no-op（applied=0 且 failed=0）⇒ `already-applied`，不再印"已应用 0 个文件"。
+process.stdout.write('\n[9] 重复 apply 显式幂等（R18 KNOWN-08d）\n')
+{
+  const unit = (id: string, paths: string[], applyState: string = APPLY.NOT_REQUESTED): ChangeUnit => ({
+    id,
+    reviewState: REVIEW.PENDING,
+    applyState: applyState as ChangeUnit['applyState'],
+    paths,
+    createdAt: 0,
+  })
+  const makeDeps = (units: readonly ChangeUnit[], options: { appliedPaths?: () => readonly string[]; applyResult?: { applied: string[]; failed: string[] } } = {}) => {
+    const calls: string[][] = []
+    return {
+      calls,
+      deps: {
+        units: () => units,
+        riskOf: (): RiskFacts => ({}),
+        apply: (sel: readonly ChangeUnit[]) => {
+          calls.push(sel.map((u) => u.id))
+          return options.applyResult ?? { applied: sel.map((u) => u.id), failed: [] }
+        },
+        discard: () => {},
+        ...(options.appliedPaths === undefined ? {} : { appliedPaths: options.appliedPaths }),
+      },
+    }
+  }
+
+  // ① 已 APPLIED 单元：selectForApply 不会选中它们（既有断言），命令层必须显式认成重复
+  {
+    const { deps, calls } = makeDeps([unit('applied-1', ['src/a.txt'], APPLY.APPLIED)])
+    let res
+    try {
+      res = applyWithGuard(deps, { paths: ['src/a.txt'] })
+    } catch (error) {
+      res = { kind: 'error', text: `THREW ${String(error)}` } as any
+    }
+    ok(res.kind === 'success', '①已 APPLIED 再 apply ⇒ success（不是歧义 error）', res.text)
+    ok(res.code === 'already-applied' && res.alreadyApplied === true, '①结构化 code=already-applied / alreadyApplied=true', JSON.stringify({ code: res.code, alreadyApplied: res.alreadyApplied }))
+    ok(res.appliedCount === 0 && calls.length === 0, '①未再次写盘：appliedCount=0 且 deps.apply 一次都没调', JSON.stringify({ appliedCount: res.appliedCount, calls }))
+    ok(String(res.text).includes('already-applied') && String(res.text).includes('未再次写盘'), '①文本明说 already-applied 且未再次写盘', res.text)
+    ok(!/已应用 0 个文件/.test(String(res.text)), '①不出现"已应用 0 个文件"的模糊成功文案')
+  }
+
+  // 不带 paths = 全部：只有已 APPLIED 单元时同样认成重复
+  {
+    const { deps, calls } = makeDeps([unit('applied-all', ['src/a.txt'], APPLY.APPLIED)])
+    const res = applyWithGuard(deps)
+    ok(res.code === 'already-applied' && calls.length === 0, '①无 paths（全部）时也走 already-applied 且零写盘')
+  }
+
+  // ② 调用方账本（快照已空、单元列表已无该候选）：账本命中 ⇒ already-applied
+  {
+    const { deps, calls } = makeDeps([], { appliedPaths: () => ['src/a.txt', 'src/b.txt'] })
+    const res = applyWithGuard(deps, { paths: ['src/a.txt'] })
+    ok(res.kind === 'success' && res.code === 'already-applied', '②账本命中 ⇒ already-applied', JSON.stringify({ code: res.code, text: res.text }))
+    ok(res.appliedCount === 0 && calls.length === 0, '②账本命中时零写盘')
+  }
+  // 账本里没有请求的路径 ⇒ 仍是 nothing-to-apply（不能把"没做过"说成"已应用"）
+  {
+    const { deps } = makeDeps([], { appliedPaths: () => ['src/other.txt'] })
+    const res = applyWithGuard(deps, { paths: ['src/a.txt'] })
+    ok(res.kind === 'error' && res.code === 'nothing-to-apply', '②账本不命中 ⇒ nothing-to-apply（不误报重复）', JSON.stringify({ kind: res.kind, code: res.code }))
+  }
+  // 账本读取抛错 ⇒ 不得变成未捕获异常
+  {
+    const { deps } = makeDeps([], {
+      appliedPaths: () => {
+        throw new Error('ledger-boom')
+      },
+    })
+    let res
+    try {
+      res = applyWithGuard(deps, { paths: ['src/a.txt'] })
+    } catch (error) {
+      res = { kind: 'threw', code: 'threw', text: String(error) } as any
+    }
+    ok(res.kind === 'error' && res.code === 'nothing-to-apply', '②账本抛错 ⇒ 降级为 nothing-to-apply（不抛栈）', res.text)
+  }
+
+  // ③ 下层 no-op（applied=0 且 failed=0）：已无净变化 ⇒ already-applied，而不是"已应用 0 个文件"
+  {
+    const { deps, calls } = makeDeps([unit('race-1', ['src/a.txt'])], { applyResult: { applied: [], failed: [] } })
+    const res = applyWithGuard(deps, { paths: ['src/a.txt'] })
+    ok(res.kind === 'success' && res.code === 'already-applied' && res.appliedCount === 0, '③下层 no-op ⇒ already-applied（success/零计数）', JSON.stringify({ code: res.code, appliedCount: res.appliedCount }))
+    ok(calls.length === 1, '③下层确实被调用一次（本层不吞调用，只把 no-op 解释清楚）', String(calls.length))
+    ok(!/已应用 0 个文件/.test(res.text), '③不再出现"已应用 0 个文件"')
+  }
+
+  // 正常路径回归：真实应用必须保持原语义（不因幂等守卫改变成功路径）
+  {
+    const { deps } = makeDeps([unit('ok-1', ['src/a.txt']), unit('ok-2', ['src/b.txt'])])
+    const res = applyWithGuard(deps)
+    ok(res.kind === 'success' && res.appliedCount === 2 && res.code === undefined, '正常 apply 仍报 appliedCount=2（不误判成 already-applied）', JSON.stringify({ code: res.code, appliedCount: res.appliedCount }))
+    ok(res.text.includes('已应用 2 个文件'), '正常 apply 文本仍是"已应用 N 个文件"')
+  }
+  // 失败路径回归：有失败项 ⇒ error + applied-with-failures（不冒充成功）
+  {
+    const { deps } = makeDeps([unit('bad-1', ['src/a.txt'])], { applyResult: { applied: [], failed: ['STALE_BASELINE'] } })
+    const res = applyWithGuard(deps)
+    ok(res.kind === 'error' && res.code === 'applied-with-failures', '失败项 ⇒ error + applied-with-failures', JSON.stringify({ kind: res.kind, code: res.code }))
+  }
+}
+
 const failed = failures > 0
 process.stdout.write(`\n断言 ${checks} 项，失败 ${failures} 项\n`)
 process.stdout.write(`RESULT: ${failed ? 'FAIL' : 'PASS'} checks=${checks} failures=${failures} mode=normal\n`)

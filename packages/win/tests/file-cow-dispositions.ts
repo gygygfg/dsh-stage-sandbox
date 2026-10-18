@@ -524,13 +524,28 @@ function main() {
       { id: 'c11-dir-whiteout', path: targets.c11, expectDir: false, expectExists: false },
       /* The whiteout lookup must not treat the wo tree's ancestor DIRECTORIES as
        * markers: ws_fs_map drops the drive colon, so <stage>\wo\C exists for any
-       * marker on C:, and counting it as a whiteout made C:\ (and every ancestor
-       * directory of any whiteout) look deleted -- which made injected PowerShell
-       * refuse to load its .psm1 modules. */
-      { id: 'dir-C-root', path: 'C:\\', expectExists: true, expectDir: true, key: 'ancestor-not-whiteouted' },
-      { id: 'dir-C-Users', path: 'C:\\Users', expectExists: true, expectDir: true, key: 'ancestor-not-whiteouted' },
-      { id: 'dir-C-Users-Administrator', path: 'C:\\Users\\Administrator', expectExists: true, expectDir: true, key: 'ancestor-not-whiteouted' },
-      { id: 'dir-C-Windows', path: 'C:\\Windows', expectExists: true, expectDir: true, key: 'ancestor-not-whiteouted' },
+       * marker on C:, and counting it as a whiteout made the drive root (and every
+       * ancestor directory of any whiteout) look deleted -- which made injected
+       * PowerShell refuse to load its .psm1 modules.
+       *
+       * ★ R18-KNOWN-07 夹具修正：旧清单**硬编码了 `C:\Users\Administrator`**
+       *   （round16 是在 Administrator 账户下跑的）。本机账户是 `C:\Users\12075`，
+       *   该路径**本来就不存在** ⇒ `Directory.Exists=false` 是**正确的主机答案**，
+       *   旧断言把它误判成"白障把祖先报成删除"。现在从真实 `USERPROFILE` 推导
+       *   祖先链（盘根 / 用户目录父级 / 用户目录 / SystemRoot），任何宿主账户下都成立。 */
+      ...(() => {
+        const home = process.env.USERPROFILE || 'C:\\Users\\Default'
+        const root = path.parse(home).root || 'C:\\'
+        const usersDir = path.dirname(home)
+        const windowsDir = process.env.SystemRoot || 'C:\\Windows'
+        const rows = [
+          { id: 'dir-drive-root', path: root },
+          { id: 'dir-users-parent', path: usersDir },
+          { id: 'dir-home', path: home },
+          { id: 'dir-system-root', path: windowsDir },
+        ]
+        return rows.map((row) => ({ ...row, expectExists: true, expectDir: true, key: 'ancestor-not-whiteouted' }))
+      })(),
       { id: 'c7b', path: targets.c7b, expectExists: false, expectDir: false },
       { id: 'c8-never-created', path: targets.c8, expectExists: false },
       { id: 'c6cmd', path: targets.c6cmd, expectExists: true, expectSize: `${expectVersion}\r\n`.length },
@@ -811,20 +826,29 @@ function main() {
     );
   }
 
-  // ---- c4b: the CoW copy itself is byte-exact.
+  // ---- c4b: R18-KNOWN-06 -- a zero-write write-intent open must NOT leave a plaintext copy.
+  /* 旧断言（round16 D6-1 时代）钉的是"CoW 副本逐字节等于真实文件"——那正是缺陷形态：
+   * `open(r+)+close`（0 字节）把整份明文复制进暂存树。R18 起 shim 在 CloseHandle 时
+   * 对"零写且内容未变"的 CoW 副本做撤销，因此本用例改为钉**新契约**：
+   *   · 暂存树里**不得**留下该文件的内容副本（`staged===null`）；
+   *   · 日志出现 `zero-write revoke`（证明撤销真的发生了，而不是"没复制"）；
+   *   · 通过 overlay 读回仍是真实内容（read-through 不受影响）；
+   *   · 真实文件不变。 */
   {
     const r = innerCases.c4b;
     const staged = stagedBytes(targets.c4b);
     const real = realBytes(targets.c4b);
     const read = r?.read?.ok ? unb64(r.read.b64) : null;
+    const revokeLog = /zero-write revoke/i.test(logText);
     const ok =
-      r && r.openOk && sameBytes(staged, contents.c4breal) && sameBytes(read, contents.c4breal) &&
-      sameBytes(real, contents.c4breal) && hasDisp(targets.c4b, 4);
+      r && r.openOk && staged === null && sameBytes(read, contents.c4breal) &&
+      sameBytes(real, contents.c4breal) && revokeLog && hasDisp(targets.c4b, 4);
     add(
       'c4b',
-      'CoW copy is byte-exact (OPEN_ALWAYS, no write) and the real file is unchanged',
+      'zero-write OPEN_ALWAYS CoW is revoked on close (KNOWN-06): no plaintext copy, overlay read-through intact, real unchanged',
       ok,
-      `staged=${show(staged)} real=${show(real)} readback=${show(read)} bytesEqual=${sameBytes(staged, contents.c4breal)} ${dispNote(targets.c4b)}`,
+      `staged=${staged === null ? 'absent' : show(staged)} real=${show(real)} readback=${show(read)} ` +
+        `log[zero-write revoke]=${revokeLog} ${dispNote(targets.c4b)}`,
     );
   }
 
@@ -1174,7 +1198,7 @@ function main() {
   addDisp('c2', targets.c2, 'CREATE_NEW creates the staged file');
   addDisp('c3', targets.c3, 'CREATE_NEW on an existing real path leaves no staged file');
   addDisp('c4', targets.c4, 'OPEN_ALWAYS+write: CoW copy, then the write lands in the overlay');
-  addDisp('c4b', targets.c4b, 'OPEN_ALWAYS CoW only: an exact copy of the real bytes');
+  addDisp('c4b', targets.c4b, 'OPEN_ALWAYS CoW only: zero-write copy revoked on close (KNOWN-06), read-through intact');
   addDisp('c4d', targets.c4d, 'CoW failure: nothing staged, ACCESS_DENIED');
   addDisp('c5', targets.c5, 'CREATE_ALWAYS replaces the staged content');
   addDisp('c5c', targets.c5c, 'libuv TRUNCATE_EXISTING mask: rejected by Windows');

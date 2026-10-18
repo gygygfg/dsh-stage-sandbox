@@ -68,7 +68,7 @@
 # 为什么需要这条（实测出来的结构性缺口）：
 #   `ctx.shell` 是**单例服务名**，两个提供方不能共存；而被禁用的那一行**根本不提供**服务。
 #
-# ── 修复②（本轮）：门控从"进程环境变量"改为"profile 开关"─────────────────────────
+# ── 修复②（上一轮）：门控从"进程环境变量"改为"profile 开关"────────────────────────
 # 旧口径 = `WINSTAGE_SHELL=1` **且** profile 开关未关。实测代价（两处独立证据）：
 #   1. `docs/DSH沙箱边界-实例侧实测.md` §5.1/§5.2、`docs/T7-暂存键重开与逐载体注入报告.md` §4.1：
 #      第二实例从未设过 `WINSTAGE_SHELL` ⇒ `winstage-shell` 行**永远不装载**，
@@ -85,21 +85,38 @@
 #   而 `ctx.fs` 的暂存面是运行期现读 `config.enabled`（见 `staging-fs.mjs`），因此
 #   "开关一开、文件面立刻变、shell 面要重启"这条差异是**已知且如实记录**的。
 #
-# 为什么能读到开关：开关的值落在 profile 覆盖层
-#   `<DSH_HOME>/profiles/<DSH_PROFILE>/cordis.patch.yml` 的 `id: winstage-sandbox`
-#   行 `config.enabled` 上（实测该文件逐字写着 `enabled: false`）。
-#   `!!js` 的求值器是同步的 `new Function('ctx','expr','with (ctx) { return eval(expr) }')`
+# ── 修复③（R17 · P0）：profile 覆盖层的定位**不能只靠进程环境变量**──────────────────
+# 实测（真实缺陷）：DSH desktop host（PID 11028）的 PEB 环境只有 50 项、**没有
+#   DSH_HOME / DSH_PROFILE**（那是 Harness 给**工具子进程**注入的，不是宿主自己的）
+#   ⇒ 上一版表达式只读这两个 env，读取段落进 fail-safe(true) ⇒ **开关写着 `enabled: false`，
+#   命令面仍被 WinStage 接管**：本会话 pwsh 的 cwd 被重定向进暂存根、真实盘看不到写入。
+# 证据：`.lead/logs/cordis-auditor/host-env-11028.txt`、`.lead/logs/cordis-auditor/gate-probe.log`。
+#
+# 现读取顺序（`PROFILE_SWITCH_READER_SOURCE`，与 `dsh-plugin/assembly-toggle.ts` **逐字共享**）：
+#   1. **ctx.baseUrl（首选）**：`dsh-app-boot` 的 `boot()` 逐字执行
+#      `ctx.baseUrl = pathToFileURL(dirname(absoluteConfigPath)).href + "/"`
+#      （`.lead/asar/.../dsh-app-boot/lib/index.js:4525`），desktop 的
+#      `absoluteConfigPath = <profile.dir>/cordis.yml`（`dsh/lib/profile-boot-*.js:289/302`）
+#      ⇒ `new URL('cordis.patch.yml', ctx.baseUrl)` 精确指向 profile 覆盖层。
+#      该 ctx 在 `!!js` 求值作用域里可用：`Entry.ctx` 继承 `Loader.ctx`
+#      （`cordis-plugin-loader/lib/index.js:133/322`），`Entry.disabledOf()` →
+#      `evaluate(this.ctx, …)`（`:347-352`）就是 `with (ctx) { eval(expr) }`（`:233-237`）。
+#      实测：干净进程 + 真 Loader + 真 Entry 里 `ctx.baseUrl` 逐字等于
+#      `file:///C:/Users/12075/.dsh/profiles/desktop/`（gate-probe.log E2）。
+#   2. env 回退：`DSH_HOME` + `DSH_PROFILE`（CLI / 自测 / 工具子进程场景）。
+#   3. 都拿不到 / 文件不存在 / 正则不匹配 / 抛错 ⇒ fail-safe `true`（= 接管，保持历史行为）。
+#      ⚠ 这一档**刻意保留**：把"读不懂"解释成"关闭"会让用户**静默失去沙箱**，比保守更危险。
+#      回归门 `tests/assembly-toggle-selftest.ts` B 段把它钉成"刻意 fail-safe"，不要改反。
+#
+# `!!js` 的求值器是同步的 `new Function('ctx','expr','with (ctx) { return eval(expr) }')`
 #   （`cordis-plugin-loader/src/config/utils.ts:5-9`），其中**`require` 不可用**
 #   （实测 `typeof require === 'undefined'`），唯一可用读文件通道是
 #   `process.getBuiltinModule('node:fs')` —— 下面两个表达式就用它。
 #
-# **fail-safe（刻意）**：判不出（文件不存在 / 正则不匹配 / 抛错）时返回 `true`
-#   ⇒ 视为"开关开启"⇒ **保持历史行为**（WinStage 接管）。
-#   把"读不懂"解释成"关闭"会让用户**静默失去沙箱**，比保守更危险。
-#
-# ★ 与 `dsh-plugin/assembly-toggle.mjs` 的 `winStageEnabledInProfileText()` **逻辑必须一致**：
-#   那边是 host 侧（直接 import），这边是装配侧（只能内联）。改一处必须同步另一处。
-#   （`assembly-toggle.mjs` 的纯函数部分由 `tests/assembly-toggle-selftest.mjs` 覆盖。）
+# ★ 与 `dsh-plugin/assembly-toggle.ts` 的 `winStageEnabledFromProfile()` / `shellProviderPlan()`
+#   必须一致：那边是 host 侧纯函数（直接 import），这边是装配侧（只能内联）。
+#   改一处必须同步另一处；`tests/assembly-toggle-selftest.ts` 会在 env × ctx.baseUrl ×
+#   profile 三态矩阵上把 YAML 表达式与模块纯函数**逐格对拍**。
 #
 # ★ 两个表达式**必须逐字成对取反**：否则会"两个都禁用"（`ctx.shell` 服务缺失 ⇒
 #   所有 shell 命令不可用）或"两个都启用"（cordis 服务重复注册 ⇒ 加载即失败）。
@@ -119,7 +136,7 @@
   #   `disabled` 变成 `{'[object Object]': …}` 而不是布尔 —— 行照旧"启用"，
   #   但**两个 shell 提供方都不让位**（实测 dump：`disabled:\n  '[object Object]': >-`）。
   #   本机因此踩过一次；回归门 `tests/assembly-toggle-selftest.mjs` A6 钉住。
-  disabled: !!js (process.env.WINSTAGE_SHELL !== '0') && ((process.env.WINSTAGE_SHELL === '1') || (() => { try { const p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; const fs = process.getBuiltinModule('node:fs'); if (!fs.existsSync(p)) return true; const m = /id:\s*winstage-sandbox\b([\s\S]*?)(?=\s*-\s*id:|\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return true; const e = /enabled:\s*(true|false)\b/.exec(m[1]); return !e || e[1] !== 'false'; } catch { return true } })())
+  disabled: !!js (process.env.WINSTAGE_SHELL !== '0') && ((process.env.WINSTAGE_SHELL === '1') || (() => { try { const fs = process.getBuiltinModule('node:fs'); let p = null; if (process.env.DSH_HOME && process.env.DSH_PROFILE) p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; try { if (ctx && typeof ctx.baseUrl === 'string' && ctx.baseUrl.length > 0) p = new URL('cordis.patch.yml', ctx.baseUrl) } catch {} if (!p) return true; if (!fs.existsSync(p)) return true; const m = /id:\s*winstage-sandbox\b([\s\S]*?)(?=\s*-\s*id:|\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return true; const e = /enabled:\s*(true|false)\b/.exec(m[1]); return !e || e[1] !== 'false' } catch { return true } })())
 
 - insert:
     - id: winstage-sandbox
@@ -163,7 +180,7 @@
       #
       # ⚠ 同样**不得出现 `: `（冒号+空格）**：会被 YAML 当成映射键分隔符（见上面
       #   `pwsh-sandbox` 行的实测说明）。因此这里用 `!== '0' && (…)` 而不是三目。
-      disabled: !!js (() => { const on = (process.env.WINSTAGE_SHELL !== '0') && ((process.env.WINSTAGE_SHELL === '1') || (() => { try { const p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; const fs = process.getBuiltinModule('node:fs'); if (!fs.existsSync(p)) return true; const m = /id:\s*winstage-sandbox\b([\s\S]*?)(?=\s*-\s*id:|\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return true; const e = /enabled:\s*(true|false)\b/.exec(m[1]); return !e || e[1] !== 'false'; } catch { return true } })()); return !on })()
+      disabled: !!js (() => { const on = (process.env.WINSTAGE_SHELL !== '0') && ((process.env.WINSTAGE_SHELL === '1') || (() => { try { const fs = process.getBuiltinModule('node:fs'); let p = null; if (process.env.DSH_HOME && process.env.DSH_PROFILE) p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; try { if (ctx && typeof ctx.baseUrl === 'string' && ctx.baseUrl.length > 0) p = new URL('cordis.patch.yml', ctx.baseUrl) } catch {} if (!p) return true; if (!fs.existsSync(p)) return true; const m = /id:\s*winstage-sandbox\b([\s\S]*?)(?=\s*-\s*id:|\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return true; const e = /enabled:\s*(true|false)\b/.exec(m[1]); return !e || e[1] !== 'false' } catch { return true } })()); return !on })()
       config:
         # 与 fs/host 两行共用同一个暂存根锚点（C-8：结构性同源）。
         # `shell-executor.mjs` 的 `effectiveWorkspaceRoot()` 以 **fs 行的 `cwd`** 为权威、

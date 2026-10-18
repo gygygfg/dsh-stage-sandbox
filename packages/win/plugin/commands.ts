@@ -29,12 +29,33 @@ export interface AlignedCommandDeps {
   apply(units: readonly ChangeUnit[]): { applied: string[]; failed: string[] }
   /** 丢弃全部暂存。 */
   discard(): void
+  /**
+   * 可选：**已应用过的路径账本**（R18 · KNOWN-08d 的幂等判据之一）。
+   *
+   * 真实接线若拿得到"曾经成功 apply 过哪些路径"（审阅服务的 `unstaged`/清单状态、
+   * 或会话级最近成功清单），实现它即可让"重复 apply 同一候选"明确返回
+   * `already-applied`，而不是落到"没有可应用的暂存改动"或让下层碰巧返回 0。
+   * 不实现也不影响其它语义：命令层还会用 `applyState === APPLIED` 兜底判定。
+   */
+  appliedPaths?(): readonly string[]
 }
 
-/** 命令返回值（与 DSH 的 `{ kind, text }` 同形）。 */
+/** 命令返回值（与 DSH 的 `{ kind, text }` 同形；R18 起带可选结构化字段）。 */
 export interface CommandResult {
   kind: 'success' | 'error'
   text: string
+  /**
+   * 结构化结果码（R18 · KNOWN-08d）：
+   *   · `'already-applied'` —— 重复 apply；**没有再次写盘**，成功语义；
+   *   · `'nothing-to-apply'` —— 既没有可应用项、也没有已应用记录（旧行为，error）；
+   *   · `'applied-with-failures'` —— 调用了下层且有失败项（error）。
+   * 不写盘的结论必须能从返回值直接读出来，而不是靠打印文本猜。
+   */
+  code?: 'already-applied' | 'nothing-to-apply' | 'applied-with-failures'
+  /** 重复 apply（链路上没有任何写盘动作）时为 true。 */
+  alreadyApplied?: boolean
+  /** 本次真正应用（写盘）的条数；`already-applied` 恒为 0。 */
+  appliedCount?: number
 }
 
 /** 单行渲染一个单元的风险档。 */
@@ -67,20 +88,76 @@ export interface ApplyInput {
 }
 
 /**
- * `/winstage-apply`：按风险分级确认后应用。
+ * `/winstage-apply`：按风险分级确认后应用（含 **R18 · KNOWN-08d 重复 apply 显式幂等**）。
  *
  * 规则（对齐 NeoAI，逐条可测）：
  *   · 所选单元若有任一**硬拒绝** ⇒ 直接 `error`（`--force` 也不能覆盖）；
  *   · `review`/`block` 档需要 `force`（或允许的 `sessionAuto`）；密钥/包安装**永不**被 `sessionAuto` 跳过；
  *   · 未确认 ⇒ `error` 并给出需再次确认的提示（"未知结果不报告为成功"）；
+ *   · **重复 apply**：所选路径已经是 `APPLIED`（单元状态）或已在 `deps.appliedPaths()` 账本里，
+ *     且当前**没有可应用项** ⇒ 返回结构化 `{kind:'success', code:'already-applied',
+ *     alreadyApplied:true, appliedCount:0}`，**不调用** `deps.apply`（不写盘），
+ *     文本明说"未再次写盘"；不再落到"没有可应用的暂存改动"的歧义 error；
+ *   · 下层报"应用 0 项且无失败"同样视为已无净变化 ⇒ `already-applied` 成功语义
+ *     （绝不把"什么都没做"印成"已应用 0 个文件"的模糊成功）；
  *   · 通过后调用 `deps.apply(selected)`，如实回报成功/失败清单。
+ *
+ * ⚠ 本函数**只做调用层幂等判定**：不改 `workspace.applyCandidate` / 审阅服务的
+ *   CAS/事务语义（重复写盘的最终防线仍在下层；本层只保证"明确重复"时不发起写盘）。
  *
  * @param deps - 依赖
  * @param input - 路径/确认
  */
 export function applyWithGuard(deps: AlignedCommandDeps, input: ApplyInput = {}): CommandResult {
-  const { selected, remaining } = selectForApply(deps.units(), input.paths)
-  if (selected.length === 0) return { kind: 'error', text: '没有可应用的暂存改动（或所选路径不存在）。' }
+  const allUnits = deps.units()
+  const { selected, remaining } = selectForApply(allUnits, input.paths)
+
+  /**
+   * 路径匹配：给了 `paths` 就按交集；没给 = "全部"（与 `selectForApply` 同口径）。
+   * @param unit - 变更单元
+   */
+  const matchesRequest = (unit: ChangeUnit): boolean =>
+    input.paths === undefined ? true : unit.paths.some((path) => input.paths!.includes(path))
+
+  /** 构造 `already-applied` 结果（成功语义、零写盘、文本给出可判定结论）。 */
+  const alreadyApplied = (paths: readonly string[], source: 'unit-state' | 'applied-ledger' | 'lower-layer-noop'): CommandResult => {
+    const list = [...new Set(paths)]
+    const shown = list.length > 0 ? list.join(', ') : '（所选路径）'
+    const why =
+      source === 'unit-state'
+        ? '这些单元已是 APPLIED 状态'
+        : source === 'applied-ledger'
+          ? '这些路径已有成功应用记录'
+          : '下层报告应用 0 项且无失败（已无净变化）'
+    return {
+      kind: 'success',
+      code: 'already-applied',
+      alreadyApplied: true,
+      appliedCount: 0,
+      text: `already-applied：${why}；本次**未再次写盘**（真实工作区未改动）：${shown}`,
+    }
+  }
+
+  if (selected.length === 0) {
+    // ① 单元状态线：目标路径已经 APPLIED（被 selectForApply 排除，但仍是"重复 apply"）
+    const appliedUnits = allUnits.filter((unit) => matchesRequest(unit) && unit.applyState === APPLY.APPLIED)
+    if (appliedUnits.length > 0) return alreadyApplied(appliedUnits.flatMap((unit) => unit.paths), 'unit-state')
+
+    // ② 调用方提供的"已应用账本"（可选能力）
+    let ledger: readonly string[] = []
+    try {
+      ledger = typeof deps.appliedPaths === 'function' ? deps.appliedPaths() : []
+    } catch {
+      ledger = [] // 账本读失败绝不影响其它语义（只退回旧 error 分支）
+    }
+    if (ledger.length > 0) {
+      const hit = input.paths === undefined ? ledger : ledger.filter((path) => input.paths!.includes(path))
+      if (hit.length > 0) return alreadyApplied(hit, 'applied-ledger')
+    }
+
+    // ③ 真正的"没有可应用项"
+    return { kind: 'error', code: 'nothing-to-apply', text: '没有可应用的暂存改动（或所选路径不存在）。' }
+  }
 
   // 硬拒绝：不可覆盖
   const hardDenied = selected.filter((u) => assess(deps.riskOf(u)).hardDeny)
@@ -103,12 +180,22 @@ export function applyWithGuard(deps: AlignedCommandDeps, input: ApplyInput = {})
   }
 
   const result = deps.apply(selected)
+  // ④ 下层 no-op：0 应用、0 失败 ⇒ 已无净变化（重复 apply / 被后来的写入取代），
+  //    不把"什么都没做"印成模糊成功；结构化表明"未再次写盘"。
+  if (result.applied.length === 0 && result.failed.length === 0) {
+    return alreadyApplied(selected.flatMap((unit) => unit.paths), 'lower-layer-noop')
+  }
   const kept = remaining.length
   const text =
     `已应用 ${result.applied.length} 个文件` +
     (result.failed.length > 0 ? `，失败 ${result.failed.length}：${result.failed.join(', ')}` : '') +
     (kept > 0 ? `；保留 ${kept} 个未选中项。` : '。')
-  return { kind: result.failed.length > 0 ? 'error' : 'success', text }
+  return {
+    kind: result.failed.length > 0 ? 'error' : 'success',
+    ...(result.failed.length > 0 ? { code: 'applied-with-failures' as const } : {}),
+    appliedCount: result.applied.length,
+    text,
+  }
 }
 
 /** `/winstage-discard`：丢弃全部暂存（有状态操作）。 */

@@ -49,6 +49,14 @@ static const WsHookTarget g_targets[] = {
     WS_TARGET(GetFileAttributesA),
     WS_TARGET(GetFileAttributesExW),
     WS_TARGET(GetFileAttributesExA),
+    /* R18-KNOWN-06: deferred CoW. A write-intent open copies the real file into the
+     * overlay (OPEN_ALWAYS semantics require content); these hooks let CloseHandle
+     * revoke that copy when nothing was ever written/truncated. */
+    WS_TARGET(CloseHandle),
+    WS_TARGET(WriteFile),
+    WS_TARGET(WriteFileEx),
+    WS_TARGET(SetEndOfFile),
+    WS_TARGET(SetFileInformationByHandle),
     /* Defect ① (TS-tier delete bypass): the deletion directives that never reach
      * DeleteFileW/RemoveDirectoryW. Callers measured on this host:
      *   - NtOpenFile(FILE_DELETE_ON_CLOSE): cmd.exe `del` / `erase`
@@ -85,6 +93,17 @@ static const WsHookTarget g_targets[] = {
     WS_TARGET(RegQueryInfoKeyW),
     WS_TARGET(RegEnumValueW),
     WS_TARGET(RegEnumKeyExW),
+    /* R18 / KNOWN-09: registry write APIs that used to be absent from WS_TARGET
+     * (IAT point-hook ⇒ "not hooked" ≡ "not intercepted" ≡ real hive write with
+     * no staging and no audit). Registered .NET Registry.SetValue / PowerShell
+     * New-ItemProperty go through RegSetKeyValueW; .NET DeleteSubKeyTree goes
+     * through RegDeleteTreeW. */
+    WS_TARGET(RegSetKeyValueW),
+    WS_TARGET(RegSetKeyValueA),
+    WS_TARGET(RegDeleteKeyValueW),
+    WS_TARGET(RegDeleteKeyValueA),
+    WS_TARGET(RegDeleteTreeW),
+    WS_TARGET(RegDeleteTreeA),
     WS_TARGET(GetProcAddress),
     WS_TARGET(LoadLibraryW),
     WS_TARGET(LoadLibraryA),
@@ -111,6 +130,8 @@ static const char *const g_targetNames[] = {
     "DeleteFileW", "DeleteFileA", "MoveFileExW", "MoveFileExA", "MoveFileW", "MoveFileA",
     "RemoveDirectoryW", "RemoveDirectoryA", "CopyFileW", "CopyFileA", "SetFileAttributesW",
     "GetFileAttributesW", "GetFileAttributesA", "GetFileAttributesExW", "GetFileAttributesExA",
+    /* R18-KNOWN-06 (must mirror g_targets) */
+    "CloseHandle", "WriteFile", "WriteFileEx", "SetEndOfFile", "SetFileInformationByHandle",
     /* defect ① targets (see the g_targets comment) */
     "NtOpenFile", "NtSetInformationFile", "MoveFileWithProgressW",
     "CreateProcessW", "CreateProcessAsUserW",
@@ -120,6 +141,9 @@ static const char *const g_targetNames[] = {
     "RegDeleteKeyExW", "RegDeleteKeyExA", "RegDeleteKeyW", "RegDeleteKeyA",
     "RegDeleteValueW", "RegDeleteValueA", "RegCloseKey", "RegFlushKey",
     "RegQueryInfoKeyW", "RegEnumValueW", "RegEnumKeyExW",
+    /* R18 / KNOWN-09 (must mirror g_targets exactly) */
+    "RegSetKeyValueW", "RegSetKeyValueA", "RegDeleteKeyValueW", "RegDeleteKeyValueA",
+    "RegDeleteTreeW", "RegDeleteTreeA",
     "GetProcAddress", "LoadLibraryW", "LoadLibraryA", "LoadLibraryExW", "LoadLibraryExA",
     "LdrLoadDll",
     "NtQueryValueKey",
@@ -385,6 +409,13 @@ int ws_hook_init(void)
         { (void **)&g_orig.GetFileAttributesA, "GetFileAttributesA" },
         { (void **)&g_orig.GetFileAttributesExW, "GetFileAttributesExW" },
         { (void **)&g_orig.GetFileAttributesExA, "GetFileAttributesExA" },
+        /* R18-KNOWN-06: deferred CoW hooks (must be captured, else the wrappers call a
+         * NULL original; same failure mode the A1 comment above records). */
+        { (void **)&g_orig.CloseHandle, "CloseHandle" },
+        { (void **)&g_orig.WriteFile, "WriteFile" },
+        { (void **)&g_orig.WriteFileEx, "WriteFileEx" },
+        { (void **)&g_orig.SetEndOfFile, "SetEndOfFile" },
+        { (void **)&g_orig.SetFileInformationByHandle, "SetFileInformationByHandle" },
         /* defect ① targets (see the g_targets comment) */
         { (void **)&g_orig.NtOpenFile, "NtOpenFile" },
         { (void **)&g_orig.NtSetInformationFile, "NtSetInformationFile" },

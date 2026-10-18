@@ -27,6 +27,11 @@ pnpm-debug.log*
 *.log
 *.tmp
 *.bak
+# 团队/agent 的内部工作区（协议、探针、逐条日志、临时报告）——**不入库**。
+# 对外交付的结论写在 `packages/win/docs/`（如 round17 报告），而不是把运行产物提交上来。
+/.lead/
+/.playwright-mcp/
+/.probe-lead-write.txt
 
 # ── 本地 vendor 与凭据（绝不入库）─────────────────────────────────────────────
 # `@deepseek-ai/*` 是私有包，公共 registry 404；本目录从 DSH 桌面端 app.asar 提取，

@@ -49,6 +49,15 @@
 （`e2e/README.md` 与 `tools/ebk-sandbox-test.ts` 直接引用）。同目录的 `汇总报告.md`
 与各域 `报告/缺陷` 是本轮结论。
 
+## 4.1 round17 / round18 —— 独立验收与残余收口（现行结论）
+
+- [`round17/R17-独立验收报告.md`](round17/R17-独立验收报告.md)：独立验收轮（2 条 P0 + 6 条 P1/P2 修复，
+  含"开关关仍接管 shell"与"凭据明文进 review.json"；§3 为 9 条残余清单）。
+- [`round18/R18-残余修复与验收报告.md`](round18/R18-残余修复与验收报告.md)：把 R17 §3 的 9 条残余全部闭环
+  （WOW64 32KEY fail-closed、注册表候选 appliable:false、真实文件物化、目录↔文件 apply、--read-only、
+  shim 读遮蔽、零写 CoW、白障祖先目录、关态停轮询/限制日志/双层卸载/apply 幂等/判定面），
+  并记录 canonical shim 重建、TS 车道判据、最终门禁与诚实残余。
+
 ## 5. archive —— 历史归档（不代表现行口径）
 
 | 目录 | 内容 |
