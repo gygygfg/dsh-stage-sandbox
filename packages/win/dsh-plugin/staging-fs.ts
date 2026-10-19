@@ -666,17 +666,42 @@ export function createStagingFileSystem(options = {}) {
         typeof options.sessionId === 'string' && options.sessionId.length > 0 ? options.sessionId : undefined
       /** 会话 id（'' = 无会话/共享）→ ReviewService；一次进程内不重复解析 */
       this.sessionServices = new Map()
-      /** 无会话的共享服务（日志用；也保证升级前的 `.dshstage/` 布局原样存在） */
-      this.staging = this.stagingFor(undefined)
       /**
-       * R12 修复 · D7-a：绕过暂存的账本**与 `review.json` 同一个存储根**。
+       * ★ R19 修复（P1·关态零影响）：共享服务改为**惰性构造**，构造函数绝不建暂存根。
        *
-       * 为什么在这里取而不是让调用方传：`stagingFor(undefined)` 的 `storeDir` 就是
-       * `resolveReviewStoreDir()` 对同一个 `workspaceRoot` 的解析结果，
-       * 与 `ReviewService.publish()` 写 `review.json` 的目录**逐字同源**。
-       * 于是"记了账"与"面板读得到账"是结构性事实，不靠两处约定。
+       * 旧实现在这里无条件 `this.staging = this.stagingFor(undefined)`。`getReviewService()`
+       * 会 new `ReviewService` → `Workspace.init()` → `Store.ensureLayout()`，于是**只要
+       * `winstage-fs` 行被装载**（它恒装载，关态也不 disable —— "一个提供方、两种面"），
+       * 哪怕 `config.enabled === false`、`stagingEnabled() === false`，磁盘上都会被创建
+       * `%LOCALAPPDATA%\Temp\winstage-stage\<键>\` 的整套布局：
+       *   `manifest.json + staged/ candidates/ blobs/ real/ cache/ private/ staged-ext/`
+       * 这直接违反"关闭后本插件不做任何检查 / 关态对原 harness 零影响"（`plugin/config.ts`
+       * 的 `enabled` 描述、`docs/插件启动-环境监测与开关保证.md` §2），也是"关态仍写盘"的
+       * 唯一一处装配期写入。最小复现（先红）：`.t/r19-cordis/probe7.ts` —— 旧实现构造后
+       * 8 个条目；`.t/r19-cordis/offstate-diff.ts` C0 现在断言根目录为空。
+       *
+       * 为什么删掉是安全的：`this.staging` 全文件**只有一个读者**（下面的
+       * `unstagedLedgerDir`），其余所有暂存路径都走 `stagingFor(...)`（本身就是惰性 + 缓存）；
+       * 而 `noteUnstaged()`（唯一账本写入点）只在 `stagingEnabled()` 为真的分支里被调用，
+       * 所以账本落点同样可以按需解析 —— 见下面 `unstagedLedgerDir` 的 getter。
+       * ⚠ 不要把它改成"关态时给个空壳服务"：那仍会建根；必须**完全不触碰**存储。
        */
-      this.unstagedLedgerDir = this.staging?.storeDir ?? this.staging?.workspace?.store?.dir
+      /**
+       * **开态 prewarm（保留既有语义；关态绝不触发）**：开关为**开**时仍在构造期解析一次
+       * 共享服务 —— 与 R19 之前的行为对齐（"启动即建共享服务 / 迁移升级前的 `.dshstage/` 旧布局"），
+       * 以免惰性化把"启动即迁移"的时机推迟到首次暂存操作。
+       * 判据用 `this.stagingEnabled()`（现读 loader 行真值；此时 `workspaceRoot`/`rootEntry`
+       * 都已就绪）。**关态下这段一步都不执行** ⇒ 不 `getReviewService()`、不 `ensureLayout()`、
+       * 不在磁盘建任何暂存根（`crosscheck-boundaries` §7 与 `.t/r19-cordis/probe7.ts` 钉住）。
+       * 解析失败不能拖垮装配：与旧实现一致地只记 error 日志（服务会在首次真正用到时重试）。
+       */
+      if (this.stagingEnabled()) {
+        try {
+          this.stagingFor(undefined)
+        } catch (error) {
+          this.logError(`开态 prewarm 共享暂存服务失败（已忽略，首次暂存操作会重试）：${error?.message ?? error}`)
+        }
+      }
       /** 已就"某类操作绕过暂存"报过 error 日志的键（只报一次；账本本身不丢） */
       this.warnedUnstaged = new Set()
       /** 本实例登记的 `watch()` 观察者：`{ rel, isDir, changed }`（见下方 watch 覆写） */
@@ -793,6 +818,34 @@ export function createStagingFileSystem(options = {}) {
         `会话工作区（${this.sessionWorkspaceOf(sandboxPolicy) ?? '未知'}）与 WinStage 配置的暂存根（${this.workspaceRoot}）不同：` +
           '本会话的写入**仍然进暂存**（暂存优先，R12 D7-a 修复），并会记一条"配置根不一致"的账到 review.json 的 unstaged 段。',
       )
+    }
+
+    /**
+     * R12 修复 · D7-a（R19 改为**惰性**）：绕过暂存的账本落点。
+     *
+     * 为什么必须与 `review.json` **同一个存储根**：`stagingFor(undefined)` 的 `storeDir` 就是
+     * `resolveReviewStoreDir()` 对同一个 `workspaceRoot` 的解析结果，与 `ReviewService.publish()`
+     * 写 `review.json` 的目录**逐字同源**，于是"记了账"与"面板读得到账"是结构性事实。
+     *
+     * 为什么改成 getter（R19 关态零影响）：账本写入点 `noteUnstaged()` **只会在
+     * `stagingEnabled()` 为真的路径上被调用**，所以关态完全不需要解析它；旧实现把它放在
+     * 构造函数里 ⇒ 关态装配也要 `getReviewService()` ⇒ 建暂存根。现在首次真正记账时才解析，
+     * 解析失败（根不可用等）仍按 `recordUnstaged()` 既有纪律落 error 日志、绝不让写失败。
+     * 解析结果缓存到 `_unstagedLedgerDir`（一次实例生命周期内不变）。
+     */
+    get unstagedLedgerDir() {
+      if (this._unstagedLedgerDir === undefined) {
+        try {
+          const service = this.stagingFor(undefined)
+          this._unstagedLedgerDir = service?.storeDir ?? service?.workspace?.store?.dir ?? null
+        } catch (error) {
+          // 解析不出来 ⇒ 交给 recordUnstaged() 按"无落点"处理（它会自己响），而不是抛给调用方；
+          // 记 null 避免每次记账都重试 + 重复日志（一次实例生命周期内只解析一次）。
+          this.logError(`账本落点解析失败（已忽略，不影响本次操作）：${error?.message ?? error}`)
+          this._unstagedLedgerDir = null
+        }
+      }
+      return this._unstagedLedgerDir ?? undefined
     }
 
     /**
@@ -1891,18 +1944,37 @@ export function createStagingFileSystem(options = {}) {
     }
 
     async lstatInner(path, opts, signal) {
+      /**
+       * ★ R21 修复（P2·读侧守卫位置）：`lstat` 的遮蔽判定此前排在**两个早退之后** ——
+       * 关态（`!stagingEnabled()`）与异工作区（`!inConfiguredWorkspace()`）两条分支
+       * 直接 `super.lstat` 返回，于是：
+       *   · `readPolicy:'block'` 下 `stat`/`readText` 抛 `FS_READ_DENIED`，`lstat` 却把
+       *     `type`/`size` 原样交出去（存在性与大小可读 —— 与 crosscheck-boundaries 发现的
+       *     “`stat` 是第五条漏网入口”是同一族缺陷，只是这次是 `lstat` 分支位置写错）；
+       *   · `readPolicy:'record'` 下这次读**一条可见性记录都不产生**，`review.json` 的
+       *     `readVisibility` 段照样读成“没有敏感读”。
+       * 注释原本就写着“必须在早退之前”，实现却排在之后（代码/注释不一致）。
+       *
+       * 修法与 `statInner` / `listDirInner` 同形：**先算出逻辑绝对路径，再守卫，最后才
+       * 分派**（关态/异工作区仍然照旧 `super`，只是这一次读已经被登记/已按策略拦下）。
+       * 结构约束（`tests/crosscheck-boundaries.ts` §2 的位置断言会机检）：
+       * `guardMaskedRead(` 的**首次出现位置必须早于函数里第一个 `return`** —— 因此
+       * 空/非字符串路径的失败分支只能**后置**（它没有可判定的绝对路径，守卫跳过；
+       * 关态仍交回基类、开态沿用既有 `FS_NOT_FOUND`，错误语义与旧实现逐字一致）。
+       */
+      const base = opts?.cwd || this.config?.cwd || process.cwd()
+      const validPath = typeof path === 'string' && path.trim().length > 0
+      let abs
+      if (validPath) {
+        abs = canonical(isAbsolute(path) ? path : join(base, path))
+        this.guardMaskedRead({ targetKey: FsTargetKey(abs), displayPath: path }, 'lstat')
+      }
       if (!this.stagingEnabled()) return super.lstat(path, opts, signal)
       if (!this.inConfiguredWorkspace()) {
         this.warnForeignWorkspace()
         return super.lstat(path, opts, signal)
       }
-      if (typeof path !== 'string' || path.trim().length === 0) {
-        throw new FsError('file_path must be a non-empty string', 'FS_NOT_FOUND')
-      }
-      const base = opts?.cwd || this.config?.cwd || process.cwd()
-      const abs = canonical(isAbsolute(path) ? path : join(base, path))
-      // 与 `statInner` 同一理由：`lstat` 也是读入口，必须在早退之前过遮蔽判定。
-      this.guardMaskedRead({ targetKey: FsTargetKey(abs), displayPath: path }, 'lstat')
+      if (!validPath) throw new FsError('file_path must be a non-empty string', 'FS_NOT_FOUND')
       const place = this.keyOf({ targetKey: FsTargetKey(abs), displayPath: path })
       if (place === undefined) return super.lstat(path, opts, signal)
       const ws = this.stagingFor(this.sessionIdOf()).fresh()

@@ -75,7 +75,38 @@ typedef struct WsOriginals {
     BOOL(WINAPI *RemoveDirectoryA)(LPCSTR);
     BOOL(WINAPI *CopyFileW)(LPCWSTR, LPCWSTR, BOOL);
     BOOL(WINAPI *CopyFileA)(LPCSTR, LPCSTR, BOOL);
+    /* R19: CopyFileEx is what robocopy / CopyFile2-era callers use; it was absent
+     * from WS_TARGET => real-disk writes that bypass staging and the read mask. */
+    BOOL(WINAPI *CopyFileExW)(LPCWSTR, LPCWSTR, LPPROGRESS_ROUTINE, LPVOID, LPBOOL, DWORD);
+    BOOL(WINAPI *CopyFileExA)(LPCSTR, LPCSTR, LPPROGRESS_ROUTINE, LPVOID, LPBOOL, DWORD);
+    /* robocopy resolves CopyFile2 dynamically (measured: CopyFileExW never called). */
+    HRESULT(WINAPI *CopyFile2)(PCWSTR, PCWSTR, COPYFILE2_EXTENDED_PARAMETERS *);
     BOOL(WINAPI *SetFileAttributesW)(LPCWSTR, DWORD);
+    /* R20 / R17: the file-side surface that was absent from WS_TARGET in R19. IAT
+     * point-hook => "not hooked" == "not intercepted" == real-disk write with
+     * neither staging nor audit. Semantics live in ws_file.c. */
+    BOOL(WINAPI *ReplaceFileW)(LPCWSTR, LPCWSTR, LPCWSTR, DWORD, LPVOID, LPVOID);
+    BOOL(WINAPI *ReplaceFileA)(LPCSTR, LPCSTR, LPCSTR, DWORD, LPVOID, LPVOID);
+    NTSTATUS(NTAPI *NtCreateFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
+                                  PVOID /*PLARGE_INTEGER AllocationSize*/, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+    BOOL(WINAPI *CreateHardLinkW)(LPCWSTR, LPCWSTR, LPSECURITY_ATTRIBUTES);
+    BOOL(WINAPI *CreateHardLinkA)(LPCSTR, LPCSTR, LPSECURITY_ATTRIBUTES);
+    HANDLE(WINAPI *FindFirstFileW)(LPCWSTR, LPWIN32_FIND_DATAW);
+    HANDLE(WINAPI *FindFirstFileA)(LPCSTR, LPWIN32_FIND_DATAA);
+    HANDLE(WINAPI *FindFirstFileExW)(LPCWSTR, FINDEX_INFO_LEVELS, LPVOID, FINDEX_SEARCH_OPS, LPVOID, DWORD);
+    HANDLE(WINAPI *FindFirstFileExA)(LPCSTR, FINDEX_INFO_LEVELS, LPVOID, FINDEX_SEARCH_OPS, LPVOID, DWORD);
+    BOOL(WINAPI *FindNextFileW)(HANDLE, LPWIN32_FIND_DATAW);
+    BOOL(WINAPI *FindNextFileA)(HANDLE, LPWIN32_FIND_DATAA);
+    /* R20 / R19: FindClose must be visible so the enumeration filter can drop its
+     * per-handle (directory path) state; otherwise the table would grow without
+     * bound in long-lived carriers (powershell.exe / node.exe). */
+    BOOL(WINAPI *FindClose)(HANDLE);
+    /* R20 / R19: node's fs.readdirSync does NOT go through FindFirstFile*: it
+     * opens the directory and calls ntdll!NtQueryDirectoryFile directly (measured,
+     * 2026-10-19). Without this target node still sees the masked names. */
+    NTSTATUS(NTAPI *NtQueryDirectoryFile)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK,
+                                          PVOID, ULONG, FILE_INFORMATION_CLASS, BOOLEAN,
+                                          PUNICODE_STRING, BOOLEAN);
     /* Overlay-aware existence/stat hooks (added for the A1 stat gap): the
      * originals are captured like every other target. */
     DWORD(WINAPI *GetFileAttributesW)(LPCWSTR);
@@ -143,6 +174,61 @@ typedef struct WsOriginals {
     LONG(WINAPI *RegDeleteKeyValueA)(HKEY, LPCSTR, LPCSTR);
     LONG(WINAPI *RegDeleteTreeW)(HKEY, LPCWSTR);
     LONG(WINAPI *RegDeleteTreeA)(HKEY, LPCSTR);
+    /* R19: the APIs below were absent from WS_TARGET (IAT point-hook => not hooked
+     * => real-hive write with neither staging nor audit; measured writing the REAL
+     * hive in the production TS lane). All are fail-closed HARD_DENY + WAL now. */
+    LONG(WINAPI *RegCreateKeyTransactedW)(HKEY, LPCWSTR, DWORD, LPWSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD, HANDLE, PVOID);
+    LONG(WINAPI *RegCreateKeyTransactedA)(HKEY, LPCSTR, DWORD, LPSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD, HANDLE, PVOID);
+    LONG(WINAPI *RegOpenKeyTransactedW)(HKEY, LPCWSTR, DWORD, REGSAM, PHKEY, HANDLE, PVOID);
+    LONG(WINAPI *RegOpenKeyTransactedA)(HKEY, LPCSTR, DWORD, REGSAM, PHKEY, HANDLE, PVOID);
+    LONG(WINAPI *RegDeleteKeyTransactedW)(HKEY, LPCWSTR, REGSAM, DWORD, HANDLE, PVOID);
+    LONG(WINAPI *RegDeleteKeyTransactedA)(HKEY, LPCSTR, REGSAM, DWORD, HANDLE, PVOID);
+    LONG(WINAPI *RegCopyTreeW)(HKEY, LPCWSTR, HKEY);
+    LONG(WINAPI *RegCopyTreeA)(HKEY, LPCSTR, HKEY);
+    LONG(WINAPI *RegRenameKey)(HKEY, LPCWSTR, LPCWSTR);
+    LONG(WINAPI *RegLoadKeyW)(HKEY, LPCWSTR, LPCWSTR);
+    LONG(WINAPI *RegLoadKeyA)(HKEY, LPCSTR, LPCSTR);
+    LONG(WINAPI *RegUnLoadKeyW)(HKEY, LPCWSTR);
+    LONG(WINAPI *RegUnLoadKeyA)(HKEY, LPCSTR);
+    LONG(WINAPI *RegSaveKeyW)(HKEY, LPCWSTR, LPSECURITY_ATTRIBUTES);
+    LONG(WINAPI *RegSaveKeyA)(HKEY, LPCSTR, LPSECURITY_ATTRIBUTES);
+    LONG(WINAPI *RegSaveKeyExW)(HKEY, LPCWSTR, LPSECURITY_ATTRIBUTES, DWORD);
+    LONG(WINAPI *RegSaveKeyExA)(HKEY, LPCSTR, LPSECURITY_ATTRIBUTES, DWORD);
+    LONG(WINAPI *RegRestoreKeyW)(HKEY, LPCWSTR, DWORD);
+    LONG(WINAPI *RegRestoreKeyA)(HKEY, LPCSTR, DWORD);
+    LONG(WINAPI *RegReplaceKeyW)(HKEY, LPCWSTR, LPCWSTR, LPCWSTR);
+    LONG(WINAPI *RegReplaceKeyA)(HKEY, LPCSTR, LPCSTR, LPCSTR);
+    LONG(WINAPI *RegConnectRegistryW)(LPCWSTR, HKEY, PHKEY);
+    LONG(WINAPI *RegConnectRegistryA)(LPCSTR, HKEY, PHKEY);
+    /* R19: ntdll registry write surface (direct imports bypass every Reg* hook). */
+    NTSTATUS(NTAPI *NtCreateKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
+    NTSTATUS(NTAPI *NtSetValueKey)(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID, ULONG);
+    NTSTATUS(NTAPI *NtDeleteKey)(HANDLE);
+    NTSTATUS(NTAPI *NtDeleteValueKey)(HANDLE, PUNICODE_STRING);
+    NTSTATUS(NTAPI *NtRenameKey)(HANDLE, PUNICODE_STRING);
+    NTSTATUS(NTAPI *NtLoadKey)(POBJECT_ATTRIBUTES, POBJECT_ATTRIBUTES);
+    NTSTATUS(NTAPI *NtLoadKey2)(POBJECT_ATTRIBUTES, POBJECT_ATTRIBUTES, ULONG);
+    NTSTATUS(NTAPI *NtUnloadKey)(POBJECT_ATTRIBUTES);
+    NTSTATUS(NTAPI *NtSaveKey)(HANDLE, HANDLE);
+    NTSTATUS(NTAPI *NtSaveKeyEx)(HANDLE, HANDLE, ULONG);
+    NTSTATUS(NTAPI *NtRestoreKey)(HANDLE, HANDLE, ULONG);
+    NTSTATUS(NTAPI *NtReplaceKey)(POBJECT_ATTRIBUTES, HANDLE, POBJECT_ATTRIBUTES);
+    /* R20 / R16: the Zw* aliases are SEPARATE ntdll exports (and separate IAT
+     * names), so each one needs its own captured original: if we only captured
+     * Nt*, GetProcAddress(ntdll,"Zw...") would resolve to a pointer our identity
+     * table does not know and the caller would keep the real, unlimited export. */
+    NTSTATUS(NTAPI *ZwCreateKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
+    NTSTATUS(NTAPI *ZwSetValueKey)(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID, ULONG);
+    NTSTATUS(NTAPI *ZwDeleteKey)(HANDLE);
+    NTSTATUS(NTAPI *ZwDeleteValueKey)(HANDLE, PUNICODE_STRING);
+    NTSTATUS(NTAPI *ZwRenameKey)(HANDLE, PUNICODE_STRING);
+    NTSTATUS(NTAPI *ZwLoadKey)(POBJECT_ATTRIBUTES, POBJECT_ATTRIBUTES);
+    NTSTATUS(NTAPI *ZwLoadKey2)(POBJECT_ATTRIBUTES, POBJECT_ATTRIBUTES, ULONG);
+    NTSTATUS(NTAPI *ZwUnloadKey)(POBJECT_ATTRIBUTES);
+    NTSTATUS(NTAPI *ZwSaveKey)(HANDLE, HANDLE);
+    NTSTATUS(NTAPI *ZwSaveKeyEx)(HANDLE, HANDLE, ULONG);
+    NTSTATUS(NTAPI *ZwRestoreKey)(HANDLE, HANDLE, ULONG);
+    NTSTATUS(NTAPI *ZwReplaceKey)(POBJECT_ATTRIBUTES, HANDLE, POBJECT_ATTRIBUTES);
     /* task-18: ntdll!NtQueryValueKey -- reg.exe reads values without going through advapi32. */
     NTSTATUS(NTAPI *NtQueryValueKey)(HANDLE, const void * /*PUNICODE_STRING*/, ULONG, PVOID, ULONG, PULONG);
     /* task-18c: the rest of the ntdll query family (same policy as NtQueryValueKey). */
@@ -377,6 +463,10 @@ BOOL WINAPI ws_RemoveDirectoryW(LPCWSTR);
 BOOL WINAPI ws_RemoveDirectoryA(LPCSTR);
 BOOL WINAPI ws_CopyFileW(LPCWSTR, LPCWSTR, BOOL);
 BOOL WINAPI ws_CopyFileA(LPCSTR, LPCSTR, BOOL);
+/* R19: staged CopyFileEx (reuses CopyFileW staging + mask semantics). */
+BOOL WINAPI ws_CopyFileExW(LPCWSTR, LPCWSTR, LPPROGRESS_ROUTINE, LPVOID, LPBOOL, DWORD);
+BOOL WINAPI ws_CopyFileExA(LPCSTR, LPCSTR, LPPROGRESS_ROUTINE, LPVOID, LPBOOL, DWORD);
+HRESULT WINAPI ws_CopyFile2(PCWSTR, PCWSTR, COPYFILE2_EXTENDED_PARAMETERS *);
 BOOL WINAPI ws_SetFileAttributesW(LPCWSTR, DWORD);
 DWORD WINAPI ws_GetFileAttributesW(LPCWSTR);
 DWORD WINAPI ws_GetFileAttributesA(LPCSTR);
@@ -422,10 +512,80 @@ LONG WINAPI ws_RegDeleteKeyValueA(HKEY, LPCSTR, LPCSTR);
 LONG WINAPI ws_RegDeleteTreeW(HKEY, LPCWSTR);
 LONG WINAPI ws_RegDeleteTreeA(HKEY, LPCSTR);
 
+/* R19: fail-closed hard-deny hooks for the registry write surface that used to be
+ * invisible to the IAT point-hook (transacted / tree / hive-file / connect / ntdll). */
+LONG WINAPI ws_RegCreateKeyTransactedW(HKEY, LPCWSTR, DWORD, LPWSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD, HANDLE, PVOID);
+LONG WINAPI ws_RegCreateKeyTransactedA(HKEY, LPCSTR, DWORD, LPSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD, HANDLE, PVOID);
+LONG WINAPI ws_RegOpenKeyTransactedW(HKEY, LPCWSTR, DWORD, REGSAM, PHKEY, HANDLE, PVOID);
+LONG WINAPI ws_RegOpenKeyTransactedA(HKEY, LPCSTR, DWORD, REGSAM, PHKEY, HANDLE, PVOID);
+LONG WINAPI ws_RegDeleteKeyTransactedW(HKEY, LPCWSTR, REGSAM, DWORD, HANDLE, PVOID);
+LONG WINAPI ws_RegDeleteKeyTransactedA(HKEY, LPCSTR, REGSAM, DWORD, HANDLE, PVOID);
+LONG WINAPI ws_RegCopyTreeW(HKEY, LPCWSTR, HKEY);
+LONG WINAPI ws_RegCopyTreeA(HKEY, LPCSTR, HKEY);
+LONG WINAPI ws_RegRenameKey(HKEY, LPCWSTR, LPCWSTR);
+LONG WINAPI ws_RegLoadKeyW(HKEY, LPCWSTR, LPCWSTR);
+LONG WINAPI ws_RegLoadKeyA(HKEY, LPCSTR, LPCSTR);
+LONG WINAPI ws_RegUnLoadKeyW(HKEY, LPCWSTR);
+LONG WINAPI ws_RegUnLoadKeyA(HKEY, LPCSTR);
+LONG WINAPI ws_RegSaveKeyW(HKEY, LPCWSTR, LPSECURITY_ATTRIBUTES);
+LONG WINAPI ws_RegSaveKeyA(HKEY, LPCSTR, LPSECURITY_ATTRIBUTES);
+LONG WINAPI ws_RegSaveKeyExW(HKEY, LPCWSTR, LPSECURITY_ATTRIBUTES, DWORD);
+LONG WINAPI ws_RegSaveKeyExA(HKEY, LPCSTR, LPSECURITY_ATTRIBUTES, DWORD);
+LONG WINAPI ws_RegRestoreKeyW(HKEY, LPCWSTR, DWORD);
+LONG WINAPI ws_RegRestoreKeyA(HKEY, LPCSTR, DWORD);
+LONG WINAPI ws_RegReplaceKeyW(HKEY, LPCWSTR, LPCWSTR, LPCWSTR);
+LONG WINAPI ws_RegReplaceKeyA(HKEY, LPCSTR, LPCSTR, LPCSTR);
+LONG WINAPI ws_RegConnectRegistryW(LPCWSTR, HKEY, PHKEY);
+LONG WINAPI ws_RegConnectRegistryA(LPCSTR, HKEY, PHKEY);
+NTSTATUS NTAPI ws_NtCreateKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
+NTSTATUS NTAPI ws_NtSetValueKey(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID, ULONG);
+NTSTATUS NTAPI ws_NtDeleteKey(HANDLE);
+NTSTATUS NTAPI ws_NtDeleteValueKey(HANDLE, PUNICODE_STRING);
+NTSTATUS NTAPI ws_NtRenameKey(HANDLE, PUNICODE_STRING);
+NTSTATUS NTAPI ws_NtLoadKey(POBJECT_ATTRIBUTES, POBJECT_ATTRIBUTES);
+NTSTATUS NTAPI ws_NtLoadKey2(POBJECT_ATTRIBUTES, POBJECT_ATTRIBUTES, ULONG);
+NTSTATUS NTAPI ws_NtUnloadKey(POBJECT_ATTRIBUTES);
+NTSTATUS NTAPI ws_NtSaveKey(HANDLE, HANDLE);
+NTSTATUS NTAPI ws_NtSaveKeyEx(HANDLE, HANDLE, ULONG);
+NTSTATUS NTAPI ws_NtRestoreKey(HANDLE, HANDLE, ULONG);
+NTSTATUS NTAPI ws_NtReplaceKey(POBJECT_ATTRIBUTES, HANDLE, POBJECT_ATTRIBUTES);
+/* R20 / R16: Zw* aliases. Same fail-closed deny + WAL as their Nt* twin; kept as
+ * distinct symbols because each is a distinct IAT name/export. */
+NTSTATUS NTAPI ws_ZwCreateKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
+NTSTATUS NTAPI ws_ZwSetValueKey(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID, ULONG);
+NTSTATUS NTAPI ws_ZwDeleteKey(HANDLE);
+NTSTATUS NTAPI ws_ZwDeleteValueKey(HANDLE, PUNICODE_STRING);
+NTSTATUS NTAPI ws_ZwRenameKey(HANDLE, PUNICODE_STRING);
+NTSTATUS NTAPI ws_ZwLoadKey(POBJECT_ATTRIBUTES, POBJECT_ATTRIBUTES);
+NTSTATUS NTAPI ws_ZwLoadKey2(POBJECT_ATTRIBUTES, POBJECT_ATTRIBUTES, ULONG);
+NTSTATUS NTAPI ws_ZwUnloadKey(POBJECT_ATTRIBUTES);
+NTSTATUS NTAPI ws_ZwSaveKey(HANDLE, HANDLE);
+NTSTATUS NTAPI ws_ZwSaveKeyEx(HANDLE, HANDLE, ULONG);
+NTSTATUS NTAPI ws_ZwRestoreKey(HANDLE, HANDLE, ULONG);
+NTSTATUS NTAPI ws_ZwReplaceKey(POBJECT_ATTRIBUTES, HANDLE, POBJECT_ATTRIBUTES);
+
 /* --- ws_file.c: directive-level deletion + the non-Win32 exports ---------- */
 NTSTATUS NTAPI ws_NtOpenFile(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
 NTSTATUS NTAPI ws_NtSetInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
 BOOL WINAPI ws_MoveFileWithProgressW(LPCWSTR, LPCWSTR, LPPROGRESS_ROUTINE, LPVOID, DWORD);
+/* R20 / R17-R19: file-side hooks that used to be invisible to the IAT point-hook
+ * (real-disk writes / metadata leaks). Implemented in ws_file.c. */
+BOOL WINAPI ws_ReplaceFileW(LPCWSTR, LPCWSTR, LPCWSTR, DWORD, LPVOID, LPVOID);
+BOOL WINAPI ws_ReplaceFileA(LPCSTR, LPCSTR, LPCSTR, DWORD, LPVOID, LPVOID);
+NTSTATUS NTAPI ws_NtCreateFile(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
+                               PVOID /*PLARGE_INTEGER*/, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+BOOL WINAPI ws_CreateHardLinkW(LPCWSTR, LPCWSTR, LPSECURITY_ATTRIBUTES);
+BOOL WINAPI ws_CreateHardLinkA(LPCSTR, LPCSTR, LPSECURITY_ATTRIBUTES);
+HANDLE WINAPI ws_FindFirstFileW(LPCWSTR, LPWIN32_FIND_DATAW);
+HANDLE WINAPI ws_FindFirstFileA(LPCSTR, LPWIN32_FIND_DATAA);
+HANDLE WINAPI ws_FindFirstFileExW(LPCWSTR, FINDEX_INFO_LEVELS, LPVOID, FINDEX_SEARCH_OPS, LPVOID, DWORD);
+HANDLE WINAPI ws_FindFirstFileExA(LPCSTR, FINDEX_INFO_LEVELS, LPVOID, FINDEX_SEARCH_OPS, LPVOID, DWORD);
+BOOL WINAPI ws_FindNextFileW(HANDLE, LPWIN32_FIND_DATAW);
+BOOL WINAPI ws_FindNextFileA(HANDLE, LPWIN32_FIND_DATAA);
+BOOL WINAPI ws_FindClose(HANDLE);
+NTSTATUS NTAPI ws_NtQueryDirectoryFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK,
+                                       PVOID, ULONG, FILE_INFORMATION_CLASS, BOOLEAN,
+                                       PUNICODE_STRING, BOOLEAN);
 
 /* --- ws_proc.c: CreateProcess* + child self-injection -------------------- */
 void ws_proc_set_self_module(HMODULE self);

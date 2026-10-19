@@ -26,10 +26,13 @@ import {
   CREATE_UNICODE_ENVIRONMENT,
   SHIM_INJECT_FAILURE_EXIT,
   TRANSPARENT_TIER,
+  REGISTRY_ATTRIBUTION_CODE,
+  registryAttributionFor,
   buildCapabilityCanaryScript,
   buildChildEnvironment,
   classifyCommandRisk,
   hasCurlWgetDownloadFlag,
+  hasPwshOpaqueFlag,
   isVersionOrHelpProbe,
   judgeCanary,
   parseMarkerJson,
@@ -1040,6 +1043,40 @@ async function main() {
       modes.every((mode) => ['shim', 'restricted-token', 'appcontainer'].includes(mode)),
       JSON.stringify(modes),
     )
+    // ── R20②：注册表写归因能力（机读、不得冒充已归因）────────────────────────
+    const attrShim = registryAttributionFor('shim')
+    const attrT1 = registryAttributionFor('restricted-token')
+    const attrT0 = registryAttributionFor('appcontainer')
+    check(
+      'R20② shim 档：attributable=true + code=ATTRIBUTABLE_VIA_WAL + wal=expected',
+      attrShim.attributable === true && attrShim.code === REGISTRY_ATTRIBUTION_CODE.ATTRIBUTABLE && attrShim.wal === 'expected',
+      JSON.stringify(attrShim),
+    )
+    check(
+      'R20② T1 档：attributable=false + code=NOT_ATTRIBUTABLE_NO_SHIM + wal=none-by-construction',
+      attrT1.attributable === false && attrT1.code === REGISTRY_ATTRIBUTION_CODE.NOT_ATTRIBUTABLE && attrT1.wal === 'none-by-construction',
+      JSON.stringify(attrT1),
+    )
+    check(
+      'R20② T1 档残余面写明 no-shim / no-WAL / unhooked / raw syscall（不得省略）',
+      ['no shim', 'WAL', 'unhooked', 'raw syscall'].every((needle) => attrT1.residual.some((line) => line.includes(needle))),
+      JSON.stringify(attrT1.residual),
+    )
+    check(
+      'R20② 文案明确"不把 Access denied / 空 WAL 读成归因结论"',
+      /不可归因/.test(attrT1.summary) && /Access denied/.test(attrT1.summary) && /没有 WAL/.test(attrT1.summary),
+      attrT1.summary,
+    )
+    check(
+      'R20② T0(APPContainer) 也是无 shim ⇒ 不可归因，但机制字段如实标 appcontainer',
+      attrT0.attributable === false && attrT0.mechanism === 'windows-appcontainer',
+      JSON.stringify(attrT0),
+    )
+    check(
+      'R20② 未初始化 launchMode 时不冒充可归因（默认不可归因）',
+      registryAttributionFor(undefined).attributable === false,
+      JSON.stringify(registryAttributionFor(undefined)),
+    )
   }
   {
     // 6b. 环境变量痕迹：`buildChildEnvironment` 不得再注入任何 DSH_SANDBOX*
@@ -1078,6 +1115,13 @@ async function main() {
     check('去令牌化模式不建 AclSandbox（没有受限令牌）', stubs.record.sandboxes.length === 0, `sandboxes=${stubs.record.sandboxes.length}`)
     check('去令牌化模式不建 Job（如实声明 treeReclaim=taskkill）', ex.job === undefined && report.jobEnabled === false, `job=${String(ex.job)} jobEnabled=${report.jobEnabled}`)
     check('initReport 记录 tierRequested=TS 且无回退原因', report.tierRequested === TRANSPARENT_TIER && report.fallbackReason === undefined, JSON.stringify({ r: report.tierRequested, f: report.fallbackReason }))
+    check(
+      'R20② initReport.registryAttribution：shim 档可归因（code/mechanism 与 lane 同源）',
+      report.registryAttribution?.attributable === true &&
+        report.registryAttribution.code === REGISTRY_ATTRIBUTION_CODE.ATTRIBUTABLE &&
+        report.registryAttribution.mechanism === 'winstage-shim-iat',
+      JSON.stringify(report.registryAttribution),
+    )
     check('注入器被调用一次', spawnCalls.length === 1, `calls=${spawnCalls.length}`)
     check('调用的是注入器产物路径', spawnCalls[0]?.file === fakeArtifacts.injectorPath, String(spawnCalls[0]?.file))
     check('注入器参数含 --dll 与 DLL 路径', spawnCalls[0]?.args?.[0] === '--dll' && spawnCalls[0]?.args?.[1] === fakeArtifacts.dllPath, JSON.stringify(spawnCalls[0]?.args?.slice(0, 4)))
@@ -1106,6 +1150,13 @@ async function main() {
     check('回退后 launchMode=restricted-token', ex.launchMode === 'restricted-token', String(ex.launchMode))
     check('回退后 tier 如实降级为 T1', report.tierRequested === TRANSPARENT_TIER && report.tierEffective === 'T1', JSON.stringify({ req: report.tierRequested, eff: report.tierEffective }))
     check('initReport 带 fallbackReason', /fail-closed/.test(report.fallbackReason ?? ''), String(report.fallbackReason))
+    check(
+      'R20② initReport.registryAttribution：回退后的 T1 档如实声明"不可归因"（不是静默省略）',
+      report.registryAttribution?.attributable === false &&
+        report.registryAttribution.code === REGISTRY_ATTRIBUTION_CODE.NOT_ATTRIBUTABLE &&
+        report.registryAttribution.launchMode === 'restricted-token',
+      JSON.stringify(report.registryAttribution),
+    )
     check('回退路径确实建立了 AclSandbox（没有裸跑）', stubs.record.sandboxes.length === 1, `sandboxes=${stubs.record.sandboxes.length}`)
     const r = await ex.run({ command: 'faketool', cwd: STAGING })
     check('回退后 run 走受限令牌路径', r.launchMode === 'restricted-token' && r.enforcement === 'partial', JSON.stringify({ mode: r.launchMode, enf: r.enforcement }))
@@ -1357,6 +1408,55 @@ async function main() {
     check('mask 文件含 entries[] 与 probes[] 且非空', Array.isArray(maskJson.entries) && maskJson.entries.length > 0 && Array.isArray(maskJson.probes) && maskJson.probes.length > 0, `entries=${maskJson.entries?.length} probes=${maskJson.probes?.length}`)
     check('mask entries 每条都有 id/pattern/flags/matchMode', maskJson.entries.every((e) => typeof e.id === 'string' && typeof e.pattern === 'string' && typeof e.flags === 'string' && e.matchMode === 'casefold'), '字段齐全')
     check('mask probes 每条都有 path 且带 maskClass（可为 null）', maskJson.probes.every((p) => typeof p.path === 'string' && Object.prototype.hasOwnProperty.call(p, 'maskClass')), '字段齐全')
+  }
+
+  // ══════════ 12. R19：危险命令拦截的绕过回归（换行 / env 间接 / .NET Open / pwsh 缩写旗标）══════════
+  //
+  // 先红后绿：本节每一条"不得判 read-only"的样本在**修复前**都是 READ_ONLY，并且已在干净进程里
+  // 实证真写盘（R19 报告 §B 的表）；对照组则在修复前后都必须是 READ_ONLY（防一刀切误伤）。
+  section('12. R19-B：危险命令拦截绕过（换行 / env 变量 / .NET Open / pwsh 缩写旗标）')
+  {
+    const PS = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
+    const mustNotBeReadOnly = [
+      [PS, ['-NoProfile', '-Command', 'Get-Date\ncertutil -decode b64.txt out.txt'], '换行 + certutil（实测 wrote=true）'],
+      [PS, ['-NoProfile', '-Command', 'Get-Date\nnode -e "require(\'fs\').writeFileSync(\'x\',\'1\')"'], '换行 + node -e（实测 wrote=true）'],
+      [PS, ['-NoProfile', '-Command', 'Get-Date\nif (1) { certutil -decode b64.txt out.txt }'], '换行 + 语句块内 certutil'],
+      ['cmd', ['/d', '/c', 'echo hi & %comspec% /c certutil -decode b64.txt out.txt'], '%comspec% 环境变量间接（实测 wrote=true）'],
+      [PS, ['-NoProfile', '-Command', 'Get-Date; & $env:ComSpec /c certutil -decode b64.txt out.txt'], '$env:ComSpec 间接调用'],
+      [PS, ['-NoProfile', '-Command', 'Get-Date; & (certutil -decode b64.txt out.txt)'], '& (程序 …) 调用运算符分组'],
+      [PS, ['-NoProfile', '-Command', "Get-Date; $c='certutil'; & $c -decode b64.txt out.txt"], '变量间接调用未登记程序'],
+      [PS, ['-NoProfile', '-Command', "Get-Date; [IO.File]::Open((Join-Path (Get-Location) 'o.txt'),'Create').Close()"], '[IO.File]::Open (Create) 写文件'],
+      [PS, ['-NoProfile', '-Command', "Get-Date; [IO.File]::CreateText('o.txt')"], '[IO.File]::CreateText'],
+      [PS, ['-NoProfile', '-Command', "Get-Date; [IO.FileStream]::new('o.txt',[IO.FileMode]::Create)"], '[IO.FileStream]::new'],
+      ['cmd', ['/d', '/c', 'echo hi & powershell -NoProfile -ec SQBFAFgA'], 'pwsh -ec（-EncodedCommand 合法缩写）'],
+      ['cmd', ['/d', '/c', 'echo hi & powershell -NoProfile -e SQBFAFgA'], 'pwsh -e 缩写'],
+      ['cmd', ['/d', '/c', 'echo hi & powershell -NoProfile -f x.ps1'], 'pwsh -f（-File 合法缩写）'],
+    ]
+    for (const [command, args, label] of mustNotBeReadOnly) {
+      const r = classifyCommandRisk(command, args)
+      check(`R19：${label} 不得判 read-only`, r.risk !== 'read-only', `risk=${r.risk} reasons=${(r.reasons || []).join(' / ').slice(0, 160)}`)
+    }
+    // 对照组：修复后仍必须判 read-only（既不误伤多行只读脚本，也不把 -e 当 pwsh 旗标）
+    const mustStayReadOnly = [
+      [PS, ['-NoProfile', '-Command', 'Get-Date\nGet-Location'], '多行纯只读语句'],
+      [PS, ['-NoProfile', '-Command', "$s = Get-Date\n$s.ToString().Replace('a','b')"], '多行赋值 + 纯内存字符串方法'],
+      [PS, ['-NoProfile', '-Command', 'Get-Process; (Get-Date).Year'], '分号 + 括号取属性'],
+      [PS, ['-NoProfile', '-Command', 'Get-ChildItem C:\\Windows | ForEach-Object { $_.Name }'], '管道 + 脚本块读属性'],
+      ['curl', ['-e', 'http://referer.example', 'http://example.com'], 'curl -e（referer，不是 pwsh 旗标）'],
+      ['cmd', ['/d', '/c', 'echo hi & echo bye'], 'cmd 两条只读语句'],
+      ['cmd', ['/d', '/c', 'echo hi\ncertutil -decode b64.txt out.txt'], 'cmd 单行内换行（实测第二行不执行）'],
+    ]
+    for (const [command, args, label] of mustStayReadOnly) {
+      const r = classifyCommandRisk(command, args)
+      check(`R19 对照：${label} 仍判 read-only`, r.risk === 'read-only', `risk=${r.risk} reasons=${(r.reasons || []).join(' / ').slice(0, 160)}`)
+    }
+    check('helper: hasPwshOpaqueFlag(-ec)=true', hasPwshOpaqueFlag(['powershell', '-ec', 'SQBFAFgA']).hit === true)
+    check('helper: hasPwshOpaqueFlag(-e after curl)=false（不误伤 curl -e）', hasPwshOpaqueFlag(['curl', '-e', 'http://x']).hit === false)
+    check(
+      'R19：cmd 单行内换行不触发命令位切分（避免误伤）',
+      classifyCommandRisk('cmd', ['/d', '/c', 'echo hi\ncertutil -decode b64.txt o.bin']).risk === 'read-only',
+      'cmd newline: 实测不执行第二行',
+    )
   }
 
   rmSync(ROOT, { recursive: true, force: true })

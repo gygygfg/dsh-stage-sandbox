@@ -90,8 +90,14 @@ const short = (value, n = 200) => {
 //   R13 32 位视图注册表写入不入审批面（透传 + UNSTAGED 记录）
 //   R14 候选批量应用非原子（单文件原子、跨文件不回滚）
 //   R15 未 hook 的注册表 API 直落真实 hive（IAT 点钩 ⇒ "不 hook" ≡ "不拦截"）
+// R16–R20 是 R19 Windows 独立测试轮追加的五条（同一纪律：声明面不得悄悄变宽）：
+//   R16 ntdll/Zw 注册表写直调（TS 档真写真实 hive、无 WAL；T1 无归因）
+//   R17 ReplaceFileW/NtCreateFile/FindFirst* 未 hook；CopyFileEx 暂存语义未验证
+//   R18 硬链接遮蔽绕过（路径黑名单固有）
+//   R19 目录枚举元数据泄漏（FindFirstFile* 未 hook）
+//   R20 托管 .NET exe 注入崩溃；T1 无归因 fail-closed
 // 它们都是"结论比实际更强"的典型来源，因此与 R1–R12 同等对待：消失即红。
-const RESIDUAL_IDS = Object.freeze(Array.from({ length: 15 }, (_v, i) => `R${i + 1}`))
+const RESIDUAL_IDS = Object.freeze(Array.from({ length: 20 }, (_v, i) => `R${i + 1}`))
 const DOC_REL = 'docs/Windows功能开启清单.md'
 
 /** 截出 `## 13.` 到下一个二级标题之间的正文（只认这一节，避免误抓正文里的 R 编号） */
@@ -107,11 +113,11 @@ const docText = readFileSync(join(REPO, DOC_REL), 'utf8')
 const section13 = section13Of(docText)
 const residualRows = section13.split(/\r?\n/).filter((line) => /^\|\s*R\d+\s*\|/.test(line))
 const documentedIds = residualRows.map((line) => /^\|\s*(R\d+)\s*\|/.exec(line)[1])
-// 变异体同时抽掉 R7（既有）与 R13（R17 新增），证明新增的残余断言同样**能红**
-const effectiveIds = PLANT ? documentedIds.filter((id) => id !== 'R7' && id !== 'R13') : documentedIds
+// 变异体同时抽掉 R7（既有）与 R16（R19 新增），证明新增的残余断言同样**能红**
+const effectiveIds = PLANT ? documentedIds.filter((id) => id !== 'R7' && id !== 'R16') : documentedIds
 
-section(`A. 文档基线（${DOC_REL} §13）：R1–R15 逐条仍在`)
-check('§13 残余表可解析（找到二级标题且有表格行）', section13.length > 0 && residualRows.length >= 15, `rows=${residualRows.length}`)
+section(`A. 文档基线（${DOC_REL} §13）：R1–R20 逐条仍在`)
+check('§13 残余表可解析（找到二级标题且有表格行）', section13.length > 0 && residualRows.length >= 20, `rows=${residualRows.length}`)
 for (const id of RESIDUAL_IDS) {
   check(
     `残余边界 ${id} 仍记录在 §13`,

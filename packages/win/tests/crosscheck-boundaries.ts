@@ -116,8 +116,8 @@ section('2. 敏感文件遮蔽（读入口必须全覆盖）')
 
 const stagingFsSrc = readSrc('dsh-plugin/staging-fs.ts')
 /**
- * `stat` / `lstat` 是读入口，却在**早退之前**没有任何遮蔽判定：
- * 哪怕 `readPolicy:'block'` 也拦不住，且连"只记"那一条可见性记录都不产生
+ * `stat` / `lstat` 是读入口，遮蔽判定必须**在早退之前**：
+ * 否则哪怕 `readPolicy:'block'` 也拦不住，且连"只记"那一条可见性记录都不产生
  * ⇒ 存在性与文件大小可读，而面板 `readVisibility` 对此一无所知。
  */
 /** 取某个 `async <fn>(…) { … }` 的源码体（按缩进为 4 空格的收尾 `}` 切，不用脆弱的行数上限） */
@@ -128,12 +128,40 @@ function fnBody(source, name) {
   return end < 0 ? source.slice(start, start + 2000) : source.slice(start, end + 6)
 }
 
+/**
+ * ★ R21 升级（Lead 批准）：把"函数体里出现 `guardMaskedRead(` 即绿"的**存在性检查**
+ * 升级成**位置结构断言**：守卫的首次出现必须早于函数里的**第一个 `return`**。
+ *
+ * 为什么必须升级（R21-FS-01 的假绿形态）：旧断言只 `test(/guardMaskedRead\()/`，
+ * 而 `lstatInner` 的实际实现把守卫写在两个早退（`!stagingEnabled()` / `!inConfiguredWorkspace()`）
+ * **之后** —— 字符串检查照样绿，注释里那句"必须在早退之前"从未被验证，
+ * 于是 R19 报告 §5 的"lstat 守卫已代码核对"是假绿（行为缺口直到 R21 行为套件才抓到）。
+ *
+ * 位置比较前先**剥注释**：注释里可能出现 `return` / `guardMaskedRead(` 字样
+ * （本文件上方与 staging-fs 内部注释都会提到它们），不剥会造成两个方向的假读数。
+ * 同时要求"确实存在 `return super.*` 早退分支" —— 否则"守卫在第一个 return 之前"
+ * 会因为函数里根本没有 early return 而空洞成立（断言空转），这是同一族假绿。
+ */
+const stripComments = (source) => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+
 for (const fn of ['statInner', 'lstatInner']) {
   const text = fnBody(stagingFsSrc, fn)
+  const code = stripComments(text)
+  const guardAt = code.indexOf('guardMaskedRead(')
+  const firstReturn = code.search(/\breturn\b/)
   assert(
-    /guardMaskedRead\(/.test(text),
-    `\`${fn}\` 必须在早退之前调用 guardMaskedRead（第五条/第六条读入口）`,
-    text.length > 0 ? `命中 ${(text.match(/guardMaskedRead\(/g) ?? []).length} 次` : '未取到函数体',
+    guardAt >= 0 && firstReturn > guardAt,
+    `\`${fn}\` 的 guardMaskedRead 必须在**第一个 return/早退之前**（位置结构断言，不是"出现即绿"）`,
+    text.length === 0
+      ? '未取到函数体'
+      : `guardAt=${guardAt} firstReturnAt=${firstReturn}` +
+        (firstReturn > guardAt ? '' : ' ⇒ 守卫排在早退之后（R21-FS-01 的形态）'),
+  )
+  const superReturn = code.search(/\breturn super\./)
+  assert(
+    superReturn >= 0 && guardAt >= 0 && guardAt < superReturn,
+    `\`${fn}\` 存在早退分支（return super.*）且守卫在其之前 —— 否则上一条是空转`,
+    text.length === 0 ? '未取到函数体' : `guardAt=${guardAt} returnSuperAt=${superReturn}`,
   )
 }
 // 反向对照：四条既有入口仍在，没被改坏
@@ -286,10 +314,126 @@ if (typeof nextDismissed !== 'function') {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 6. R19 关态零影响（P1）：面板宿主路由不得被"上一版快照"翻成 200 / 不得读盘
+// ═══════════════════════════════════════════════════════════════════════════
+section('6. 关态面板路由：503 disabled、零读盘、不泄露上一版暂存')
+
+{
+  const { buildPanelPayload, PANEL_SNAPSHOT_PATH, PANEL_TRUST_PATH } = await import('../dsh-plugin/host-plugin.ts')
+  const { mkdirSync, rmSync } = await import('node:fs')
+  const scratch = join(PKG, '.t', 'r19-crosscheck-offstate')
+  rmSync(scratch, { recursive: true, force: true })
+  mkdirSync(scratch, { recursive: true })
+  const ws = join(scratch, 'ws')
+  mkdirSync(ws, { recursive: true })
+  const stageWithStale = join(scratch, 'stage-stale')
+  const stageEmpty = join(scratch, 'stage-empty')
+  mkdirSync(stageWithStale, { recursive: true })
+  mkdirSync(stageEmpty, { recursive: true })
+  writeFileSync(
+    join(stageWithStale, 'review.json'),
+    JSON.stringify({ pending: true, workspaceRoot: ws, staging: { effective: true }, files: [{ path: 'stale-only-in-snapshot.txt' }] }),
+  )
+  const off = (stageRoot) =>
+    buildPanelPayload({
+      pathname: PANEL_SNAPSHOT_PATH,
+      query: new URLSearchParams(),
+      workspaceRoot: ws,
+      sessionId: 's1',
+      env: { WINSTAGE_STAGE_ROOT: stageRoot },
+      isEnabled: () => false,
+    })
+  const withStale = off(stageWithStale)
+  const empty = off(stageEmpty)
+  // 旧实现（红）：stale.effective:true ⇒ 200 + snapshot 内容；新实现（绿）：503 且不读快照。
+  assert(withStale.status === 503 && withStale.body?.code === 'disabled', '关态 snapshot 路由必须 503 disabled（不得被 stale 快照翻 200）', `status=${withStale.status}`)
+  assert(
+    !JSON.stringify(withStale.body ?? {}).includes('stale-only-in-snapshot'),
+    '关态响应不得泄露上一版快照里的待审内容',
+    'stale 快照只可能在开关曾开着时发布；R18 关态零 IO 不再重发布，所以它会被长期读到',
+  )
+  assert(
+    JSON.stringify(withStale) === JSON.stringify(empty),
+    '关态路由**零读盘**：有/无 review.json 两种根给出相同 payload',
+    '证明不再调用 readPublishedSnapshot()',
+  )
+  const trustOff = buildPanelPayload({
+    pathname: PANEL_TRUST_PATH,
+    query: new URLSearchParams(),
+    workspaceRoot: ws,
+    sessionId: 's1',
+    env: { WINSTAGE_STAGE_ROOT: stageWithStale },
+    isEnabled: () => false,
+  })
+  assert(trustOff.status === 503 && trustOff.body?.code === 'disabled', '关态 trust 路由同样 503 disabled', `status=${trustOff.status}`)
+  const on = buildPanelPayload({
+    pathname: PANEL_SNAPSHOT_PATH,
+    query: new URLSearchParams(),
+    workspaceRoot: ws,
+    sessionId: 's1',
+    env: { WINSTAGE_STAGE_ROOT: stageWithStale },
+    isEnabled: () => true,
+  })
+  assert(on.status === 200 && on.body?.snapshot?.pending === true, '反向对照：开态仍服务同一份快照（修复不得误伤开态）', `status=${on.status}`)
+  rmSync(scratch, { recursive: true, force: true })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7. R19 关态零影响（P1）：fs 提供方构造不得建暂存根（懒构造）
+// ═══════════════════════════════════════════════════════════════════════════
+section('7. 关态构造 fs 提供方：不创建暂存根布局（懒构造）')
+
+{
+  const stagingSrc = readSrc('dsh-plugin/staging-fs.ts')
+  assert(
+    !/^\s*this\.staging = this\.stagingFor\(undefined\)/m.test(stagingSrc),
+    '构造函数不得再无条件 `this.staging = this.stagingFor(undefined)`（旧实现关态也建整套暂存根）',
+    'staging-fs.ts:670 的旧形态（代码行；注释里提到旧写法不算）',
+  )
+  assert(
+    /get unstagedLedgerDir\(\)/.test(stagingSrc),
+    '账本落点改为**惰性** getter（首次真正记账才解析存储，关态零触碰）',
+    'noteUnstaged 只在 stagingEnabled 为真的路径上被调用',
+  )
+  const { createStagingFileSystem } = await import('../dsh-plugin/staging-fs.ts')
+  const { existsSync, mkdirSync, rmSync } = await import('node:fs')
+  const scratch = join(PKG, '.t', 'r19-crosscheck-fs-lazy')
+  rmSync(scratch, { recursive: true, force: true })
+  mkdirSync(join(scratch, 'ws'), { recursive: true })
+  const stageRoot = join(scratch, 'stage')
+  const savedRoot = process.env.WINSTAGE_STAGE_ROOT
+  process.env.WINSTAGE_STAGE_ROOT = stageRoot
+  class FakeBase {
+    static Config = {}
+    constructor(ctx, config) {
+      this.ctx = ctx
+      this.config = config
+      this.workspaceRoot = config?.cwd
+    }
+    get sandboxMode() {
+      return 'platform'
+    }
+  }
+  const Cls = createStagingFileSystem({ base: FakeBase, enabled: () => false })
+  const instance = new Cls(
+    {
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      fiber: { entry: { parent: { data: [{ id: 'winstage-sandbox', config: { enabled: false } }] } } },
+    },
+    { cwd: join(scratch, 'ws') },
+  )
+  assert(instance.stagingEnabled() === false, '对照：实例确实处于关态（stagingEnabled()===false）', 'enabled override')
+  assert(!existsSync(stageRoot), '关态构造后暂存根**不存在**（磁盘零写入）', `root=${stageRoot}`)
+  if (savedRoot === undefined) delete process.env.WINSTAGE_STAGE_ROOT
+  else process.env.WINSTAGE_STAGE_ROOT = savedRoot
+  rmSync(scratch, { recursive: true, force: true })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 const failed = checks.filter((c) => !c.pass)
 process.stdout.write(
   `\n========================================================================\n` +
-    `交叉验证（四域边界 + Cordis 卸载 + 默认收起）：断言 ${checks.length} 项，失败 ${failed.length} 项\n` +
+    `交叉验证（四域边界 + Cordis 卸载 + 默认收起 + R19 关态零影响）：断言 ${checks.length} 项，失败 ${failed.length} 项\n` +
     `RESULT: ${failed.length === 0 ? 'PASS' : 'FAIL'} checks=${checks.length} failures=${failed.length} mode=normal\n`,
 )
 process.exit(failed.length === 0 ? 0 : 1)

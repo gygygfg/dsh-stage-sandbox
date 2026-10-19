@@ -205,7 +205,36 @@ function parsePermissionRow(text) {
   return { defaultPreset, presets }
 }
 
-section('1. 潜在硬断裂：活动 profile 的 permission 行必须有**显式** defaultPreset（缺失 ⇒ 控件整块消失）')
+section('1. 潜在硬断裂：**仅**在"WinStage shell 半边接管 + 部署级 never"组合下需要 profile 显式 defaultPreset')
+
+/**
+ * ★ R19 定性修复（避免把"正常 profile"判成缺陷）：
+ *
+ * 读平台源码（`R\dsh-permission-presets\lib\index.js:138-181, 291-306`）得到的**精确**条件：
+ *   · `defaultPreset` 是 volatile 字符串、**没有默认值**；未配置时用 `derive(EMPTY_KNOBS)`：
+ *       sandbox = `ctx.shell.sandboxMode`；approval = `ctx.approval.config.policy ?? 'ask'`
+ *   · derive 结果若不是任何 preset 的 (sandbox, approval) 对 ⇒ `custom` ⇒ 构造器抛
+ *     `configure defaultPreset explicitly` ⇒ `permission` 行装不上 ⇒ `permissions` 投影缺失
+ *     ⇒ composer 的访问模式控件整块消失（client `PermissionSelect` 在
+ *     `selection === undefined || catalog === null` 时 `return null`）。
+ *   · 平台 base bundle 的 `sandbox-policy.mode` 与 `approval.policy` **同源于**
+ *     `DSH_PERMISSION_MODE ?? 'workspace-write'`（`R\dsh-base\cordis.patch.yml:246,262`），
+ *     且平台 `pwsh-sandbox.sandboxMode = ctx.sandboxPolicy.defaultMode`
+ *     （`R\dsh-pwsh-sandbox\lib\index.js:132-139`）⇒ **关态（平台 shell 提供方在场）时
+ *     这对值永远自洽**，derive 必命中 `workspace-write` 或 `danger-full-access`，
+ *     **不需要** profile 掩蔽行。
+ *   · 脆弱组合只出现在 **WinStage shell 半边接管**（`WINSTAGE_SHELL=1` 或 profile
+ *     `winstage-sandbox.config.enabled:true`）**且**部署级 `DSH_PERMISSION_MODE=danger-full-access`
+ *     时：WinStage 的 `get sandboxMode()` 恒报 `'workspace-write'`（§2 刻意如此），
+ *     与 approval=`never` 组成 (workspace-write, never) ⇒ 无 preset 匹配 ⇒ custom。
+ *
+ * 所以本段**不再**把"活动 profile 必须有 permission 行/defaultPreset"当普适规则
+ * （那会让一个从未在设置里配置过"默认访问模式"的正常 profile 假红——R19 实测：
+ * 未知 `DSH_HOME/DSH_PROFILE` 时本机 desktop profile 没有该行，但它处于关闭态、
+ * 平台 shell 提供方在场，**不是缺陷**）。判定改为：
+ *   脆弱组合（或显式 `WINSTAGE_REQUIRE_PERMISSION_ROW=1`）⇒ 必须存在且显式可解析；
+ *   其余 ⇒ 如实 SKIP（写明为什么这里不需要它）。
+ */
 
 const dshHome = process.env.DSH_HOME
 const dshProfile = process.env.DSH_PROFILE
@@ -227,24 +256,68 @@ if (profileAbs === null) {
     skip('1.4 defaultPreset 指向 presets 里定义的预设', '同上：profile 文件不可读')
   } else {
     check('1.1 活动 profile 的 cordis.patch.yml 可读', true, `DSH_HOME=${dshHome} DSH_PROFILE=${dshProfile}`)
-    // --plant：在**内存副本**上删掉 defaultPreset 行（绝不改真实 profile）
-    const profileText = PLANT ? read.text.replace(/^[ \t]*defaultPreset:.*$/m, '') : read.text
+    /** profile 的 WinStage 开关（与 fs/shell 装配同一口径：缺行/缺值按接管 = fail-safe） */
+    const profileEnablesWinStage = (() => {
+      const sectionText = /id:\s*winstage-sandbox\b([\s\S]*?)(?=\n\s*-\s*id:|\s*$)/.exec(read.text)
+      if (!sectionText) return false
+      const enabled = /enabled:\s*(true|false)\b/.exec(sectionText[1])
+      return !enabled || enabled[1] !== 'false'
+    })()
+    const shellForcedOn = process.env.WINSTAGE_SHELL === '1'
+    const shellForcedOff = process.env.WINSTAGE_SHELL === '0'
+    const winStageShellActive = !shellForcedOff && (shellForcedOn || profileEnablesWinStage)
+    const deploymentNever = process.env.DSH_PERMISSION_MODE === 'danger-full-access'
+    const fragile = winStageShellActive && deploymentNever
+    const requireRow = fragile || process.env.WINSTAGE_REQUIRE_PERMISSION_ROW === '1'
+    const modeNote =
+      `winStageShellActive=${winStageShellActive}（profile=${profileEnablesWinStage} WINSTAGE_SHELL=${process.env.WINSTAGE_SHELL ?? 'unset'}）` +
+      ` deploymentNever=${deploymentNever} fragile=${fragile} requireRow=${requireRow}`
+    /** `--plant` 在真实 profile 本来没有 permission 行时，用一条**合成**行自证断言仍能红 */
+    const SYNTHETIC_WITHOUT_DEFAULT = [
+      '# synthetic（--plant 自证用；绝不写盘）',
+      '- id: permission',
+      '  name: "@deepseek-ai/dsh-permission-presets"',
+      '  config:',
+      '    presets:',
+      '      workspace-write:',
+      '        sandbox: workspace-write',
+      '        approval: ask',
+    ].join('\n')
+    const realRow = parsePermissionRow(read.text)
+    let profileText = read.text
+    if (PLANT) {
+      profileText = realRow === null ? SYNTHETIC_WITHOUT_DEFAULT : read.text.replace(/^[ \t]*defaultPreset:.*$/m, '')
+    }
     const row = parsePermissionRow(profileText)
-    check(
-      '1.2 permission 行存在（id: permission）',
-      row !== null,
-      row === null ? '活动 profile 里没有 `- id: permission` 条目（bundle 层没有 defaultPreset，掩蔽物消失）' : `${profileAbs}`,
-    )
-    if (row === null) {
+    if (row === null && !requireRow && !PLANT) {
+      skip(
+        '1.2 permission 行存在（id: permission）',
+        `活动 profile 没有 permission 行，但当前装配**不在脆弱组合**（${modeNote}）⇒ ` +
+          'permission 行由平台 bundle 提供且 derive(EMPTY_KNOBS) 与 ctx.shell/approval 自洽，缺失不构成硬断裂。' +
+          '要强制要求请设 WINSTAGE_REQUIRE_PERMISSION_ROW=1（或让进程 env 明确处于脆弱组合）。',
+      )
+      skip('1.3 行内有显式 defaultPreset', '同上：没有 permission 行，且非脆弱组合 ⇒ 不需要 profile 掩蔽行')
+      skip('1.4 defaultPreset 指向 presets 里定义的预设', '同上：没有 permission 行，且非脆弱组合')
+    } else if (row === null) {
+      check(
+        '1.2 permission 行存在（id: permission）',
+        false,
+        `活动 profile 没有 permission 行，且当前处于**脆弱组合**（${modeNote}）⇒ derive(EMPTY_KNOBS) 会得 custom、permission 行抛错装不上`,
+      )
       check('1.3 行内有显式 defaultPreset', false, '整行不存在 ⇒ 无法给出显式 defaultPreset')
       check('1.4 defaultPreset 指向 presets 里定义的预设', false, '整行不存在 ⇒ 无法给出显式 defaultPreset')
     } else {
+      check(
+        '1.2 permission 行存在（id: permission）',
+        true,
+        `${PLANT && realRow === null ? '合成副本（--plant 自证）' : profileAbs}；${modeNote}`,
+      )
       const explicit = typeof row.defaultPreset === 'string' && row.defaultPreset.length > 0
       check(
         '1.3 行内有显式 defaultPreset',
         explicit,
         explicit
-          ? `defaultPreset=${row.defaultPreset}${PLANT ? '（--plant 已删除该行）' : ''}`
+          ? `defaultPreset=${row.defaultPreset}${PLANT && realRow !== null ? '（--plant 已删除该行）' : ''}`
           : '缺失 ⇒ derive(EMPTY_KNOBS)==="custom" 时 permission 行会抛错装不上（R\\dsh-permission-presets\\lib\\index.js:180）',
       )
       if (!explicit) {
@@ -313,7 +386,7 @@ if (shellRead.error) {
 
 section('3. `conversation.input.permission` 的接管只由 WinStage 三态开关驱动（策略无关）')
 
-const clientPath = join(REPO, 'dsh-plugin', 'client.js')
+const clientPath = join(REPO, 'dsh-plugin', 'client.ts')
 const clientRead = readText(clientPath)
 if (clientRead.error) {
   skip('3.1 找到 conversation.input.permission 的注入块', `${clientPath} 读取失败（${clientRead.error}）`)

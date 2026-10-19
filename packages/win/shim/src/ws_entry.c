@@ -4,6 +4,10 @@
 #include <stdio.h>
 
 int g_stageBound = 0;
+/* R20①: DllMain only records that the caller asked for staging. The injection
+ * transport (winstage-inject.exe / ws_proc.c self-injection) must then call the
+ * exported WinstageShimInit() itself. 0 = no staging requested at load time. */
+int g_shimAutoInitPending = 0;
 
 static void ws_env_get(const wchar_t *name, wchar_t *out, DWORD cch)
 {
@@ -171,17 +175,20 @@ static int ws_init_full(const wchar_t *configJsonPath)
     g_ws.initialized = 1;
     ws_log("initialized: stageRoot=%ls provider=%ls failClosed=%d readThrough=%d",
            g_ws.stageRoot, g_wsStage.name ? g_wsStage.name : L"(none)", g_ws.failClosed, g_ws.readThrough);
-    /* ★ WP13（A6）—— 全仓**唯一**保留的"硬清零"，理由：
-     * 本函数从 `DllMain(DLL_PROCESS_ATTACH)` 调用，而初始化过程里的
+    /* ★ WP13（A6）/ R20①：显式清零调用线程的 last error。
+     *
+     * 历史：本函数曾从 `DllMain(DLL_PROCESS_ATTACH)` 调用，初始化过程的
      * `CreateDirectoryW` / `GetFileAttributesW` / `GetTokenInformation` /
-     * `RegLoadAppKeyW` / `SetNamedSecurityInfoW` 都是**探测式**调用：失败是预期内的
-     * （stageRoot 已存在、hive 已有属主、hive 被占用……），它们会把 last error 留在
-     * `ERROR_ALREADY_EXISTS(183)` / `ERROR_FILE_NOT_FOUND(2)` / `ERROR_SHARING_VIOLATION(32)`。
-     * 这里"还原入口值"没有意义：入口值本身是这些调用之前的任意值，且被注入进程的加载器
-     * 没有义务先清零。DllMain 成功返回后按 Win32 约定该线程的 last error 未被定义，
-     * **显式清零是唯一能让紧随其后的 CLR 初始化读到 ERROR_SUCCESS 的做法** ——
-     * 即签名 A(`0xFFFF0000`/`0x8007054F`) 与签名 B(`0x80070002`) 的止血点。
-     * 安全性：`SetLastError` 只写 TEB、不经过任何 IAT，因此不会被本 DLL 的钩子重入，
+     * `RegLoadAppKeyW` / `SetNamedSecurityInfoW` 都是**探测式**调用，会把 last error
+     * 留在 `ERROR_ALREADY_EXISTS(183)` / `ERROR_FILE_NOT_FOUND(2)` /
+     * `ERROR_SHARING_VIOLATION(32)`；紧随其后的 CLR 初始化读到被污染的值会以
+     * `0xFFFF0000`/`0x8007054F` 或 `0x80070002` 退出 —— 这就是当年签名 A/B 的止血点。
+     *
+     * R20① 起初始化**不再在 DllMain 里跑**（见 DllMain 的注释）：注入器/自注入在
+     * LoadLibraryW 返回后用**独立远程线程**调用本导出并等待，所以不再有"被注入进程的
+     * 主线程紧接着读 last error"的窗口。保留清零是为了：① 直接调用本导出的消费者
+     * （winstage-probe.exe 等）拿到确定的线程状态；② 防御回退到旧调用路径。
+     * 安全性：`SetLastError` 只写 TEB、不经过任何 IAT，不会被本 DLL 的钩子重入，
      * 也不会与 `ws_log` 自身的保存/还原互相干扰。 */
     SetLastError(0);
     return 0;
@@ -336,27 +343,26 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
     switch (fdwReason) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hinstDLL);
-        /* Remote injection only runs DllMain, so auto-initialize when the caller
-         * (injector/launcher) has published the staging configuration in the
-         * environment. No environment -> the DLL loads inert. */
-        if (ws_wants_autoinit()) {
-            int rc = ws_init_full(NULL);
-            if (rc != 0) {
-                /* Leave a breadcrumb; the launcher probes WinstageShimStatsJson and
-                 * must see initialized=false and fall back. */
-                ws_config_defaults();
-                ws_config_from_env();
-                if (!g_ws.logPath[0] && g_ws.stageRoot[0]) {
-                    size_t pos = 0;
-                    ws_append_w(g_ws.logPath, WS_PATH_MAX, &pos, g_ws.stageRoot);
-                    ws_append_w(g_ws.logPath, WS_PATH_MAX, &pos, L"\\shim.log");
-                }
-                ws_log("auto-init failed: rc=%d", rc);
-                /* 同 A6：DllMain 的**失败出口**也必须显式清零 —— 失败路径上
-                 * `ws_config_defaults`/`ws_config_from_env`/`ws_log` 都会留下
-                 * 探测式调用的错误（2/3/183），而被注入进程的 CLR 初始化紧随其后。 */
-                SetLastError(0);
-            }
+        /* ★ R20① (carrier) —— DllMain **不再**做初始化，只登记"这次加载是为暂存来的"。
+         *
+         * 背景（实测，R19-FSREG-03 / R20①）：远程 `LoadLibraryW` 只跑 DllMain，而
+         * DllMain 跑在 loader lock 里、且对于"入口是 mscoree、CLR 尚未初始化"的纯托管
+         * 进程，重活（OpenProcessToken / attach reg hive / 全模块 IAT 补丁 / 日志 I/O）
+         * 在 CLR 起来之前执行；实测一次坏 thunk 解析就让进程在 ucrtbase!strcmp 里
+         * 0xC0000005（见 R20 报告）。任何初始化失败还会使整个 LoadLibraryW 失败。
+         *
+         * 现在：注入器（winstage-inject.exe）与子进程自注入（ws_proc.c）在
+         * LoadLibraryW 返回后，**新建一个远程线程调用导出的 `WinstageShimInit()`**，
+         * 等它返回（就绪）之后才 ResumeThread 目标主线程。因此重活不再在
+         * loader-lock / CLR 未初始化窗口里跑，且初始化失败是可观察的返回值而不是
+         * "整个 LoadLibraryW 失败"。
+         *
+         * 这里只读一次环境并保存 last error（不写日志、不做 I/O）：loader 与紧随其后的
+         * CLR 初始化都会读该线程的 last error。 */
+        {
+            DWORD saved = GetLastError();
+            g_shimAutoInitPending = ws_wants_autoinit();
+            SetLastError(saved);
         }
         break;
     case DLL_PROCESS_DETACH:

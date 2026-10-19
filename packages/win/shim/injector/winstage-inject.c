@@ -264,6 +264,44 @@ static BOOL append_quoted_arg(wchar_t *buf, size_t cap, size_t *pos, const wchar
     return TRUE;
 }
 
+/* ★ R20①（carrier）—— 延迟初始化的第二步。
+ *
+ * DllMain 现在**不做**初始化（只登记意图），所以远程 LoadLibraryW 成功只代表
+ * "模块映射进来了"，钩子还没装。注入器在本进程把同一个 DLL 加载一次、用
+ * GetProcAddress 拿到 `WinstageShimInit`，再用
+
+ *     远程地址 = 远程模块基址 + (本地导出地址 - 本地模块基址)
+
+ * 算出它在目标进程里的地址（同一 DLL 映像的相对偏移在两个进程里一致；系统 DLL
+ * 同址的假设已在 LoadLibraryW 那步用过，这里是同一原理但更严格 —— 只用同一个文件）。
+ * 之后在目标进程里起第二个远程线程调用它，等返回码（= 初始化结果）后才由调用方
+ * ResumeThread。DllMain 已惰性化，因此这里在本进程的 LoadLibrary 不会装任何钩子。
+ *
+ * 失败处理：LoadLibrary 失败 ⇒ 老行为（fail closed）。初始化线程以异常码结束
+ * ⇒ 进程没有可用钩子，同样 fail closed。初始化返回普通 Win32 错误码时保持旧语义
+ * （注入成功、子进程继续；rc 写进报告），因为 DISABLE=1（rc=1058）与"配置不全导致
+ * DllMain 初始化失败但进程照跑"在 R20 之前就是这个行为。 */
+static FARPROC resolve_remote_export(HMODULE remoteModule, const wchar_t *dllPath)
+{
+    if (!remoteModule || !dllPath) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return NULL;
+    }
+    HMODULE local = LoadLibraryExW(dllPath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!local) {
+        return NULL;
+    }
+    FARPROC localFn = GetProcAddress(local, "WinstageShimInit");
+    FARPROC remoteFn = NULL;
+    if (localFn) {
+        remoteFn = (FARPROC)((BYTE *)(ULONG_PTR)remoteModule + ((BYTE *)localFn - (BYTE *)local));
+    } else {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+    }
+    FreeLibrary(local);
+    return remoteFn;
+}
+
 int wmain(int argc, wchar_t **argv)
 {
     Options o;
@@ -426,6 +464,9 @@ int wmain(int argc, wchar_t **argv)
     void *remoteMem = NULL;
     DWORD remoteExitCode = 0;
     int haveRemoteExitCode = 0;
+    DWORD shimInitRc = 0;
+    int haveShimInitRc = 0;
+    int shimInitFailed = 0;
 
     size_t dllBytes = (wcslen(o.dll) + 1) * sizeof(wchar_t);
     if (noInject) {
@@ -480,11 +521,55 @@ int wmain(int argc, wchar_t **argv)
     }
     }
 
+    /* ★ R20①：模块已映射（remoteModule != NULL）⇒ 在目标进程里调用导出的
+     * WinstageShimInit()，等它返回（就绪）后才继续。 */
+    if (injected && !noInject && remoteModule) {
+        trace_stage(o.report, "loaded", (unsigned long)(ULONG_PTR)remoteModule);
+        FARPROC remoteInit = resolve_remote_export(remoteModule, o.dll);
+        if (!remoteInit) {
+            injectErr = GetLastError() ? GetLastError() : ERROR_PROC_NOT_FOUND;
+            shimInitFailed = 1;
+            injected = FALSE;
+        } else {
+            HANDLE ith = CreateRemoteThread(pi.hProcess, NULL, 0,
+                                            (LPTHREAD_START_ROUTINE)remoteInit, NULL, 0, NULL);
+            if (!ith) {
+                injectErr = GetLastError();
+                shimInitFailed = 1;
+                injected = FALSE;
+            } else {
+                DWORD initWait = WaitForSingleObject(ith, o.timeoutMs);
+                DWORD initRc = 0;
+                if (initWait != WAIT_OBJECT_0) {
+                    injectErr = ERROR_TIMEOUT;
+                    shimInitFailed = 1;
+                    injected = FALSE;
+                } else if (!GetExitCodeThread(ith, &initRc)) {
+                    injectErr = GetLastError();
+                    shimInitFailed = 1;
+                    injected = FALSE;
+                } else {
+                    shimInitRc = initRc;
+                    haveShimInitRc = 1;
+                    if ((initRc & 0x80000000u) != 0) {
+                        /* 初始化线程以异常码结束 ⇒ 目标进程里钩子没装成，
+                         * 继续放行会变成"看起来沙箱、实际直写" ⇒ fail closed。 */
+                        injectErr = initRc;
+                        shimInitFailed = 1;
+                        injected = FALSE;
+                    }
+                }
+                CloseHandle(ith);
+            }
+        }
+    }
+
     /* ★ round-3 诊断：注入阶段收尾（成功/失败都落一份，便于事后分段定位） */
     trace_stage(o.report, injected ? "injected" : "inject-failed", 0);
     if (!injected) {
         char detail[256];
-        snprintf(detail, sizeof(detail), "remote LoadLibraryW failed");
+        snprintf(detail, sizeof(detail), shimInitFailed ? "remote WinstageShimInit failed"
+                                                        : "remote LoadLibraryW failed");
         TerminateProcess(pi.hProcess, INJECT_FAILED);
         char pathA[4096];
         json_escape_path(L"inject", pathA, sizeof(pathA));
@@ -497,10 +582,16 @@ int wmain(int argc, wchar_t **argv)
         } else {
             snprintf(exitA, sizeof(exitA), "null");
         }
+        char initA[32];
+        if (haveShimInitRc) {
+            snprintf(initA, sizeof(initA), "%lu", (unsigned long)shimInitRc);
+        } else {
+            snprintf(initA, sizeof(initA), "null");
+        }
         snprintf(json, sizeof(json),
                  "{\"ok\":false,\"tool\":\"winstage-inject\",\"stage\":\"%s\",\"error\":\"%s\","
-                 "\"win32Error\":%lu,\"remoteThreadExit\":%s,\"dll\":\"%s\"}\n",
-                 pathA, detail, (unsigned long)injectErr, exitA, dllA);
+                 "\"win32Error\":%lu,\"remoteThreadExit\":%s,\"shimInitRc\":%s,\"dll\":\"%s\"}\n",
+                 pathA, detail, (unsigned long)injectErr, exitA, initA, dllA);
         fputs(json, stderr);
         write_report(o.report, json);
         CloseHandle(pi.hThread);
@@ -555,12 +646,20 @@ int wmain(int argc, wchar_t **argv)
     {
         char dllA[4096];
         json_escape_path(o.dll, dllA, sizeof(dllA));
+        char initA[32];
+        if (haveShimInitRc) {
+            snprintf(initA, sizeof(initA), "%lu", (unsigned long)shimInitRc);
+        } else {
+            snprintf(initA, sizeof(initA), "null");
+        }
         char json[6144];
         snprintf(json, sizeof(json),
                  "{\"ok\":true,\"tool\":\"winstage-inject\",\"dll\":\"%s\",\"childPid\":%lu,"
-                 "\"childExitCode\":%lu,\"childTimedOut\":%s,\"remoteModule\":\"0x%llx\"}\n",
+                 "\"childExitCode\":%lu,\"childTimedOut\":%s,\"remoteModule\":\"0x%llx\","
+                 "\"shimInitRc\":%s}\n",
                  dllA, (unsigned long)pi.dwProcessId, (unsigned long)childExit,
-                 childTimedOut ? "true" : "false", (unsigned long long)(ULONG_PTR)remoteModule);
+                 childTimedOut ? "true" : "false", (unsigned long long)(ULONG_PTR)remoteModule,
+                 initA);
         write_report(o.report, json);
     }
     CloseHandle(pi.hThread);

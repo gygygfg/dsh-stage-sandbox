@@ -2288,3 +2288,506 @@ static LONG ws_enum_key_ex_inner(HKEY hKey, DWORD dwIndex, LPWSTR lpName, LPDWOR
     }
     return ERROR_SUCCESS;
 }
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ * R19 / P0 — the API surface the IAT point-hook could not see.
+ *
+ * Measured (2026-10-18, production TS lane, native probe): the following calls
+ * wrote / deleted / renamed the REAL HKCU hive with NO staging and NO WAL record:
+ *   RegCreateKeyTransactedW+Commit, RegDeleteKeyTransactedW+Commit,
+ *   RegRenameKey (real kernel handle), ntdll!NtCreateKey/NtSetValueKey/
+ *   NtDeleteKey/NtDeleteValueKey/NtRenameKey.
+ * They were simply absent from WS_TARGET, and "not hooked" == "not intercepted".
+ *
+ * None of them can be represented honestly in the WAL (transaction commit/rollback,
+ * subtree copy, rename, whole-hive load/save/replace). The only honest outcome for
+ * a WRITE is: refuse + record it (fail-closed). Reads keep their passthrough where
+ * the API is genuinely read-only (a transacted open without write bits, a local
+ * RegConnectRegistry); everything else is HARD_DENY.
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+/* HARD_DENY reason codes 4..8 — must equal REG_STAGE_HARD_DENY_REASON in
+ * src/registry-stage.ts. */
+#define WS_HARD_DENY_TRANSACTED_NOT_STAGEABLE  4u
+#define WS_HARD_DENY_TREE_OP_NOT_STAGEABLE     5u
+#define WS_HARD_DENY_HIVE_FILE_NOT_STAGEABLE   6u
+#define WS_HARD_DENY_REMOTE_HIVE_NOT_STAGEABLE 7u
+#define WS_HARD_DENY_NT_WRITE_NOT_STAGEABLE    8u
+
+#define WS_NT_ACCESS_DENIED ((NTSTATUS)0xC0000022L)
+
+static void ws_reg_widen(LPCSTR s, wchar_t *out, DWORD cch)
+{
+    out[0] = 0;
+    if (s && s[0]) {
+        MultiByteToWideChar(CP_ACP, 0, s, -1, out, (int)cch);
+        out[cch - 1] = 0;
+    }
+}
+
+/* Resolve (hKey, lpSubKey) to a canonical path for the audit record; never fail
+ * the denial because the path was unresolvable (the deny itself must still happen). */
+static void ws_reg_path_for_audit(HKEY hKey, LPCWSTR lpSubKey, const wchar_t *placeholder,
+                                  wchar_t *out, DWORD cch)
+{
+    wchar_t hive[64];
+    int isPseudo = 0, isBareRoot = 0;
+    out[0] = 0;
+    if (!ws_rstore_canonical(hKey, lpSubKey, hive, 64, out, cch, &isPseudo, &isBareRoot) || !out[0]) {
+        ws_strlcpy_w(out, placeholder, cch);
+    }
+}
+
+static LONG ws_reg_deny_write_audited(HKEY hKey, LPCWSTR lpSubKey, const wchar_t *placeholder, UINT16 reason)
+{
+    wchar_t path[WS_PATH_MAX];
+    ws_reg_path_for_audit(hKey, lpSubKey, placeholder, path, WS_PATH_MAX);
+    ws_reg_hard_deny_reason(path, reason);
+    return ERROR_ACCESS_DENIED;
+}
+
+static void ws_reg_nt_path_for_audit(POBJECT_ATTRIBUTES oa, HANDLE handle,
+                                     const wchar_t *placeholder, wchar_t *out, DWORD cch)
+{
+    out[0] = 0;
+    if (handle) {
+        ws_reg_path_for_audit((HKEY)handle, NULL, L"", out, cch);
+        if (out[0] && !ws_starts_with_ci_w(out, L"<")) return;
+    }
+    if (oa && oa->ObjectName && oa->ObjectName->Buffer && oa->ObjectName->Length) {
+        const wchar_t *n = oa->ObjectName->Buffer;
+        size_t len = oa->ObjectName->Length / sizeof(wchar_t);
+        if (len > 0 && _wcsnicmp(n, L"\\Registry\\User\\", 15) == 0) {
+            const wchar_t *rest = n + 15;
+            const wchar_t *slash = wcschr(rest, L'\\');
+            if (slash) {
+                size_t pos = 0;
+                ws_append_w(out, cch, &pos, L"HKCU\\");
+                ws_append_w(out, cch, &pos, slash + 1);
+                return;
+            }
+        } else if (len > 0 && _wcsnicmp(n, L"\\Registry\\Machine\\", 18) == 0) {
+            size_t pos = 0;
+            ws_append_w(out, cch, &pos, L"HKLM\\");
+            ws_append_w(out, cch, &pos, n + 18);
+            return;
+        } else if (len < cch) {
+            memcpy(out, n, len * sizeof(wchar_t));
+            out[len] = 0;
+            return;
+        }
+    }
+    ws_strlcpy_w(out, placeholder, cch);
+}
+
+/* R20 / R16: thread-local re-entrancy depth for the ntdll deny entries.
+ *
+ * Why it is needed (and what it is NOT defending against): the deny path is not
+ * just "return an error" -- it appends a WAL record (`ws_reg_hard_deny_reason`),
+ * which runs the FILE hooks (journal create/write). Provider-skip already keeps
+ * advapi32/kernelbase/ntdll internal calls on their real exports, so our own
+ * `ws_Reg*` wrappers (and the staged/unstaged passthrough branches) cannot
+ * re-enter these deny entries (measured: the `reg-passthrough-write` probe on a
+ * REAL kernel handle still succeeds and only writes an UNSTAGED record). The
+ * guard is the cheap belt-and-braces for the remaining case: any future path
+ * that does re-enter a deny entry on the same thread must not append N records
+ * for one logical call (and must not recurse through the journal writer until
+ * the stack dies). Depth > 0 ⇒ refuse again with the same STATUS_ACCESS_DENIED,
+ * without a second record. */
+static _Thread_local int t_wsNtDenyDepth;
+
+static NTSTATUS ws_reg_nt_deny(POBJECT_ATTRIBUTES oa, HANDLE handle, const wchar_t *placeholder, UINT16 reason)
+{
+    if (t_wsNtDenyDepth > 0) {
+        return WS_NT_ACCESS_DENIED;
+    }
+    t_wsNtDenyDepth++;
+    wchar_t path[WS_PATH_MAX];
+    ws_reg_nt_path_for_audit(oa, handle, placeholder, path, WS_PATH_MAX);
+    ws_reg_hard_deny_reason(path, reason);
+    t_wsNtDenyDepth--;
+    return WS_NT_ACCESS_DENIED;
+}
+
+static LONG ws_reg_deny_reg_write(HKEY hKey, LPCWSTR lpSubKey, UINT16 reason, DWORD savedLastError)
+{
+    LONG rc = ws_reg_deny_write_audited(hKey, lpSubKey, L"<unresolved-registry-write>", reason);
+    SetLastError(savedLastError);
+    return rc;
+}
+
+/* ---- transacted family ---------------------------------------------------- */
+LONG WINAPI ws_RegCreateKeyTransactedW(HKEY hKey, LPCWSTR lpSubKey, DWORD Reserved, LPWSTR lpClass,
+                                       DWORD dwOptions, REGSAM samDesired, LPSECURITY_ATTRIBUTES sa,
+                                       PHKEY phkResult, LPDWORD lpdwDisposition, HANDLE hTransaction,
+                                       PVOID pExtended)
+{
+    (void)Reserved; (void)lpClass; (void)dwOptions; (void)samDesired; (void)sa;
+    (void)phkResult; (void)lpdwDisposition; (void)hTransaction; (void)pExtended;
+    DWORD saved = GetLastError();
+    if (phkResult) *phkResult = NULL;
+    return ws_reg_deny_reg_write(hKey, lpSubKey, WS_HARD_DENY_TRANSACTED_NOT_STAGEABLE, saved);
+}
+
+LONG WINAPI ws_RegCreateKeyTransactedA(HKEY hKey, LPCSTR lpSubKey, DWORD Reserved, LPSTR lpClass,
+                                       DWORD dwOptions, REGSAM samDesired, LPSECURITY_ATTRIBUTES sa,
+                                       PHKEY phkResult, LPDWORD lpdwDisposition, HANDLE hTransaction,
+                                       PVOID pExtended)
+{
+    wchar_t sub[WS_PATH_MAX];
+    ws_reg_widen(lpSubKey, sub, WS_PATH_MAX);
+    return ws_RegCreateKeyTransactedW(hKey, lpSubKey ? sub : NULL, Reserved, NULL, dwOptions, samDesired,
+                                      sa, phkResult, lpdwDisposition, hTransaction, pExtended);
+}
+
+LONG WINAPI ws_RegOpenKeyTransactedW(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGSAM samDesired,
+                                     PHKEY phkResult, HANDLE hTransaction, PVOID pExtended)
+{
+    (void)ulOptions; (void)hTransaction; (void)pExtended;
+    DWORD saved = GetLastError();
+    /* Write-intent open: fail closed with an audit record. A read-only open has no
+     * side effect and is passed through (same policy as the WOW64 view reads). */
+    if ((samDesired & WS_SAM_WRITE_INTENT) != 0) {
+        if (phkResult) *phkResult = NULL;
+        return ws_reg_deny_reg_write(hKey, lpSubKey, WS_HARD_DENY_TRANSACTED_NOT_STAGEABLE, saved);
+    }
+    if (g_orig.RegOpenKeyTransactedW) {
+        LONG rc = g_orig.RegOpenKeyTransactedW(hKey, lpSubKey, ulOptions, samDesired, phkResult,
+                                               hTransaction, pExtended);
+        SetLastError(saved);
+        return rc;
+    }
+    if (phkResult) *phkResult = NULL;
+    return ws_reg_deny_reg_write(hKey, lpSubKey, WS_HARD_DENY_TRANSACTED_NOT_STAGEABLE, saved);
+}
+
+LONG WINAPI ws_RegOpenKeyTransactedA(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM samDesired,
+                                     PHKEY phkResult, HANDLE hTransaction, PVOID pExtended)
+{
+    wchar_t sub[WS_PATH_MAX];
+    ws_reg_widen(lpSubKey, sub, WS_PATH_MAX);
+    return ws_RegOpenKeyTransactedW(hKey, lpSubKey ? sub : NULL, ulOptions, samDesired, phkResult,
+                                    hTransaction, pExtended);
+}
+
+LONG WINAPI ws_RegDeleteKeyTransactedW(HKEY hKey, LPCWSTR lpSubKey, REGSAM samDesired, DWORD Reserved,
+                                       HANDLE hTransaction, PVOID pExtended)
+{
+    (void)samDesired; (void)Reserved; (void)hTransaction; (void)pExtended;
+    DWORD saved = GetLastError();
+    return ws_reg_deny_reg_write(hKey, lpSubKey, WS_HARD_DENY_TRANSACTED_NOT_STAGEABLE, saved);
+}
+
+LONG WINAPI ws_RegDeleteKeyTransactedA(HKEY hKey, LPCSTR lpSubKey, REGSAM samDesired, DWORD Reserved,
+                                       HANDLE hTransaction, PVOID pExtended)
+{
+    wchar_t sub[WS_PATH_MAX];
+    ws_reg_widen(lpSubKey, sub, WS_PATH_MAX);
+    return ws_RegDeleteKeyTransactedW(hKey, lpSubKey ? sub : NULL, samDesired, Reserved,
+                                      hTransaction, pExtended);
+}
+
+/* ---- subtree copy / rename ------------------------------------------------ */
+LONG WINAPI ws_RegCopyTreeW(HKEY hKeySrc, LPCWSTR lpSubKey, HKEY hKeyDest)
+{
+    DWORD saved = GetLastError();
+    wchar_t path[WS_PATH_MAX];
+    ws_reg_path_for_audit(hKeySrc, lpSubKey, L"<RegCopyTreeW>", path, WS_PATH_MAX);
+    if (hKeyDest && !ws_starts_with_ci_w(path, L"<")) {
+        wchar_t dst[WS_PATH_MAX];
+        ws_reg_path_for_audit(hKeyDest, NULL, L"", dst, WS_PATH_MAX);
+        if (dst[0]) {
+            wchar_t both[WS_PATH_MAX];
+            size_t pos = 0;
+            both[0] = 0;
+            ws_append_w(both, WS_PATH_MAX, &pos, path);
+            ws_append_w(both, WS_PATH_MAX, &pos, L" -> ");
+            ws_append_w(both, WS_PATH_MAX, &pos, dst);
+            ws_reg_hard_deny_reason(both, WS_HARD_DENY_TREE_OP_NOT_STAGEABLE);
+            SetLastError(saved);
+            return ERROR_ACCESS_DENIED;
+        }
+    }
+    ws_reg_hard_deny_reason(path, WS_HARD_DENY_TREE_OP_NOT_STAGEABLE);
+    SetLastError(saved);
+    return ERROR_ACCESS_DENIED;
+}
+
+LONG WINAPI ws_RegCopyTreeA(HKEY hKeySrc, LPCSTR lpSubKey, HKEY hKeyDest)
+{
+    wchar_t sub[WS_PATH_MAX];
+    ws_reg_widen(lpSubKey, sub, WS_PATH_MAX);
+    return ws_RegCopyTreeW(hKeySrc, lpSubKey ? sub : NULL, hKeyDest);
+}
+
+LONG WINAPI ws_RegRenameKey(HKEY hKey, LPCWSTR lpSubKeyName, LPCWSTR lpNewKeyName)
+{
+    (void)lpNewKeyName;
+    DWORD saved = GetLastError();
+    return ws_reg_deny_reg_write(hKey, lpSubKeyName, WS_HARD_DENY_TREE_OP_NOT_STAGEABLE, saved);
+}
+
+/* ---- whole-hive load / save / restore / replace --------------------------- */
+LONG WINAPI ws_RegLoadKeyW(HKEY hKey, LPCWSTR lpSubKey, LPCWSTR lpFile)
+{
+    (void)lpFile;
+    DWORD saved = GetLastError();
+    return ws_reg_deny_reg_write(hKey, lpSubKey, WS_HARD_DENY_HIVE_FILE_NOT_STAGEABLE, saved);
+}
+
+LONG WINAPI ws_RegLoadKeyA(HKEY hKey, LPCSTR lpSubKey, LPCSTR lpFile)
+{
+    wchar_t sub[WS_PATH_MAX];
+    ws_reg_widen(lpSubKey, sub, WS_PATH_MAX);
+    (void)lpFile;
+    return ws_RegLoadKeyW(hKey, lpSubKey ? sub : NULL, NULL);
+}
+
+LONG WINAPI ws_RegUnLoadKeyW(HKEY hKey, LPCWSTR lpSubKey)
+{
+    DWORD saved = GetLastError();
+    return ws_reg_deny_reg_write(hKey, lpSubKey, WS_HARD_DENY_HIVE_FILE_NOT_STAGEABLE, saved);
+}
+
+LONG WINAPI ws_RegUnLoadKeyA(HKEY hKey, LPCSTR lpSubKey)
+{
+    wchar_t sub[WS_PATH_MAX];
+    ws_reg_widen(lpSubKey, sub, WS_PATH_MAX);
+    return ws_RegUnLoadKeyW(hKey, lpSubKey ? sub : NULL);
+}
+
+LONG WINAPI ws_RegSaveKeyW(HKEY hKey, LPCWSTR lpFile, LPSECURITY_ATTRIBUTES sa)
+{
+    (void)lpFile; (void)sa;
+    DWORD saved = GetLastError();
+    return ws_reg_deny_reg_write(hKey, NULL, WS_HARD_DENY_HIVE_FILE_NOT_STAGEABLE, saved);
+}
+
+LONG WINAPI ws_RegSaveKeyA(HKEY hKey, LPCSTR lpFile, LPSECURITY_ATTRIBUTES sa)
+{
+    (void)lpFile;
+    return ws_RegSaveKeyW(hKey, NULL, sa);
+}
+
+LONG WINAPI ws_RegSaveKeyExW(HKEY hKey, LPCWSTR lpFile, LPSECURITY_ATTRIBUTES sa, DWORD flags)
+{
+    (void)lpFile; (void)sa; (void)flags;
+    DWORD saved = GetLastError();
+    return ws_reg_deny_reg_write(hKey, NULL, WS_HARD_DENY_HIVE_FILE_NOT_STAGEABLE, saved);
+}
+
+LONG WINAPI ws_RegSaveKeyExA(HKEY hKey, LPCSTR lpFile, LPSECURITY_ATTRIBUTES sa, DWORD flags)
+{
+    (void)lpFile;
+    return ws_RegSaveKeyExW(hKey, NULL, sa, flags);
+}
+
+LONG WINAPI ws_RegRestoreKeyW(HKEY hKey, LPCWSTR lpFile, DWORD flags)
+{
+    (void)lpFile; (void)flags;
+    DWORD saved = GetLastError();
+    return ws_reg_deny_reg_write(hKey, NULL, WS_HARD_DENY_HIVE_FILE_NOT_STAGEABLE, saved);
+}
+
+LONG WINAPI ws_RegRestoreKeyA(HKEY hKey, LPCSTR lpFile, DWORD flags)
+{
+    (void)lpFile;
+    return ws_RegRestoreKeyW(hKey, NULL, flags);
+}
+
+LONG WINAPI ws_RegReplaceKeyW(HKEY hKey, LPCWSTR lpSubKey, LPCWSTR lpNewFile, LPCWSTR lpOldFile)
+{
+    (void)lpNewFile; (void)lpOldFile;
+    DWORD saved = GetLastError();
+    return ws_reg_deny_reg_write(hKey, lpSubKey, WS_HARD_DENY_HIVE_FILE_NOT_STAGEABLE, saved);
+}
+
+LONG WINAPI ws_RegReplaceKeyA(HKEY hKey, LPCSTR lpSubKey, LPCSTR lpNewFile, LPCSTR lpOldFile)
+{
+    wchar_t sub[WS_PATH_MAX];
+    ws_reg_widen(lpSubKey, sub, WS_PATH_MAX);
+    (void)lpNewFile; (void)lpOldFile;
+    return ws_RegReplaceKeyW(hKey, lpSubKey ? sub : NULL, NULL, NULL);
+}
+
+/* A local connection is just another handle on the same machine: reads and the
+ * already-hooked write paths keep working. A REMOTE hive cannot be redirected to
+ * the local overlay at all, so it is fail-closed + audited. */
+static int ws_reg_is_local_machine(LPCWSTR name)
+{
+    if (!name || !name[0]) return 1;
+    while (*name == L'\\') name++;
+    wchar_t own[256];
+    DWORD cch = 256;
+    if (!GetComputerNameW(own, &cch)) return 0;
+    return ws_wcscmp_ci(name, own) == 0 || _wcsicmp(name, L".") == 0;
+}
+
+LONG WINAPI ws_RegConnectRegistryW(LPCWSTR lpMachineName, HKEY hKey, PHKEY phkResult)
+{
+    DWORD saved = GetLastError();
+    if (ws_reg_is_local_machine(lpMachineName) && g_orig.RegConnectRegistryW) {
+        LONG rc = g_orig.RegConnectRegistryW(lpMachineName, hKey, phkResult);
+        SetLastError(saved);
+        return rc;
+    }
+    if (phkResult) *phkResult = NULL;
+    return ws_reg_deny_reg_write(hKey, NULL, WS_HARD_DENY_REMOTE_HIVE_NOT_STAGEABLE, saved);
+}
+
+LONG WINAPI ws_RegConnectRegistryA(LPCSTR lpMachineName, HKEY hKey, PHKEY phkResult)
+{
+    wchar_t machine[256];
+    ws_reg_widen(lpMachineName, machine, 256);
+    return ws_RegConnectRegistryW(lpMachineName ? machine : NULL, hKey, phkResult);
+}
+
+/* ---- ntdll write surface -------------------------------------------------- */
+NTSTATUS NTAPI ws_NtCreateKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
+                              ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
+{
+    (void)DesiredAccess; (void)TitleIndex; (void)Class; (void)CreateOptions;
+    if (KeyHandle) *KeyHandle = NULL;
+    if (Disposition) *Disposition = 0;
+    return ws_reg_nt_deny(ObjectAttributes, NULL, L"<NtCreateKey>", WS_HARD_DENY_NT_WRITE_NOT_STAGEABLE);
+}
+
+NTSTATUS NTAPI ws_NtSetValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName, ULONG TitleIndex,
+                                ULONG Type, PVOID Data, ULONG DataSize)
+{
+    (void)ValueName; (void)TitleIndex; (void)Type; (void)Data; (void)DataSize;
+    return ws_reg_nt_deny(NULL, KeyHandle, L"<NtSetValueKey>", WS_HARD_DENY_NT_WRITE_NOT_STAGEABLE);
+}
+
+NTSTATUS NTAPI ws_NtDeleteKey(HANDLE KeyHandle)
+{
+    return ws_reg_nt_deny(NULL, KeyHandle, L"<NtDeleteKey>", WS_HARD_DENY_NT_WRITE_NOT_STAGEABLE);
+}
+
+NTSTATUS NTAPI ws_NtDeleteValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName)
+{
+    (void)ValueName;
+    return ws_reg_nt_deny(NULL, KeyHandle, L"<NtDeleteValueKey>", WS_HARD_DENY_NT_WRITE_NOT_STAGEABLE);
+}
+
+NTSTATUS NTAPI ws_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName)
+{
+    (void)NewName;
+    return ws_reg_nt_deny(NULL, KeyHandle, L"<NtRenameKey>", WS_HARD_DENY_NT_WRITE_NOT_STAGEABLE);
+}
+
+NTSTATUS NTAPI ws_NtLoadKey(POBJECT_ATTRIBUTES DestinationKeyName, POBJECT_ATTRIBUTES HiveFileName)
+{
+    (void)HiveFileName;
+    return ws_reg_nt_deny(DestinationKeyName, NULL, L"<NtLoadKey>", WS_HARD_DENY_HIVE_FILE_NOT_STAGEABLE);
+}
+
+NTSTATUS NTAPI ws_NtLoadKey2(POBJECT_ATTRIBUTES DestinationKeyName, POBJECT_ATTRIBUTES HiveFileName, ULONG Flags)
+{
+    (void)HiveFileName; (void)Flags;
+    return ws_reg_nt_deny(DestinationKeyName, NULL, L"<NtLoadKey2>", WS_HARD_DENY_HIVE_FILE_NOT_STAGEABLE);
+}
+
+NTSTATUS NTAPI ws_NtUnloadKey(POBJECT_ATTRIBUTES DestinationKeyName)
+{
+    return ws_reg_nt_deny(DestinationKeyName, NULL, L"<NtUnloadKey>", WS_HARD_DENY_HIVE_FILE_NOT_STAGEABLE);
+}
+
+NTSTATUS NTAPI ws_NtSaveKey(HANDLE KeyHandle, HANDLE FileHandle)
+{
+    (void)FileHandle;
+    return ws_reg_nt_deny(NULL, KeyHandle, L"<NtSaveKey>", WS_HARD_DENY_HIVE_FILE_NOT_STAGEABLE);
+}
+
+NTSTATUS NTAPI ws_NtSaveKeyEx(HANDLE KeyHandle, HANDLE FileHandle, ULONG Format)
+{
+    (void)FileHandle; (void)Format;
+    return ws_reg_nt_deny(NULL, KeyHandle, L"<NtSaveKeyEx>", WS_HARD_DENY_HIVE_FILE_NOT_STAGEABLE);
+}
+
+NTSTATUS NTAPI ws_NtRestoreKey(HANDLE KeyHandle, HANDLE FileHandle, ULONG Flags)
+{
+    (void)FileHandle; (void)Flags;
+    return ws_reg_nt_deny(NULL, KeyHandle, L"<NtRestoreKey>", WS_HARD_DENY_HIVE_FILE_NOT_STAGEABLE);
+}
+
+NTSTATUS NTAPI ws_NtReplaceKey(POBJECT_ATTRIBUTES NewHiveFileName, HANDLE KeyHandle,
+                               POBJECT_ATTRIBUTES BackupHiveFileName)
+{
+    (void)NewHiveFileName; (void)BackupHiveFileName;
+    return ws_reg_nt_deny(NULL, KeyHandle, L"<NtReplaceKey>", WS_HARD_DENY_HIVE_FILE_NOT_STAGEABLE);
+}
+
+/* ── R20 / R16: the 12 Zw* aliases ───────────────────────────────────────────
+ * On x64 ntdll exports ZwCreateKey ... ZwReplaceKey as SEPARATE exports (the
+ * Zw stub is the syscall thunk the Nt stub also uses). A caller that imports
+ * ZwXxx has an IAT slot pointing at the Zw export, so hooking only NtXxx would
+ * miss it entirely; the contract therefore adds both names to WS_TARGET and both
+ * are denied here. The body is deliberately a 1:1 alias of the Nt twin: same
+ * fail-closed outcome, same WAL record (kind=5 HARD_DENY, status=5,
+ * type=8 for the 5 write ops / type=6 for the 7 hive-file ops).
+ * NOTE: the originals (g_orig.Zw*) are captured by the hook engine but are NOT
+ * called -- every one of these operations is unrepresentable in the overlay, so
+ * passing through would write the real hive. */
+NTSTATUS NTAPI ws_ZwCreateKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
+                              ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
+{
+    return ws_NtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
+}
+
+NTSTATUS NTAPI ws_ZwSetValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName, ULONG TitleIndex,
+                                ULONG Type, PVOID Data, ULONG DataSize)
+{
+    return ws_NtSetValueKey(KeyHandle, ValueName, TitleIndex, Type, Data, DataSize);
+}
+
+NTSTATUS NTAPI ws_ZwDeleteKey(HANDLE KeyHandle)
+{
+    return ws_NtDeleteKey(KeyHandle);
+}
+
+NTSTATUS NTAPI ws_ZwDeleteValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName)
+{
+    return ws_NtDeleteValueKey(KeyHandle, ValueName);
+}
+
+NTSTATUS NTAPI ws_ZwRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName)
+{
+    return ws_NtRenameKey(KeyHandle, NewName);
+}
+
+NTSTATUS NTAPI ws_ZwLoadKey(POBJECT_ATTRIBUTES DestinationKeyName, POBJECT_ATTRIBUTES HiveFileName)
+{
+    return ws_NtLoadKey(DestinationKeyName, HiveFileName);
+}
+
+NTSTATUS NTAPI ws_ZwLoadKey2(POBJECT_ATTRIBUTES DestinationKeyName, POBJECT_ATTRIBUTES HiveFileName, ULONG Flags)
+{
+    return ws_NtLoadKey2(DestinationKeyName, HiveFileName, Flags);
+}
+
+NTSTATUS NTAPI ws_ZwUnloadKey(POBJECT_ATTRIBUTES DestinationKeyName)
+{
+    return ws_NtUnloadKey(DestinationKeyName);
+}
+
+NTSTATUS NTAPI ws_ZwSaveKey(HANDLE KeyHandle, HANDLE FileHandle)
+{
+    return ws_NtSaveKey(KeyHandle, FileHandle);
+}
+
+NTSTATUS NTAPI ws_ZwSaveKeyEx(HANDLE KeyHandle, HANDLE FileHandle, ULONG Format)
+{
+    return ws_NtSaveKeyEx(KeyHandle, FileHandle, Format);
+}
+
+NTSTATUS NTAPI ws_ZwRestoreKey(HANDLE KeyHandle, HANDLE FileHandle, ULONG Flags)
+{
+    return ws_NtRestoreKey(KeyHandle, FileHandle, Flags);
+}
+
+NTSTATUS NTAPI ws_ZwReplaceKey(POBJECT_ATTRIBUTES NewHiveFileName, HANDLE KeyHandle,
+                               POBJECT_ATTRIBUTES BackupHiveFileName)
+{
+    return ws_NtReplaceKey(NewHiveFileName, KeyHandle, BackupHiveFileName);
+}

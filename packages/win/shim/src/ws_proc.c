@@ -27,6 +27,7 @@
 
 static wchar_t g_selfDll[WS_PATH_MAX];
 static int g_selfDllOk;
+static HMODULE g_selfBase; /* this shim's module base (for remote export addresses) */
 /* defect 4: was a non-reentrant `volatile LONG g_procLock`. */
 static WsLock g_procLock = { 0, 0, 0, "proc" };
 static long g_injectCount;
@@ -72,6 +73,7 @@ void ws_proc_set_self_module(HMODULE self)
     if (!self) {
         return;
     }
+    g_selfBase = self;
     DWORD n = GetModuleFileNameW(self, g_selfDll, WS_PATH_MAX);
     g_selfDllOk = (n > 0 && n < WS_PATH_MAX);
     ws_log("child injection armed: self=%ls ok=%d", g_selfDllOk ? g_selfDll : L"(unknown)", g_selfDllOk);
@@ -149,6 +151,56 @@ static wchar_t *ws_env_with_contract(const wchar_t *env)
 
 /* -------------------------------------------------------------- injection */
 
+/* ★ R20①：DllMain 不再做初始化，所以远程 LoadLibraryW 成功只代表模块已映射。
+ * 这里在子进程里再起一个远程线程调用本 DLL 导出的 `WinstageShimInit()`，等它返回
+ * （= 初始化完成）之后，调用方才会 ResumeThread。重活因此不再跑在 loader-lock /
+ * CLR 未初始化窗口里，初始化失败也变成可判定的返回码。
+ *
+ * 远程地址 = 远程模块基址 + (本地导出地址 - 本地模块基址)：同一个 DLL 映像在
+ * 两个进程里的相对偏移一致（远程 LoadLibraryW 返回的 HMODULE 就是远程基址）。
+ *
+ * 失败语义：线程超时/以异常码结束 ⇒ 子进程里没有可用钩子 ⇒ 失败关闭（调用方会
+ * TerminateProcess）；返回普通 Win32 错误码时保持 R20 之前的 DllMain 语义
+ * （子进程继续跑，只记录日志）——DISABLE=1 的 1058 就是这类情况。 */
+static int ws_remote_init(HANDLE hProcess, HMODULE remoteModule)
+{
+    if (!g_selfBase || !remoteModule) {
+        SetLastError(ERROR_MOD_NOT_FOUND);
+        return 0;
+    }
+    BYTE *localFn = (BYTE *)(void *)&WinstageShimInit;
+    BYTE *remoteFn = (BYTE *)(ULONG_PTR)remoteModule + (localFn - (BYTE *)g_selfBase);
+    HANDLE th = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)remoteFn, NULL, 0, NULL);
+    if (!th) {
+        return 0;
+    }
+    DWORD waitMs = ws_inject_wait_ms();
+    ws_stuck_enter("inject:remote-WinstageShimInit");
+    DWORD wait = WaitForSingleObject(th, waitMs);
+    ws_stuck_leave();
+    DWORD rc = 0;
+    GetExitCodeThread(th, &rc);
+    CloseHandle(th);
+    if (wait != WAIT_OBJECT_0) {
+        ws_log("STUCK remote WinstageShimInit did not complete within %lu ms (pid=%lu); failing closed",
+               (unsigned long)waitMs, (unsigned long)GetProcessId(hProcess));
+        SetLastError(ERROR_TIMEOUT);
+        return 0;
+    }
+    if ((rc & 0x80000000u) != 0) {
+        ws_log("remote WinstageShimInit crashed (exit=0x%lx, pid=%lu); failing closed",
+               (unsigned long)rc, (unsigned long)GetProcessId(hProcess));
+        SetLastError(rc);
+        return 0;
+    }
+    if (rc != 0) {
+        ws_log("child shim init returned %lu (pid=%lu); child continues (same semantics as the"
+               " previous DllMain auto-init)",
+               (unsigned long)rc, (unsigned long)GetProcessId(hProcess));
+    }
+    return 1;
+}
+
 static int ws_inject_into(HANDLE hProcess)
 {
     if (!g_selfDllOk) {
@@ -191,6 +243,13 @@ static int ws_inject_into(HANDLE hProcess)
                 }
                 if (!ok) {
                     SetLastError(ERROR_DLL_INIT_FAILED);
+                }
+                /* R20①：模块映射成功还不够 —— 在子进程里跑显式初始化并等它就绪。 */
+                if (ok && !ws_remote_init(hProcess, (HMODULE)(ULONG_PTR)moduleResult)) {
+                    if (GetLastError() == ERROR_SUCCESS) {
+                        SetLastError(ERROR_DLL_INIT_FAILED);
+                    }
+                    ok = 0;
                 }
             }
         }

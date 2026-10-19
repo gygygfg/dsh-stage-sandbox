@@ -663,6 +663,35 @@ static void ws_mask_normalize(const wchar_t *in, wchar_t *out, DWORD cch)
             out[i] = L'\\';
         }
     }
+    /* ★ R19-A5：ADS（alternate data stream）说明符必须剥离后再匹配。
+     *
+     * 现场（R19 check-path + 注入实证）：`…\.npmrc:$DATA` / `…\.npmrc:stream` 被判 allow ——
+     * leaf 锚定的规则（`\\.npmrc$`、`\\.git-credentials$`、`\\(hosts|lmhosts)$`、
+     * `\\.(pfx|p12|…)$` 等）被 `:stream` 后缀破坏；而命名流的内容确实可被读出来
+     * （R19 用 node 注入读 `…\.npmrc:r19s` 拿到明文 marker）。目录形态的规则
+     * （`\\.ssh(\\|$)` 等）因路径前缀仍含 `\.ssh\` 而侥幸命中，leaf 规则则全部漏。
+     *
+     * 语义：**遮蔽一个文件 = 遮蔽它的所有流**。Windows 文件名里冒号保留给流说明符
+     * （Win32 路径的 leaf 中第一个 `:`，盘符冒号在 leaf 之外），因此剥到第一个冒号
+     * 只会得到"基文件"，不会把普通文件名截断。剥离是单向收紧：
+     *   · 基文件命中 ⇒ 它的任何流也命中（正确）；
+     *   · 未被遮蔽的普通文件带流 ⇒ 基名照旧不命中（不误伤）。
+     * 与 `src/paths.ts::maskKey()` 的同一处剥离**必须同步**（同一件事两套实现是历史
+     * 最痛的缺陷形态）；`tests/paths-masks.ts` 的 ADS 探针会钉死这条。 */
+    {
+        size_t leafStart = 0;
+        for (size_t i = 0; out[i]; i++) {
+            if (out[i] == L'\\') {
+                leafStart = i + 1;
+            }
+        }
+        for (size_t i = leafStart; out[i]; i++) {
+            if (out[i] == L':') {
+                out[i] = 0;
+                break;
+            }
+        }
+    }
     size_t n = wcslen(out);
     while (n > 3 && out[n - 1] == L'\\') {
         out[--n] = 0;

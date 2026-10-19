@@ -16,7 +16,7 @@
 | [`测试套件总览.md`](测试套件总览.md) | **测试的唯一入口**：离线/沙箱/治理套件清单、怎么跑、判据在哪 |
 | [`项目规范-测试与修改流程.md`](项目规范-测试与修改流程.md) | 改代码前/后的流程规范（含基线封印纪律） |
 | [`插件启动-环境监测与开关保证.md`](插件启动-环境监测与开关保证.md) | 启动环境监测与开关语义（`PUBLISHING.md` 引用） |
-| [`Windows功能开启清单.md`](Windows功能开启清单.md) | **残余边界 R1–R17 的权威列表**（`tests/residual-baseline.ts` 会读它，删行即判红） |
+| [`Windows功能开启清单.md`](Windows功能开启清单.md) | **残余边界 R1–R20 的权威列表**（`tests/residual-baseline.ts` 会读它，删行即判红） |
 | [`Agent沙箱暂存—提交架构设计手册-v3.0.md`](Agent沙箱暂存—提交架构设计手册-v3.0.md) | 设计手册 v3.0；代码注释里的"手册 #x.y"都指它 |
 | `源码基线.sha256` | **硬判据**（不是文档）：受封印文件的逐条哈希，`tests/baseline-integrity.ts` 读它 |
 
@@ -57,6 +57,16 @@
   （WOW64 32KEY fail-closed、注册表候选 appliable:false、真实文件物化、目录↔文件 apply、--read-only、
   shim 读遮蔽、零写 CoW、白障祖先目录、关态停轮询/限制日志/双层卸载/apply 幂等/判定面），
   并记录 canonical shim 重建、TS 车道判据、最终门禁与诚实残余。
+- [`round19/R19-独立测试与边界修复报告.md`](round19/R19-独立测试与边界修复报告.md)：Windows 侧独立测试与边界修复轮
+  （4 个 P0 + 4 个 P1/P2 修复；§3 为 R16–R20 残余清单）。
+- [`round20/R20-残余修复报告.md`](round20/R20-残余修复报告.md)：把 R19 §3 的 R16–R20 残余收口
+  （ntdll/Zw 注册表写 fail-closed+WAL、ReplaceFileW/NtCreateFile/FindFirst*/NtQueryDirectoryFile 接线、
+  硬链接遮蔽读写双面收口、目录枚举过滤、托管 exe 注入根因与延迟初始化、T1 归因结构化声明），
+  并记录 canonical shim/dist 重建、新测试套件与最终门禁/诚实残余。
+- [`round21/R21-证据缺口收口报告.md`](round21/R21-证据缺口收口报告.md)：收口 R19 汇总里的 **5 项"未验证/证据缺口"**
+  （RegCopyTree/RegRenameKey 生产 lane 复验、注册表 apply 对抗样本、文件侧对抗审计、readPolicy 双档 +
+  sensitive-content 端到端脱敏、GUI/DOM 实况与 `dsh plugin remove` 实跑、`build-shim --help` 工具链修复），
+  过程中新修 13 处缺陷；附 3 项非产品口径的独立复核结论与 R21 新登记残余。
 
 ## 5. archive —— 历史归档（不代表现行口径）
 

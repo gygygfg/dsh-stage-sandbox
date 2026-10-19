@@ -1611,31 +1611,53 @@ export class ReviewService {
      */
     let redaction = { lines: [], masked: false, segments: 0, reasons: [] }
     if (sensitiveMasked) {
-      const view = []
+      /**
+       * ★ R21 修复（P1 · 块标量正文漏明）：**必须一次喂给 `maskSensitiveLines()` 整个块**。
+       *
+       * `sensitive-content.ts` 的块标量遮蔽是**跨行状态机**（打开行 `secret: |` 决定
+       * 后续缩进行要整行换成占位，理由码 `block-scalar`）。旧实现这里**逐行**调用
+       * `maskSensitiveLines([{ …单行… }])` ⇒ 状态机永远看不到打开行的下一行，于是
+       * 块标量正文（真实 YAML 凭据文件的常态：短、可读、不是 16+ 高熵串）原样进
+       * `review.json`，而条目同时写着 `contentMasked: true` —— 与 R17-P0-02 修掉的
+       * "安全声明与实际相反"是同一形态（R21 独立复现：`.lead/logs/fs-policy/probe-e.log`）。
+       * R17 的单测之所以绿：它直接调**多行** API，没走这条真实链路。
+       *
+       * 修法：
+       *   1. 先把本条目要展示的行攒成**一个数组**（含 `change-header`/`note`：它们是
+       *      hunk/段落边界，缩进 ≤ 打开行时会让状态机复位，避免跨 hunk 误遮）；
+       *   2. **一次**调用 `maskSensitiveLines(全部行)`；
+       *   3. 再按 `maxLinesPerFile` 过滤内容行、按 `maxLineChars` 截断（**截断仍在掩码之后**，
+       *      否则长秘密只被遮住前半段、尾巴留在 payload 里 —— 见下方原注释的教训）。
+       */
+      const maskInput = []
+      let contentLines = 0
       for (const line of all) {
-        if (line.type === 'change-header' || line.type === 'note') continue
-        if (view.length >= limits.maxLinesPerFile) break
-        const text = String(line.text ?? '')
-        /**
-         * ⚠ 截断必须发生在**掩码之前**，但报的长度必须是**整行**的。
-         *
-         * 早先的写法是先 `slice(0, maxLineChars)` 再掩 —— 那会让"值比 `maxLineChars`
-         * 长"的秘密只被遮住前 140 字符，**尾巴留在 payload 里**（一个自己造出来的新泄漏）。
-         * 正确做法：拿整行去数长度与命中，只在最后按显示宽度裁剪。
-         * 因为 `<REDACTED len=N>` 比任何密钥都短，`sensitiveMasked` 条目实际不会被裁到。
-         */
-        const masked = maskSensitiveLines([{ type: line.type, line: line.line, text }])
-        const shown = masked.masked ? masked.lines[0]?.text ?? text : text
+        if (line.type === 'change-header' || line.type === 'note') {
+          // 边界行不占展示配额，但**必须**进掩码输入（块标量状态机靠它复位）
+          maskInput.push({ type: line.type, line: line.line, text: String(line.text ?? '') })
+          continue
+        }
+        if (contentLines >= limits.maxLinesPerFile) break
+        contentLines += 1
+        maskInput.push({ type: line.type, line: line.line, text: String(line.text ?? '') })
+      }
+      const maskedBlock = maskSensitiveLines(maskInput)
+      const view = []
+      for (const maskedLine of maskedBlock.lines) {
+        if (maskedLine?.type === 'change-header' || maskedLine?.type === 'note') continue
+        const shown = String(maskedLine?.text ?? '')
         view.push({
-          type: line.type,
-          line: line.line,
+          type: maskedLine?.type,
+          line: maskedLine?.line,
           text: shown.length > limits.maxLineChars ? `${shown.slice(0, limits.maxLineChars)}…` : shown,
         })
-        redaction.masked = redaction.masked || masked.masked
-        redaction.segments += masked.segments
-        for (const reason of masked.reasons) if (!redaction.reasons.includes(reason)) redaction.reasons.push(reason)
       }
-      redaction.lines = view
+      redaction = {
+        lines: view,
+        masked: maskedBlock.masked,
+        segments: maskedBlock.segments,
+        reasons: maskedBlock.reasons,
+      }
     }
 
     for (const line of all) {

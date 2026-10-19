@@ -99,6 +99,33 @@ const REPAIR_ONLY = args.has('--repair-stale');
  * explicit, opt-in cleanup path (see sweepResidue()). Like --check/--repair-stale
  * it is a pure filesystem mode and needs no toolchain. */
 const SWEEP_ONLY = args.has('--sweep');
+/* R21: `--help` used to be silently ignored (it was just an unknown token in the
+ * `args` set), so asking for usage ran a FULL build and overwrote canonical
+ * shim/out — measured: `node tools/build-shim.ts --help` rebuilt all three
+ * artifacts. That is a tool that changes the deliverable when asked to do
+ * nothing. Help is now a pure usage path, and it must be handled BEFORE any
+ * toolchain/filesystem work. Keep the flag list below in sync with the real
+ * options (--out-dir, --profile, --json, --clean, --check, --repair-stale,
+ * --sweep). Exit code 0: help is not an error (2 stays reserved for bad usage). */
+if (args.has('--help') || args.has('-h')) {
+  const usage = `usage: node tools/build-shim.ts [options]
+
+  (no options)     build winstage-shim.dll + winstage-inject.exe + winstage-probe.exe
+                   into packages/win/shim/out (or --out-dir)
+  --check          offline artifact presence/shape check; needs no toolchain
+  --repair-stale   restore a missing final artifact from its newest *.stale-* copy
+  --sweep          remove regenerable residue (.tmp-*, .pdb, report *.json) from out-dir
+  --json           machine-readable output for --check / --sweep
+  --clean          drop the artifacts before building (explicit opt-in)
+  --out-dir <dir>  build into <dir> instead of packages/win/shim/out
+  --profile <p>    full (default) | file-only
+  -h, --help       print this usage and exit 0 (no build, no canonical overwrite)
+
+exit codes: 0 = ok (help included), 1 = build/verify failure, 2 = usage error
+`;
+  console.log(usage);
+  process.exit(0);
+}
 const PROFILE = (() => {
   const flag = process.argv.slice(2).find((a) => a.startsWith('--profile='));
   if (flag) return flag.split('=')[1];

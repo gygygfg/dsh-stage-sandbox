@@ -16,6 +16,9 @@
  */
 #include "winstage_internal.h"
 
+/* offsetof() for the R20 directory-info layouts (FILE_*_DIR_INFORMATION). */
+#include <stddef.h>
+
 /* R11-D-13d-seq: shared per-process call ordinal, so log lines can be ordered and bound
  * to probe actions (existsSync -> statSync -> lstatSync -> readFileSync). */
 static volatile LONG g_wsSeqN;
@@ -23,6 +26,13 @@ static long ws_seq(void) { return (long)InterlockedIncrement(&g_wsSeqN); }
 
 /* Verbose file tracing (WINSTAGE_SHIM_VERBOSE=1). */
 #define WS_TRACE_FILE(...) do { if (g_ws.verbose) ws_log(__VA_ARGS__); } while (0)
+
+/* R20: diagnostic traces (ATTRDBG-* / read-branch / probe-stat) used to be
+ * unconditional ws_log calls. An ordinary carrier (PowerShell startup) then
+ * wrote multi-MB logs and paid a file append per intercepted call. They are
+ * diagnostics, not audit: keep the call sites but only emit under
+ * WINSTAGE_SHIM_VERBOSE=1. */
+#define WS_DBG(...) do { if (g_ws.verbose) ws_log(__VA_ARGS__); } while (0)
 
 /* Re-entrancy guard for shim-internal mutations of STAGED paths.
  *
@@ -90,6 +100,452 @@ static int ws_is_device_path(const wchar_t *norm)
     const wchar_t *base = wcsrchr(norm, L'\\');
     return ws_is_device_name(base ? base + 1 : norm);
 }
+/* ═══ R20 FOLLOW-UP（P0）：NT 命名空间 / Win32 设备别名 -> 普通 Win32 路径 ═══
+ *
+ * 现场（canonical R20 实测：`.lead/logs/file-shim/pathbypass-r20.log`）：原生用户模块
+ * 用 `\Device\HarddiskVolumeN\…` / `\??\Volume{GUID}\…` 调 NtCreateFile 时，
+ * `ws_nt_path_from_object()` 只认 `\??\X:\…` 与 `\??\UNC\…`，其余一律"透传" ⇒
+ *   ① 写意图绕过（R17：真实盘被写）；
+ *   ② 遮蔽读绕过（R18：设备路径读 `.npmrc` 得到明文）；
+ *   ③ `NtOpenFile(FILE_DELETE_ON_CLOSE)` 设备路径真实删除（R19 `del` 载体同族）。
+ * Win32 侧的 `\\?\GLOBALROOT\Device\…` / `\\.\X:` 是同一根因（`ws_normalize_path` 认不出）。
+ *
+ * 本 helper 把**可映射**的设备别名转成普通 Win32 路径，之后统一走现有管线
+ * （写 deny / 遮蔽 deny / 读 overlay / delete whiteout / 枚举过滤）。逐条覆盖：
+ *   `\Device\HarddiskVolumeN[\…]`            -> `X:[\…]`（QueryDosDevice 盘符缓存）
+ *   `\Device\Mup\server\share[\…]`           -> `\\server\share[\…]`
+ *   `\??\Volume{GUID}\…` / `\\?\Volume{GUID}\…` -> 挂载点 + rest（GetVolumePathNamesForVolumeNameW）
+ *   `\??\UNC\server\share[\…]`               -> `\\server\share[\…]`
+ *   `\??\X:\…` / `\DosDevices\X:\…`          -> `X:\…`（`\DosDevices` 是 `\??` 的对象管理器别名）
+ *   `\SystemRoot[\…]`                        -> `<WindowsDirectory>[\…]`（GetWindowsDirectoryW）
+ *   `\??\` / `\\?\` / `\\.\` + `GLOBALROOT\…` -> 剥掉 GLOBALROOT 后继续映射
+ *   `\\.\X:[\…]`                             -> `X:[\…]`
+ * **映射不了的**（`\\.\PhysicalDriveN`、`\Device\NamedPipe`、未知 `\Device\…`、相对名…）
+ * 返回 0，由调用方按「写/删一律 deny；mask 已声明时读也 deny」处理（见
+ * ws_NtCreateFile / ws_NtOpenFile / ws_NtQueryDirectoryFile），findings §6 逐条点名残余。 */
+typedef struct WsDriveDev {
+    wchar_t letter;
+    wchar_t canonical; /* R21: smallest letter bound to the same device (subst/duplicate drive) */
+    wchar_t device[WS_PATH_MAX];
+} WsDriveDev;
+static WsDriveDev g_driveDev[26];
+static INIT_ONCE g_driveDevOnce = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK ws_drive_dev_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once;
+    (void)param;
+    (void)ctx;
+    for (int i = 0; i < 26; i++) {
+        wchar_t drive[3];
+        drive[0] = (wchar_t)(L'A' + i);
+        drive[1] = L':';
+        drive[2] = 0;
+        WCHAR dev[WS_PATH_MAX];
+        DWORD n = QueryDosDeviceW(drive, dev, WS_PATH_MAX);
+        if (n > 0 && n < WS_PATH_MAX) {
+            g_driveDev[i].letter = drive[0];
+            g_driveDev[i].canonical = drive[0];
+            ws_strlcpy_w(g_driveDev[i].device, dev, WS_PATH_MAX);
+        }
+    }
+    /* R21: `subst Y: C:\x` gives Y: the SAME device as C:. Normalise the alias to
+     * the smallest letter of the volume so staging/mask keys cannot be split in
+     * two by two spellings of the same file. */
+    for (int i = 0; i < 26; i++) {
+        if (!g_driveDev[i].letter) {
+            continue;
+        }
+        for (int j = 0; j < i; j++) {
+            if (!g_driveDev[j].letter) {
+                continue;
+            }
+            if (ws_wcscmp_ci(g_driveDev[i].device, g_driveDev[j].device) == 0) {
+                g_driveDev[i].canonical = g_driveDev[j].canonical;
+                break;
+            }
+        }
+    }
+    return TRUE;
+}
+
+/* \\localhost\X$\rest / \\127.0.0.1\X$\rest / \\<本机名>\X$\rest -> X:\rest
+ * （R21：同一本地文件经管理共享 UNC 访问时，mask 与 staging 必须落在同一个键上） */
+static wchar_t g_computerName[64];
+static INIT_ONCE g_computerNameOnce = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK ws_computer_name_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once;
+    (void)param;
+    (void)ctx;
+    DWORD n = (DWORD)(sizeof(g_computerName) / sizeof(g_computerName[0]));
+    if (!GetComputerNameW(g_computerName, &n)) {
+        g_computerName[0] = 0;
+    }
+    return TRUE;
+}
+
+static int ws_local_admin_share(const wchar_t *p, wchar_t *out, DWORD cch)
+{
+    if (!p || p[0] != L'\\' || p[1] != L'\\') {
+        return 0;
+    }
+    const wchar_t *server = p + 2;
+    const wchar_t *slash = wcschr(server, L'\\');
+    if (!slash || slash == server) {
+        return 0;
+    }
+    size_t slen = (size_t)(slash - server);
+    int local = (slen == 9 && _wcsnicmp(server, L"localhost", 9) == 0) ||
+                (slen == 9 && _wcsnicmp(server, L"127.0.0.1", 9) == 0);
+    if (!local) {
+        InitOnceExecuteOnce(&g_computerNameOnce, ws_computer_name_init, NULL, NULL);
+        if (g_computerName[0] && wcslen(g_computerName) == slen &&
+            _wcsnicmp(server, g_computerName, (int)slen) == 0) {
+            local = 1;
+        }
+    }
+    if (!local) {
+        return 0;
+    }
+    const wchar_t *share = slash + 1;
+    if (!((share[0] >= L'A' && share[0] <= L'Z') || (share[0] >= L'a' && share[0] <= L'z')) ||
+        share[1] != L'$' || (share[2] != L'\\' && share[2] != 0)) {
+        return 0;
+    }
+    wchar_t letter = share[0];
+    if (letter >= L'a' && letter <= L'z') {
+        letter = (wchar_t)(letter - L'a' + L'A');
+    }
+    wchar_t driveBuf[3] = { letter, L':', 0 };
+    size_t opos = 0;
+    out[0] = 0;
+    return ws_append_w(out, cch, &opos, driveBuf) && ws_append_w(out, cch, &opos, share + 2);
+}
+
+/* Drive-letter alias (subst / duplicated letters) -> canonical letter. */
+static int ws_canonical_drive(const wchar_t *p, wchar_t *out, DWORD cch)
+{
+    if (!p || !((p[0] >= L'A' && p[0] <= L'Z') || (p[0] >= L'a' && p[0] <= L'z')) || p[1] != L':') {
+        return 0;
+    }
+    InitOnceExecuteOnce(&g_driveDevOnce, ws_drive_dev_init, NULL, NULL);
+    int idx = (p[0] >= L'a' && p[0] <= L'z') ? (int)(p[0] - L'a') : (int)(p[0] - L'A');
+    if (idx < 0 || idx >= 26 || !g_driveDev[idx].letter) {
+        return 0;
+    }
+    wchar_t upper = (p[0] >= L'a' && p[0] <= L'z') ? (wchar_t)(p[0] - L'a' + L'A') : p[0];
+    wchar_t canon = g_driveDev[idx].canonical ? g_driveDev[idx].canonical : g_driveDev[idx].letter;
+    if (canon != upper) {
+        wchar_t driveBuf[3] = { canon, L':', 0 };
+        size_t opos = 0;
+        out[0] = 0;
+        return ws_append_w(out, cch, &opos, driveBuf) && ws_append_w(out, cch, &opos, p + 2);
+    }
+    /* subst drive: QueryDosDeviceW("Y:") returns the symlink target in the
+     * `\\??\\C:\\target` form (NOT the device name like "\\Device\\HarddiskVolume4"),
+     * so the duplicate-device rule above cannot see it. Map `Y:\\rest` to the
+     * target path + `\\rest` so the same file cannot get two staging keys. */
+    const wchar_t *dev = g_driveDev[idx].device;
+    if (ws_starts_with_ci_w(dev, L"\\??\\")) {
+        dev += 4;
+    } else {
+        return 0;
+    }
+    if (!dev[0]) {
+        return 0;
+    }
+    int absDrive = ((dev[0] >= L'A' && dev[0] <= L'Z') || (dev[0] >= L'a' && dev[0] <= L'z')) &&
+                   dev[1] == L':' && (dev[2] == L'\\' || dev[2] == 0);
+    int absUnc = dev[0] == L'\\' && dev[1] == L'\\' && dev[2] && dev[2] != L'?' && dev[2] != L'.';
+    if (!absDrive && !absUnc) {
+        return 0;
+    }
+    size_t opos = 0;
+    out[0] = 0;
+    return ws_append_w(out, cch, &opos, dev) && ws_append_w(out, cch, &opos, p + 2);
+}
+
+/* 8.3 short name -> long name when the object exists (R21: `LONGFI~1.TXT` and
+ * `LongFileName-For-ShortName-Test.txt` must be the same staging key). */
+static int ws_long_name_of(const wchar_t *p, wchar_t *out, DWORD cch)
+{
+    if (!p || !wcschr(p, L'~')) {
+        return 0;
+    }
+    DWORD saved = GetLastError();
+    DWORD n = GetLongPathNameW(p, out, cch);
+    SetLastError(saved);
+    if (n == 0 || n >= cch) {
+        out[0] = 0;
+        return 0;
+    }
+    return ws_wcscmp_ci(out, p) != 0;
+}
+
+/* R21: canonicalise the Win32-alias spellings that the IAT hooks would otherwise
+ * treat as DIFFERENT files (split staging keys / split mask decisions):
+ *   `\\?\C:\…` / `\\?\UNC\…`  -> plain Win32 form
+ *   `\\localhost\C$\…` etc.   -> `C:\…`
+ *   `Y:\…` (subst)            -> canonical drive letter (`C:\…`)
+ *   `LONGFI~1.TXT`            -> long name when the object exists
+ * Returns 1 only when something changed; `out` is the canonical form then. */
+static int ws_canonical_aliases(const wchar_t *in, wchar_t *out, DWORD cch)
+{
+    if (!in || !in[0]) {
+        return 0;
+    }
+    int maybe = 0;
+    if (ws_starts_with_ci_w(in, L"\\\\?\\")) {
+        maybe = 1;
+    } else if (in[0] == L'\\' && in[1] == L'\\') {
+        maybe = 1;
+    } else if (((in[0] >= L'A' && in[0] <= L'Z') || (in[0] >= L'a' && in[0] <= L'z')) && in[1] == L':') {
+        maybe = 1;
+    }
+    if (!maybe && !wcschr(in, L'~')) {
+        return 0;
+    }
+    DWORD saved = GetLastError();
+    wchar_t cur[WS_PATH_MAX];
+    wchar_t tmp[WS_PATH_MAX];
+    ws_strlcpy_w(cur, in, WS_PATH_MAX);
+    int changed = 0;
+    if (ws_starts_with_ci_w(cur, L"\\\\?\\UNC\\")) {
+        size_t opos = 0;
+        tmp[0] = 0;
+        if (ws_append_w(tmp, WS_PATH_MAX, &opos, L"\\\\") && ws_append_w(tmp, WS_PATH_MAX, &opos, cur + 8)) {
+            ws_strlcpy_w(cur, tmp, WS_PATH_MAX);
+            changed = 1;
+        }
+    } else if (ws_starts_with_ci_w(cur, L"\\\\?\\")) {
+        ws_strlcpy_w(cur, cur + 4, WS_PATH_MAX);
+        changed = 1;
+    }
+    if (ws_local_admin_share(cur, tmp, WS_PATH_MAX)) {
+        ws_strlcpy_w(cur, tmp, WS_PATH_MAX);
+        changed = 1;
+    }
+    if (ws_canonical_drive(cur, tmp, WS_PATH_MAX)) {
+        ws_strlcpy_w(cur, tmp, WS_PATH_MAX);
+        changed = 1;
+    }
+    if (ws_long_name_of(cur, tmp, WS_PATH_MAX)) {
+        ws_strlcpy_w(cur, tmp, WS_PATH_MAX);
+        changed = 1;
+    }
+    SetLastError(saved);
+    if (!changed) {
+        out[0] = 0;
+        return 0;
+    }
+    ws_strlcpy_w(out, cur, cch);
+    return 1;
+}
+
+/* `Volume{GUID}[\rest]` -> mount-point + rest. */
+static int ws_try_volume_guid(const wchar_t *p, wchar_t *out, DWORD cch)
+{
+    if (!ws_starts_with_ci_w(p, L"Volume{")) {
+        return 0;
+    }
+    const wchar_t *close = wcschr(p, L'}');
+    if (!close) {
+        return 0;
+    }
+    if (close[1] != L'\\' && close[1] != 0) {
+        return 0;
+    }
+    wchar_t volName[WS_PATH_MAX];
+    size_t pos = 0;
+    volName[0] = 0;
+    if (!ws_append_w(volName, WS_PATH_MAX, &pos, L"\\\\?\\")) {
+        return 0;
+    }
+    size_t guidLen = (size_t)(close - p) + 1;
+    if (pos + guidLen + 2 >= WS_PATH_MAX) {
+        return 0;
+    }
+    memcpy(volName + pos, p, guidLen * sizeof(wchar_t));
+    pos += guidLen;
+    volName[pos++] = L'\\';
+    volName[pos] = 0;
+    wchar_t paths[WS_PATH_MAX];
+    DWORD plen = 0;
+    if (!GetVolumePathNamesForVolumeNameW(volName, paths, WS_PATH_MAX, &plen)) {
+        return 0;
+    }
+    if (!paths[0]) {
+        return 0;
+    }
+    wchar_t mount[WS_PATH_MAX];
+    ws_strlcpy_w(mount, paths, WS_PATH_MAX);
+    size_t mlen = wcslen(mount);
+    if (mlen > 1 && mount[mlen - 1] == L'\\') {
+        mount[mlen - 1] = 0;
+    }
+    size_t opos = 0;
+    if (!ws_append_w(out, cch, &opos, mount)) {
+        return 0;
+    }
+    return ws_append_w(out, cch, &opos, close + 1);
+}
+
+/* 1 = mapped to a normal Win32 path. Never touches the caller's last error. */
+static int ws_nt_device_to_win(const wchar_t *nt, wchar_t *out, DWORD cch)
+{
+    DWORD saved = GetLastError();
+    int ok = 0;
+    out[0] = 0;
+    if (nt && nt[0]) {
+        const wchar_t *p = nt;
+        /* peel GLOBALROOT namespace prefixes: \\?\ / \\.\ / \??\ + GLOBALROOT */
+        if (ws_starts_with_ci_w(p, L"\\\\?\\GLOBALROOT") || ws_starts_with_ci_w(p, L"\\\\.\\GLOBALROOT") ||
+            ws_starts_with_ci_w(p, L"\\??\\GLOBALROOT")) {
+            p += 14; /* namespace prefix (4 chars) + "GLOBALROOT" (10) */
+        }
+        /* \??\ / \DosDevices\ / \GLOBAL??\ : the same object-manager dos-devices
+         * namespace under its other aliases (attacker can spell the same volume
+         * three ways). */
+        const wchar_t *tail = NULL;
+        if (ws_starts_with_ci_w(p, L"\\??\\")) {
+            tail = p + 4;
+        } else if (ws_starts_with_ci_w(p, L"\\DosDevices\\")) {
+            tail = p + 12;
+        } else if (ws_starts_with_ci_w(p, L"\\GLOBAL??\\")) {
+            tail = p + 10;
+        }
+        if (tail) {
+            if (ws_starts_with_ci_w(tail, L"Volume{")) {
+                p = tail;
+            } else if (ws_starts_with_ci_w(tail, L"UNC\\")) {
+                size_t opos = 0;
+                ok = ws_append_w(out, cch, &opos, L"\\\\") && ws_append_w(out, cch, &opos, tail + 4);
+                SetLastError(saved);
+                return ok;
+            } else if (((tail[0] >= L'A' && tail[0] <= L'Z') || (tail[0] >= L'a' && tail[0] <= L'z')) &&
+                       tail[1] == L':' && (tail[2] == L'\\' || tail[2] == 0)) {
+                size_t opos = 0;
+                ok = ws_append_w(out, cch, &opos, tail);
+                SetLastError(saved);
+                return ok;
+            } else {
+                p = tail; /* e.g. \??\GLOBALROOT already peeled; fall through */
+            }
+        }
+        if (ws_starts_with_ci_w(p, L"\\\\?\\Volume{")) {
+            p += 4;
+        }
+        if (ws_starts_with_ci_w(p, L"Volume{")) {
+            ok = ws_try_volume_guid(p, out, cch);
+            SetLastError(saved);
+            return ok;
+        }
+        if (ws_starts_with_ci_w(p, L"\\SystemRoot")) {
+            wchar_t winDir[WS_PATH_MAX];
+            UINT n = GetWindowsDirectoryW(winDir, WS_PATH_MAX);
+            if (n > 0 && n < WS_PATH_MAX) {
+                size_t opos = 0;
+                ok = ws_append_w(out, cch, &opos, winDir) && ws_append_w(out, cch, &opos, p + 11);
+            }
+            SetLastError(saved);
+            return ok;
+        }
+        if (ws_starts_with_ci_w(p, L"\\Device\\Mup\\")) {
+            size_t opos = 0;
+            ok = ws_append_w(out, cch, &opos, L"\\\\") && ws_append_w(out, cch, &opos, p + 12);
+            SetLastError(saved);
+            return ok;
+        }
+        if (ws_starts_with_ci_w(p, L"\\Device\\")) {
+            InitOnceExecuteOnce(&g_driveDevOnce, ws_drive_dev_init, NULL, NULL);
+            for (int i = 0; i < 26; i++) {
+                if (!g_driveDev[i].letter) {
+                    continue;
+                }
+                size_t dl = wcslen(g_driveDev[i].device);
+                if (dl && ws_starts_with_ci_w(p, g_driveDev[i].device) &&
+                    (p[dl] == L'\\' || p[dl] == 0)) {
+                    wchar_t letterBuf[3] = { g_driveDev[i].letter, L':', 0 };
+                    size_t opos = 0;
+                    ok = ws_append_w(out, cch, &opos, letterBuf) && ws_append_w(out, cch, &opos, p + dl);
+                    break;
+                }
+            }
+            SetLastError(saved);
+            return ok;
+        }
+        if (ws_starts_with_ci_w(p, L"\\\\.\\") &&
+            ((p[4] >= L'A' && p[4] <= L'Z') || (p[4] >= L'a' && p[4] <= L'z')) && p[5] == L':' &&
+            (p[6] == L'\\' || p[6] == 0)) {
+            size_t opos = 0;
+            ok = ws_append_w(out, cch, &opos, p + 4);
+            SetLastError(saved);
+            return ok;
+        }
+    }
+    SetLastError(saved);
+    return 0;
+}
+
+/* Cheap prefix test: is this one of the namespaces the mapper handles? Used to
+ * decide "unmapped device alias => fail closed (write/delete) instead of guessing". */
+static int ws_is_nt_alias(const wchar_t *p)
+{
+    return p && p[0] && (ws_starts_with_ci_w(p, L"\\Device\\") || ws_starts_with_ci_w(p, L"\\??\\") ||
+                         ws_starts_with_ci_w(p, L"\\\\?\\") || ws_starts_with_ci_w(p, L"\\\\.\\") ||
+                         ws_starts_with_ci_w(p, L"\\DosDevices\\") || ws_starts_with_ci_w(p, L"\\GLOBAL??\\") ||
+                         ws_starts_with_ci_w(p, L"\\SystemRoot") || ws_starts_with_ci_w(p, L"Volume{"));
+}
+
+/* Same cheap prefix test on an OBJECT_ATTRIBUTES name (no NUL assumption). */
+static int ws_is_nt_alias_oa(POBJECT_ATTRIBUTES oa)
+{
+    if (!oa || !oa->ObjectName || !oa->ObjectName->Buffer || oa->ObjectName->Length == 0) {
+        return 0;
+    }
+    const UNICODE_STRING *us = oa->ObjectName;
+    if (us->Length > (ULONG)((WS_PATH_MAX - 1) * sizeof(wchar_t))) {
+        return 1;
+    }
+    wchar_t nz[WS_PATH_MAX];
+    size_t n = (size_t)(us->Length / sizeof(wchar_t));
+    memcpy(nz, us->Buffer, n * sizeof(wchar_t));
+    nz[n] = 0;
+    return ws_is_nt_alias(nz);
+}
+
+/* Map when possible. Returns 1 when `out` holds a mapped Win32 path (callers
+ * only use `out` on 1); 0 means "leave the caller's path untouched". Hot path:
+ * every CreateFileW/open hook calls this, so an unmapped path must not pay a
+ * WS_PATH_MAX copy. LastError-transparent. */
+static int ws_path_effective(const wchar_t *in, wchar_t *out, DWORD cch)
+{
+    DWORD saved = GetLastError();
+    out[0] = 0;
+    if (!in || !in[0]) {
+        SetLastError(saved);
+        return 0;
+    }
+    wchar_t stage1[WS_PATH_MAX];
+    wchar_t stage2[WS_PATH_MAX];
+    const wchar_t *cur = in;
+    int changed = 0;
+    if (ws_nt_device_to_win(cur, stage1, WS_PATH_MAX)) {
+        cur = stage1;
+        changed = 1;
+    }
+    if (ws_canonical_aliases(cur, stage2, WS_PATH_MAX)) {
+        cur = stage2;
+        changed = 1;
+    }
+    if (changed) {
+        ws_strlcpy_w(out, cur, cch);
+    }
+    SetLastError(saved);
+    return changed;
+}
+
 /* Prefix test for the staging root / passthrough entries: the prefix must end at
  * a path separator, otherwise a real file whose name merely STARTS WITH the
  * staging root (e.g. stage root "C:\s\stage" and file "C:\s\stage-report.txt")
@@ -114,19 +570,41 @@ static int ws_should_intercept(const wchar_t *path, wchar_t *norm, DWORD cch)
         SetLastError(ws_saved_last_error);
         return 0;
     }
+    /* R20 FOLLOW-UP（P0）：先剥 NT 命名空间/设备别名（\Device\…、\??\Volume{GUID}\…、
+     * \\?\GLOBALROOT\Device\…、\\.\X: …），否则下面会把它们当"设备/相对路径"放行，
+     * 使写遮蔽/读遮蔽/delete 全部绕过。映射不了的名字保持原样 → 后面的
+     * ws_is_device_path() 照旧放行（残余逐条登记，见 helper 注释）。 */
+    wchar_t eff[WS_PATH_MAX];
+    const wchar_t *effPath = path;
+    if (ws_path_effective(path, eff, WS_PATH_MAX)) {
+        effPath = eff;
+    }
     /* Device/console names first, and on the raw string: GetFullPathNameW would
      * happily turn "CONOUT$" into "<cwd>\CONOUT$". */
     wchar_t probe[WS_PATH_MAX];
-    if (ws_normalize_path(path, probe, WS_PATH_MAX) && ws_is_device_path(probe)) {
+    if (ws_normalize_path(effPath, probe, WS_PATH_MAX) && ws_is_device_path(probe)) {
         SetLastError(ws_saved_last_error);
         return 0;
     }
     /* Relative paths are resolved against the process CWD before staging, so a
      * relative write is staged instead of silently reaching the real disk. */
     wchar_t full[WS_PATH_MAX];
-    if (!GetFullPathNameW(path, WS_PATH_MAX, full, NULL)) {
-        SetLastError(ws_saved_last_error);
-        return 0;
+    if (!GetFullPathNameW(effPath, WS_PATH_MAX, full, NULL)) {
+        /* R21：`ws_path_effective()` 会剥掉 `\\?\` 前缀；对于 >MAX_PATH 的路径，
+         * 不带前缀的 GetFullPathNameW 会失败（本机 LongPathsEnabled=0）。此前这
+         * 直接 return 0 ⇒ 读透传被破坏（gate-runner S2：注入后读长路径文件 ERR=3），
+         * 更糟的是写意图也会落进"放行"分支。这里用**调用方原始路径**重试一次
+         * （原始路径通常带 `\\?\`），拿到绝对路径后照常归一化 ⇒ 继续走暂存/遮蔽
+         * 管线；写意图仍由 provider 的暂存失败 fail-closed。 */
+        if (effPath != path) {
+            if (!GetFullPathNameW(path, WS_PATH_MAX, full, NULL)) {
+                SetLastError(ws_saved_last_error);
+                return 0;
+            }
+        } else {
+            SetLastError(ws_saved_last_error);
+            return 0;
+        }
     }
     if (!ws_normalize_path(full, norm, cch)) {
         SetLastError(ws_saved_last_error);
@@ -158,21 +636,50 @@ static int ws_resolve_file(const wchar_t *norm, uint32_t intent, wchar_t *out, u
     return g_wsStage.file_resolve(norm, intent, out, WS_PATH_MAX, flags);
 }
 
+/* ── R21：>MAX_PATH 的真实 API 前缀（本机 LongPathsEnabled=0）───────────────
+ * 归一化后的路径是普通 Win32 形式；仅当长度需要扩展前缀时才加 `\\?\` /
+ * `\\?\UNC\`。只在**真实 API 边界**使用（provider 仍按普通路径映射暂存树）。 */
+static const wchar_t *ws_api_path(const wchar_t *in, wchar_t *buf, DWORD cch)
+{
+    if (!in || !in[0] || !buf) {
+        return in;
+    }
+    size_t n = wcslen(in);
+    if (n < 248 || ws_starts_with_ci_w(in, L"\\\\?\\")) {
+        return in;
+    }
+    size_t pos = 0;
+    buf[0] = 0;
+    if (in[0] == L'\\' && in[1] == L'\\') {
+        if (!(ws_append_w(buf, cch, &pos, L"\\\\?\\UNC\\") && ws_append_w(buf, cch, &pos, in + 2))) {
+            return in;
+        }
+    } else if (!(ws_append_w(buf, cch, &pos, L"\\\\?\\") && ws_append_w(buf, cch, &pos, in))) {
+        return in;
+    }
+    return buf;
+}
+
 /* Real-API accessors for the stat family. These MUST NOT re-enter the hooks:
  * they are used by ws_file_exists() (a CoW/whiteout decision about the REAL
  * file) and as the tail of the overlay-aware wrappers. The captured original is
  * preferred; the plain call is only reached before ws_hook_init captured the
  * originals (nothing is patched yet) or if a capture ever failed, and our own
- * module's import table is never patched, so it still reaches the real API. */
+ * module's import table is never patched, so it still reaches the real API.
+ * R21: >MAX_PATH 的真实文件需要扩展前缀，否则 stat 会误报不存在（读透传因此断）。 */
 static DWORD ws_real_attrs_w(const wchar_t *path)
 {
-    return g_orig.GetFileAttributesW ? g_orig.GetFileAttributesW(path) : GetFileAttributesW(path);
+    wchar_t apiBuf[WS_PATH_MAX];
+    const wchar_t *p = ws_api_path(path, apiBuf, WS_PATH_MAX);
+    return g_orig.GetFileAttributesW ? g_orig.GetFileAttributesW(p) : GetFileAttributesW(p);
 }
 
 static BOOL ws_real_attrs_ex_w(const wchar_t *path, GET_FILEEX_INFO_LEVELS level, LPVOID info)
 {
-    return g_orig.GetFileAttributesExW ? g_orig.GetFileAttributesExW(path, level, info)
-                                       : GetFileAttributesExW(path, level, info);
+    wchar_t apiBuf[WS_PATH_MAX];
+    const wchar_t *p = ws_api_path(path, apiBuf, WS_PATH_MAX);
+    return g_orig.GetFileAttributesExW ? g_orig.GetFileAttributesExW(p, level, info)
+                                       : GetFileAttributesExW(p, level, info);
 }
 
 /* ★ WP13（B7）：这是每次 CreateFile / Delete / Move / SetFileAttributes 都会跑的
@@ -201,6 +708,18 @@ static void ws_a2w_buf(const char *in, wchar_t *out, DWORD cch)
 #define WS_FILE_WRITE_ACCESS_MASK \
     (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | \
      FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD)
+
+/* ── R19-A1：**读边界位**（mask 判定用；Lead 拍板语义，见 ws_create_file_core 的 mask 段）
+ *
+ * mask 的语义是**读边界**，不是"禁止一切访问"：
+ *   · desiredAccess 命中本掩码（GENERIC_READ / FILE_READ_DATA / GENERIC_ALL / MAXIMUM_ALLOWED）
+ *     ⇒ 这是"读内容"意图 ⇒ ERROR_ACCESS_DENIED（`r+` = GENERIC_READ|GENERIC_WRITE 也命中，
+ *     `MemoryMappedFile` / `[IO.File]::Open(...,'ReadWrite')` 同理）；
+ *   · **纯写意图**（不含上述读位）⇒ 允许进暂存，但**绝不做 CoW copy-up**
+ *     （不把真实明文搬进 overlay；否则写意图 open 之后用同一 handle 读，就能读到明文 ——
+ *      R19 实测：`fs.openSync(masked,'r+')` + `readSync` 直接输出 marker）。
+ * 这条区分是刻意的：不把"写敏感文件"整体封死，同时消灭"明文进暂存/被读回"的泄露面。 */
+#define WS_FILE_READ_ACCESS_MASK (GENERIC_READ | GENERIC_ALL | MAXIMUM_ALLOWED | FILE_READ_DATA)
 
 static uint32_t ws_intent_of_create(DWORD access, DWORD disposition)
 {
@@ -461,7 +980,1414 @@ BOOL WINAPI ws_SetFileInformationByHandle(HANDLE hFile, FILE_INFO_BY_HANDLE_CLAS
     return g_orig.SetFileInformationByHandle(hFile, FileInformationClass, lpFileInformation, dwBufferSize);
 }
 
+/* ======================================================================== *
+ *  R20 file-side hooks (R17 / R18 / R19)
+ *
+ *  R19 measured three file-side boundary holes that the IAT point-hook could
+ *  not see because the names were absent from WS_TARGET:
+ *    R18  hardlink alias: `mklink /H harmless.txt .npmrc` then reading the
+ *         normal name returned the plaintext (the mask is a PATH blacklist);
+ *    R19  directory enumeration leaked the masked file NAME/SIZE/TIME via
+ *         cmd dir / Get-ChildItem / node readdir (FindFirstFile* was unhooked);
+ *    R17  ReplaceFileW / NtCreateFile / CreateHardLink wrote the REAL disk.
+ *
+ *  Safety invariant for every hook below: the REAL system is never written.
+ *  When the shim cannot stage / answer exactly, the call fails closed with
+ *  ERROR_ACCESS_DENIED (Win32) or STATUS_ACCESS_DENIED (NTSTATUS), and the
+ *  reason is logged. Read paths are the exception: an ordinary read that the
+ *  mask does not deny is passed through, because breaking read semantics would
+ *  kill every injected carrier (PowerShell/CLR/node).
+ * ======================================================================== */
+
+/* Implemented further down in this file (used by the R18/R17 helpers above the
+ * main hook bodies): handle -> normalized path, staged path -> logical path. */
+static int ws_path_of_handle(HANDLE h, wchar_t *out, DWORD cch);
+static int ws_logical_from_staged(const wchar_t *norm, wchar_t *out, DWORD cch);
+/* R21: whiteout->recreate helpers (defined further down, used by the hardlink
+ * staging block above create_file_core). */
+static int ws_logically_whiteouted(const wchar_t *norm);
+static void ws_clear_whiteout(const wchar_t *norm);
+
+/* ---------------------------------------------------------------- R18 ---- */
+/* Thread-local guard for the hardlink enumeration itself.
+ * `FindFirstFileNameW` opens the file internally; kernelbase's CreateFileW is
+ * one of the IATs the hook engine patches, so that internal open CAN re-enter
+ * ws_CreateFileW. While this flag is set the read/copy-up hardlink guards are
+ * skipped, which makes that re-entry a bounded, single-level pass-through
+ * instead of unbounded recursion. */
+static _Thread_local int t_hlGuard;
+
+/* "\Users\x" (volume-relative, FindFirstFileNameW form) -> "C:\Users\x". */
+static int ws_path_from_volume_relative(const wchar_t *basePath, const wchar_t *volRel, wchar_t *out, DWORD cch)
+{
+    wchar_t volRoot[WS_PATH_MAX];
+    out[0] = 0;
+    if (!basePath || !basePath[0] || !volRel || !volRel[0]) {
+        return 0;
+    }
+    if (!GetVolumePathNameW(basePath, volRoot, WS_PATH_MAX)) {
+        return 0;
+    }
+    size_t n = wcslen(volRoot);
+    /* drive root "C:\" -> "C:" so that "\Users" joins to "C:\Users" */
+    if (n > 1 && volRoot[n - 1] == L'\\') {
+        volRoot[n - 1] = 0;
+    }
+    size_t pos = 0;
+    return ws_append_w(out, cch, &pos, volRoot) && ws_append_w(out, cch, &pos, volRel);
+}
+
+/* 1 = deny (a link name matches the read mask), 0 = allow,
+ * -1 = the file has >1 link but its names cannot be enumerated (fail closed). */
+static int ws_hardlink_alias_check_handle(HANDLE h, const wchar_t *path, wchar_t *outRule, DWORD outRuleCch)
+{
+    if (outRule && outRuleCch) {
+        outRule[0] = 0;
+    }
+    if (!ws_mask_declared() || t_hlGuard || !h || h == INVALID_HANDLE_VALUE || !path || !path[0]) {
+        return 0;
+    }
+    BY_HANDLE_FILE_INFORMATION bi;
+    BOOL ok = g_orig.GetFileInformationByHandle ? g_orig.GetFileInformationByHandle(h, &bi)
+                                                : GetFileInformationByHandle(h, &bi);
+    if (!ok) {
+        return 0; /* cannot even read the link count: leave the call alone */
+    }
+    if (bi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        return 0; /* directory link counts are not "hardlinks" */
+    }
+    if (bi.nNumberOfLinks <= 1) {
+        return 0; /* the precise, cheap case: no aliases possible */
+    }
+    DWORD len = WS_PATH_MAX;
+    wchar_t linkName[WS_PATH_MAX];
+    linkName[0] = 0;
+    t_hlGuard++;
+    HANDLE f = FindFirstFileNameW(path, 0, &len, linkName);
+    if (f == INVALID_HANDLE_VALUE) {
+        t_hlGuard--;
+        ws_log_w(L"read-deny: multi-link file but hardlink enumeration failed (fail-closed)", path);
+        if (outRule && outRuleCch) {
+            ws_strlcpy_w(outRule, L"<hardlink-enum-failed>", outRuleCch);
+        }
+        return -1;
+    }
+    int deny = 0;
+    for (;;) {
+        wchar_t full[WS_PATH_MAX];
+        wchar_t rule[256];
+        if (ws_path_from_volume_relative(path, linkName, full, WS_PATH_MAX) &&
+            ws_mask_decide_read(full, rule, 256)) {
+            deny = 1;
+            if (outRule && outRuleCch) {
+                ws_strlcpy_w(outRule, rule, outRuleCch);
+            }
+            ws_log_w(L"read-deny: hardlink alias matches read mask", full);
+            break;
+        }
+        DWORD len2 = WS_PATH_MAX;
+        if (!FindNextFileNameW(f, &len2, linkName)) {
+            break;
+        }
+    }
+    if (!FindClose(f)) { /* nothing sensible to do on close failure */ }
+    t_hlGuard--;
+    return deny;
+}
+
+/* Same guard for a path: opens the REAL file (captured original, never the
+ * hook) with zero-desired-access, checks, closes. Used by paths that so far
+ * have no handle (copy-up / CopyFile / move materialize). */
+static int ws_path_hardlink_alias_masked(const wchar_t *realPath, wchar_t *outRule, DWORD outRuleCch)
+{
+    if (outRule && outRuleCch) {
+        outRule[0] = 0;
+    }
+    if (!ws_mask_declared() || t_hlGuard || !realPath || !realPath[0] || !g_orig.CreateFileW) {
+        return 0;
+    }
+    HANDLE h = g_orig.CreateFileW(realPath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    int r = ws_hardlink_alias_check_handle(h, realPath, outRule, outRuleCch);
+    if (g_orig.CloseHandle) {
+        g_orig.CloseHandle(h);
+    }
+    return r;
+}
+
+/* ---------------------------------------------------------------- R19 ---- */
+/* Directory-enumeration filter. FindFirstFile* returns the first entry; if it
+ * is masked we walk FindNextFile* until a visible entry or the end, then hand
+ * the caller a handle whose next entry (and all following ones) are filtered
+ * the same way. The directory behind each live handle is kept in a small
+ * side table so FindNextFile* can rebuild "dir\name" and re-run the SAME mask
+ * decision the read/open hooks use; FindClose drops the entry. */
+#define WS_FIND_MAX_TRACKED 128
+typedef struct WsFindEntry {
+    HANDLE handle;
+    wchar_t dir[WS_PATH_MAX];
+} WsFindEntry;
+
+static WsFindEntry g_findTracked[WS_FIND_MAX_TRACKED];
+static WsLock g_findLock;
+static INIT_ONCE g_findOnce = INIT_ONCE_STATIC_INIT;
+static volatile LONG g_findTrackedCount;
+static volatile LONG g_findTableFullLogged;
+
+static BOOL CALLBACK ws_find_lock_once(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once;
+    (void)param;
+    (void)ctx;
+    ws_lock_init(&g_findLock, "find");
+    return TRUE;
+}
+static void ws_find_ready(void)
+{
+    InitOnceExecuteOnce(&g_findOnce, ws_find_lock_once, NULL, NULL);
+}
+
+static void ws_find_register(HANDLE h, const wchar_t *dir)
+{
+    if (!h || h == INVALID_HANDLE_VALUE || !dir || !dir[0]) {
+        return;
+    }
+    ws_find_ready();
+    ws_lock_enter(&g_findLock);
+    for (int i = 0; i < WS_FIND_MAX_TRACKED; i++) {
+        if (!g_findTracked[i].handle) {
+            g_findTracked[i].handle = h;
+            ws_strlcpy_w(g_findTracked[i].dir, dir, WS_PATH_MAX);
+            InterlockedIncrement(&g_findTrackedCount);
+            ws_lock_leave(&g_findLock);
+            return;
+        }
+    }
+    ws_lock_leave(&g_findLock);
+    if (InterlockedExchange(&g_findTableFullLogged, 1) == 0) {
+        ws_log("find filter table full (%d); enumeration of the newest handle is NOT filtered", WS_FIND_MAX_TRACKED);
+    }
+}
+
+static int ws_find_lookup(HANDLE h, wchar_t *dir, DWORD cch)
+{
+    if (!h || h == INVALID_HANDLE_VALUE || InterlockedCompareExchange(&g_findTrackedCount, 0, 0) == 0) {
+        return 0;
+    }
+    int found = 0;
+    ws_find_ready();
+    ws_lock_enter(&g_findLock);
+    for (int i = 0; i < WS_FIND_MAX_TRACKED; i++) {
+        if (g_findTracked[i].handle == h) {
+            ws_strlcpy_w(dir, g_findTracked[i].dir, cch);
+            found = 1;
+            break;
+        }
+    }
+    ws_lock_leave(&g_findLock);
+    return found;
+}
+
+static void ws_find_unregister(HANDLE h)
+{
+    if (!h || h == INVALID_HANDLE_VALUE || InterlockedCompareExchange(&g_findTrackedCount, 0, 0) == 0) {
+        return;
+    }
+    ws_find_ready();
+    ws_lock_enter(&g_findLock);
+    for (int i = 0; i < WS_FIND_MAX_TRACKED; i++) {
+        if (g_findTracked[i].handle == h) {
+            memset(&g_findTracked[i], 0, sizeof(g_findTracked[i]));
+            InterlockedDecrement(&g_findTrackedCount);
+            break;
+        }
+    }
+    ws_lock_leave(&g_findLock);
+}
+
+static BOOL ws_find_orig_close(HANDLE h)
+{
+    return g_orig.FindClose ? g_orig.FindClose(h) : FindClose(h);
+}
+
+/* Directory part of a find pattern, normalized. Returns 0 when this pattern is
+ * not filtered (mask undeclared, out-of-scope stage/passthrough tree, no
+ * directory component, or a wildcard in the DIRECTORY component: rebuilding
+ * "dir\name" would then be a guess, so filtering is skipped and the caller
+ * keeps the real API's answer). */
+static int ws_find_dir_of_pattern_w(const wchar_t *pattern, wchar_t *dir, DWORD cch)
+{
+    wchar_t full[WS_PATH_MAX];
+    wchar_t norm[WS_PATH_MAX];
+    dir[0] = 0;
+    if (!ws_mask_declared() || !pattern || !pattern[0]) {
+        return 0;
+    }
+    DWORD err = GetLastError();
+    DWORD n = GetFullPathNameW(pattern, WS_PATH_MAX, full, NULL);
+    SetLastError(err);
+    if (n == 0 || n >= WS_PATH_MAX) {
+        return 0;
+    }
+    if (!ws_normalize_path(full, norm, WS_PATH_MAX)) {
+        return 0;
+    }
+    if (g_ws.haveStageRoot) {
+        if (ws_under_prefix(norm, g_ws.stageRoot)) {
+            return 0;
+        }
+        for (int i = 0; i < g_ws.passthroughCount; i++) {
+            if (ws_under_prefix(norm, g_ws.passthrough[i])) {
+                return 0;
+            }
+        }
+    }
+    const wchar_t *last = wcsrchr(norm, L'\\');
+    if (!last || last == norm) {
+        return 0; /* no directory component ("*" / "\*") or drive-less name */
+    }
+    size_t nDir = (size_t)(last - norm);
+    if (nDir + 1 > cch) {
+        return 0;
+    }
+    wchar_t cand[WS_PATH_MAX];
+    memcpy(cand, norm, nDir * sizeof(wchar_t));
+    cand[nDir] = 0;
+    if (wcschr(cand, L'*') || wcschr(cand, L'?')) {
+        return 0;
+    }
+    ws_strlcpy_w(dir, cand, cch);
+    return 1;
+}
+
+/* Does "dir\name" (the entry the real API just returned) match a read-mask
+ * rule? Overflow => deny (never leak an entry because a path was too long). */
+static int ws_find_entry_masked(const wchar_t *dir, const wchar_t *name, wchar_t *outRule, DWORD outRuleCch)
+{
+    wchar_t full[WS_PATH_MAX];
+    size_t pos = 0;
+    full[0] = 0;
+    if (!ws_append_w(full, WS_PATH_MAX, &pos, dir)) {
+        return 1;
+    }
+    if (!(pos > 0 && full[pos - 1] == L'\\')) {
+        if (!ws_append_w(full, WS_PATH_MAX, &pos, L"\\")) {
+            return 1;
+        }
+    }
+    if (!ws_append_w(full, WS_PATH_MAX, &pos, name)) {
+        return 1;
+    }
+    return ws_mask_decide_read(full, outRule, outRuleCch);
+}
+
+/* ---------------------------------------------------------------- R17 ---- */
+/* R17 CreateHardLink: staging semantics.
+ *
+ * A hardlink is a WRITE (a new directory entry / link count). Doing it on the
+ * real disk while sandboxed violates the staging invariant, and the link can
+ * also alias a masked file (R18). Policy:
+ *   · source or destination masked           -> fail closed (ERROR_ACCESS_DENIED);
+ *   · source file has a masked hardlink alias -> fail closed (precise R18 rule);
+ *   · otherwise both sides are moved into the overlay: the real source content
+ *     is materialized under the staging tree when needed, then the link is
+ *     created between the two STAGED paths (no real disk write at all).
+ * Result is an NTSTATUS so NtSetInformationFile(FileLinkInformation) can share
+ * the same core. */
+#define WS_R20_STATUS_OBJECT_NAME_COLLISION ((NTSTATUS)0xC0000035L)
+#define WS_R20_STATUS_OBJECT_NAME_NOT_FOUND ((NTSTATUS)0xC0000034L)
+#define WS_R20_STATUS_ACCESS_DENIED        ((NTSTATUS)0xC0000022L)
+#define WS_R20_STATUS_NOT_SUPPORTED        ((NTSTATUS)0xC00000BBL)
+#define WS_R20_STATUS_INVALID_PARAMETER    ((NTSTATUS)0xC000000DL)
+
+static NTSTATUS ws_hardlink_stage(const wchar_t *srcNorm, const wchar_t *dstNorm, int replaceIfExists)
+{
+    wchar_t stagedSrc[WS_PATH_MAX];
+    wchar_t stagedDst[WS_PATH_MAX];
+    uint32_t fSrc = 0;
+    uint32_t fDst = 0;
+    if (ws_mask_declared()) {
+        wchar_t rule[256];
+        if (ws_mask_decide_read(srcNorm, rule, 256)) {
+            ws_log_w(L"fail-closed CreateHardLink: masked source", srcNorm);
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+        if (ws_mask_decide_read(dstNorm, rule, 256)) {
+            ws_log_w(L"fail-closed CreateHardLink: masked destination", dstNorm);
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+        if (ws_path_hardlink_alias_masked(srcNorm, rule, 256) != 0) {
+            ws_log_w(L"fail-closed CreateHardLink: source has a masked hardlink alias", srcNorm);
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+    }
+    if (ws_resolve_file(srcNorm, WINSTAGE_IO_READ, stagedSrc, &fSrc) != 0) {
+        return WS_R20_STATUS_ACCESS_DENIED;
+    }
+    if (fSrc & WINSTAGE_RES_WHITEOUT) {
+        return WS_R20_STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    if (ws_resolve_file(dstNorm, WINSTAGE_IO_WRITE, stagedDst, &fDst) != 0) {
+        return WS_R20_STATUS_ACCESS_DENIED;
+    }
+    int srcStaged = (fSrc & WINSTAGE_RES_STAGED) != 0;
+    int dstStagedExists = ws_file_exists(stagedDst);
+    int dstRealExists = ws_file_exists(dstNorm);
+    if (replaceIfExists) {
+        if (dstStagedExists) {
+            t_wsFileBusy++;
+            if (g_orig.DeleteFileW) g_orig.DeleteFileW(stagedDst);
+            t_wsFileBusy--;
+        }
+    } else if (dstStagedExists || dstRealExists) {
+        return WS_R20_STATUS_OBJECT_NAME_COLLISION;
+    }
+    wchar_t linkSource[WS_PATH_MAX];
+    if (srcStaged) {
+        ws_strlcpy_w(linkSource, stagedSrc, WS_PATH_MAX);
+    } else {
+        if (!ws_file_exists(srcNorm)) {
+            return WS_R20_STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        if (!ws_ensure_dirs(stagedSrc, 0)) {
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+        if (!ws_file_exists(stagedSrc)) {
+            /* materialize into the overlay so the link is a link between two
+             * STAGED names: the real file's link count / directory is untouched */
+            t_wsFileBusy++;
+            BOOL copied = g_orig.CopyFileW ? g_orig.CopyFileW(srcNorm, stagedSrc, FALSE) : FALSE;
+            t_wsFileBusy--;
+            if (!copied) {
+                ws_log_w(L"fail-closed CreateHardLink (source materialize failed)", srcNorm);
+                return WS_R20_STATUS_ACCESS_DENIED;
+            }
+        }
+        ws_strlcpy_w(linkSource, stagedSrc, WS_PATH_MAX);
+    }
+    if (!g_orig.CreateHardLinkW) {
+        return WS_R20_STATUS_NOT_SUPPORTED;
+    }
+    t_wsFileBusy++; /* kernelbase's CreateHardLinkW reaches NtSetInformationFile internally */
+    BOOL ok = g_orig.CreateHardLinkW(stagedDst, linkSource, NULL);
+    DWORD err = GetLastError();
+    t_wsFileBusy--;
+    if (!ok) {
+        switch (err) {
+        case ERROR_FILE_EXISTS:
+        case ERROR_ALREADY_EXISTS:
+            return WS_R20_STATUS_OBJECT_NAME_COLLISION;
+        case ERROR_FILE_NOT_FOUND:
+            return WS_R20_STATUS_OBJECT_NAME_NOT_FOUND;
+        default:
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+    }
+    ws_clear_whiteout(dstNorm); /* R21: linking onto a logically-deleted path recreates it */
+    ws_log_w(L"CreateHardLink staged", stagedDst);
+    return 0;
+}
+
+/* Win32 wrapper body for both the ANSI/WIDE entry points. */
+static BOOL ws_create_hardlink_core(LPCWSTR link, LPCWSTR existing)
+{
+    wchar_t normLink[WS_PATH_MAX];
+    wchar_t normExisting[WS_PATH_MAX];
+    if (!link || !link[0] || !existing || !existing[0]) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    int iLink = ws_should_intercept(link, normLink, WS_PATH_MAX);
+    int iExisting = ws_should_intercept(existing, normExisting, WS_PATH_MAX);
+    if (!iLink && !iExisting) {
+        if (!g_orig.CreateHardLinkW) {
+            SetLastError(ERROR_NOT_SUPPORTED);
+            return FALSE;
+        }
+        return g_orig.CreateHardLinkW(link, existing, NULL);
+    }
+    if (iLink != iExisting) {
+        /* one side is stage/passthrough and the other is not: half in scope,
+         * cannot stage atomically -> never write the real disk */
+        ws_log_w(L"fail-closed CreateHardLink (half in scope)", iLink ? link : existing);
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+    NTSTATUS st = ws_hardlink_stage(normExisting, normLink, 0);
+    if (st < 0) {
+        SetLastError(st == WS_R20_STATUS_OBJECT_NAME_COLLISION ? ERROR_ALREADY_EXISTS
+                    : st == WS_R20_STATUS_OBJECT_NAME_NOT_FOUND ? ERROR_FILE_NOT_FOUND
+                                                               : ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* R17 ReplaceFileW / ReplaceFileA: fail closed.
+ *
+ * ReplaceFile is an atomic 3-path transaction (replaced target + replacement +
+ * optional backup). Mapping it onto the overlay needs multi-file whiteout +
+ * rename journaling; the risk of a half-applied replacement is higher than the
+ * benefit, so the agreed R20 policy is FAIL-CLOSED: the real system is never
+ * written (measured before/after with the native carrier, see findings).
+ * Calls whose every path is out of the shim's scope pass through unchanged. */
+static BOOL ws_replace_file_locked(LPCWSTR replaced, LPCWSTR replacement, LPCWSTR backup, DWORD flags,
+                                   LPVOID exclude, LPVOID reserved)
+{
+    wchar_t normReplaced[WS_PATH_MAX];
+    wchar_t normReplacement[WS_PATH_MAX];
+    wchar_t normBackup[WS_PATH_MAX];
+    if (!replaced || !replaced[0] || !replacement || !replacement[0]) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    int i1 = ws_should_intercept(replaced, normReplaced, WS_PATH_MAX);
+    int i2 = ws_should_intercept(replacement, normReplacement, WS_PATH_MAX);
+    int i3 = (backup && backup[0]) ? ws_should_intercept(backup, normBackup, WS_PATH_MAX) : 0;
+    if (!i1 && !i2 && !i3) {
+        return g_orig.ReplaceFileW ? g_orig.ReplaceFileW(replaced, replacement, backup, flags, exclude, reserved)
+                                   : ReplaceFileW(replaced, replacement, backup, flags, exclude, reserved);
+    }
+    ws_log_w(L"fail-closed ReplaceFileW (real-disk zero-write; no staging model)", replaced);
+    SetLastError(ERROR_ACCESS_DENIED);
+    return FALSE;
+}
+
+/* Extract a Win32 normalized path from an OBJECT_ATTRIBUTES (NT name form).
+ * Mirrors ws_attrbyname_overlay's measured constraints: copy by Length (the
+ * buffer is not guaranteed NUL-terminated), strip `\??\` first, never guess an
+ * unrepresentable NT namespace name. Returns 0 when not trustworthy. */
+static int ws_nt_path_from_object(POBJECT_ATTRIBUTES oa, wchar_t *out, DWORD cch)
+{
+    out[0] = 0;
+    if (!oa || !oa->ObjectName || !oa->ObjectName->Buffer || oa->ObjectName->Length == 0) {
+        return 0;
+    }
+    const UNICODE_STRING *us = oa->ObjectName;
+    if (us->Length > (ULONG)((WS_PATH_MAX - 1) * sizeof(wchar_t))) {
+        return 0;
+    }
+    wchar_t nz[WS_PATH_MAX];
+    size_t n = (size_t)(us->Length / sizeof(wchar_t));
+    memcpy(nz, us->Buffer, n * sizeof(wchar_t));
+    nz[n] = 0;
+    if (ws_starts_with_ci_w(nz, L"\\??\\UNC\\")) {
+        size_t len = wcslen(nz + 8);
+        nz[0] = nz[1] = L'\\';
+        memmove(nz + 2, nz + 8, (len + 1) * sizeof(wchar_t));
+    } else if (ws_starts_with_ci_w(nz, L"\\??\\") &&
+               ((nz[4] >= L'A' && nz[4] <= L'Z') || (nz[4] >= L'a' && nz[4] <= L'z')) &&
+               nz[5] == L':' && (nz[6] == L'\\' || nz[6] == L'/' || nz[6] == 0)) {
+        size_t len = wcslen(nz + 4);
+        memmove(nz, nz + 4, (len + 1) * sizeof(wchar_t));
+    }
+    if (ws_starts_with_ci_w(nz, L"\\Device\\") || ws_starts_with_ci_w(nz, L"\\\\.\\") ||
+        ws_starts_with_ci_w(nz, L"\\??\\") || ws_starts_with_ci_w(nz, L"\\\\?\\GLOBALROOT") ||
+        ws_starts_with_ci_w(nz, L"\\\\?\\Volume{") || ws_starts_with_ci_w(nz, L"\\SystemRoot") ||
+        ws_starts_with_ci_w(nz, L"\\DosDevices\\")) {
+        /* R20 FOLLOW-UP（P0）：NT 命名空间/设备别名先尝试映射成普通 Win32 路径。
+         * 映射成功后与普通调用走完全相同的暂存/遮蔽/delete 管线；映射不了的名字
+         * 仍返回 0，由 ws_NtCreateFile 按「写/删 deny、mask 声明时读 deny」处理。 */
+        wchar_t conv[WS_PATH_MAX];
+        if (ws_nt_device_to_win(nz, conv, WS_PATH_MAX)) {
+            ws_strlcpy_w(nz, conv, WS_PATH_MAX);
+        } else {
+            return 0;
+        }
+    }
+    wchar_t abs[WS_PATH_MAX];
+    DWORD err = GetLastError();
+    DWORD got = GetFullPathNameW(nz, WS_PATH_MAX, abs, NULL);
+    SetLastError(err);
+    if (got == 0 || got >= WS_PATH_MAX) {
+        ws_strlcpy_w(abs, nz, WS_PATH_MAX);
+    }
+    return ws_normalize_path(abs, out, cch);
+}
+
+/* Win32 path -> NT object path (only the two shapes the object manager accepts
+ * for a RootDirectory==NULL open: `\??\X:\...` and `\??\UNC\...`). */
+static int ws_nt_path_from_win(const wchar_t *win, wchar_t *out, DWORD cch)
+{
+    size_t pos = 0;
+    out[0] = 0;
+    if (!win || !win[0]) {
+        return 0;
+    }
+    if (ws_starts_with_ci_w(win, L"\\??\\")) {
+        return ws_append_w(out, cch, &pos, win);
+    }
+    if (win[0] == L'\\' && win[1] == L'\\' && win[2] && win[2] != L'?' && win[2] != L'.') {
+        return ws_append_w(out, cch, &pos, L"\\??\\UNC\\") && ws_append_w(out, cch, &pos, win + 2);
+    }
+    if (((win[0] >= L'A' && win[0] <= L'Z') || (win[0] >= L'a' && win[0] <= L'z')) &&
+        win[1] == L':' && win[2] == L'\\') {
+        return ws_append_w(out, cch, &pos, L"\\??\\") && ws_append_w(out, cch, &pos, win);
+    }
+    return 0;
+}
+
+/* R17 NtCreateFile: direct NT create. Only USER modules' IATs carry this hook
+ * (core modules are excluded by the hook engine), so this is the "native code
+ * bypasses CreateFileW staging" surface. Policy:
+ *   · write intent (write access bits / DELETE / FILE_CREATE / FILE_OVERWRITE /
+ *     FILE_SUPERSEDE / FILE_DELETE_ON_CLOSE, or a maybe-create disposition on a
+ *     path that does not exist) => fail closed with STATUS_ACCESS_DENIED: the
+ *     real disk is never written;
+ *   · masked path (read OR write) => STATUS_ACCESS_DENIED (same read boundary
+ *     as every other read hook);
+ *   · plain read intent => pass through, overlay-aware (whiteout => not found,
+ *     staged copy => open the staged path instead), and the multi-link alias
+ *     guard is applied on the opened handle (R18). This is what keeps carriers
+ *     that statically import ntdll!NtCreateFile alive. */
+static int ws_nt_create_write_intent(ACCESS_MASK access, ULONG disposition, ULONG options)
+{
+    if (access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA |
+                  FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD)) {
+        return 1;
+    }
+    if (options & 0x00001000u /* FILE_DELETE_ON_CLOSE */) {
+        return 1;
+    }
+    switch (disposition) {
+    case 0: /* FILE_SUPERSEDE */
+    case 2: /* FILE_CREATE */
+    case 4: /* FILE_OVERWRITE */
+    case 5: /* FILE_OVERWRITE_IF */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+NTSTATUS NTAPI ws_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
+                               PIO_STATUS_BLOCK IoStatusBlock, PVOID AllocationSize, ULONG FileAttributes,
+                               ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions,
+                               PVOID EaBuffer, ULONG EaLength)
+{
+    ws_callhit_named("NtCreateFile");
+    if (t_wsFileBusy || !ObjectAttributes || !ObjectAttributes->ObjectName ||
+        !ObjectAttributes->ObjectName->Buffer) {
+        return g_orig.NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize,
+                                   FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer,
+                                   EaLength);
+    }
+    int writeIntent = ws_nt_create_write_intent(DesiredAccess, CreateDisposition, CreateOptions);
+    if (ObjectAttributes->RootDirectory) {
+        /* handle-relative name: the target cannot be proven -> never write; with the
+         * read mask active it could also read a masked file through its directory
+         * handle, so reads are denied too (A+B hybrid fallback, see findings §6.3). */
+        if (writeIntent || ws_mask_declared()) {
+            ws_log("fail-closed NtCreateFile: handle-relative target (unmappable)");
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = WS_R20_STATUS_ACCESS_DENIED;
+                IoStatusBlock->Information = 0;
+            }
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+        return g_orig.NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize,
+                                   FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer,
+                                   EaLength);
+    }
+    wchar_t norm[WS_PATH_MAX];
+    if (!ws_nt_path_from_object(ObjectAttributes, norm, WS_PATH_MAX)) {
+        /* R20 FOLLOW-UP（P0）A+B 混合兜底：设备/卷命名空间里**映射不了**的名字
+         * （\\.\PhysicalDriveN、未知 \Device\…、\??\… 等）无法走暂存/遮蔽管线。
+         * 写/删一律 deny（永不写真实盘）；mask 已声明时读也 deny（否则可用设备
+         * 路径读回被遮蔽文件明文）。未声明 mask 且纯读时维持透传（兼容探测类调用）。 */
+        if (ws_is_nt_alias_oa(ObjectAttributes) && (writeIntent || ws_mask_declared())) {
+            ws_log("fail-closed NtCreateFile: unmappable NT-namespace name (write or mask-read)");
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = WS_R20_STATUS_ACCESS_DENIED;
+                IoStatusBlock->Information = 0;
+            }
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+        return g_orig.NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize,
+                                   FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer,
+                                   EaLength);
+    }
+    if (!ws_should_intercept(norm, norm, WS_PATH_MAX)) {
+        /* explicit stage-root / passthrough scope */
+        return g_orig.NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize,
+                                   FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer,
+                                   EaLength);
+    }
+    if (ws_mask_declared()) {
+        wchar_t rule[256];
+        if (ws_mask_decide_read(norm, rule, 256)) {
+            ws_log_w(L"read/write denied by mask (NtCreateFile)", norm);
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = WS_R20_STATUS_ACCESS_DENIED;
+                IoStatusBlock->Information = 0;
+            }
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+    }
+    if (!writeIntent && CreateDisposition == 3 /* FILE_OPEN_IF: create-if-missing */) {
+        wchar_t mapped[WS_PATH_MAX];
+        uint32_t flags = 0;
+        int have = ws_resolve_file(norm, WINSTAGE_IO_READ, mapped, &flags) == 0;
+        if (!have || (flags & WINSTAGE_RES_WHITEOUT) || !ws_file_exists(mapped)) {
+            /* this "read" would CREATE a real file -> not stageable */
+            ws_log_w(L"fail-closed NtCreateFile (FILE_OPEN_IF would create)", norm);
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = WS_R20_STATUS_ACCESS_DENIED;
+                IoStatusBlock->Information = 0;
+            }
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+    }
+    if (writeIntent) {
+        ws_log_w(L"fail-closed NtCreateFile (write intent; real-disk zero-write)", norm);
+        if (g_ws.auditPath[0]) {
+            char esc[WS_PATH_MAX * 3];
+            ws_audit_escape_w(norm, esc, sizeof(esc));
+            ws_audit("{\"op\":\"file.ntcreate\",\"mode\":\"write\",\"decision\":\"deny\",\"path\":\"%s\"}", esc);
+        }
+        if (IoStatusBlock) {
+            IoStatusBlock->Status = WS_R20_STATUS_ACCESS_DENIED;
+            IoStatusBlock->Information = 0;
+        }
+        return WS_R20_STATUS_ACCESS_DENIED;
+    }
+    /* Plain read intent: honour the overlay exactly like ws_create_file_core's
+     * read branch (whiteout -> not found; staged copy -> open the overlay path). */
+    wchar_t mapped[WS_PATH_MAX];
+    uint32_t flags = 0;
+    if (ws_resolve_file(norm, WINSTAGE_IO_READ, mapped, &flags) == 0) {
+        if (flags & WINSTAGE_RES_WHITEOUT) {
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = WS_R20_STATUS_OBJECT_NAME_NOT_FOUND;
+                IoStatusBlock->Information = 0;
+            }
+            return WS_R20_STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        if ((flags & WINSTAGE_RES_STAGED) && ws_wcscmp_ci(mapped, norm) != 0) {
+            wchar_t nt[WS_PATH_MAX];
+            if (ws_nt_path_from_win(mapped, nt, WS_PATH_MAX)) {
+                OBJECT_ATTRIBUTES oa = *ObjectAttributes;
+                UNICODE_STRING un;
+                un.Buffer = nt;
+                un.Length = (USHORT)(wcslen(nt) * sizeof(wchar_t));
+                un.MaximumLength = (USHORT)(un.Length + sizeof(wchar_t));
+                oa.ObjectName = &un;
+                oa.RootDirectory = NULL;
+                NTSTATUS st = g_orig.NtCreateFile(FileHandle, DesiredAccess, &oa, IoStatusBlock, AllocationSize,
+                                                  FileAttributes, ShareAccess, CreateDisposition, CreateOptions,
+                                                  EaBuffer, EaLength);
+                ws_log_w(st < 0 ? L"NtCreateFile overlay(read) FAILED" : L"NtCreateFile overlay(read)", mapped);
+                return st;
+            }
+        }
+    }
+    NTSTATUS st = g_orig.NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize,
+                                      FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer,
+                                      EaLength);
+    if (st >= 0 && FileHandle && *FileHandle && !t_hlGuard && ws_mask_declared()) {
+        wchar_t rule[256];
+        if (ws_hardlink_alias_check_handle(*FileHandle, norm, rule, 256) != 0) {
+            if (g_orig.CloseHandle) g_orig.CloseHandle(*FileHandle);
+            *FileHandle = NULL;
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = WS_R20_STATUS_ACCESS_DENIED;
+                IoStatusBlock->Information = 0;
+            }
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+    }
+    return st;
+}
+
+/* NtSetInformationFile(FileLinkInformation=11): create a hardlink through a
+ * source handle. Shares ws_hardlink_stage (mask + staged semantics) so the
+ * `mklink`-equivalent cannot write the real disk nor link a masked file. */
+static NTSTATUS ws_nt_set_file_link(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
+                                    ULONG Length)
+{
+    if (!FileInformation || Length < sizeof(FILE_LINK_INFORMATION)) {
+        return WS_R20_STATUS_INVALID_PARAMETER;
+    }
+    PFILE_LINK_INFORMATION li = (PFILE_LINK_INFORMATION)FileInformation;
+    if (li->FileNameLength == 0 || li->FileNameLength > (ULONG)((WS_PATH_MAX - 1) * sizeof(wchar_t))) {
+        return WS_R20_STATUS_INVALID_PARAMETER;
+    }
+    wchar_t srcPath[WS_PATH_MAX];
+    wchar_t srcNorm[WS_PATH_MAX];
+    if (!ws_path_of_handle(FileHandle, srcPath, WS_PATH_MAX)) {
+        return WS_R20_STATUS_ACCESS_DENIED;
+    }
+    wchar_t logical[WS_PATH_MAX];
+    int srcIsStagedCopy = 0;
+    if (ws_should_intercept(srcPath, srcNorm, WS_PATH_MAX)) {
+        /* handle opened on the real path */
+    } else if (ws_logical_from_staged(srcPath, logical, WS_PATH_MAX) &&
+               ws_should_intercept(logical, srcNorm, WS_PATH_MAX)) {
+        srcIsStagedCopy = 1;
+    } else {
+        return g_orig.NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, 11);
+    }
+    wchar_t nameBuf[WS_PATH_MAX];
+    size_t nameCch = (size_t)(li->FileNameLength / sizeof(wchar_t));
+    if (nameCch >= WS_PATH_MAX) {
+        return WS_R20_STATUS_INVALID_PARAMETER;
+    }
+    memcpy(nameBuf, li->FileName, nameCch * sizeof(wchar_t));
+    nameBuf[nameCch] = 0;
+    wchar_t dstRaw[WS_PATH_MAX];
+    if (li->RootDirectory) {
+        wchar_t dirPath[WS_PATH_MAX];
+        if (!ws_path_of_handle(li->RootDirectory, dirPath, WS_PATH_MAX)) {
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+        wchar_t joined[WS_PATH_MAX];
+        size_t pos = 0;
+        joined[0] = 0;
+        if (!ws_append_w(joined, WS_PATH_MAX, &pos, dirPath)) {
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+        if (!(pos > 0 && joined[pos - 1] == L'\\') &&
+            !ws_append_w(joined, WS_PATH_MAX, &pos, L"\\")) {
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+        if (!ws_append_w(joined, WS_PATH_MAX, &pos, nameBuf[0] == L'\\' ? nameBuf + 1 : nameBuf)) {
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+        ws_strlcpy_w(dstRaw, joined, WS_PATH_MAX);
+    } else {
+        wchar_t abs[WS_PATH_MAX];
+        wchar_t oaName[WS_PATH_MAX];
+        if (ws_starts_with_ci_w(nameBuf, L"\\??\\")) {
+            OBJECT_ATTRIBUTES oa;
+            UNICODE_STRING un;
+            memset(&oa, 0, sizeof(oa));
+            oa.Length = sizeof(oa);
+            un.Buffer = nameBuf;
+            un.Length = (USHORT)(nameCch * sizeof(wchar_t));
+            un.MaximumLength = (USHORT)(un.Length + sizeof(wchar_t));
+            oa.ObjectName = &un;
+            if (!ws_nt_path_from_object(&oa, oaName, WS_PATH_MAX)) {
+                return WS_R20_STATUS_ACCESS_DENIED;
+            }
+        } else {
+            ws_strlcpy_w(oaName, nameBuf, WS_PATH_MAX);
+        }
+        if (!ws_should_intercept(oaName, abs, WS_PATH_MAX)) {
+            /* destination outside the staged view but source inside: half in scope */
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+        ws_strlcpy_w(dstRaw, abs, WS_PATH_MAX);
+    }
+    wchar_t dstNorm[WS_PATH_MAX];
+    if (!ws_should_intercept(dstRaw, dstNorm, WS_PATH_MAX)) {
+        return WS_R20_STATUS_ACCESS_DENIED;
+    }
+    if (ws_mask_declared()) {
+        wchar_t rule[256];
+        if (ws_mask_decide_read(srcNorm, rule, 256) || ws_mask_decide_read(dstNorm, rule, 256)) {
+            ws_log_w(L"fail-closed NtSetInformationFile(link): masked source or destination", dstNorm);
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+        if (!srcIsStagedCopy && ws_hardlink_alias_check_handle(FileHandle, srcPath, rule, 256) != 0) {
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+    }
+    NTSTATUS st = ws_hardlink_stage(srcNorm, dstNorm, li->ReplaceIfExists ? 1 : 0);
+    if (IoStatusBlock) {
+        IoStatusBlock->Status = st;
+        IoStatusBlock->Information = 0;
+    }
+    if (st < 0) {
+        ws_log_w(L"fail-closed NtSetInformationFile(link)", dstNorm);
+    }
+    return st;
+}
+
+/* Keep the linker honest about ws_ReplaceFileA even though the body is shared. */
+
+/* ---------------------------------------------------------- R17/R18 entry points */
+
+BOOL WINAPI ws_CreateHardLinkW(LPCWSTR lpFileName, LPCWSTR lpExistingFileName, LPSECURITY_ATTRIBUTES lpSecurityAttributes)
+{
+    (void)lpSecurityAttributes;
+    return ws_create_hardlink_core(lpFileName, lpExistingFileName);
+}
+
+BOOL WINAPI ws_CreateHardLinkA(LPCSTR lpFileName, LPCSTR lpExistingFileName, LPSECURITY_ATTRIBUTES lpSecurityAttributes)
+{
+    (void)lpSecurityAttributes;
+    wchar_t link[WS_PATH_MAX];
+    wchar_t existing[WS_PATH_MAX];
+    ws_a2w_buf(lpFileName, link, WS_PATH_MAX);
+    ws_a2w_buf(lpExistingFileName, existing, WS_PATH_MAX);
+    return ws_create_hardlink_core(link[0] ? link : NULL, existing[0] ? existing : NULL);
+}
+
+BOOL WINAPI ws_ReplaceFileW(LPCWSTR lpReplacedFileName, LPCWSTR lpReplacementFileName,
+                            LPCWSTR lpBackupFileName, DWORD dwReplaceFlags, LPVOID lpExclude, LPVOID lpReserved)
+{
+    return ws_replace_file_locked(lpReplacedFileName, lpReplacementFileName, lpBackupFileName,
+                                  dwReplaceFlags, lpExclude, lpReserved);
+}
+
+BOOL WINAPI ws_ReplaceFileA(LPCSTR lpReplacedFileName, LPCSTR lpReplacementFileName,
+                            LPCSTR lpBackupFileName, DWORD dwReplaceFlags, LPVOID lpExclude, LPVOID lpReserved)
+{
+    wchar_t replaced[WS_PATH_MAX];
+    wchar_t replacement[WS_PATH_MAX];
+    wchar_t backup[WS_PATH_MAX];
+    ws_a2w_buf(lpReplacedFileName, replaced, WS_PATH_MAX);
+    ws_a2w_buf(lpReplacementFileName, replacement, WS_PATH_MAX);
+    if (lpBackupFileName) {
+        ws_a2w_buf(lpBackupFileName, backup, WS_PATH_MAX);
+    } else {
+        backup[0] = 0;
+    }
+    return ws_replace_file_locked(replaced[0] ? replaced : NULL, replacement[0] ? replacement : NULL,
+                                  backup[0] ? backup : NULL, dwReplaceFlags, lpExclude, lpReserved);
+}
+
+/* ------------------------------------------------------------ R19 enum filter */
+
+HANDLE WINAPI ws_FindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData)
+{
+    ws_callhit_named("FindFirstFileW");
+    HANDLE h = g_orig.FindFirstFileW ? g_orig.FindFirstFileW(lpFileName, lpFindFileData)
+                                     : FindFirstFileW(lpFileName, lpFindFileData);
+    if (h == INVALID_HANDLE_VALUE || !lpFindFileData || !ws_mask_declared()) {
+        return h;
+    }
+    wchar_t dir[WS_PATH_MAX];
+    if (!ws_find_dir_of_pattern_w(lpFileName, dir, WS_PATH_MAX)) {
+        return h;
+    }
+    wchar_t rule[256];
+    if (ws_mask_decide_read(dir, rule, 256)) {
+        ws_find_orig_close(h);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    for (;;) {
+        if (!ws_find_entry_masked(dir, lpFindFileData->cFileName, rule, 256)) {
+            ws_find_register(h, dir);
+            return h;
+        }
+        BOOL next = g_orig.FindNextFileW ? g_orig.FindNextFileW(h, lpFindFileData)
+                                         : FindNextFileW(h, lpFindFileData);
+        if (!next) {
+            ws_find_orig_close(h);
+            ws_log_w(L"FindFirstFileW: every entry hidden by the read mask", dir);
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+}
+
+HANDLE WINAPI ws_FindFirstFileA(LPCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData)
+{
+    ws_callhit_named("FindFirstFileA");
+    HANDLE h = g_orig.FindFirstFileA ? g_orig.FindFirstFileA(lpFileName, lpFindFileData)
+                                     : FindFirstFileA(lpFileName, lpFindFileData);
+    if (h == INVALID_HANDLE_VALUE || !lpFindFileData || !ws_mask_declared()) {
+        return h;
+    }
+    wchar_t patternW[WS_PATH_MAX];
+    ws_a2w_buf(lpFileName, patternW, WS_PATH_MAX);
+    wchar_t dir[WS_PATH_MAX];
+    if (!ws_find_dir_of_pattern_w(patternW, dir, WS_PATH_MAX)) {
+        return h;
+    }
+    wchar_t rule[256];
+    if (ws_mask_decide_read(dir, rule, 256)) {
+        ws_find_orig_close(h);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    for (;;) {
+        wchar_t nameW[WS_PATH_MAX];
+        ws_a2w_buf(lpFindFileData->cFileName, nameW, WS_PATH_MAX);
+        if (!ws_find_entry_masked(dir, nameW, rule, 256)) {
+            ws_find_register(h, dir);
+            return h;
+        }
+        BOOL next = g_orig.FindNextFileA ? g_orig.FindNextFileA(h, lpFindFileData)
+                                         : FindNextFileA(h, lpFindFileData);
+        if (!next) {
+            ws_find_orig_close(h);
+            ws_log_w(L"FindFirstFileA: every entry hidden by the read mask", dir);
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+}
+
+HANDLE WINAPI ws_FindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInfoLevelId, LPVOID lpFindFileData,
+                                  FINDEX_SEARCH_OPS fSearchOp, LPVOID lpSearchFilter, DWORD dwAdditionalFlags)
+{
+    ws_callhit_named("FindFirstFileExW");
+    HANDLE h = g_orig.FindFirstFileExW
+                   ? g_orig.FindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter,
+                                             dwAdditionalFlags)
+                   : FindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter,
+                                      dwAdditionalFlags);
+    if (h == INVALID_HANDLE_VALUE || !lpFindFileData || !ws_mask_declared()) {
+        return h;
+    }
+    /* Only the two documented info levels use the WIN32_FIND_DATA layout; any
+     * other level would make "read cFileName" a guess, so it is left unfiltered. */
+    if (fInfoLevelId != FindExInfoStandard && fInfoLevelId != FindExInfoBasic) {
+        return h;
+    }
+    LPWIN32_FIND_DATAW data = (LPWIN32_FIND_DATAW)lpFindFileData;
+    wchar_t dir[WS_PATH_MAX];
+    if (!ws_find_dir_of_pattern_w(lpFileName, dir, WS_PATH_MAX)) {
+        return h;
+    }
+    wchar_t rule[256];
+    if (ws_mask_decide_read(dir, rule, 256)) {
+        ws_find_orig_close(h);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    for (;;) {
+        if (!ws_find_entry_masked(dir, data->cFileName, rule, 256)) {
+            ws_find_register(h, dir);
+            return h;
+        }
+        BOOL next = g_orig.FindNextFileW ? g_orig.FindNextFileW(h, data) : FindNextFileW(h, data);
+        if (!next) {
+            ws_find_orig_close(h);
+            ws_log_w(L"FindFirstFileExW: every entry hidden by the read mask", dir);
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+}
+
+HANDLE WINAPI ws_FindFirstFileExA(LPCSTR lpFileName, FINDEX_INFO_LEVELS fInfoLevelId, LPVOID lpFindFileData,
+                                  FINDEX_SEARCH_OPS fSearchOp, LPVOID lpSearchFilter, DWORD dwAdditionalFlags)
+{
+    ws_callhit_named("FindFirstFileExA");
+    HANDLE h = g_orig.FindFirstFileExA
+                   ? g_orig.FindFirstFileExA(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter,
+                                             dwAdditionalFlags)
+                   : FindFirstFileExA(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter,
+                                      dwAdditionalFlags);
+    if (h == INVALID_HANDLE_VALUE || !lpFindFileData || !ws_mask_declared()) {
+        return h;
+    }
+    if (fInfoLevelId != FindExInfoStandard && fInfoLevelId != FindExInfoBasic) {
+        return h;
+    }
+    LPWIN32_FIND_DATAA data = (LPWIN32_FIND_DATAA)lpFindFileData;
+    wchar_t patternW[WS_PATH_MAX];
+    ws_a2w_buf(lpFileName, patternW, WS_PATH_MAX);
+    wchar_t dir[WS_PATH_MAX];
+    if (!ws_find_dir_of_pattern_w(patternW, dir, WS_PATH_MAX)) {
+        return h;
+    }
+    wchar_t rule[256];
+    if (ws_mask_decide_read(dir, rule, 256)) {
+        ws_find_orig_close(h);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    for (;;) {
+        wchar_t nameW[WS_PATH_MAX];
+        ws_a2w_buf(data->cFileName, nameW, WS_PATH_MAX);
+        if (!ws_find_entry_masked(dir, nameW, rule, 256)) {
+            ws_find_register(h, dir);
+            return h;
+        }
+        BOOL next = g_orig.FindNextFileA ? g_orig.FindNextFileA(h, data) : FindNextFileA(h, data);
+        if (!next) {
+            ws_find_orig_close(h);
+            ws_log_w(L"FindFirstFileExA: every entry hidden by the read mask", dir);
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+}
+
+BOOL WINAPI ws_FindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData)
+{
+    wchar_t dir[WS_PATH_MAX];
+    if (!lpFindFileData || !ws_mask_declared() || !ws_find_lookup(hFindFile, dir, WS_PATH_MAX)) {
+        return g_orig.FindNextFileW ? g_orig.FindNextFileW(hFindFile, lpFindFileData)
+                                    : FindNextFileW(hFindFile, lpFindFileData);
+    }
+    for (;;) {
+        BOOL ok = g_orig.FindNextFileW ? g_orig.FindNextFileW(hFindFile, lpFindFileData)
+                                       : FindNextFileW(hFindFile, lpFindFileData);
+        if (!ok) {
+            return FALSE;
+        }
+        wchar_t rule[256];
+        if (!ws_find_entry_masked(dir, lpFindFileData->cFileName, rule, 256)) {
+            return TRUE;
+        }
+    }
+}
+
+BOOL WINAPI ws_FindNextFileA(HANDLE hFindFile, LPWIN32_FIND_DATAA lpFindFileData)
+{
+    wchar_t dir[WS_PATH_MAX];
+    if (!lpFindFileData || !ws_mask_declared() || !ws_find_lookup(hFindFile, dir, WS_PATH_MAX)) {
+        return g_orig.FindNextFileA ? g_orig.FindNextFileA(hFindFile, lpFindFileData)
+                                    : FindNextFileA(hFindFile, lpFindFileData);
+    }
+    for (;;) {
+        BOOL ok = g_orig.FindNextFileA ? g_orig.FindNextFileA(hFindFile, lpFindFileData)
+                                       : FindNextFileA(hFindFile, lpFindFileData);
+        if (!ok) {
+            return FALSE;
+        }
+        wchar_t nameW[WS_PATH_MAX];
+        ws_a2w_buf(lpFindFileData->cFileName, nameW, WS_PATH_MAX);
+        wchar_t rule[256];
+        if (!ws_find_entry_masked(dir, nameW, rule, 256)) {
+            return TRUE;
+        }
+    }
+}
+
+BOOL WINAPI ws_FindClose(HANDLE hFindFile)
+{
+    ws_find_unregister(hFindFile);
+    return ws_find_orig_close(hFindFile);
+}
+
+/* R19 (node carrier): node/libuv's fs.readdir opens the directory with
+ * CreateFileW and then calls ntdll!NtQueryDirectoryFile DIRECTLY (measured:
+ * node.exe contains the string, resolves it dynamically; FindFirstFile* never
+ * appears in the shim log for readdir). Filtering the returned buffer is the
+ * only way to hide masked names from that carrier.
+ *
+ * The filter is applied IN PLACE on the caller's own buffer, preserving the
+ * enumeration context held by the kernel (no side table, no re-open):
+ *   · the real NtQueryDirectoryFile fills FileInformation with a linked list of
+ *     entries (NextEntryOffset / FileNameLength / FileName) for the class;
+ *   · every entry whose "dir\name" matches a read-mask rule is spliced out;
+ *   · if EVERY entry of a batch was filtered the call is repeated to get the
+ *     next batch (ReturnSingleEntry=1 included), until a visible entry or
+ *     STATUS_NO_MORE_FILES remains.
+ * Unknown info classes / async completions / unresolvable handles are passed
+ * through unchanged (never guess, never corrupt the caller's buffer). */
+#define WS_R20_STATUS_BUFFER_OVERFLOW ((NTSTATUS)0x80000005L)
+#define WS_R20_STATUS_NO_MORE_FILES    ((NTSTATUS)0x80000006L)
+#define WS_R20_STATUS_PENDING          ((NTSTATUS)0x00000103L)
+
+static _Thread_local int t_dirQueryBusy;
+
+/* Offset of FileNameLength / FileName for every directory info class we can
+ * safely parse. Layouts come from the SDK structs themselves (offsetof), not
+ * from hand-computed numbers. */
+static int ws_dir_entry_layout(ULONG cls, ULONG *nameLenOff, ULONG *nameOff)
+{
+    switch (cls) {
+    case FileDirectoryInformation: /* 1 */
+        *nameLenOff = (ULONG)offsetof(FILE_DIRECTORY_INFORMATION, FileNameLength);
+        *nameOff = (ULONG)offsetof(FILE_DIRECTORY_INFORMATION, FileName);
+        return 1;
+    case FileFullDirectoryInformation: /* 2 */
+        *nameLenOff = (ULONG)offsetof(FILE_FULL_DIR_INFORMATION, FileNameLength);
+        *nameOff = (ULONG)offsetof(FILE_FULL_DIR_INFORMATION, FileName);
+        return 1;
+    case FileBothDirectoryInformation: /* 3 */
+        *nameLenOff = (ULONG)offsetof(FILE_BOTH_DIR_INFORMATION, FileNameLength);
+        *nameOff = (ULONG)offsetof(FILE_BOTH_DIR_INFORMATION, FileName);
+        return 1;
+    case FileIdBothDirectoryInformation: /* 37 */
+        *nameLenOff = (ULONG)offsetof(FILE_ID_BOTH_DIR_INFORMATION, FileNameLength);
+        *nameOff = (ULONG)offsetof(FILE_ID_BOTH_DIR_INFORMATION, FileName);
+        return 1;
+    case FileIdFullDirectoryInformation: /* 38 */
+        *nameLenOff = (ULONG)offsetof(FILE_ID_FULL_DIR_INFORMATION, FileNameLength);
+        *nameOff = (ULONG)offsetof(FILE_ID_FULL_DIR_INFORMATION, FileName);
+        return 1;
+    case FileNamesInformation: /* 12 */
+        *nameLenOff = (ULONG)offsetof(FILE_NAMES_INFORMATION, FileNameLength);
+        *nameOff = (ULONG)offsetof(FILE_NAMES_INFORMATION, FileName);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Directory path behind the enumeration handle (Win32 form, normalized).
+ * GetFinalPathNameByHandleW works for the FILE_READ_DATA|SYNCHRONIZE handle
+ * libuv opens (measured); failure => no filtering (bounded, logged).
+ * R20 FOLLOW-UP（P0）：句柄可能来自 `\Device\HarddiskVolumeN\…` 或
+ * `\??\Volume{GUID}\…` 打开（GetFinalPathNameByHandleW 返回 `\\?\Volume{…}\…`），
+ * 先过 ws_nt_device_to_win 再归一化，否则该句柄的枚举不受遮蔽过滤。 */
+static int ws_dir_path_of_handle(HANDLE h, wchar_t *dir, DWORD cch)
+{
+    dir[0] = 0;
+    wchar_t raw[WS_PATH_MAX];
+    DWORD n = GetFinalPathNameByHandleW(h, raw, WS_PATH_MAX, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (n == 0 || n >= WS_PATH_MAX) {
+        n = GetFinalPathNameByHandleW(h, raw, WS_PATH_MAX, VOLUME_NAME_DOS);
+        if (n == 0 || n >= WS_PATH_MAX) {
+            return 0;
+        }
+    }
+    if (ws_nt_device_to_win(raw, dir, cch)) {
+        /* converted: volume-GUID / device-path handle */
+    } else if (!ws_normalize_path(raw, dir, cch)) {
+        dir[0] = 0;
+        return 0;
+    }
+    if (ws_is_device_path(dir)) {
+        dir[0] = 0;
+        return 0;
+    }
+    /* Only absolute drive / UNC names can be combined with an entry name. */
+    if (!(((dir[0] >= L'A' && dir[0] <= L'Z') || (dir[0] >= L'a' && dir[0] <= L'z')) && dir[1] == L':' &&
+          dir[2] == L'\\') &&
+        !(dir[0] == L'\\' && dir[1] == L'\\' && dir[2] && dir[2] != L'?' && dir[2] != L'.')) {
+        dir[0] = 0;
+        return 0;
+    }
+    return 1;
+}
+
+/* Was this handle opened through an NT-namespace/device name we could not map?
+ * Used to fail closed (instead of silently enumerating unfiltered) when the read
+ * mask is active. */
+static int ws_handle_is_unmapped_device(HANDLE h)
+{
+    wchar_t raw[WS_PATH_MAX];
+    DWORD n = GetFinalPathNameByHandleW(h, raw, WS_PATH_MAX, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (n == 0 || n >= WS_PATH_MAX) {
+        return 0; /* cannot tell -> do not invent a denial */
+    }
+    wchar_t conv[WS_PATH_MAX];
+    if (ws_nt_device_to_win(raw, conv, WS_PATH_MAX)) {
+        return 0;
+    }
+    return ws_is_nt_alias(raw);
+}
+
+NTSTATUS NTAPI ws_NtQueryDirectoryFile(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
+                                       PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
+                                       ULONG Length, FILE_INFORMATION_CLASS FileInformationClass,
+                                       BOOLEAN ReturnSingleEntry, PUNICODE_STRING FileName, BOOLEAN RestartScan)
+{
+    ws_callhit_named("NtQueryDirectoryFile");
+    ULONG nameLenOff = 0;
+    ULONG nameOff = 0;
+    wchar_t dir[WS_PATH_MAX];
+    if (!g_orig.NtQueryDirectoryFile || t_wsFileBusy || t_dirQueryBusy || !ws_mask_declared() ||
+        !FileHandle || FileHandle == INVALID_HANDLE_VALUE || !FileInformation || Length < 64 ||
+        !ws_dir_entry_layout((ULONG)FileInformationClass, &nameLenOff, &nameOff)) {
+        return g_orig.NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                           FileInformation, Length, FileInformationClass, ReturnSingleEntry,
+                                           FileName, RestartScan);
+    }
+    if (!ws_dir_path_of_handle(FileHandle, dir, WS_PATH_MAX)) {
+        /* R20 FOLLOW-UP（P0）：句柄来自映射不了的设备/卷命名空间 ⇒ 无法重建目录项
+         * 全路径 ⇒ 过滤不了。mask 生效时 fail-closed（拒绝），绝不静默返回未过滤
+         * 的名字；其它情况（非目录句柄/临时失败）保持透传。 */
+        if (ws_handle_is_unmapped_device(FileHandle)) {
+            ws_log("fail-closed NtQueryDirectoryFile: unmapped device-path handle cannot be filtered");
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = WS_R20_STATUS_ACCESS_DENIED;
+                IoStatusBlock->Information = 0;
+            }
+            return WS_R20_STATUS_ACCESS_DENIED;
+        }
+        return g_orig.NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                           FileInformation, Length, FileInformationClass, ReturnSingleEntry,
+                                           FileName, RestartScan);
+    }
+    BYTE *tmp = (BYTE *)HeapAlloc(GetProcessHeap(), 0, Length);
+    if (!tmp) {
+        return g_orig.NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                           FileInformation, Length, FileInformationClass, ReturnSingleEntry,
+                                           FileName, RestartScan);
+    }
+    NTSTATUS result = WS_R20_STATUS_ACCESS_DENIED;
+    BOOLEAN restart = RestartScan;
+    t_dirQueryBusy = 1;
+    for (;;) {
+        IO_STATUS_BLOCK localIosb;
+        PIO_STATUS_BLOCK iosb = IoStatusBlock;
+        if (!iosb) {
+            memset(&localIosb, 0, sizeof(localIosb));
+            iosb = &localIosb;
+        }
+        NTSTATUS st = g_orig.NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, iosb,
+                                                  FileInformation, Length, FileInformationClass, ReturnSingleEntry,
+                                                  FileName, restart);
+        restart = FALSE; /* only the caller's first request may restart the scan */
+        if (st == WS_R20_STATUS_PENDING && Event && !ApcRoutine) {
+            if (WaitForSingleObject(Event, 30000) == WAIT_OBJECT_0) {
+                st = iosb->Status;
+            }
+        }
+        if (st == WS_R20_STATUS_PENDING) {
+            /* Async completion we cannot filter without breaking the contract.
+             * Documented residual: this call is left untouched. */
+            ws_log("NtQueryDirectoryFile: async completion cannot be filtered (pass-through)");
+            result = st;
+            break;
+        }
+        if (st == WS_R20_STATUS_NO_MORE_FILES) {
+            iosb->Information = 0;
+            result = st;
+            break;
+        }
+        if (st < 0 && st != WS_R20_STATUS_BUFFER_OVERFLOW) {
+            result = st;
+            break;
+        }
+        ULONG info = iosb->Information;
+        if (info > Length) {
+            info = Length;
+        }
+        ULONG outOff = 0;
+        ULONG pos = 0;
+        ULONG visible = 0;
+        ULONG total = 0;
+        BYTE *lastVisible = NULL;
+        while (pos + nameOff <= info && pos + nameLenOff + sizeof(ULONG) <= info) {
+            BYTE *e = (BYTE *)FileInformation + pos;
+            ULONG next = *(ULONG *)e;
+            if (next != 0 && (next < nameOff || next > info - pos)) {
+                break; /* malformed entry: stop filtering this batch */
+            }
+            ULONG nameLen = *(ULONG *)(e + nameLenOff);
+            int hide = 0;
+            if (nameLen > 0 && nameLen <= (info - pos - nameOff) && (nameLen / sizeof(wchar_t)) < WS_PATH_MAX) {
+                wchar_t name[WS_PATH_MAX];
+                wchar_t rule[256];
+                ULONG cch = nameLen / sizeof(wchar_t);
+                memcpy(name, e + nameOff, (size_t)nameLen);
+                name[cch] = 0;
+                hide = ws_find_entry_masked(dir, name, rule, 256);
+            }
+            total++;
+            if (!hide) {
+                ULONG copyLen = next ? next : (info - pos);
+                if (outOff + copyLen <= Length) {
+                    memcpy(tmp + outOff, e, copyLen);
+                    if (lastVisible) {
+                        *(ULONG *)lastVisible = outOff - (ULONG)(lastVisible - tmp);
+                    }
+                    lastVisible = tmp + outOff;
+                    outOff += copyLen;
+                    visible++;
+                }
+            }
+            if (!next) {
+                break;
+            }
+            pos += next;
+        }
+        if (lastVisible) {
+            *(ULONG *)lastVisible = 0;
+        }
+        if (visible > 0) {
+            memcpy(FileInformation, tmp, outOff);
+            iosb->Information = outOff;
+            iosb->Status = st;
+            result = st;
+            break;
+        }
+        if (st == WS_R20_STATUS_BUFFER_OVERFLOW || total == 0) {
+            /* all entries filtered but the real call cannot advance (the caller's
+             * buffer is too small for even one entry). Return its status with an
+             * empty Information; callers then either end the scan or grow the
+             * buffer. A SHORT success batch is NOT an end condition: keep asking
+             * for the next batch (ReturnSingleEntry included). */
+            iosb->Information = 0;
+            result = st;
+            break;
+        }
+        /* every entry of this batch was hidden: ask for the next batch */
+    }
+    t_dirQueryBusy = 0;
+    HeapFree(GetProcessHeap(), 0, tmp);
+    if (result == 0) {
+        ws_log_w(L"NtQueryDirectoryFile filtered response", dir);
+    }
+    return result;
+}
+
 /* --------------------------------------------------------------- hooks */
+
+/* ═══ R21：delete → recreate（whiteout 后再创建）════════════════════════════════
+ *
+ * `dp_file_resolve(READ)` 先查 whiteout 标记、再查暂存副本。于是沙箱内
+ * `write → unlink → write` 之后：暂存树里**有**新副本、但 whiteout 标记还在 ⇒
+ * 读回仍是 FILE_NOT_FOUND（R21 探针实测 `recreate.injected status=1`）。
+ * 语义上"删除后又创建"应让路径重新存在，因此每次写入/建目录/改名/复制/建链接
+ * 成功把路径**重新物化**时，同步清掉 whiteout 标记。
+ *
+ * wo 路径布局与内置 provider（ws_stage.c 文件头）一致：`<root>\wo\<drive-less 路径>`、
+ * UNC 为 `<root>\wo\_unc\<server>\<share>\…`。这里刻意与 `ws_logical_from_staged`
+ * 一样只做"布局镜像"，不改 provider（provider 不在本轮写域）。 */
+static int ws_stage_side_path(const wchar_t *norm, const wchar_t *leaf, wchar_t *out, DWORD cch)
+{
+    if (!norm || !norm[0] || !g_ws.haveStageRoot || !g_ws.stageRoot[0]) {
+        return 0;
+    }
+    size_t pos = 0;
+    out[0] = 0;
+    if (!ws_append_w(out, cch, &pos, g_ws.stageRoot) || !ws_append_w(out, cch, &pos, L"\\") ||
+        !ws_append_w(out, cch, &pos, leaf)) {
+        return 0;
+    }
+    if (norm[0] == L'\\' && norm[1] == L'\\') {
+        return ws_append_w(out, cch, &pos, L"\\_unc") && ws_append_w(out, cch, &pos, L"\\") &&
+               ws_append_w(out, cch, &pos, norm + 2);
+    }
+    if (!ws_append_w(out, cch, &pos, L"\\")) {
+        return 0;
+    }
+    for (const wchar_t *p = norm; *p; p++) {
+        if (*p == L':') {
+            continue;
+        }
+        if (pos + 1 >= cch) {
+            return 0;
+        }
+        out[pos++] = *p;
+        out[pos] = 0;
+    }
+    return 1;
+}
+
+/* 1 = the logical path is currently whiteout-deleted in this sandbox. */
+static int ws_logically_whiteouted(const wchar_t *norm)
+{
+    if (!g_wsStage.file_whiteouted || !norm || !norm[0]) {
+        return 0;
+    }
+    return g_wsStage.file_whiteouted(norm) == 1;
+}
+
+/* Remove the whiteout marker so "delete then recreate" becomes visible again.
+ * Best-effort by design: the write itself already succeeded; a failed marker
+ * removal only keeps the old (deleted) view — it never writes the real disk. */
+static void ws_clear_whiteout(const wchar_t *norm)
+{
+    wchar_t wo[WS_PATH_MAX];
+    if (!norm || !norm[0] || !ws_stage_side_path(norm, L"wo", wo, WS_PATH_MAX) || !g_orig.DeleteFileW) {
+        return;
+    }
+    t_wsFileBusy++;
+    DWORD attrs = g_orig.GetFileAttributesW ? g_orig.GetFileAttributesW(wo) : INVALID_FILE_ATTRIBUTES;
+    if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (g_orig.DeleteFileW(wo)) {
+            ws_log_w(L"whiteout cleared after recreate", norm);
+        }
+    }
+    t_wsFileBusy--;
+}
 
 /* Write-intent opens of an EXISTING real file must copy the real content into
  * the overlay first (copy-on-write). Without CoW, an OPEN_ALWAYS/GENERIC_WRITE
@@ -473,20 +2399,52 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
                                   LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
                                   DWORD dwFlagsAndAttributes, HANDLE hTemplateFile, int isAnsi)
 {
+    /* R20 FOLLOW-UP（P0）：先剥 NT 命名空间/Win32 设备别名（\\?\GLOBALROOT\Device\…、
+     * \\.\X:、\??\Volume{GUID}\…）。否则下面的遮蔽判定看到的是"设备/相对名"，
+     * 会跳过 mask，随后 ws_should_intercept 再映射成功 ⇒ 遮蔽读/写绕过。
+     * 映射不了的设备名保持原样（后续按原逻辑 passthrough，残余见 findings §6）。 */
+    wchar_t effectiveName[WS_PATH_MAX];
+    LPCWSTR rawName = lpFileName;
+    if (lpFileName && lpFileName[0] && ws_path_effective(lpFileName, effectiveName, WS_PATH_MAX)) {
+        lpFileName = effectiveName;
+    }
     /* Read masking (task-10) runs before anything else, so a sensitive path is
      * denied even if it would otherwise pass through (staging root, device names,
-     * passthrough prefixes). Only read-class access is subject to the mask; writes
-     * keep the staging behaviour. */
+     * passthrough prefixes).
+     *
+     * ── R19-A1（Lead 拍板语义）：**mask 是读边界**，不是"一切访问都拒" ──────────────
+     * 现场（R19 注入实证）：旧判据只在 `!writeAccessMask && !destructiveMask` 时查 mask，
+     * 于是 `fs.openSync(masked, 'r+')`（GENERIC_READ|GENERIC_WRITE，desiredAccess=0x3）
+     * 完全跳过 mask ⇒ 走 CoW copy-up 把真实明文复制进 overlay ⇒ 调用方从**同一个 handle**
+     * 读回明文（`readSync` 输出 marker；`MemoryMappedFile.CreateFromFile` 同样中招）。
+     *
+     * 现在的三分（顺序即优先级）：
+     *   ① 被 mask 命中 + desiredAccess 含**可读位**（WS_FILE_READ_ACCESS_MASK，
+     *      含 `GENERIC_ALL`/`MAXIMUM_ALLOWED`/`r+`）⇒ ERROR_ACCESS_DENIED；
+     *   ② 被 mask 命中 + **纯写意图**（不含可读位）⇒ 允许进暂存，但**不做 CoW copy-up**
+     *      （见下方 `maskNoCopyUp`，只建空占位副本），因此同 handle 读不回真实内容；
+     *   ③ 未被 mask 命中 ⇒ 与旧行为完全一致。
+     * ③ 不是"写也全拒"：写敏感路径仍然成功、仍然只落暂存，只是不再把明文搬进暂存树。 */
     DWORD writeAccessMask = dwDesiredAccess & WS_FILE_WRITE_ACCESS_MASK;
+    DWORD readAccessMask = dwDesiredAccess & WS_FILE_READ_ACCESS_MASK;
     int destructiveMask = (dwCreationDisposition == CREATE_NEW || dwCreationDisposition == CREATE_ALWAYS ||
                            dwCreationDisposition == TRUNCATE_EXISTING);
-    if (ws_mask_declared() && !writeAccessMask && !destructiveMask && lpFileName && lpFileName[0]) {
+    int maskNoCopyUp = 0;
+    /* R21：mask 判定用**调用方原始路径**：`ws_mask_normalize()` 自己会做
+     * realpath/长名/盘符归一，能识别 `\\?\` 前缀与 >MAX_PATH 的真实文件；而
+     * `effectiveName` 对长路径去掉了前缀，mask 归一化会失败（fail-closed 或漏判）。 */
+    if (ws_mask_declared() && rawName && rawName[0]) {
         wchar_t maskedBy[256];
-        if (ws_mask_decide_read(lpFileName, maskedBy, 256)) {
-            ws_log_w(L"read masked", lpFileName);
-            WS_TRACE_FILE("CreateFile read denied by mask rule %ls", maskedBy);
-            SetLastError(ERROR_ACCESS_DENIED);
-            return INVALID_HANDLE_VALUE;
+        if (ws_mask_decide_read(rawName, maskedBy, 256)) {
+            if (readAccessMask || (!writeAccessMask && !destructiveMask)) {
+                ws_log_w(L"read masked", rawName);
+                WS_TRACE_FILE("CreateFile read denied by mask rule %ls", maskedBy);
+                SetLastError(ERROR_ACCESS_DENIED);
+                return INVALID_HANDLE_VALUE;
+            }
+            /* 纯写意图：写入照常进暂存，但 CoW copy-up 会泄露明文 ⇒ 改为空占位副本。 */
+            maskNoCopyUp = 1;
+            ws_log_w(L"masked path, write-only intent: staging without CoW copy-up", rawName);
         }
     }
 
@@ -503,10 +2461,12 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
                  (unsigned long)dwCreationDisposition);
     }
     if (!intercept) {
-        return isAnsi ? g_orig.CreateFileA((LPCSTR)lpFileName, dwDesiredAccess, dwShareMode,
+        /* R21：passthrough 用原始路径（可能带 `\\?\`，>MAX_PATH 的真实 API 需要它）。 */
+        LPCWSTR passName = rawName ? rawName : lpFileName;
+        return isAnsi ? g_orig.CreateFileA((LPCSTR)passName, dwDesiredAccess, dwShareMode,
                                            lpSecurityAttributes, dwCreationDisposition,
                                            dwFlagsAndAttributes, hTemplateFile)
-                      : g_orig.CreateFileW(lpFileName, dwDesiredAccess, dwShareMode,
+                      : g_orig.CreateFileW(passName, dwDesiredAccess, dwShareMode,
                                            lpSecurityAttributes, dwCreationDisposition,
                                            dwFlagsAndAttributes, hTemplateFile);
     }
@@ -534,10 +2494,14 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
              * 失败run 的日志因此停在 "CreateFile request" 那一行，无法区分"死在我们钩子里"
              * 与"死在钩子之后"。这里记下解析结果；else 分支再记一次开启结果，两者一对比
              * 就能把死亡点夹在中间。 */
-            ws_log("read-branch resolved flags=0x%lx mapped=%ls", (unsigned long)rflags, mapped);
+            WS_DBG("read-branch resolved flags=0x%lx mapped=%ls", (unsigned long)rflags, mapped);
         }
         HANDLE h;
         DWORD stagedErr = ERROR_SUCCESS;
+        wchar_t apiPathBuf[WS_PATH_MAX];
+        const wchar_t *apiMapped = ws_api_path(mapped, apiPathBuf, WS_PATH_MAX);
+        wchar_t apiNormBuf[WS_PATH_MAX];
+        const wchar_t *apiNorm = ws_api_path(norm, apiNormBuf, WS_PATH_MAX);
         if (rflags & WINSTAGE_RES_STAGED) {
             /* ── WP13 overlay 读穿（read-through）修复 ────────────────────────────
              * `WINSTAGE_RES_STAGED` 只是"解析那一刻 overlay 里有件"的**快照**
@@ -561,32 +2525,32 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
              * 回落失败时**保留 overlay 那次错误**（否则调用者看到 3 而非 2，语义漂移）。
              * 幂等/不递归：回落目标 `norm` 位于 stageRoot 与 passthrough 之外
              * （ws_should_intercept 已排除），且经 `g_orig.CreateFileW` 直调、不进钩子。 */
-            h = g_orig.CreateFileW(mapped, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+            h = g_orig.CreateFileW(apiMapped, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
                                    dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
             stagedErr = GetLastError();
     { /* R11-D-13d-ovl: record the overlay open's own outcome (zero semantic change) */
         DWORD ovl_se = GetLastError();
-        ws_log("ATTRDBG-CFW-OVL handle=%p valid=%d err=%lu path=%ls", (void *)h,
+        WS_DBG("ATTRDBG-CFW-OVL handle=%p valid=%d err=%lu path=%ls", (void *)h,
                (h != INVALID_HANDLE_VALUE) ? 1 : 0, (unsigned long)stagedErr, lpFileName);
         SetLastError(ovl_se);
     }
             if (h == INVALID_HANDLE_VALUE && !destructive &&
                 ws_wcscmp_ci(mapped, norm) != 0 && ws_file_exists(norm)) {
                 ws_log_w(L"CreateFile overlay(read) miss -> read-through real", norm);
-                HANDLE hReal = g_orig.CreateFileW(norm, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+                HANDLE hReal = g_orig.CreateFileW(apiNorm, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
                                                   dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
                 h = hReal;
                 stagedErr = (hReal == INVALID_HANDLE_VALUE) ? stagedErr : ERROR_SUCCESS;
             }
         } else {
-            h = g_orig.CreateFileW(mapped, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+            h = g_orig.CreateFileW(apiMapped, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
                                    dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
             stagedErr = GetLastError();
             if (g_ws.traceStagedOps) {
                 /* ★ round-4 诊断：读穿（RES_REAL）分支的**开启结果**。与上面的
                  * "read-branch resolved" 配对：若失败run 只有 resolved 没有这一行，
                  * 死亡点就在 `g_orig.CreateFileW` 之内/紧后；若两行都有，则死在钩子之外。 */
-                ws_log("read-branch real-open ok=%d err=%lu", h != INVALID_HANDLE_VALUE,
+                WS_DBG("read-branch real-open ok=%d err=%lu", h != INVALID_HANDLE_VALUE,
                        (unsigned long)stagedErr);
             }
         }
@@ -605,6 +2569,20 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
             }
             SetLastError(stagedErr);
         }
+        /* R18: the opened file may be a hardlink alias of a masked file. The
+         * mask check above only saw the caller's path; enumerate the file's
+         * link names once the handle exists and deny if ANY of them is masked. */
+        if (h != INVALID_HANDLE_VALUE && !t_hlGuard && ws_mask_declared()) {
+            wchar_t hlRule[256];
+            if (ws_hardlink_alias_check_handle(h, mapped, hlRule, 256) != 0) {
+                if (g_orig.CloseHandle) {
+                    g_orig.CloseHandle(h);
+                }
+                ws_log_w(L"read denied: hardlink alias of a masked file", norm);
+                SetLastError(ERROR_ACCESS_DENIED);
+                return INVALID_HANDLE_VALUE;
+            }
+        }
         return h;
     }
 
@@ -616,13 +2594,70 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
         return INVALID_HANDLE_VALUE;
     }
     int stagedExists = ws_file_exists(staged);
+    /* R21: delete-then-recreate. A whiteout marker makes the logical path absent
+     * even when a staged copy exists, so the open/create decisions below must use
+     * the LOGICAL existence, not the real one. */
+    int logicalWhiteout = ws_logically_whiteouted(norm);
     /* R18-KNOWN-06: remember whether THIS open created the CoW copy. Only that
      * shape is revocable at close (a pre-existing staged copy belongs to an
      * earlier, possibly real, modification and must never be revoked here). */
     int copiedForDeferredCoW = 0;
-    if (dwCreationDisposition == CREATE_NEW && (realExists || stagedExists)) {
+    if (dwCreationDisposition == CREATE_NEW && (stagedExists || (realExists && !logicalWhiteout))) {
         SetLastError(ERROR_FILE_EXISTS);
         return INVALID_HANDLE_VALUE;
+    }
+    if (logicalWhiteout && !stagedExists && !writeAccess && !destructive &&
+        dwCreationDisposition == OPEN_EXISTING) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (logicalWhiteout && !stagedExists && dwCreationDisposition == TRUNCATE_EXISTING) {
+        /* logically deleted: the real content must not be resurrected */
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    /* R18: a hardlink can give a MASKED file a harmless-looking second name.
+     * CoW copy-up would then move the plaintext into the overlay (readable
+     * through the same handle). Detect it BEFORE copying: treat exactly like
+     * the masked write-intent case above (overlay placeholder, no plaintext). */
+    if (ws_mask_declared() && !maskNoCopyUp && !t_hlGuard && realExists && !stagedExists) {
+        wchar_t hlRule[256];
+        if (ws_path_hardlink_alias_masked(norm, hlRule, 256) != 0) {
+            maskNoCopyUp = 1;
+            ws_log_w(L"write-intent open: file has a masked hardlink alias -> staging without CoW copy-up", norm);
+        }
+    }
+    /* R19-A1 ②：被遮蔽路径的**纯写意图** open —— 绝不 CoW copy-up。
+     * 目的：让后续写/截断仍有 overlay 目标可操作（OPEN_ALWAYS / TRUNCATE_EXISTING 不会因
+     * 缺件变成 ERROR_FILE_NOT_FOUND），同时 overlay 里**没有任何真实明文**：
+     * 调用方即便用同一个 handle 读回，也只会读到"空文件 + 自己写进去的内容"。
+     * 目录形态无法用"空文件占位"表达（且被遮蔽目录的写意图 open 本就该拒绝）⇒ fail-closed。 */
+    if (maskNoCopyUp) {
+        DWORD realAttrsMasked = ws_real_attrs_w(norm);
+        if (realAttrsMasked != INVALID_FILE_ATTRIBUTES && (realAttrsMasked & FILE_ATTRIBUTE_DIRECTORY)) {
+            ws_log_w(L"fail-closed CreateFileW (masked write-intent on a directory)", norm);
+            SetLastError(ERROR_ACCESS_DENIED);
+            return INVALID_HANDLE_VALUE;
+        }
+        if (!stagedExists) {
+            /* 父链必须先建：直接 CreateFileW 不会补目录（否则 AppData\…\PSReadLine\
+             * ConsoleHost_history.txt 这类正常写会被误拒）。失败仍 fail-closed。 */
+            if (!ws_ensure_dirs(staged, 0)) {
+                ws_log_w(L"fail-closed CreateFileW (masked write-intent placeholder dirs failed)", staged);
+                SetLastError(ERROR_ACCESS_DENIED);
+                return INVALID_HANDLE_VALUE;
+            }
+            HANDLE ph = g_orig.CreateFileW(staged, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                           NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (ph == INVALID_HANDLE_VALUE) {
+                ws_log_w(L"fail-closed CreateFileW (masked write-intent placeholder failed)", staged);
+                SetLastError(ERROR_ACCESS_DENIED);
+                return INVALID_HANDLE_VALUE;
+            }
+            CloseHandle(ph);
+            ws_log_w(L"CreateFileW masked write-intent: empty placeholder (no plaintext copy-up)", staged);
+            stagedExists = ws_file_exists(staged);
+        }
     }
     /* Copy-on-write. Needed for every write-intent open whose overlay content is
      * kept (OPEN_* with write access) AND for TRUNCATE_EXISTING: a truncate still
@@ -634,7 +2669,8 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
      * truncate then fails with ERROR_ACCESS_DENIED exactly like the real API.
      * CREATE_ALWAYS discards the content in the open itself and CREATE_NEW was
      * already rejected above, so neither needs the copy. */
-    if (!stagedExists && realExists && (!destructive || dwCreationDisposition == TRUNCATE_EXISTING)) {
+    if (!stagedExists && realExists && !logicalWhiteout &&
+        (!destructive || dwCreationDisposition == TRUNCATE_EXISTING)) {
         DWORD realAttrs = ws_real_attrs_w(norm);
         if (realAttrs != INVALID_FILE_ATTRIBUTES && (realAttrs & FILE_ATTRIBUTE_DIRECTORY)) {            /* ★ round-4 修复：**目录不能 CoW** —— `CopyFileW` 对目录必然失败，旧代码于是把
              * "打开一个已存在的目录"误判成 `copy-on-write failed` 并 fail-closed 拒绝。
@@ -664,6 +2700,11 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
     if (copiedForDeferredCoW && h != INVALID_HANDLE_VALUE) {
         ws_cow_track(h, staged, norm);
     }
+    if (h != INVALID_HANDLE_VALUE) {
+        /* R21: this open wrote/created the logical path again => it must stop
+         * looking deleted (whiteout marker cleared). */
+        ws_clear_whiteout(norm);
+    }
     if (g_ws.traceStagedOps && (writeAccess || destructive)) {
         /* Do not lose the failing call's error code while tracing it (see the
          * read branch above): the sandboxed caller must see the same error an
@@ -681,7 +2722,7 @@ HANDLE WINAPI ws_CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dw
 {
     { /* R11-D-13d-cfw: open-form log, LastError-safe (zero semantic change) */
         DWORD cfw_se = GetLastError();
-        ws_log("ATTRDBG-CFW seq=%ld desiredAccess=0x%lx share=0x%lx disposition=%lu flags=0x%lx path=%ls", /* R11-D-13d-seq */
+        WS_DBG("ATTRDBG-CFW seq=%ld desiredAccess=0x%lx share=0x%lx disposition=%lu flags=0x%lx path=%ls", /* R11-D-13d-seq */
                ws_seq(), (unsigned long)dwDesiredAccess, (unsigned long)dwShareMode, (unsigned long)dwCreationDisposition,
                (unsigned long)dwFlagsAndAttributes, lpFileName);
         SetLastError(cfw_se);
@@ -721,6 +2762,9 @@ BOOL WINAPI ws_CreateDirectoryW(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecu
     }
     BOOL ok = g_orig.CreateDirectoryW(mapped, lpSecurityAttributes);
     DWORD lastErr = GetLastError();
+    if (ok) {
+        ws_clear_whiteout(norm); /* R21: delete dir -> recreate dir */
+    }
     ws_log_w(ok ? L"CreateDirectoryW staged" : L"CreateDirectoryW staged FAILED", mapped);
     SetLastError(lastErr);
     return ok;
@@ -820,6 +2864,14 @@ static BOOL ws_move_locked(LPCWSTR src, LPCWSTR dst, DWORD flags)
     } else {
         /* materialize the real source into the overlay, then hide the original */
         DWORD realAttrs = GetFileAttributesW(normSrc);
+        if (ws_mask_declared()) {
+            wchar_t hlRule[256];
+            if (ws_path_hardlink_alias_masked(normSrc, hlRule, 256) != 0) {
+                ws_log_w(L"MoveFile denied: source is a hardlink alias of a masked file", normSrc);
+                SetLastError(ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
+        }
         DWORD copyFlags = flags;
         (void)copyFlags;
         ok = g_orig.CopyFileW ? g_orig.CopyFileW(normSrc, stagedDst, FALSE) : FALSE;
@@ -830,6 +2882,7 @@ static BOOL ws_move_locked(LPCWSTR src, LPCWSTR dst, DWORD flags)
     }
     if (ok) {
         DWORD lastErr = GetLastError(); /* the log write must not become the caller's error */
+        ws_clear_whiteout(normDst);     /* R21: move onto a logically-deleted path recreates it */
         ws_log_w(L"MoveFileExW staged", stagedDst);
         SetLastError(lastErr);
     }
@@ -949,6 +3002,35 @@ BOOL WINAPI ws_RemoveDirectoryA(LPCSTR lpPathName)
 
 static BOOL ws_copy_file_locked(LPCWSTR src, LPCWSTR dst, BOOL failIfExists)
 {
+    /* R20 FOLLOW-UP（P0）：设备/卷命名空间路径先映射成普通 Win32，否则 mask 看到的是
+     * `\\?\GLOBALROOT\Device\…` 这类名字（不匹配 leaf 遮蔽规则）⇒ 明文被复制。 */
+    wchar_t effSrc[WS_PATH_MAX];
+    wchar_t effDst[WS_PATH_MAX];
+    if (src && src[0] && ws_path_effective(src, effSrc, WS_PATH_MAX)) {
+        src = effSrc;
+    }
+    if (dst && dst[0] && ws_path_effective(dst, effDst, WS_PATH_MAX)) {
+        dst = effDst;
+    }
+    /* ═══ R19-A2：CopyFileW/A 必须先过 mask 判定 ═══════════════════════════════
+     * 现场（R19 注入实证）：旧实现直接 `ws_resolve_file(src, WINSTAGE_IO_READ)` 取真实路径
+     * 再 CopyFileW ⇒ 被遮蔽文件的内容被整份复制进 overlay（暂存树/候选面出现明文 marker），
+     * `.NET File.Copy`（走 CopyFileW）同样命中；而"读"本该被 mask 拒绝。
+     * 判据：mask 是读边界 —— src 与 dst **任一**命中遮蔽表都拒绝（dst 落在敏感目录同理：
+     * 那是把内容写进被遮蔽位置，同样属于不该发生的跨边界拷贝）。 */
+    if (ws_mask_declared()) {
+        wchar_t maskedBy[256];
+        if (src && src[0] && ws_mask_decide_read(src, maskedBy, 256)) {
+            ws_log_w(L"CopyFile masked source denied", src);
+            SetLastError(ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+        if (dst && dst[0] && ws_mask_decide_read(dst, maskedBy, 256)) {
+            ws_log_w(L"CopyFile masked destination denied", dst);
+            SetLastError(ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+    }
     wchar_t normSrc[WS_PATH_MAX], normDst[WS_PATH_MAX];
     if (!ws_should_intercept(src, normSrc, WS_PATH_MAX) || !ws_should_intercept(dst, normDst, WS_PATH_MAX)) {
         return g_orig.CopyFileW(src, dst, failIfExists);
@@ -960,6 +3042,16 @@ static BOOL ws_copy_file_locked(LPCWSTR src, LPCWSTR dst, BOOL failIfExists)
         SetLastError(ERROR_ACCESS_DENIED);
         return FALSE;
     }
+    /* R18: the source may be a hardlink alias of a masked file (the path mask
+     * check above cannot see a second name). Deny before copying a byte. */
+    if (ws_mask_declared() && !(fSrc & WINSTAGE_RES_STAGED)) {
+        wchar_t hlRule[256];
+        if (ws_path_hardlink_alias_masked(stagedSrc, hlRule, 256) != 0) {
+            ws_log_w(L"CopyFile denied: source is a hardlink alias of a masked file", stagedSrc);
+            SetLastError(ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+    }
     if (fSrc & (WINSTAGE_RES_WHITEOUT)) {
         SetLastError(ERROR_FILE_NOT_FOUND);
         return FALSE;
@@ -968,7 +3060,11 @@ static BOOL ws_copy_file_locked(LPCWSTR src, LPCWSTR dst, BOOL failIfExists)
         SetLastError(ERROR_FILE_EXISTS);
         return FALSE;
     }
-    return g_orig.CopyFileW(stagedSrc, stagedDst, FALSE);
+    BOOL copied = g_orig.CopyFileW(stagedSrc, stagedDst, FALSE);
+    if (copied) {
+        ws_clear_whiteout(normDst); /* R21: copy onto a logically-deleted path recreates it */
+    }
+    return copied;
 }
 
 BOOL WINAPI ws_CopyFileW(LPCWSTR src, LPCWSTR dst, BOOL failIfExists)
@@ -982,6 +3078,98 @@ BOOL WINAPI ws_CopyFileA(LPCSTR src, LPCSTR dst, BOOL failIfExists)
     ws_a2w_buf(src, a, WS_PATH_MAX);
     ws_a2w_buf(dst, b, WS_PATH_MAX);
     return ws_copy_file_locked(a[0] ? a : NULL, b[0] ? b : NULL, failIfExists);
+}
+
+/* R19-A2b: `CopyFileExW/A` — robocopy and other real callers use THIS entry, not
+ * CopyFileW. Before the hook they wrote the REAL disk directly (measured by
+ * security-auditor: injected robocopy leaked a plaintext .npmrc into the real
+ * workspace) because the name was absent from WS_TARGET. Semantics:
+ *   · both paths non-intercepted -> original CopyFileEx (no behaviour change);
+ *   · otherwise -> the same staging + read-mask path as CopyFileW;
+ *     `COPY_FILE_FAIL_IF_EXISTS` maps to failIfExists; the progress callback is
+ *     honoured at start/end (the staged copy is one real CopyFileW, so there is no
+ *     per-chunk progress to report) and a pre-cancelled call aborts BEFORE writing
+ *     anything (ERROR_REQUEST_ABORTED), exactly like the real API. */
+BOOL WINAPI ws_CopyFileExW(LPCWSTR src, LPCWSTR dst, LPPROGRESS_ROUTINE progress,
+                           LPVOID progressData, LPBOOL cancel, DWORD flags)
+{
+    WS_STUCK("CopyFileExW");
+    ws_stuck_path(src);
+    wchar_t normSrc[WS_PATH_MAX], normDst[WS_PATH_MAX];
+    if (!ws_should_intercept(src, normSrc, WS_PATH_MAX) || !ws_should_intercept(dst, normDst, WS_PATH_MAX)) {
+        if (g_orig.CopyFileExW) {
+            return g_orig.CopyFileExW(src, dst, progress, progressData, cancel, flags);
+        }
+        return ws_copy_file_locked(src, dst, (flags & COPY_FILE_FAIL_IF_EXISTS) != 0);
+    }
+    if (cancel && *cancel) {
+        SetLastError(ERROR_REQUEST_ABORTED);
+        return FALSE;
+    }
+    BOOL failIfExists = (flags & COPY_FILE_FAIL_IF_EXISTS) != 0;
+    LARGE_INTEGER total = { .QuadPart = 0 };
+    LARGE_INTEGER zero = { .QuadPart = 0 };
+    if (progress) {
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(src, GetFileExInfoStandard, &fad)) {
+            total.HighPart = (LONG)fad.nFileSizeHigh;
+            total.LowPart = fad.nFileSizeLow;
+        }
+        DWORD stop = progress(zero, zero, zero, zero, 0, CALLBACK_STREAM_SWITCH, NULL, NULL, progressData);
+        if (stop == PROGRESS_CANCEL) {
+            SetLastError(ERROR_REQUEST_ABORTED);
+            return FALSE;
+        }
+        if (stop == PROGRESS_STOP) {
+            SetLastError(ERROR_REQUEST_ABORTED);
+            return FALSE;
+        }
+        if (stop == PROGRESS_QUIET) {
+            progress = NULL; /* caller asked us to stop calling it */
+        }
+    }
+    BOOL ok = ws_copy_file_locked(src, dst, failIfExists);
+    DWORD lastErr = GetLastError();
+    if (ok && progress) {
+        progress(total, total, total, total, 0, CALLBACK_CHUNK_FINISHED, NULL, NULL, progressData);
+    }
+    if (ok) {
+        ws_log_w(L"CopyFileExW staged", dst);
+    }
+    SetLastError(lastErr);
+    return ok;
+}
+
+BOOL WINAPI ws_CopyFileExA(LPCSTR src, LPCSTR dst, LPPROGRESS_ROUTINE progress,
+                           LPVOID progressData, LPBOOL cancel, DWORD flags)
+{
+    wchar_t a[WS_PATH_MAX], b[WS_PATH_MAX];
+    ws_a2w_buf(src, a, WS_PATH_MAX);
+    ws_a2w_buf(dst, b, WS_PATH_MAX);
+    return ws_CopyFileExW(a[0] ? a : NULL, b[0] ? b : NULL, progress, progressData, cancel, flags);
+}
+
+/* robocopy calls CopyFile2 (resolved dynamically: CopyFileExW never appeared in the
+ * injected shim log). Same policy as CopyFileExW: staging + mask, HRESULT contract. */
+HRESULT WINAPI ws_CopyFile2(PCWSTR src, PCWSTR dst, COPYFILE2_EXTENDED_PARAMETERS *params)
+{
+    WS_STUCK("CopyFile2");
+    ws_stuck_path(src);
+    wchar_t normSrc[WS_PATH_MAX], normDst[WS_PATH_MAX];
+    if (!ws_should_intercept(src, normSrc, WS_PATH_MAX) || !ws_should_intercept(dst, normDst, WS_PATH_MAX)) {
+        if (g_orig.CopyFile2) return g_orig.CopyFile2(src, dst, params);
+        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    }
+    BOOL failIfExists = params && (params->dwCopyFlags & COPY_FILE_FAIL_IF_EXISTS) != 0;
+    DWORD cancelFlag = params ? params->dwCopyFlags : 0;
+    (void)cancelFlag;
+    if (ws_copy_file_locked(src, dst, failIfExists)) {
+        ws_log_w(L"CopyFile2 staged", dst);
+        return S_OK;
+    }
+    DWORD err = GetLastError();
+    if (err == 0) err = ERROR_ACCESS_DENIED;
+    return HRESULT_FROM_WIN32(err);
 }
 
 BOOL WINAPI ws_SetFileAttributesW(LPCWSTR lpFileName, DWORD dwFileAttributes)
@@ -1005,6 +3193,14 @@ BOOL WINAPI ws_SetFileAttributesW(LPCWSTR lpFileName, DWORD dwFileAttributes)
             return FALSE;
         }
         /* materialize so the attribute change is visible in the overlay */
+        if (ws_mask_declared()) {
+            wchar_t hlRule[256];
+            if (ws_path_hardlink_alias_masked(norm, hlRule, 256) != 0) {
+                ws_log_w(L"SetFileAttributes denied: hardlink alias of a masked file", norm);
+                SetLastError(ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
+        }
         if (!g_orig.CopyFileW(norm, mapped, FALSE)) {
             return FALSE;
         }
@@ -1041,9 +3237,15 @@ BOOL WINAPI ws_SetFileAttributesW(LPCWSTR lpFileName, DWORD dwFileAttributes)
  * the overlay (and it must never re-enter these wrappers). */
 static int ws_stat_read_masked(LPCWSTR lpFileName)
 {
+    /* R20 FOLLOW-UP（P0）：设备/卷命名空间路径先映射，否则遮蔽判定看到的是
+     * `\\?\GLOBALROOT\Device\…` 形态 ⇒ stat/exists 泄漏被遮蔽路径的元数据。 */
+    wchar_t eff[WS_PATH_MAX];
+    const wchar_t *p = lpFileName;
+    if (lpFileName && lpFileName[0] && ws_path_effective(lpFileName, eff, WS_PATH_MAX)) {
+        p = eff;
+    }
     wchar_t maskedBy[256];
-    return ws_mask_declared() && lpFileName && lpFileName[0] &&
-           ws_mask_decide_read(lpFileName, maskedBy, 256);
+    return ws_mask_declared() && p && p[0] && ws_mask_decide_read(p, maskedBy, 256);
 }
 
 /* PowerShell's AppLocker / App-Control lock-down probe.
@@ -1095,7 +3297,7 @@ static int ws_stat_resolve(LPCWSTR lpFileName, wchar_t *mapped, DWORD cch, int *
         {
             DWORD probeAttrs = ws_real_attrs_w(lpFileName);
             DWORD probeErr = GetLastError();
-            ws_log("lockdown-probe stat: exists=%d err=%lu path=%ls",
+            WS_DBG("lockdown-probe stat: exists=%d err=%lu path=%ls",
                    probeAttrs != INVALID_FILE_ATTRIBUTES, (unsigned long)probeErr, lpFileName);
         }
         ws_strlcpy_w(mapped, lpFileName, cch);
@@ -1128,9 +3330,9 @@ static void ws_attr_log(const char *api, const wchar_t *path)
         return;
     }
     if (path) {
-        ws_log("ATTRDBG seq=%ld api=%s path=%ls", ws_seq(), api, path); /* R11-D-13d-seq */
+        WS_DBG("ATTRDBG seq=%ld api=%s path=%ls", ws_seq(), api, path); /* R11-D-13d-seq */
     } else {
-        ws_log("ATTRDBG api=%s path=<null>", api);
+        WS_DBG("ATTRDBG api=%s path=<null>", api);
     }
     InterlockedExchange(&g_attrLogBusy, 0);
 }
@@ -1140,9 +3342,9 @@ static void ws_attr_log_nt(const char *api, const UNICODE_STRING *us)
         return;
     }
     if (us && us->Buffer) {
-        ws_log("ATTRDBG api=%s path=%.*ls", api, (int)(us->Length / sizeof(wchar_t)), us->Buffer);
+        WS_DBG("ATTRDBG api=%s path=%.*ls", api, (int)(us->Length / sizeof(wchar_t)), us->Buffer);
     } else {
-        ws_log("ATTRDBG api=%s path=<null>", api);
+        WS_DBG("ATTRDBG api=%s path=<null>", api);
     }
     InterlockedExchange(&g_attrLogBusy, 0);
 }
@@ -1152,14 +3354,14 @@ DWORD WINAPI ws_GetFileAttributesW(LPCWSTR lpFileName)
     ws_attr_log("GetFileAttributesW", lpFileName); /* R11-D-13d-attr */
     ws_callhit_named("GetFileAttributesW"); /* R11-D-13d */
     if (ws_stat_read_masked(lpFileName)) {
-        ws_log("ATTRDBG-W branch=masked in=%ls", lpFileName); /* R11-D-13d-w */
+        WS_DBG("ATTRDBG-W branch=masked in=%ls", lpFileName); /* R11-D-13d-w */
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_FILE_ATTRIBUTES;
     }
     wchar_t mapped[WS_PATH_MAX];
     int isStaged = 0;
     if (ws_stat_resolve(lpFileName, mapped, WS_PATH_MAX, &isStaged)) {
-        ws_log("ATTRDBG-W branch=resolve-fail in=%ls", lpFileName); /* R11-D-13d-w */
+        WS_DBG("ATTRDBG-W branch=resolve-fail in=%ls", lpFileName); /* R11-D-13d-w */
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_FILE_ATTRIBUTES;
     }
@@ -1172,7 +3374,7 @@ DWORD WINAPI ws_GetFileAttributesW(LPCWSTR lpFileName)
     DWORD lastErr = GetLastError();
     WS_TRACE_FILE("GetFileAttributesW mapped=%ls staged=%d -> attrs=0x%lx err=%lu",
                   mapped, isStaged, (unsigned long)attrs, (unsigned long)lastErr);
-    ws_log("ATTRDBG-W rc=0 in=%ls mapped=%ls staged=%d attrs=0x%lx err=%lu", lpFileName, mapped, isStaged, (unsigned long)attrs, (unsigned long)lastErr); /* R11-D-13d-w */
+    WS_DBG("ATTRDBG-W rc=0 in=%ls mapped=%ls staged=%d attrs=0x%lx err=%lu", lpFileName, mapped, isStaged, (unsigned long)attrs, (unsigned long)lastErr); /* R11-D-13d-w */
     SetLastError(lastErr);
     return attrs;
 }
@@ -1182,14 +3384,14 @@ BOOL WINAPI ws_GetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS l
     ws_attr_log("GetFileAttributesExW", lpFileName); /* R11-D-13d-attr */
     ws_callhit_named("GetFileAttributesExW"); /* R11-D-13d */
     if (ws_stat_read_masked(lpFileName)) {
-        ws_log("ATTRDBG-ExW branch=masked in=%ls", lpFileName); /* R11-D-13d-w */
+        WS_DBG("ATTRDBG-ExW branch=masked in=%ls", lpFileName); /* R11-D-13d-w */
         SetLastError(ERROR_FILE_NOT_FOUND);
         return FALSE;
     }
     wchar_t mapped[WS_PATH_MAX];
     int isStaged = 0;
     if (ws_stat_resolve(lpFileName, mapped, WS_PATH_MAX, &isStaged)) {
-        ws_log("ATTRDBG-ExW branch=resolve-fail in=%ls", lpFileName); /* R11-D-13d-w */
+        WS_DBG("ATTRDBG-ExW branch=resolve-fail in=%ls", lpFileName); /* R11-D-13d-w */
         SetLastError(ERROR_FILE_NOT_FOUND);
         return FALSE;
     }
@@ -1197,7 +3399,7 @@ BOOL WINAPI ws_GetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS l
     DWORD lastErr = GetLastError(); /* see ws_GetFileAttributesW: the trace clobbers it */
     WS_TRACE_FILE("GetFileAttributesExW mapped=%ls staged=%d -> ok=%d err=%lu",
                   mapped, isStaged, (int)ok, (unsigned long)lastErr);
-    ws_log("ATTRDBG-ExW rc=0 in=%ls mapped=%ls staged=%d ok=%d err=%lu", lpFileName, mapped, isStaged, (int)ok, (unsigned long)lastErr); /* R11-D-13d-w */
+    WS_DBG("ATTRDBG-ExW rc=0 in=%ls mapped=%ls staged=%d ok=%d err=%lu", lpFileName, mapped, isStaged, (int)ok, (unsigned long)lastErr); /* R11-D-13d-w */
     SetLastError(lastErr);
     return ok;
 }
@@ -1424,11 +3626,29 @@ NTSTATUS NTAPI ws_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJ
         raw[i] = ObjectAttributes->ObjectName->Buffer[i];
     }
     raw[cch] = 0;
-    if (ws_starts_with_ci_w(raw, L"\\??\\")) {
+    /* R20 FOLLOW-UP（P0）：delete-on-close 也必须先剥设备/卷命名空间，否则
+     * `\Device\HarddiskVolumeN\…` 会被当成"设备路径"透传 ⇒ 内核真实删除。 */
+    wchar_t conv[WS_PATH_MAX];
+    if (ws_nt_device_to_win(raw, conv, WS_PATH_MAX)) {
+        ws_strlcpy_w(raw, conv, WS_PATH_MAX);
+    } else if (ws_starts_with_ci_w(raw, L"\\??\\")) {
         memmove(raw, raw + 4, (wcslen(raw + 4) + 1) * sizeof(wchar_t));
+        if (ws_nt_device_to_win(raw, conv, WS_PATH_MAX)) {
+            ws_strlcpy_w(raw, conv, WS_PATH_MAX);
+        }
     }
     wchar_t norm[WS_PATH_MAX];
     if (!ws_should_intercept(raw, norm, WS_PATH_MAX)) {
+        /* delete-on-close on an NT alias that could not be mapped to Win32: never pass
+         * FILE_DELETE_ON_CLOSE through to the kernel (real disk would be deleted). */
+        if (ws_is_nt_alias(raw)) {
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = (NTSTATUS)0xC0000022; /* STATUS_ACCESS_DENIED */
+                IoStatusBlock->Information = 0;
+            }
+            ws_log_w(L"fail-closed NtOpenFile(delete-on-close, unmapped NT alias)", raw);
+            return (NTSTATUS)0xC0000022;
+        }
         return g_orig.NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, OpenOptions);
     }
     WS_TRACE_FILE("NtOpenFile delete-on-close request raw=%ls normalized=%ls intercept=1 options=0x%lx",
@@ -1465,6 +3685,12 @@ NTSTATUS NTAPI ws_NtSetInformationFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoSta
 {
     ws_callhit_named("NtSetInformationFile"); /* R11-D-13d */
     ULONG cls = (ULONG)FileInformationClass;
+    /* R17/R18: FileLinkInformation(11) is a hardlink CREATE (a write). It is
+     * routed through the staged hardlink core so it can neither write the real
+     * disk nor link a masked file. Handled before the disposition classes. */
+    if (!t_wsFileBusy && FileHandle && cls == 11 /* FileLinkInformation */) {
+        return ws_nt_set_file_link(FileHandle, IoStatusBlock, FileInformation, Length);
+    }
     int wantDelete = 0;
     if (!t_wsFileBusy && FileHandle && cls == WS_FID_DISPOSITION && FileInformation &&
         Length >= sizeof(BOOLEAN)) {
@@ -1542,7 +3768,7 @@ BOOL WINAPI ws_GetFileInformationByHandle(HANDLE hFile, LPVOID lpFileInformation
         ok = GetFileInformationByHandle(hFile, (LPBY_HANDLE_FILE_INFORMATION)lpFileInformation);
     }
     DWORD e = GetLastError();
-    ws_log("ATTRDBG-GFIBH seq=%ld handle=%p ok=%d err=%lu", ws_seq(), (void *)hFile, (int)ok, (unsigned long)e); /* R11-D-13d-seq */
+    WS_DBG("ATTRDBG-GFIBH seq=%ld handle=%p ok=%d err=%lu", ws_seq(), (void *)hFile, (int)ok, (unsigned long)e); /* R11-D-13d-seq */
     SetLastError(e);
     return ok;
 }
@@ -1572,7 +3798,7 @@ NTSTATUS NTAPI ws_NtQueryInformationFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoS
     } else {
         st = NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
-    ws_log("ATTRDBG-NTQIF seq=%ld handle=%p class=%d status=0x%lx", /* R11-D-13d-seq */
+    WS_DBG("ATTRDBG-NTQIF seq=%ld handle=%p class=%d status=0x%lx", /* R11-D-13d-seq */
            ws_seq(), (void *)FileHandle, FileInformationClass, (unsigned long)st);
     return st;
 }
@@ -1594,7 +3820,7 @@ BOOL WINAPI ws_GetFileInformationByHandleEx(HANDLE hFile, int FileInformationCla
                                           lpFileInformation, dwBufferSize);
     }
     DWORD e = GetLastError();
-    ws_log("ATTRDBG-GFIBHEX handle=%p class=%d ok=%d err=%lu",
+    WS_DBG("ATTRDBG-GFIBHEX handle=%p class=%d ok=%d err=%lu",
            (void *)hFile, FileInformationClass, (int)ok, (unsigned long)e);
     SetLastError(e);
     return ok;
@@ -1746,7 +3972,7 @@ NTSTATUS NTAPI ws_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes, PVO
     int ws_r = ws_attrbyname_overlay(ws_nqaf_orig != 0, ObjectAttributes, ws_path, ws_win, ws_nt);
     if (ws_r == 2) {
         NTSTATUS ws_gone = (NTSTATUS)0xC0000034L; /* STATUS_OBJECT_NAME_NOT_FOUND */
-        ws_log("ATTRDBG-NQAF pid=%lu handle=%p path=%ls mapped=<whiteout> nt=<none> staged=0 status=0x%lx class=%lu seq=%ld",
+        WS_DBG("ATTRDBG-NQAF pid=%lu handle=%p path=%ls mapped=<whiteout> nt=<none> staged=0 status=0x%lx class=%lu seq=%ld",
                (unsigned long)GetCurrentProcessId(), (void *)0, ws_path, (unsigned long)ws_gone,
                (unsigned long)0, ws_seq());
         return ws_gone;
@@ -1760,7 +3986,7 @@ NTSTATUS NTAPI ws_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes, PVO
         ws_oa.ObjectName = &ws_un;
         ws_oa.RootDirectory = NULL;
         NTSTATUS ws_st = ws_nqaf_orig(&ws_oa, FileInformation);
-        ws_log("ATTRDBG-NQAF pid=%lu handle=%p path=%ls mapped=%ls nt=%ls staged=1 status=0x%lx class=%lu seq=%ld",
+        WS_DBG("ATTRDBG-NQAF pid=%lu handle=%p path=%ls mapped=%ls nt=%ls staged=1 status=0x%lx class=%lu seq=%ld",
                (unsigned long)GetCurrentProcessId(), (void *)0, ws_path, ws_win, ws_nt,
                (unsigned long)ws_st, (unsigned long)0, ws_seq());
         return ws_st;
@@ -1774,11 +4000,11 @@ NTSTATUS NTAPI ws_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes, PVO
     const UNICODE_STRING *us = (ObjectAttributes ? ObjectAttributes->ObjectName : 0);
     const wchar_t *ws_map_log = (ws_r == 0 && ws_win[0]) ? ws_win : L"<none>";
     if (us && us->Buffer) {
-        ws_log("ATTRDBG-NQAF pid=%lu handle=%p path=%.*ls mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
+        WS_DBG("ATTRDBG-NQAF pid=%lu handle=%p path=%.*ls mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
                (unsigned long)GetCurrentProcessId(), (void *)0, (int)(us->Length / sizeof(wchar_t)),
                us->Buffer, ws_map_log, ws_r, (unsigned long)st, (unsigned long)0, ws_seq());
     } else {
-        ws_log("ATTRDBG-NQAF pid=%lu handle=%p path=<null> mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
+        WS_DBG("ATTRDBG-NQAF pid=%lu handle=%p path=<null> mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
                (unsigned long)GetCurrentProcessId(), (void *)0, ws_map_log, ws_r, (unsigned long)st,
                (unsigned long)0, ws_seq());
     }
@@ -1813,7 +4039,7 @@ NTSTATUS NTAPI ws_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
     int ws_r = ws_attrbyname_overlay(ws_nqfaf_orig != 0, ObjectAttributes, ws_path, ws_win, ws_nt);
     if (ws_r == 2) {
         NTSTATUS ws_gone = (NTSTATUS)0xC0000034L; /* STATUS_OBJECT_NAME_NOT_FOUND */
-        ws_log("ATTRDBG-NQFAF pid=%lu handle=%p path=%ls mapped=<whiteout> nt=<none> staged=0 status=0x%lx class=%lu seq=%ld",
+        WS_DBG("ATTRDBG-NQFAF pid=%lu handle=%p path=%ls mapped=<whiteout> nt=<none> staged=0 status=0x%lx class=%lu seq=%ld",
                (unsigned long)GetCurrentProcessId(), (void *)0, ws_path, (unsigned long)ws_gone,
                (unsigned long)0, ws_seq());
         return ws_gone;
@@ -1827,7 +4053,7 @@ NTSTATUS NTAPI ws_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
         ws_oa.ObjectName = &ws_un;
         ws_oa.RootDirectory = NULL;
         NTSTATUS ws_st = ws_nqfaf_orig(&ws_oa, FileInformation);
-        ws_log("ATTRDBG-NQFAF pid=%lu handle=%p path=%ls mapped=%ls nt=%ls staged=1 status=0x%lx class=%lu seq=%ld",
+        WS_DBG("ATTRDBG-NQFAF pid=%lu handle=%p path=%ls mapped=%ls nt=%ls staged=1 status=0x%lx class=%lu seq=%ld",
                (unsigned long)GetCurrentProcessId(), (void *)0, ws_path, ws_win, ws_nt,
                (unsigned long)ws_st, (unsigned long)0, ws_seq());
         return ws_st;
@@ -1841,11 +4067,11 @@ NTSTATUS NTAPI ws_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
     const UNICODE_STRING *us = (ObjectAttributes ? ObjectAttributes->ObjectName : 0);
     const wchar_t *ws_map_log = (ws_r == 0 && ws_win[0]) ? ws_win : L"<none>";
     if (us && us->Buffer) {
-        ws_log("ATTRDBG-NQFAF pid=%lu handle=%p path=%.*ls mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
+        WS_DBG("ATTRDBG-NQFAF pid=%lu handle=%p path=%.*ls mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
                (unsigned long)GetCurrentProcessId(), (void *)0, (int)(us->Length / sizeof(wchar_t)),
                us->Buffer, ws_map_log, ws_r, (unsigned long)st, (unsigned long)0, ws_seq());
     } else {
-        ws_log("ATTRDBG-NQFAF pid=%lu handle=%p path=<null> mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
+        WS_DBG("ATTRDBG-NQFAF pid=%lu handle=%p path=<null> mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
                (unsigned long)GetCurrentProcessId(), (void *)0, ws_map_log, ws_r, (unsigned long)st,
                (unsigned long)0, ws_seq());
     }
@@ -1934,7 +4160,7 @@ NTSTATUS NTAPI ws_NtQueryInformationByName(POBJECT_ATTRIBUTES ObjectAttributes, 
                 NTSTATUS ws_gone = (NTSTATUS)0xC0000034L; /* STATUS_OBJECT_NAME_NOT_FOUND */
                 IoStatusBlock->Status = ws_gone;
                 IoStatusBlock->Information = 0;
-                ws_log("ATTRDBG-NQIFBN pid=%lu handle=%p path=%ls mapped=<whiteout> nt=<none> staged=0 status=0x%lx class=%lu seq=%ld",
+                WS_DBG("ATTRDBG-NQIFBN pid=%lu handle=%p path=%ls mapped=<whiteout> nt=<none> staged=0 status=0x%lx class=%lu seq=%ld",
                        (unsigned long)GetCurrentProcessId(), (void *)0, ws_nz, (unsigned long)ws_gone,
                        (unsigned long)FileInformationClass, ws_seq());
                 return ws_gone;
@@ -1981,7 +4207,7 @@ NTSTATUS NTAPI ws_NtQueryInformationByName(POBJECT_ATTRIBUTES ObjectAttributes, 
                     ws_oa.ObjectName = &ws_un;
                     ws_oa.RootDirectory = NULL;
                     NTSTATUS ws_st = ws_nqifbn_orig(&ws_oa, IoStatusBlock, FileInformation, Length, FileInformationClass);
-                    ws_log("ATTRDBG-NQIFBN pid=%lu handle=%p path=%ls mapped=%ls nt=%ls staged=1 status=0x%lx class=%lu seq=%ld",
+                    WS_DBG("ATTRDBG-NQIFBN pid=%lu handle=%p path=%ls mapped=%ls nt=%ls staged=1 status=0x%lx class=%lu seq=%ld",
                            (unsigned long)GetCurrentProcessId(), (void *)0, ws_nz, ws_map, ws_nt,
                            (unsigned long)ws_st, (unsigned long)FileInformationClass, ws_seq());
                     return ws_st;
@@ -2000,12 +4226,12 @@ NTSTATUS NTAPI ws_NtQueryInformationByName(POBJECT_ATTRIBUTES ObjectAttributes, 
     const UNICODE_STRING *us = (ObjectAttributes ? ObjectAttributes->ObjectName : 0);
     const wchar_t *ws_map_log = (ws_staged >= 0 && ws_map[0]) ? ws_map : L"<none>";
     if (us && us->Buffer) {
-        ws_log("ATTRDBG-NQIFBN pid=%lu handle=%p path=%.*ls mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
+        WS_DBG("ATTRDBG-NQIFBN pid=%lu handle=%p path=%.*ls mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
                (unsigned long)GetCurrentProcessId(), (void *)0, (int)(us->Length / sizeof(wchar_t)),
                us->Buffer, ws_map_log, ws_staged, (unsigned long)st, (unsigned long)FileInformationClass,
                ws_seq());
     } else {
-        ws_log("ATTRDBG-NQIFBN pid=%lu handle=%p path=<null> mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
+        WS_DBG("ATTRDBG-NQIFBN pid=%lu handle=%p path=<null> mapped=%ls nt=<none> staged=%d status=0x%lx class=%lu seq=%ld",
                (unsigned long)GetCurrentProcessId(), (void *)0, ws_map_log, ws_staged, (unsigned long)st,
                (unsigned long)FileInformationClass, ws_seq());
     }

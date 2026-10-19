@@ -186,6 +186,37 @@ export const OFFLINE_SUITES = [
   //   会话里如实 SKIP（不是 PASS），与"缺能力宿主的用例 SKIP"同口径。
   //   与 verify.cmd 的清单必须逐字一致（两处同时改；tests/suite-wiring.ts 机器检查）。
   { id: 'cli-contract', script: 'tests/cli-contract.ts', title: 'CLI 契约（--help 退出码/子命令真实参数/候选未找到/workspace 校验/store 根/档位行/字典 markdown）' },
+  // R19 独立测试轮追加（Lead 收口时登记）：
+  //   r19-file-boundaries：文件侧边界矩阵（`..\` 穿越 / 仅大小写 rename / 工作区内 junction
+  //     穿透 apply / 尾点尾空格 / CAS 冲突）+ R19 hook 面与已登记残余的静态守卫；离线、零管理员。
+  //   r19-shim-boundaries：C shim 的真实行为回归（写意图 open 读掩码 / CopyFileW mask /
+  //     ADS 流名 / robocopy）——用 canonical `shim\out` 注入 node 子进程；
+  //     产物缺失时整段如实 SKIP（不是 PASS）。
+  // 两处清单（此处与 verify.cmd）必须逐字同序同名；suite-wiring 机器检查。
+  { id: 'r19-file-boundaries', script: 'tests/r19-file-boundaries.ts', title: 'R19 文件侧边界（穿越/大小写 rename/junction apply/尾点/CAS + hook 面残余静态守卫）' },
+  { id: 'r19-shim-boundaries', script: 'tests/r19-shim-boundaries.ts', title: 'R19 shim 边界（写意图 open 读掩码/CopyFileW/ADS/robocopy；canonical shim\\out；缺失 SKIP）' },
+  // R20 残余修复轮追加（Lead 收口时登记）：
+  //   r20-file-boundaries：R17 文件侧 hook（ReplaceFileW/NtCreateFile/CopyFileEx 暂存语义）
+  //     + R18 硬链接遮蔽 + R19 目录枚举过滤（FindFirst/FindNext/NtQueryDirectoryFile）的行为回归。
+  //   r20-registry-boundaries：R16 ntdll/Zw 注册表写 hook 契约 + 硬拒原因码 + 已 hook/未 hook 镜像。
+  //   r20-managed-carrier：R20① 纯托管 .NET 载体（AnyCPU PE32 注入 / DllMain 延迟初始化 /
+  //     托管写进暂存且真盘零写）；依赖 csc + canonical 三件套，缺失时如实 SKIP。
+  // 两处清单（此处与 verify.cmd）必须逐字同序同名；suite-wiring 机器检查。
+  { id: 'r20-file-boundaries', script: 'tests/r20-file-boundaries.ts', title: 'R20 文件侧边界（R17 ReplaceFileW/NtCreateFile/CopyFileEx + R18 硬链接遮蔽 + R19 目录枚举过滤）' },
+  { id: 'r20-registry-boundaries', script: 'tests/r20-registry-boundaries.ts', title: 'R20 注册表边界（R16 ntdll/Zw 写 hook 契约/硬拒原因码/已 hook 与未 hook 镜像）' },
+  { id: 'r20-managed-carrier', script: 'tests/r20-managed-carrier.ts', title: 'R20① 纯托管 .NET 载体（AnyCPU PE32 注入 / DllMain 延迟初始化 / 托管写进暂存且真盘零写）' },
+  // R21 工具链缺口收口（Lead）：`node tools/build-shim.ts --help` 旧实现会忽略未知参数并
+  // 直接重建 canonical shim/out（问用法却改动交付物）。行为断言 + 静态守卫。
+  { id: 'build-shim-help', script: 'tests/build-shim-help.ts', title: '工具链回归（build-shim --help/-h 必须纯 usage、退出 0、不改 canonical shim/out）' },
+  // R21 证据缺口收口（G1/G2）：注册表 apply 正面对抗样本（大值/默认值/非空键删除/链接键/
+  // volatile/32 位视图/重名冲突），并钉住 R21-REG-01（批内同值多条按 WAL 顺序重放）回归。
+  { id: 'r21-registry-apply', script: 'tests/r21-registry-apply.ts', title: 'R21 注册表 apply 对抗样本（大值/默认值/非空键删除/链接键/volatile/32 位视图/重名冲突；44 断言）' },
+  // R21 证据缺口收口（G4）：readPolicy=record/block 双档 e2e + sensitive-content 端到端脱敏。
+  { id: 'r21-fs-policy', script: 'tests/r21-fs-policy.ts', title: 'R21 fs 读策略双档 e2e（readPolicy record/block × readText/readBytes/readByteRange/listDir/stat/lstat；60 断言）' },
+  { id: 'r21-sensitive-e2e', script: 'tests/r21-sensitive-e2e.ts', title: 'R21 sensitive-content 端到端脱敏（块标量/URI 内嵌凭据/凭据键真实链路不落明文；49 断言）' },
+  // R21 证据缺口收口（G3）：文件侧对抗审计（UNC/\\?\UNC/subst/8.3 短名/删除后重建/
+  //   只读位保留/部分失败幂等重试/并发 apply 口径/长路径读透传）。
+  { id: 'r21-file-adversarial', script: 'tests/r21-file-adversarial.ts', title: 'R21 文件侧对抗审计（UNC/subst/8.3/删除重建/只读位/部分失败重试/并发 apply/长路径读；24 断言）' },
 ]
 
 /** 需要未受限会话的套件 */

@@ -885,29 +885,34 @@ export function buildPanelPayload({ pathname, query, workspaceRoot, sessionId, e
     return { status: 500, body: { ok: false, code: 'no-workspace-root', route: pathname } }
   }
   const sid = read('session')
-  let enabled = isEnabled()
-  let probeSnapshot = null
-  if (!enabled) {
-    try {
-      const probe = readPublishedSnapshot({ workspaceRoot, sessionId: sid, env })
-      if (probe.ok && probe.snapshot) {
-        probeSnapshot = probe.snapshot
-        if (probe.snapshot.staging && probe.snapshot.staging.effective === true) {
-          enabled = true
-        }
-      }
-    } catch {
-      /* 读不到就按关处理（与旧行为一致，绝不因此放行） */
-    }
-  }
-  if (!enabled) {
+  /**
+   * ★ R19 修复（P1·关态零影响）：**关态不得读已发布快照，更不得被它翻成开态**。
+   *
+   * 旧实现（R12 的 D7-b 兜底）在 `isEnabled() === false` 时先
+   * `readPublishedSnapshot(...)` 探一次，只要那份**已发布**快照写着
+   * `staging.effective === true` 就把 `enabled` 翻成 true ⇒ 路由返回 **200 + 上一版待审**。
+   * 两个后果，都与"关闭 = 对原 harness 零影响"冲突：
+   *   1. **关态仍读盘**：GUI 每轮轮询（1.5s）都会让宿主读一次 `review.json`；
+   *   2. **关态仍接管面板**：上一版快照是"开关还开着时"发布的；R18 又把关态轮询改成
+   *      零 IO（不再重发布）⇒ 那份 `effective:true` 的快照会**长期不更新**，于是关闭态
+   *      每次都能把面板顶起来（而 `/winstage approve` 此刻是拒绝执行的 ⇒ 用户看到
+   *      "关掉了却仍在审批"，按钮还必然失败）。文档承诺的是"面板路由即时 503 disabled"
+   *      （`docs/插件启动-环境监测与开关保证.md` §2）。
+   * R13 的结论本来就写着那条"或"分支**不可达**（fs 面的 `staging.effective` 只由
+   * `config.enabled` 决定）——唯一能让它变真的是**陈旧快照**，因此这里整段删除。
+   * 判据：`.t/r19-cordis/offstate-diff.ts` B1-B4（关态 503 / 不泄快照 / 有无关文件同 payload /
+   * trust 同样 503）。
+   */
+  if (!isEnabled()) {
+    // 注意：503 响应体**仍给两张脸**（R13 的信息量保留），但不读快照 ⇒ faces.file 恒 off，
+    // 这正是关闭态的真实事实；命令面是否被 WINSTAGE_SHELL 强制只看 env。
     return {
       status: 503,
       body: {
         ok: false,
         code: 'disabled',
         route: pathname,
-        staging: panelStagingFaces({ configEnabled: false, env, snapshot: probeSnapshot }),
+        staging: panelStagingFaces({ configEnabled: false, env }),
       },
     }
   }
@@ -1747,6 +1752,31 @@ export function apply(ctx, config = {}) {
   // 3) 启动探测（如实报告受限令牌能力；与暂存面无关）
   if (config.probeOnStart === false) {
     log.info('probeOnStart=false，跳过启动探测。')
+    return
+  }
+  /**
+   * ★ R19 修复（P1·关态零影响）：**关闭态必须零探测**。
+   *
+   * `probeRuntime()` 不是纯查询：`WindowsStageExecutor.capabilities()` 要加载
+   * ACL/win32 模块，`probeWin32Abi()`（`src/capability.ts:111`）会在
+   *   · `dirname(tmpdir())` 下 `mkdir`+`write`+`rm` 一个 `dsh-probe-outside-*` 目录
+   *     （`capability.ts:218-227`）；
+   *   · 尝试写 `C:\Windows\dsh-probe-write.txt` 再删掉（`capability.ts:229-236`）；
+   *   · 派生 `ping.exe` / `node -e setTimeout(...)` 子进程并建 Job Object 验证可指派
+   *     （`capability.ts:340-367`），随后 TerminateProcess；
+   *   · `stat` `C:\Windows\System32\config\SAM`、`C:\Windows\win.ini`（`capability.ts:239-246`）。
+   * 也就是说它是**真实写盘 + 建进程**。而设置里 `enabled:false` 的语义是
+   * "关闭后本插件不做任何检查"（`plugin/config.ts` 的 `enabled` 描述逐字如此），
+   * 与"关态对原 harness 零影响"直接冲突：旧实现只判 `probeOnStart`，于是
+   * **关态 + 默认 `probeOnStart:true` 的宿主每次启动都会跑这套探测**。
+   * 先红后绿：`.t/r19-cordis/repro-offstate-probe.ts`（关态 probeRuntimeCalls 1 → 0）。
+   *
+   * 这里用与命令面/面板/轮询**同一个** `isEnabled()`（每次现读 loader 行真值），
+   * 所以它不会把 apply 快照当成开关（R17 修掉的旧缺陷），且运行中热关开关不改变
+   * "启动期已过"这一事实——本段只在 apply 期求值一次。
+   */
+  if (!isEnabled()) {
+    log.info('设置里当前为关闭：跳过启动能力探测（关态零 IO，不调用 probeRuntime）。')
     return
   }
   const probe = startupProbe ?? probeRuntime()

@@ -42,7 +42,34 @@ static const WsHookTarget g_targets[] = {
     WS_TARGET(RemoveDirectoryA),
     WS_TARGET(CopyFileW),
     WS_TARGET(CopyFileA),
+    /* R19: robocopy / CopyFileEx callers were writing the REAL disk (absent from
+     * WS_TARGET); staged now, same semantics as CopyFileW. */
+    WS_TARGET(CopyFileExW),
+    WS_TARGET(CopyFileExA),
+    WS_TARGET(CopyFile2),
     WS_TARGET(SetFileAttributesW),
+    /* R20 / R17: file-side surface absent from WS_TARGET in R19. IAT point-hook
+     * => "not hooked" == "not intercepted" == real-disk write. Implemented in
+     * ws_file.c; see docs/Windows功能开启清单.md §13 R17. */
+    WS_TARGET(ReplaceFileW),
+    WS_TARGET(ReplaceFileA),
+    WS_TARGET(NtCreateFile),
+    WS_TARGET(CreateHardLinkW),
+    WS_TARGET(CreateHardLinkA),
+    /* R20 / R19: directory enumeration must be filtered, otherwise the names /
+     * sizes / timestamps of masked files leak even though their contents do not. */
+    WS_TARGET(FindFirstFileW),
+    WS_TARGET(FindFirstFileA),
+    WS_TARGET(FindFirstFileExW),
+    WS_TARGET(FindFirstFileExA),
+    WS_TARGET(FindNextFileW),
+    WS_TARGET(FindNextFileA),
+    /* R20 / R19: FindClose drops the enumeration filter's per-handle state. */
+    WS_TARGET(FindClose),
+    /* R20 / R19: node/libuv scans directories through this ntdll export, not
+     * through FindFirstFile* (measured). Core modules keep the real slot (see
+     * ws_target_keeps_core_slot); user modules and dynamic resolution get ours. */
+    WS_TARGET(NtQueryDirectoryFile),
     /* Added by A1: existence/stat queries must consult the overlay, otherwise a
      * staged write is invisible to Test-Path / File.Exists / `if exist`. */
     WS_TARGET(GetFileAttributesW),
@@ -104,6 +131,63 @@ static const WsHookTarget g_targets[] = {
     WS_TARGET(RegDeleteKeyValueA),
     WS_TARGET(RegDeleteTreeW),
     WS_TARGET(RegDeleteTreeA),
+    /* R19 / P0: these write APIs were NOT in WS_TARGET, so IAT point-hooking never
+     * saw them: they wrote/deleted the REAL hive with neither staging nor audit
+     * (measured in the production TS lane, 2026-10-18). They have no honest WAL
+     * representation (transaction semantics / subtree copy / rename / hive files),
+     * so every one is fail-closed HARD_DENY + WAL record -- never a silent write. */
+    WS_TARGET(RegCreateKeyTransactedW),
+    WS_TARGET(RegCreateKeyTransactedA),
+    WS_TARGET(RegOpenKeyTransactedW),
+    WS_TARGET(RegOpenKeyTransactedA),
+    WS_TARGET(RegDeleteKeyTransactedW),
+    WS_TARGET(RegDeleteKeyTransactedA),
+    WS_TARGET(RegCopyTreeW),
+    WS_TARGET(RegCopyTreeA),
+    WS_TARGET(RegRenameKey),
+    WS_TARGET(RegLoadKeyW),
+    WS_TARGET(RegLoadKeyA),
+    WS_TARGET(RegUnLoadKeyW),
+    WS_TARGET(RegUnLoadKeyA),
+    WS_TARGET(RegSaveKeyW),
+    WS_TARGET(RegSaveKeyA),
+    WS_TARGET(RegSaveKeyExW),
+    WS_TARGET(RegSaveKeyExA),
+    WS_TARGET(RegRestoreKeyW),
+    WS_TARGET(RegRestoreKeyA),
+    WS_TARGET(RegReplaceKeyW),
+    WS_TARGET(RegReplaceKeyA),
+    WS_TARGET(RegConnectRegistryW),
+    WS_TARGET(RegConnectRegistryA),
+    /* R20 / R16: the ntdll registry write surface. In R19 it was deliberately
+     * left out of WS_TARGET (the deny implementations existed but were
+     * unreachable), so a direct ntdll/Zw call wrote the REAL hive with no WAL.
+     * Now every one is a fail-closed HARD_DENY + WAL (ws_reg.c); the Zw* aliases
+     * are separate exports and therefore separate targets. */
+    WS_TARGET(NtCreateKey),
+    WS_TARGET(NtSetValueKey),
+    WS_TARGET(NtDeleteKey),
+    WS_TARGET(NtDeleteValueKey),
+    WS_TARGET(NtRenameKey),
+    WS_TARGET(NtLoadKey),
+    WS_TARGET(NtLoadKey2),
+    WS_TARGET(NtUnloadKey),
+    WS_TARGET(NtSaveKey),
+    WS_TARGET(NtSaveKeyEx),
+    WS_TARGET(NtRestoreKey),
+    WS_TARGET(NtReplaceKey),
+    WS_TARGET(ZwCreateKey),
+    WS_TARGET(ZwSetValueKey),
+    WS_TARGET(ZwDeleteKey),
+    WS_TARGET(ZwDeleteValueKey),
+    WS_TARGET(ZwRenameKey),
+    WS_TARGET(ZwLoadKey),
+    WS_TARGET(ZwLoadKey2),
+    WS_TARGET(ZwUnloadKey),
+    WS_TARGET(ZwSaveKey),
+    WS_TARGET(ZwSaveKeyEx),
+    WS_TARGET(ZwRestoreKey),
+    WS_TARGET(ZwReplaceKey),
     WS_TARGET(GetProcAddress),
     WS_TARGET(LoadLibraryW),
     WS_TARGET(LoadLibraryA),
@@ -129,6 +213,15 @@ static const char *const g_targetNames[] = {
     "CreateFileW", "CreateFileA", "CreateDirectoryW", "CreateDirectoryA",
     "DeleteFileW", "DeleteFileA", "MoveFileExW", "MoveFileExA", "MoveFileW", "MoveFileA",
     "RemoveDirectoryW", "RemoveDirectoryA", "CopyFileW", "CopyFileA", "SetFileAttributesW",
+    /* R19: must mirror g_targets (CopyFileEx staged) */
+    "CopyFileExW", "CopyFileExA", "CopyFile2",
+    /* R20 / R17-R19 (must mirror g_targets exactly) */
+    "ReplaceFileW", "ReplaceFileA", "NtCreateFile",
+    "CreateHardLinkW", "CreateHardLinkA",
+    "FindFirstFileW", "FindFirstFileA", "FindFirstFileExW", "FindFirstFileExA",
+    "FindNextFileW", "FindNextFileA",
+    "FindClose",
+    "NtQueryDirectoryFile",
     "GetFileAttributesW", "GetFileAttributesA", "GetFileAttributesExW", "GetFileAttributesExA",
     /* R18-KNOWN-06 (must mirror g_targets) */
     "CloseHandle", "WriteFile", "WriteFileEx", "SetEndOfFile", "SetFileInformationByHandle",
@@ -144,6 +237,22 @@ static const char *const g_targetNames[] = {
     /* R18 / KNOWN-09 (must mirror g_targets exactly) */
     "RegSetKeyValueW", "RegSetKeyValueA", "RegDeleteKeyValueW", "RegDeleteKeyValueA",
     "RegDeleteTreeW", "RegDeleteTreeA",
+    /* R19 P0 (must mirror g_targets exactly) */
+    "RegCreateKeyTransactedW", "RegCreateKeyTransactedA",
+    "RegOpenKeyTransactedW", "RegOpenKeyTransactedA",
+    "RegDeleteKeyTransactedW", "RegDeleteKeyTransactedA",
+    "RegCopyTreeW", "RegCopyTreeA", "RegRenameKey",
+    "RegLoadKeyW", "RegLoadKeyA", "RegUnLoadKeyW", "RegUnLoadKeyA",
+    "RegSaveKeyW", "RegSaveKeyA", "RegSaveKeyExW", "RegSaveKeyExA",
+    "RegRestoreKeyW", "RegRestoreKeyA", "RegReplaceKeyW", "RegReplaceKeyA",
+    "RegConnectRegistryW", "RegConnectRegistryA",
+    /* R20 / R16: ntdll registry write surface + Zw aliases (must mirror g_targets) */
+    "NtCreateKey", "NtSetValueKey", "NtDeleteKey", "NtDeleteValueKey", "NtRenameKey",
+    "NtLoadKey", "NtLoadKey2", "NtUnloadKey", "NtSaveKey", "NtSaveKeyEx",
+    "NtRestoreKey", "NtReplaceKey",
+    "ZwCreateKey", "ZwSetValueKey", "ZwDeleteKey", "ZwDeleteValueKey", "ZwRenameKey",
+    "ZwLoadKey", "ZwLoadKey2", "ZwUnloadKey", "ZwSaveKey", "ZwSaveKeyEx",
+    "ZwRestoreKey", "ZwReplaceKey",
     "GetProcAddress", "LoadLibraryW", "LoadLibraryA", "LoadLibraryExW", "LoadLibraryExA",
     "LdrLoadDll",
     "NtQueryValueKey",
@@ -284,9 +393,71 @@ static HMODULE ws_self_module(void)
 #define WS_FAM_REG  2
 #define WS_FAM_CTL  3
 
+/* R20 / R16: the ntdll registry write surface uses the Nt / Zw prefix instead of
+ * "Reg", so it needs an explicit classification -- otherwise
+ * WINSTAGE_SHIM_DISABLE_REG would leave these write hooks installed. */
+static int ws_name_is_reg_nt(const char *name)
+{
+    static const char *const kNames[] = {
+        "CreateKey", "SetValueKey", "DeleteKey", "DeleteValueKey", "RenameKey",
+        "LoadKey", "LoadKey2", "UnloadKey", "SaveKey", "SaveKeyEx", "RestoreKey", "ReplaceKey",
+    };
+    if (!name) {
+        return 0;
+    }
+    if (strncmp(name, "Nt", 2) != 0 && strncmp(name, "Zw", 2) != 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); i++) {
+        if (strcmp(name + 2, kNames[i]) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* R20 / R17: NtCreateFile is the low-level open path every Win32 file API funnels
+ * through. Patching kernelbase's IAT slot for it would route ALL file opens
+ * through our deny hook (they already reach the shim through the Win32-level
+ * targets above); the point of the new target is the DIRECT NtCreateFile call
+ * from a carrier module (node.exe imports it directly). Core Windows modules
+ * therefore keep their real slot for this one name. */
+static int ws_is_core_windows_module(HMODULE base)
+{
+    return base != NULL && (base == g_orig.hKernel32 || base == g_orig.hKernelBase ||
+                            base == g_orig.hAdvapi32 || base == g_orig.hNtdll);
+}
+
+static int ws_target_keeps_core_slot(const char *name, HMODULE base)
+{
+    if (!ws_is_core_windows_module(base)) {
+        return 0;
+    }
+    if (strcmp(name, "NtCreateFile") == 0) {
+        return 1;
+    }
+    if (strcmp(name, "NtQueryDirectoryFile") == 0) {
+        /* kernelbase enumerates directories through it internally; patching the
+         * core slot would route every FindFirstFile* internal step back into the
+         * enum filter (and the filter itself calls the original). */
+        return 1;
+    }
+    /* R20 / R16 (measured): the staging engine itself materialises hive keys via
+     * advapi32/kernelbase -> ntdll!NtCreateKey. Patching kernelbase's slot made the
+     * shim's own internal call hit its own deny (reg.exe add => Access denied,
+     * materialize_chain failed 5, zero WAL; WINSTAGE_SHIM_SKIP of the 24 names
+     * restored it). Core Windows modules therefore keep the real slot for the
+     * whole ntdll/Zw registry write family too; the attack surface is the USER
+     * module's direct import / P-Invoke, which keeps being patched and denied. */
+    return ws_name_is_reg_nt(name) ? 1 : 0;
+}
+
 static int ws_target_family(const char *name)
 {
     if (strncmp(name, "Reg", 3) == 0) {
+        return WS_FAM_REG;
+    }
+    if (ws_name_is_reg_nt(name)) {
         return WS_FAM_REG;
     }
     if (strcmp(name, "GetProcAddress") == 0 || strncmp(name, "LoadLibrary", 11) == 0 ||
@@ -401,7 +572,26 @@ int ws_hook_init(void)
         { (void **)&g_orig.RemoveDirectoryA, "RemoveDirectoryA" },
         { (void **)&g_orig.CopyFileW, "CopyFileW" },
         { (void **)&g_orig.CopyFileA, "CopyFileA" },
+        { (void **)&g_orig.CopyFileExW, "CopyFileExW" },
+        { (void **)&g_orig.CopyFileExA, "CopyFileExA" },
+        { (void **)&g_orig.CopyFile2, "CopyFile2" },
         { (void **)&g_orig.SetFileAttributesW, "SetFileAttributesW" },
+        /* R20 / R17-R19: captured originals for the new file-side targets. A NULL
+         * original is handled per wrapper (read-intent pass-through falls back to
+         * the real API only when captured). */
+        { (void **)&g_orig.ReplaceFileW, "ReplaceFileW" },
+        { (void **)&g_orig.ReplaceFileA, "ReplaceFileA" },
+        { (void **)&g_orig.NtCreateFile, "NtCreateFile" },
+        { (void **)&g_orig.CreateHardLinkW, "CreateHardLinkW" },
+        { (void **)&g_orig.CreateHardLinkA, "CreateHardLinkA" },
+        { (void **)&g_orig.FindFirstFileW, "FindFirstFileW" },
+        { (void **)&g_orig.FindFirstFileA, "FindFirstFileA" },
+        { (void **)&g_orig.FindFirstFileExW, "FindFirstFileExW" },
+        { (void **)&g_orig.FindFirstFileExA, "FindFirstFileExA" },
+        { (void **)&g_orig.FindNextFileW, "FindNextFileW" },
+        { (void **)&g_orig.FindNextFileA, "FindNextFileA" },
+        { (void **)&g_orig.FindClose, "FindClose" },
+        { (void **)&g_orig.NtQueryDirectoryFile, "NtQueryDirectoryFile" },
         /* A1 stat/existence hooks: without these capture entries the new
          * replacements would call a NULL original (observed as 0xC0000005 in
          * cmd.exe and powershell.exe). */
@@ -450,6 +640,37 @@ int ws_hook_init(void)
         { (void **)&g_orig.RegQueryInfoKeyW, "RegQueryInfoKeyW" },
         { (void **)&g_orig.RegEnumValueW, "RegEnumValueW" },
         { (void **)&g_orig.RegEnumKeyExW, "RegEnumKeyExW" },
+        /* R19: the only two new target families that may PASS A READ THROUGH. */
+        { (void **)&g_orig.RegOpenKeyTransactedW, "RegOpenKeyTransactedW" },
+        { (void **)&g_orig.RegOpenKeyTransactedA, "RegOpenKeyTransactedA" },
+        { (void **)&g_orig.RegConnectRegistryW, "RegConnectRegistryW" },
+        { (void **)&g_orig.RegConnectRegistryA, "RegConnectRegistryA" },
+        /* R20 / R16: ntdll registry write origins (resolved explicitly from ntdll,
+         * but the shared order also works because only ntdll exports them). */
+        { (void **)&g_orig.NtCreateKey, "NtCreateKey" },
+        { (void **)&g_orig.NtSetValueKey, "NtSetValueKey" },
+        { (void **)&g_orig.NtDeleteKey, "NtDeleteKey" },
+        { (void **)&g_orig.NtDeleteValueKey, "NtDeleteValueKey" },
+        { (void **)&g_orig.NtRenameKey, "NtRenameKey" },
+        { (void **)&g_orig.NtLoadKey, "NtLoadKey" },
+        { (void **)&g_orig.NtLoadKey2, "NtLoadKey2" },
+        { (void **)&g_orig.NtUnloadKey, "NtUnloadKey" },
+        { (void **)&g_orig.NtSaveKey, "NtSaveKey" },
+        { (void **)&g_orig.NtSaveKeyEx, "NtSaveKeyEx" },
+        { (void **)&g_orig.NtRestoreKey, "NtRestoreKey" },
+        { (void **)&g_orig.NtReplaceKey, "NtReplaceKey" },
+        { (void **)&g_orig.ZwCreateKey, "ZwCreateKey" },
+        { (void **)&g_orig.ZwSetValueKey, "ZwSetValueKey" },
+        { (void **)&g_orig.ZwDeleteKey, "ZwDeleteKey" },
+        { (void **)&g_orig.ZwDeleteValueKey, "ZwDeleteValueKey" },
+        { (void **)&g_orig.ZwRenameKey, "ZwRenameKey" },
+        { (void **)&g_orig.ZwLoadKey, "ZwLoadKey" },
+        { (void **)&g_orig.ZwLoadKey2, "ZwLoadKey2" },
+        { (void **)&g_orig.ZwUnloadKey, "ZwUnloadKey" },
+        { (void **)&g_orig.ZwSaveKey, "ZwSaveKey" },
+        { (void **)&g_orig.ZwSaveKeyEx, "ZwSaveKeyEx" },
+        { (void **)&g_orig.ZwRestoreKey, "ZwRestoreKey" },
+        { (void **)&g_orig.ZwReplaceKey, "ZwReplaceKey" },
         { (void **)&g_orig.LdrGetProcedureAddress, "LdrGetProcedureAddress" },
         { (void **)&g_orig.LdrLoadDll, "LdrLoadDll" },
         { (void **)&g_orig.NtQueryValueKey, "NtQueryValueKey" },
@@ -569,6 +790,25 @@ static int ws_patch_module(HMODULE base)
     if (nt->Signature != IMAGE_NT_SIGNATURE) {
         return 0;
     }
+    /* R20 / carrier (measured 2026-10-19): a pure-managed AnyCPU exe is a PE32
+     * (i386) image that the loader runs inside an x64 process (mscoree entry).
+     * Its import table uses 4-byte IMAGE_THUNK_DATA entries, so walking it with
+     * the x64 8-byte stride runs past the NULL terminator and reads the
+     * "_CorExeMain\0mscoree.dll" string bytes as AddressOfData RVAs; strcmp then
+     * dereferences a garbage pointer -> ucrtbase 0xC0000005 inside DllMain
+     * ("remote LoadLibraryW failed 1114"). A 4-byte slot cannot hold a 64-bit
+     * function pointer either, so the correct action is: skip the module. The IL
+     * code's file/registry access still funnels through mscoree / kernelbase /
+     * kernel32, which ARE patched. */
+#ifdef _WIN64
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
+        return 0;
+    }
+#else
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386) {
+        return 0;
+    }
+#endif
     int patched = 0;
     IMAGE_DATA_DIRECTORY *impDir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (impDir->VirtualAddress) {
@@ -587,6 +827,12 @@ static int ws_patch_module(HMODULE base)
                 const char *fname = (const char *)ibn->Name;
                 const WsHookTarget *t = ws_find_target(fname);
                 if (!t) {
+                    continue;
+                }
+                if (ws_target_keeps_core_slot(fname, base)) {
+                    if (g_ws.verbose) {
+                        ws_log("  iat keep-core %s (core module keeps the real slot)", fname);
+                    }
                     continue;
                 }
                 if (ft->u1.Function == (ULONG_PTR)t->replacement) {

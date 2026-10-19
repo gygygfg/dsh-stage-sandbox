@@ -25,7 +25,7 @@
  *   - 遮蔽前先规范化，符号链接不能绕过（#16.6）；硬拒绝先于软遮蔽（#16.7）
  */
 
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, normalize, relative, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import {
@@ -1292,6 +1292,26 @@ export class Workspace {
   rename(from, to, opts = {}) {
     const { key: fromRel } = this.keyOf(from)
     const { key: toRel } = this.keyOf(to)
+    /**
+     * ── R19 修复（P1）：**仅大小写重命名**不得被当作"删除 + 新建"暂存 ─────────────
+     *
+     * 现场（`tests/r19-file-boundaries.ts` 先红）：`rename(a.txt → A.txt)` 在
+     * NTFS（不区分大小写）上，`keyOf()` 给出两个不同字符串键 `a.txt` / `A.txt`，但
+     * `ensureEntry('A.txt')` 读到的真实基线就是同一个文件、写入内容又相同 ⇒ 目标键
+     * **没有净变化**；源键被 `remove()` 标成 deleted ⇒ 候选里只剩 `delete: a.txt`。
+     * 批准后真实文件被**删掉**（期望是改大小写）—— 静默数据丢失。
+     *
+     * 正确表示"只改大小写"需要 rename 专用的候选单元与落盘原语（当前候选模型只有
+     * create/modify/delete + 内容 hash），本轮不做半成品语义；这里**显式拒绝**并把
+     * 限制写进残余边界（R16 之后），绝不退化成删除。
+     */
+    if (fromRel !== toRel && compareKey(fromRel) === compareKey(toRel)) {
+      throw new SandboxError(
+        'CASE_ONLY_RENAME_UNSUPPORTED',
+        `case-only rename is not representable in the staging model: ${fromRel} -> ${toRel}`,
+        { from: fromRel, to: toRel, reason: 'NTFS is case-insensitive; staging would degrade to a delete (data loss)' },
+      )
+    }
     const state = this.exists(from)
     if (!state.exists) throw new SandboxError('ENOENT', `${from} does not exist`, { path: fromRel })
     if (state.kind === 'file') {
@@ -1777,8 +1797,11 @@ export class Workspace {
         }
       }
       try {
-        this.applyOneChange(change, opts)
-        applied.push({ path: change.path, op: change.op })
+        // R21: `false` = already at the desired state (idempotent no-op). It is not
+        // counted as "applied" (selftest #12.3 expects applied.length===0 on re-apply)
+        // and not counted as failed.
+        const wrote = this.applyOneChange(change, opts)
+        if (wrote !== false) applied.push({ path: change.path, op: change.op })
       } catch (error) {
         failed.push({
           path: change.path,
@@ -1893,9 +1916,54 @@ export class Workspace {
 
   applyOneChange(change, opts) {
     const abs = this.absolute(change.path)
+    /**
+     * ── R19 修复（P1）：相对键解析后逃出工作区 ⇒ **fail-closed**，绝不沿链接写到外部 ──
+     *
+     * 现场（`tests/r19-file-boundaries.ts` 先红）：工作区内存在 `junction -> C:\outside`
+     * 时，`writeFile(<ws>\junction\evil.txt)` 用**词法**键 `junction\evil.txt` 记录变更；
+     * `absolute()` 返回词法路径，落盘时 Windows 会**跟随 junction** 写到真实外部目标。
+     * 即：候选看起来是"工作区内改动"，批准却改了工作区外文件；且 `maskWarnings` 为空
+     * （maskOf 按解析后的外部路径判定，外部路径不在遮蔽表里）。
+     *
+     * 判据（与 `classifyChange()` 的 `outside` 判定同源）：非外部条目（`external !== true`）
+     * 的绝对路径必须 `canonical()` 后仍在 `canonical(root)` 内；否则结构化拒绝。
+     * 外部条目（键=规范化绝对路径，`external:true`）按 S3a 设计仍可落盘（走审批面警告）。
+     */
+    if (change.external !== true && !isInside(this.root, abs)) {
+      throw new SandboxError(
+        'APPLY_PATH_OUTSIDE',
+        `refusing to apply ${change.path}: it resolves outside the workspace (reparse point / junction escape)`,
+        {
+          path: change.path,
+          target: canonical(abs),
+          workspaceRoot: canonical(this.root),
+          reason: 'a workspace-relative key must resolve inside the workspace at apply time; stage the real external path instead',
+        },
+      )
+    }
     // 条件检查：真实文件必须仍是我们记录的基线（#12.1）
     const realNow = existsSync(abs) && statKind(abs)?.kind === 'file' ? hashFile(abs) : hashAbsent()
     const expected = change.before?.hash ?? hashAbsent()
+    /**
+     * ── R21（幂等快路径，partial-apply 重试语义）───────────────────────────────
+     * 批量应用中途失败后再次批准这份候选时，**已经落盘**的那些条目会走到这里：
+     * 真实盘已经是 `after.hash`，但 `before.hash` 还是旧值 ⇒ 旧实现抛
+     * `STALE_BASELINE`，把"我上次已经成功写入了"报成"被外部改动"（R21 探针实测
+     * `partial.second` 的 failed 里出现了 STALE_BASELINE）。
+     * 语义上"真实盘已经是期望内容"就是幂等成功（不写、不误报冲突）：
+     *   · 删除类：目标已不存在 ⇒ no-op；
+     *   · 内容类：当前内容 == 期望内容 ⇒ no-op（不刷新时间戳/属性）。
+     * 目录类（mkdir / dir）不在此列：它们的 after.hash 恒为 absent，必须走后面对照分支。
+     */
+    const desiredHash = change.after?.hash
+    const isDirEntry = change.op === 'mkdir' || change.kind === 'dir'
+    if (!isDirEntry) {
+      if (change.op === 'delete') {
+        if (!existsSync(abs)) return false // already deleted (idempotent re-apply of a delete)
+      } else if (desiredHash !== undefined && desiredHash !== hashAbsent() && realNow === desiredHash) {
+        return false // already at the desired content (idempotent re-apply of a write)
+      }
+    }
     if (!opts.force && realNow !== expected) {
       throw new SandboxError('STALE_BASELINE', `real file changed after this edit was recorded (expected ${expected}, found ${realNow}); refusing to overwrite`, {
         path: change.path,
@@ -1935,7 +2003,7 @@ export class Workspace {
      */
     if (change.op === 'mkdir' || (change.kind === 'dir' && change.op !== 'delete')) {
       const nowKind = statKind(abs)?.kind
-      if (nowKind === 'dir') return
+      if (nowKind === 'dir') return false /* R21: mkdir 已满足 => no-op */
       if (nowKind === 'file') {
         const backup = `${abs}.winstage-dirswap-${randomUUID().slice(0, 8)}`
         renameSync(abs, backup)
@@ -1959,14 +2027,17 @@ export class Workspace {
         } catch {
           /* 备份清不掉只是残留，目录替换已经成功 */
         }
-        return
+        return true
       }
       mkdirSync(abs, { recursive: true })
-      return
+      return true
     }
 
     if (change.op === 'delete' || change.after?.hash === hashAbsent()) {
-      if (existsSync(abs)) {
+      if (!existsSync(abs)) {
+        return false /* R21: already gone => no-op */
+      }
+      {
         const repair = makeRemovable(abs)
         try {
           /**
@@ -1987,7 +2058,7 @@ export class Workspace {
           })
         }
       }
-      return
+      return true
     }
 
     if (!this.store.hasBlob(change.after.hash)) {
@@ -2106,9 +2177,31 @@ export class Workspace {
           rolledBack: existsSync(abs),
         })
       }
-      return
+      return true
+    }
+    /**
+     * ── R21 修复：内容替换必须**保留原文件的 Windows 属性位**（至少只读位）──
+     * 现场（R21 探针）：真实文件带 `+R` 时，`writeFileAtomicReplacing()` 是先写临时
+     * 文件再 rename 覆盖，新文件**没有**只读位 ⇒ 一次正常 apply 静默清掉只读保护。
+     * Node 的 `chmod` 在 Windows 上只映射只读位；因此替换前取 `stat.mode`、替换后
+     * 用 `chmod` 还原。恢复失败不改变"内容已落盘"的事实（显式忽略，属性面残余在
+     * findings 里登记：hidden/system 位无法经 Node 可靠还原）。
+     */
+    let priorMode
+    try {
+      priorMode = statSync(abs).mode
+    } catch {
+      priorMode = undefined
     }
     writeFileAtomicReplacing(abs, content)
+    if (priorMode !== undefined) {
+      try {
+        chmodSync(abs, priorMode)
+      } catch {
+        /* content is already applied; attribute restore is best-effort */
+      }
+    }
+    return true
   }
 
   // ==================== 命令执行前后的物化与提取（#3.2 / 3.6 / A16） ====================

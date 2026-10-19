@@ -40,6 +40,8 @@ import {
   REG_STAGE_HOOKED_APIS,
   REG_STAGE_UNHOOKED_APIS,
   REG_STAGE_HARD_DENY_APIS,
+  REG_STAGE_HARD_DENY_REASON,
+  R19_HARD_DENY_REASON_BY_API,
   REG_STAGE_UNSUPPORTED_TYPES,
   REGISTERED_HARD_DENIALS,
   HARD_DENY_STATUS,
@@ -234,7 +236,7 @@ export function runRegistryStageChecks(harness) {
         'both stageable',
       )
 
-      const hardDenyApis = ['RegSetKeySecurity', 'RegLoadKey', 'RegUnLoadKey', 'RegSaveKey', 'RegRestoreKey', 'RegReplaceKey', 'RegRenameKey', 'RegCopyTree', 'RegCreateKeyTransactedW', 'RegConnectRegistryW', 'NtSetValueKey', 'ZwSetValueKey', 'NtCreateKey']
+      const hardDenyApis = ['RegSetKeySecurity', 'RegLoadKey', 'RegUnLoadKey', 'RegSaveKey', 'RegRestoreKey', 'RegReplaceKey', 'RegRenameKey', 'RegCopyTree', 'RegCreateKeyTransactedW', 'RegConnectRegistryW', 'NtOpenKey', 'ZwOpenKey']
       check(
         `未支持的 ${hardDenyApis.length} 个 API 全部硬拒且带理由`,
         hardDenyApis.every((api) => {
@@ -251,9 +253,59 @@ export function runRegistryStageChecks(harness) {
         REG_STAGE_HOOKED_APIS.join(','),
       )
       check(
-        '除递归删除（无 WAL 表示，fail-closed）外，被 hook 的 API 都可暂存',
-        REG_STAGE_HOOKED_APIS.filter((api) => !api.startsWith('RegDeleteTree')).every((api) => classifyRegistryOperation({ api, path: 'HKLM\\Software\\Probe' }).stageable === true),
-        REG_STAGE_HOOKED_APIS.filter((api) => !api.startsWith('RegDeleteTree')).join(','),
+        '除递归删除/R19 无法表示写类（fail-closed）外，被 hook 的 API 都可暂存',
+        REG_STAGE_HOOKED_APIS.filter((api) => !api.startsWith('RegDeleteTree') && REG_STAGE_HARD_DENY_APIS[api] === undefined && !(api in R19_HARD_DENY_REASON_BY_API)).every(
+          (api) => classifyRegistryOperation({ api, path: 'HKLM\\Software\\Probe' }).stageable === true,
+        ),
+        REG_STAGE_HOOKED_APIS.filter((api) => !api.startsWith('RegDeleteTree') && REG_STAGE_HARD_DENY_APIS[api] === undefined && !(api in R19_HARD_DENY_REASON_BY_API)).join(','),
+      )
+      check(
+        'R19 新增的 23 个被 hook 写类入口全部 fail-closed 且带原因码（不是"暂存成功"的假承诺）',
+        Object.entries(R19_HARD_DENY_REASON_BY_API).every(([api, reason]) => {
+          const verdict = classifyRegistryOperation({ api, path: 'HKCU\\Software\\Probe' })
+          return verdict.stageable === false && verdict.status === HARD_DENY_STATUS && verdict.hardDenyReason === reason
+        }),
+        Object.keys(R19_HARD_DENY_REASON_BY_API).length + ' apis',
+      )
+      // ─── R20 / R16：ntdll 写面 + Zw 别名（24 个）───────────────────────────
+      // 契约：12 个 Nt* 与 12 个 Zw* 都进 WS_TARGET；5 个写操作 → 原因码 8，
+      // 7 个 hive-file 操作 → 原因码 6。这里锁定 TS 侧的可查数据与分类结果。
+      const r20NtWriteOps = ['NtCreateKey', 'NtSetValueKey', 'NtDeleteKey', 'NtDeleteValueKey', 'NtRenameKey']
+      const r20NtHiveOps = ['NtLoadKey', 'NtLoadKey2', 'NtUnloadKey', 'NtSaveKey', 'NtSaveKeyEx', 'NtRestoreKey', 'NtReplaceKey']
+      const zwAlias = (names) => names.map((name) => `Zw${name.slice(2)}`)
+      const r20WriteApis = [...r20NtWriteOps, ...zwAlias(r20NtWriteOps)]
+      const r20HiveApis = [...r20NtHiveOps, ...zwAlias(r20NtHiveOps)]
+      check(
+        'R20：24 个 ntdll 注册表写类入口（12 Nt* + 12 Zw*）全部在 REG_STAGE_HOOKED_APIS',
+        [...r20WriteApis, ...r20HiveApis].length === 24 && [...r20WriteApis, ...r20HiveApis].every((api) => REG_STAGE_HOOKED_APIS.includes(api)),
+        `missing=${[...r20WriteApis, ...r20HiveApis].filter((api) => !REG_STAGE_HOOKED_APIS.includes(api)).join(',') || '(none)'}`,
+      )
+      check(
+        'R20：10 个 ntdll 写操作（5 Nt* + 5 Zw*）分类为 HARD_DENY(reason=NT_SYSCALL_WRITE_NOT_STAGEABLE=8)',
+        r20WriteApis.every((api) => {
+          const verdict = classifyRegistryOperation({ api, path: 'HKCU\\Software\\Probe' })
+          return verdict.stageable === false && verdict.status === HARD_DENY_STATUS && verdict.hardDenyReason === 'NT_SYSCALL_WRITE_NOT_STAGEABLE'
+        }),
+        r20WriteApis.join(','),
+      )
+      check(
+        'R20：14 个 ntdll hive-file 操作（7 Nt* + 7 Zw*）分类为 HARD_DENY(reason=HIVE_FILE_OPERATION_NOT_STAGEABLE=6)',
+        r20HiveApis.every((api) => {
+          const verdict = classifyRegistryOperation({ api, path: 'HKCU\\Software\\Probe' })
+          return verdict.stageable === false && verdict.status === HARD_DENY_STATUS && verdict.hardDenyReason === 'HIVE_FILE_OPERATION_NOT_STAGEABLE'
+        }),
+        r20HiveApis.join(','),
+      )
+      check(
+        'R20：原因码 8 与 C 侧 WS_HARD_DENY_NT_WRITE_NOT_STAGEABLE 同为 8（WAL type 可归因）',
+        REG_STAGE_HARD_DENY_REASON.NT_SYSCALL_WRITE_NOT_STAGEABLE === 8 && REG_STAGE_HARD_DENY_REASON.HIVE_FILE_OPERATION_NOT_STAGEABLE === 6,
+        `8=${REG_STAGE_HARD_DENY_REASON.NT_SYSCALL_WRITE_NOT_STAGEABLE} 6=${REG_STAGE_HARD_DENY_REASON.HIVE_FILE_OPERATION_NOT_STAGEABLE}`,
+      )
+      check(
+        'R20：真残余（NtOpenKey/ZwOpenKey）仍在 UNHOOKED 里（"漏了什么"保持可查）',
+        REG_STAGE_UNHOOKED_APIS.includes('NtOpenKey') && REG_STAGE_UNHOOKED_APIS.includes('ZwOpenKey') &&
+          [...r20WriteApis, ...r20HiveApis].every((api) => !REG_STAGE_UNHOOKED_APIS.includes(api)),
+        REG_STAGE_UNHOOKED_APIS.join(','),
       )
       check(
         'RegDeleteTreeW/A 被 hook 但 fail-closed 硬拒（不再直落真实 hive）',
@@ -427,15 +479,23 @@ export function runRegistryStageChecks(harness) {
         `${REG_STAGE_UNHOOKED_APIS.length} 条：${REG_STAGE_UNHOOKED_APIS.join(', ')}`,
       )
 
-      // ③ 硬拒清单当下**全都未被真 hook** ⇒ 它们是意图声明，不是已拦截的证据
+      // ③ 硬拒清单现在分两类：**已进 WS_TARGET** ⇒ 硬拒真的会执行（必须可分类为 HARD_DENY）；
+      //    **仍未 hook** ⇒ 意图声明，当下直落真实 hive。R19 之前这里"全部未 hook"。
       const denyApis = Object.keys(REG_STAGE_HARD_DENY_APIS)
       const denyReallyHooked = denyApis.filter((api) => targets.includes(api))
+      const denyStillBlind = denyApis.filter((api) => !targets.includes(api))
       check(
-        `硬拒清单的 ${denyApis.length} 条目前都不在 WS_TARGET 内（= 意图声明，当下直落真实 hive）`,
-        denyReallyHooked.length === 0,
-        denyReallyHooked.length
-          ? `已被真 hook ⇒ 硬拒现在生效，需重新分类：${denyReallyHooked.join(', ')}`
-          : '全部未 hook ⇒ 当下结局是直落真实 hive，不是硬拒',
+        `硬拒清单 ${denyApis.length} 条：已 hook ${denyReallyHooked.length} 条（硬拒会执行）/ 仍盲 ${denyStillBlind.length} 条（意图声明）`,
+        denyReallyHooked.length > 0 && denyStillBlind.length > 0,
+        `hooked=${denyReallyHooked.join(',')} | blind=${denyStillBlind.join(',')}`,
+      )
+      check(
+        '已 hook 的硬拒 API 全部真的分类为 HARD_DENY（否则"硬拒"仍是假承诺）',
+        denyReallyHooked.every((api) => {
+          const verdict = classifyRegistryOperation({ api, path: 'HKCU\\Software\\Probe' })
+          return verdict.stageable === false && verdict.status === HARD_DENY_STATUS
+        }),
+        denyReallyHooked.join(','),
       )
 
       // ④ 反向自证：往 WS_TARGET 名单里种一条**当前盲区**的 API，上面"无交集"的两条必须变红

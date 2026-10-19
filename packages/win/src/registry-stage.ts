@@ -1,4 +1,4 @@
-// @ts-nocheck —— 全量 TS 化过渡脚手架：本文件由 .mjs 机械转换而来，类型待逐步补齐。
+﻿// @ts-nocheck —— 全量 TS 化过渡脚手架：本文件由 .mjs 机械转换而来，类型待逐步补齐。
 /**
  * registry-stage —— 注册表**写入暂存**层（覆盖 hive + WAL 日志 + 候选 + 选择性应用）
  *
@@ -250,10 +250,63 @@ export const REG_STAGE_HOOKED_APIS = Object.freeze([
   'RegDeleteKeyValueA',
   'RegDeleteTreeW',
   'RegDeleteTreeA',
+  /* R19 / P0：以前不在 WS_TARGET 的写类入口 ⇒ 生产 TS 档**直写真实 hive 且无 WAL**。
+   * 现在全部进 WS_TARGET 并 fail-closed HARD_DENY + WAL（无法暂存：事务/整树/重命名/
+   * hive 文件语义覆盖层表示不了）。 */
+  'RegCreateKeyTransactedW',
+  'RegCreateKeyTransactedA',
+  'RegOpenKeyTransactedW',
+  'RegOpenKeyTransactedA',
+  'RegDeleteKeyTransactedW',
+  'RegDeleteKeyTransactedA',
+  'RegCopyTreeW',
+  'RegCopyTreeA',
+  'RegRenameKey',
+  'RegLoadKeyW',
+  'RegLoadKeyA',
+  'RegUnLoadKeyW',
+  'RegUnLoadKeyA',
+  'RegSaveKeyW',
+  'RegSaveKeyA',
+  'RegSaveKeyExW',
+  'RegSaveKeyExA',
+  'RegRestoreKeyW',
+  'RegRestoreKeyA',
+  'RegReplaceKeyW',
+  'RegReplaceKeyA',
+  'RegConnectRegistryW',
+  'RegConnectRegistryA',
+  /* R20 / R16：ntdll 写面 + Zw 别名（24 个）全部进 WS_TARGET，并 fail-closed
+   * HARD_DENY(type=8 写类 / type=6 hive-file 类) + WAL。IAT 点钩能拦住"经 IAT 解析
+   * 的直调"；`NtOpenKey`/`ZwOpenKey`（纯打开/读面）仍不在拦截面内，见 UNHOOKED。 */
+  'NtCreateKey',
+  'NtSetValueKey',
+  'NtDeleteKey',
+  'NtDeleteValueKey',
+  'NtRenameKey',
+  'NtLoadKey',
+  'NtLoadKey2',
+  'NtUnloadKey',
+  'NtSaveKey',
+  'NtSaveKeyEx',
+  'NtRestoreKey',
+  'NtReplaceKey',
+  'ZwCreateKey',
+  'ZwSetValueKey',
+  'ZwDeleteKey',
+  'ZwDeleteValueKey',
+  'ZwRenameKey',
+  'ZwLoadKey',
+  'ZwLoadKey2',
+  'ZwUnloadKey',
+  'ZwSaveKey',
+  'ZwSaveKeyEx',
+  'ZwRestoreKey',
+  'ZwReplaceKey',
 ])
 
 /**
- * ★ 交叉验证实测（R17）：**不在 shim 拦截面上**的注册表 API ⇒ 当前**直落真实 hive**。
+ * ★ 交叉验证实测（R17 起）：**不在 shim 拦截面上**的注册表 API ⇒ 当前**直落真实 hive**。
  *
  * 这条清单终结一句**假承诺**（`docs/T3-注册表暂存设计.md` §8.2 原话）：
  *     "任何不在被 hook 的 8 个 API 之内的调用**同样硬拒**（`REG_STAGE_API_NOT_HOOKED`）：
@@ -266,40 +319,42 @@ export const REG_STAGE_HOOKED_APIS = Object.freeze([
  *     / 硬拒状态**永远没人执行**；
  *   · 因此"不 hook"在 IAT 模型下等价于 **"不拦截"**，而"不拦截"= **写入直落真实 hive**，
  *     既不暂存、也不产生任何 `HARD_DENY`/`UNSTAGED` 审计记录。
- *   （`REG_STAGE_API_NOT_HOOKED` 在 `shim/` 全目录 **0 命中**，可作上述第二点的硬证据。）
  *
- * 涉及的两类 API（均为写入侧，即本插件声称要暂存的那一面）：
- *   · `RegSetKeyValueW/A`：语义 = `RegCreateKeyEx` + `RegSetValueEx` + `RegCloseKey`。
- *     .NET `Registry.SetValue` / `Microsoft.Win32` 与 PowerShell `New-ItemProperty`
- *     走的就是它，**不经过**我们 hook 的那两个入口 ⇒ 直落真实 hive。
- *   · `RegDeleteTreeW/A`：递归删子树。.NET `DeleteSubKeyTree` 走它 ⇒ 直落真实 hive。
- * 要治本必须在 C 侧给它们写 `ws_` 实现并列入 `WS_TARGET`（本会话没有 MSVC，见 README §1.1）。
- *
- * 本清单的作用是让"漏了什么"成为**可查的数据**，而不是文档里的一句承诺：
- * 只有当 API 真的进了 `WS_TARGET`，`classifyRegistryOperation()` 才会被调用、下面那条
- * 硬拒清单才谈得上"生效"。`tests/registry-stage.ts` 直接从 `ws_hook.c` 解析 `WS_TARGET`
- * 名单并与本清单求交集 ⇒ **补上 hook 而没从本清单删掉即红**（防清单漂成新的假承诺）。
+ * 当前**真残余**（R20 校准后）：
+ *   · `NtOpenKey`/`ZwOpenKey`：纯打开/读面，不在 WS_TARGET。仅"打开"不产生写入；
+ *     真正的写操作（NtSetValueKey/NtDeleteKey/...）已经被 deny，所以不构成写泄漏。
+ *     保留在此是为了让"打开面仍可被利用于探测"这件事可查。
+ *   · **raw `syscall` 指令**：结构性上限。任何 IAT 钩都拦不住直接 `syscall` 的代码；
+ *     只有 T1 受限令牌（内核拒绝）或内核面能兜底。这里无法用 API 名表达，故以文档 +
+ *     `REGISTERED_HARD_DENIALS.semantic` 登记。
+ *   · 少数 Reg* 变体：远程 Ex、预定义键重定向、按令牌视图、SD 改写。
+ * 本清单让"还漏了什么"保持可查；C 侧 deny 实现已启用（见 HOOKED/原因码），S2R17 的
+ * 镜像测试会保证"补了 hook 却仍列盲区"立刻变红。
  */
 export const REG_STAGE_UNHOOKED_APIS = Object.freeze([
-  /* R18：`RegSetKeyValueW/A`、`RegDeleteTreeW/A` 已补齐为 WS_TARGET（见
-   * REG_STAGE_HOOKED_APIS）；下面这些**仍然**不在 WS_TARGET 内 ⇒ 当下仍直落
-   * 真实 hive，只是本清单让"还漏了什么"保持可查。 */
-  'RegCreateKeyTransactedW',
-  'RegDeleteKeyTransactedW',
-  'RegOpenKeyTransactedW',
-  'RegCopyTreeW',
-  'RegRenameKey',
+  /* R20：ntdll 写类 + Zw 别名已全部进 WS_TARGET（见 REG_STAGE_HOOKED_APIS）⇒ 移出盲区。
+   * 只留纯打开/读的 NtOpenKey/ZwOpenKey。 */
+  'NtOpenKey',
+  'ZwOpenKey',
+  'RegConnectRegistryExW',
+  'RegOverridePredefKey',
+  'RegOpenUserClassesRoot',
+  'RegOpenCurrentUser',
+  'RegSetKeySecurity',
 ])
 
 /**
  * 明确**不**支持、且必须 fail-closed 的 API。
  *
- * ⚠ 生效前提（交叉验证实测，R17）：本清单是**意图声明**，不是拦截生效的证据。
+ * ⚠ 生效前提（交叉验证实测，R17；R20 校准）：本清单是**意图声明**，不是拦截生效的证据。
  *   只有当某个 API **真的在** `WS_TARGET` 名单里（见 `REG_STAGE_UNHOOKED_APIS` 的说明），
  *   shim 才会截获它、才会调用 `classifyRegistryOperation()`、本清单的硬拒才会被执行。
- *   目前本清单里**没有一条**在 `WS_TARGET` 内 ⇒ 它们当下的真实结局是**直落真实 hive**，
- *   而不是这里写的"硬拒"。把两者分开列（硬拒意图 vs 未 hook 盲区）正是为了
- *   不再让"清单上有名字"被读成"已经拦住了"。
+ *   R20 之后本清单**分成两类**（测试 S2R17③ 会机器区分）：
+ *     · 已进 `WS_TARGET`（RegRenameKey / RegCreateKeyTransactedW / RegConnectRegistryW …）
+ *       ⇒ 硬拒真的执行 = `HARD_DENY` + WAL；
+ *     · 真盲区（NtOpenKey/ZwOpenKey/RegSetKeySecurity/远程 Ex/预定义键重定向/按令牌视图）
+ *       ⇒ 这些名字"在清单上"不等于"已经拦住"，当下的真实结局仍是直落真实 hive。
+ *   把两者分开列（硬拒意图 vs 未 hook 盲区）正是为了不再让"清单上有名字"被读成"已经拦住了"。
  *
  * 为什么不能"尽力而为"地放过：这些调用的语义覆盖层复现不了
  * （整棵 hive 的加载/保存/替换、事务、重命名、SD 改写、远程 hive），
@@ -325,14 +380,11 @@ export const REG_STAGE_HARD_DENY_APIS = Object.freeze({
     '预定义键重定向会把覆盖层的路径映射整体打乱（它是"另一个 8.3 级别的重定向器"，与覆盖层叠加无法推理）',
   RegOpenUserClassesRoot: '按令牌打开的 HKCR 视图没有稳定的可暂存路径身份',
   RegOpenCurrentUser: '按令牌打开的 HKCU 视图没有稳定的可暂存路径身份',
-  NtCreateKey: '原生 API 绕过 Reg* 层；覆盖层只 hook winreg 的 8 个入口，必须 fail-closed',
-  NtOpenKey: '原生 API 绕过 Reg* 层（见 NtCreateKey）',
-  NtSetValueKey: '原生 API 绕过 Reg* 层（见 NtCreateKey）',
-  NtDeleteKey: '原生 API 绕过 Reg* 层（见 NtCreateKey）',
-  NtDeleteValueKey: '原生 API 绕过 Reg* 层（见 NtCreateKey）',
-  ZwCreateKey: '原生 API 的 Zw 别名，同样绕过 Reg* 层',
-  ZwOpenKey: '原生 API 的 Zw 别名，同样绕过 Reg* 层',
-  ZwSetValueKey: '原生 API 的 Zw 别名，同样绕过 Reg* 层',
+  /* R20：ntdll 写类已在 WS_TARGET 内由 shim 直接 fail-closed（原因码 8/6），
+   * 不再需要这里的"意图声明"。只保留纯打开面 NtOpenKey/ZwOpenKey：它们本身不写，
+   * 但不在拦截面内（见 REG_STAGE_UNHOOKED_APIS）。 */
+  NtOpenKey: '原生打开 API 不在 WS_TARGET（纯打开/读面本身无写入；后续写类已被 deny 兜底）',
+  ZwOpenKey: 'NtOpenKey 的 Zw 别名，同样不在 WS_TARGET',
 })
 
 /** `dwOptions` 里无法暂存的位 ⇒ 硬拒 */
@@ -436,11 +488,79 @@ export const REG_STAGE_HARD_DENY_REASON = Object.freeze({
   WOW64_VIEW_IN_WOW64_PROCESS_WRITE_NOT_STAGEABLE: 2,
   /** 递归删除（`RegDeleteTreeW/A`）没有 WAL 表示 ⇒ fail-closed（R18 KNOWN-09）。 */
   RECURSIVE_DELETE_NOT_STAGEABLE: 3,
+  /** R19：事务注册表 API（Create/Open/DeleteKeyTransactedW/A）无事务语义 ⇒ 硬拒。 */
+  TRANSACTED_WRITE_NOT_STAGEABLE: 4,
+  /** R19：整树复制 / 键重命名（RegCopyTreeW/A、RegRenameKey）无路径身份语义 ⇒ 硬拒。 */
+  TREE_OPERATION_NOT_STAGEABLE: 5,
+  /** R19：整 hive 的加载/卸载/保存/还原/替换 ⇒ 硬拒（绝不把覆盖层当真实 hive 落盘）。 */
+  HIVE_FILE_OPERATION_NOT_STAGEABLE: 6,
+  /** R19：远程 hive 连接（非本机）无法重定向到本地覆盖层 ⇒ 硬拒。 */
+  REMOTE_HIVE_NOT_STAGEABLE: 7,
+  /** R19 登记 / R20 启用：ntdll 写类（Nt* / Zw* 直调）无覆盖层表示 ⇒ fail-closed。
+   *  R20 起 24 个写类入口真的进了 `WS_TARGET`，这条原因码才第一次被执行。 */
+  NT_SYSCALL_WRITE_NOT_STAGEABLE: 8,
 })
 
 const HARD_DENY_REASON_NAME = Object.freeze(
   Object.fromEntries(Object.entries(REG_STAGE_HARD_DENY_REASON).map(([name, value]) => [value, name])),
 )
+
+/** R19/R20：这些入口进了 WS_TARGET 但**无法暂存** ⇒ API → 硬拒原因码。
+ *  与 C 侧 `shim/src/ws_reg.c` 的 `WS_HARD_DENY_*` 数值一一对应。
+ *  R19 = advapi32 transacted/copy/rename/hive-file/connect（23 个）；
+ *  R20 = ntdll 写面（12 个 Nt* + 12 个 Zw* 别名：5 个写操作 → 8，
+ *        7 个 hive-file 操作 → 6）。 */
+export const R19_HARD_DENY_REASON_BY_API = Object.freeze({
+  RegCreateKeyTransactedW: 'TRANSACTED_WRITE_NOT_STAGEABLE',
+  RegCreateKeyTransactedA: 'TRANSACTED_WRITE_NOT_STAGEABLE',
+  RegOpenKeyTransactedW: 'TRANSACTED_WRITE_NOT_STAGEABLE',
+  RegOpenKeyTransactedA: 'TRANSACTED_WRITE_NOT_STAGEABLE',
+  RegDeleteKeyTransactedW: 'TRANSACTED_WRITE_NOT_STAGEABLE',
+  RegDeleteKeyTransactedA: 'TRANSACTED_WRITE_NOT_STAGEABLE',
+  RegCopyTreeW: 'TREE_OPERATION_NOT_STAGEABLE',
+  RegCopyTreeA: 'TREE_OPERATION_NOT_STAGEABLE',
+  RegRenameKey: 'TREE_OPERATION_NOT_STAGEABLE',
+  RegLoadKeyW: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  RegLoadKeyA: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  RegUnLoadKeyW: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  RegUnLoadKeyA: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  RegSaveKeyW: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  RegSaveKeyA: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  RegSaveKeyExW: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  RegSaveKeyExA: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  RegRestoreKeyW: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  RegRestoreKeyA: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  RegReplaceKeyW: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  RegReplaceKeyA: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  RegConnectRegistryW: 'REMOTE_HIVE_NOT_STAGEABLE',
+  RegConnectRegistryA: 'REMOTE_HIVE_NOT_STAGEABLE',
+  /* R20 / R16：ntdll 写面（Nt* 与 Zw* 是 ntdll 的两个独立导出，必须分别列出）。 */
+  NtCreateKey: 'NT_SYSCALL_WRITE_NOT_STAGEABLE',
+  NtSetValueKey: 'NT_SYSCALL_WRITE_NOT_STAGEABLE',
+  NtDeleteKey: 'NT_SYSCALL_WRITE_NOT_STAGEABLE',
+  NtDeleteValueKey: 'NT_SYSCALL_WRITE_NOT_STAGEABLE',
+  NtRenameKey: 'NT_SYSCALL_WRITE_NOT_STAGEABLE',
+  ZwCreateKey: 'NT_SYSCALL_WRITE_NOT_STAGEABLE',
+  ZwSetValueKey: 'NT_SYSCALL_WRITE_NOT_STAGEABLE',
+  ZwDeleteKey: 'NT_SYSCALL_WRITE_NOT_STAGEABLE',
+  ZwDeleteValueKey: 'NT_SYSCALL_WRITE_NOT_STAGEABLE',
+  ZwRenameKey: 'NT_SYSCALL_WRITE_NOT_STAGEABLE',
+  /* ntdll 的 7 个整-hive 文件操作：与 advapi32 的 RegLoad/Save/... 同义 ⇒ 原因码 6。 */
+  NtLoadKey: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  NtLoadKey2: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  NtUnloadKey: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  NtSaveKey: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  NtSaveKeyEx: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  NtRestoreKey: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  NtReplaceKey: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  ZwLoadKey: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  ZwLoadKey2: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  ZwUnloadKey: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  ZwSaveKey: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  ZwSaveKeyEx: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  ZwRestoreKey: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+  ZwReplaceKey: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
+})
 
 /** 暂存操作名（纯层用字符串，便于落盘与人类核对） */
 export const REG_STAGE_OP = Object.freeze({
@@ -638,6 +758,16 @@ export function classifyRegistryOperation(operation = {}) {
     ...extra,
   })
 
+  /* R19：新进 WS_TARGET 的写类入口 —— 无法暂存 ⇒ HARD_DENY 且必须带原因码
+   * （WAL kind=5 `type`；C 侧 WS_HARD_DENY_* 数值与下方原因码逐字一致）。
+   * 必须排在 knownDeny 之前：REG_STAGE_HARD_DENY_APIS 里同名的几条（RegRenameKey/
+   * RegCreateKeyTransactedW/RegConnectRegistryW）也要带原因码，否则审计无法归因。 */
+  const r19HardDenyReason = R19_HARD_DENY_REASON_BY_API[api]
+  if (r19HardDenyReason !== undefined) {
+    return deny('REG_STAGE_API_HARD_DENY', `${api}: 覆盖层无法表示该调用（R19 fail-closed）`, {
+      hardDenyReason: r19HardDenyReason,
+    })
+  }
   const knownDeny = REG_STAGE_HARD_DENY_APIS[api]
   if (knownDeny !== undefined) return deny('REG_STAGE_API_HARD_DENY', `${api}: ${knownDeny}`)
   if (api === 'RegDeleteTreeW' || api === 'RegDeleteTreeA') {
@@ -2695,7 +2825,15 @@ export function createRegistryStage(options = {}) {
     const skipped = []
     const stale = []
     const blocked = []
-    const appliedSet = new Set(resolution.appliedPaths.map((path) => fold(path)))
+    // ★ R21 / G2 修复：`appliedSet` 只有两个用途 —— ①"上一次 apply 已应用过 ⇒ 本次跳过"
+    // （跨调用幂等）；② 计算 remaining。**不能**用它做单次批内去重：同一值单元在 WAL 里
+    // 可以有多条操作（set→set 改类型、set→delete-value …），批内把第二条当
+    // `already-applied` 跳过会让真实 hive 停在**第一条**的值 ⇒ 与覆盖层终态分叉
+    // （R21 实测：真实 hive 留下 REG_SZ "first"，覆盖层终态是 REG_DWORD 42）。
+    // 正确语义：批内按 WAL 顺序**重放每一条**，跨调用才按路径跳过。
+    const appliedBefore = new Set(resolution.appliedPaths.map((path) => fold(path)))
+    /** 本次 apply 中已满足（成功应用 / 明确 no-op / 冻结时判 appliable:false）的单元路径。 */
+    const satisfied = new Set()
     /** 本次 apply 里**已成功建立**的键（小写规范路径），用于父键依赖判定 */
     const createdHere = new Set()
 
@@ -2714,14 +2852,14 @@ export function createRegistryStage(options = {}) {
           appliable: false,
           reason: frozenUnit.unsupportedReason ?? 'unit was marked appliable:false when the candidate was frozen',
         })
-        appliedSet.add(fold(unit.path))
+        satisfied.add(fold(unit.path))
         continue
       }
       if (selected && !selected.has(fold(unit.path))) {
         skipped.push({ path: unit.path, op: unit.op, reason: 'not-selected' })
         continue
       }
-      if (appliedSet.has(fold(unit.path))) {
+      if (appliedBefore.has(fold(unit.path))) {
         skipped.push({ path: unit.path, op: unit.op, reason: 'already-applied' })
         continue
       }
@@ -2783,7 +2921,7 @@ export function createRegistryStage(options = {}) {
               'a no-op create must not block the batch (and must not trigger `reg add <existing key> /f`)',
           })
           // 目标状态已经成立 ⇒ 不留在 `remaining` 里（否则整批会被一条空操作拖成 partially-applied）。
-          appliedSet.add(fold(unit.path))
+          satisfied.add(fold(unit.path))
           continue
         }
       }
@@ -2813,7 +2951,7 @@ export function createRegistryStage(options = {}) {
       const status = (result?.status ?? result ?? 0) >>> 0
       if (status === REG_STATUS.ERROR_SUCCESS) {
         applied.push({ path: unit.path, op: unit.op })
-        appliedSet.add(fold(unit.path))
+        satisfied.add(fold(unit.path))
         if (unit.op === 'create-key') createdHere.add(fold(unit.path))
         if (unit.op === 'delete-key') createdHere.delete(fold(unit.path))
         // 我们自己的写入**合法地**改变了真实 hive（例如先应用了 B，再应用 A 时该键已经多了一个值）。
@@ -2828,7 +2966,8 @@ export function createRegistryStage(options = {}) {
     }
 
     resolution.appliedPaths = [...new Set([...resolution.appliedPaths, ...applied.map((unit) => unit.path)])]
-    const remaining = units.filter((unit) => !appliedSet.has(fold(unit.path)))
+    // 上一次 apply 已应用过的路径也算"已满足"（跨调用幂等），否则会被误留进 remaining 把整批打成 partially-applied。
+    const remaining = units.filter((unit) => !satisfied.has(fold(unit.path)) && !appliedBefore.has(fold(unit.path)))
     if (failed.length === 0 && remaining.length === 0 && applied.length > 0) resolution.status = CANDIDATE_STATUS.APPLIED
     else if (applied.length > 0) resolution.status = CANDIDATE_STATUS.PARTIALLY_APPLIED
     else if (stale.length > 0 && failed.length === 0) resolution.status = CANDIDATE_STATUS.STALE

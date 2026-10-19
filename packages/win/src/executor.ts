@@ -2662,6 +2662,8 @@ export class WindowsStageExecutor {
         : undefined,
       shimConfig: config,
       shimConfigPath: configPath,
+      // R20②：shim 档的注册表写审计走 WAL ⇒ 可归因（同源字段，单一投影）
+      registryAttribution: registryAttributionFor(this.launchMode),
     })
     return this.initReport
   }
@@ -2956,6 +2958,8 @@ export class WindowsStageExecutor {
           }
         : undefined,
       appContainer: this.appContainerInfo,
+      // R20②：本档的注册表写归因能力（T1/T0 无 shim ⇒ 结构化声明"不可归因"，不冒充已归因）
+      registryAttribution: registryAttributionFor(this.launchMode),
     })
     return this.initReport
   }
@@ -3958,6 +3962,40 @@ export const OPAQUE_PAYLOAD_OPERATORS = Object.freeze([
 ])
 
 /**
+ * ★ R19-B2：PowerShell 参数的**合法缩写**让上面的 `-enc*` / `-file` 正则漏判。
+ *
+ * 现场（R19 实证）：`powershell -ec <base64>` 是 `-EncodedCommand` 的合法缩写（`-en`/`-e` 同类），
+ * `-f script.ps1` 是 `-File` 的缩写。当同一条命令行里还有只读动词时（`cmd /c echo hi & powershell -ec …`），
+ * 旧实现判 READ_ONLY ⇒ 降级档一票放行 ⇒ 编码载荷真实执行（干净进程实证 wrote=true）。
+ *
+ * 判据刻意**只在 powershell/pwsh 程序 token 之后**扫描短旗标：`-e` 是大量只读命令的普通参数
+ * （`grep -e`、`curl -e`），全局匹配会把它们误判成"判不出来"。
+ *
+ * @param {string[]} tokens 已小写的 token 序列（含分隔符）
+ * @returns {{hit:boolean, label?:string}}
+ */
+export function hasPwshOpaqueFlag(tokens) {
+  const list = Array.isArray(tokens) ? tokens : []
+  const PWSH = new Set(['powershell', 'powershell.exe', 'pwsh', 'pwsh.exe'])
+  for (let i = 0; i < list.length; i += 1) {
+    if (!PWSH.has(baseNameLower(list[i]))) continue
+    for (let j = i + 1; j < list.length; j += 1) {
+      const token = String(list[j] ?? '')
+      if (isCommandSeparator(token)) break
+      const lower = token.toLowerCase()
+      // -EncodedCommand 的合法缩写：-e / -ec / -en / -enco（含 .exe 形式无关）
+      if (/^-(e|ec|en|enco)$/.test(lower)) return { hit: true, label: `pwsh 短旗标 ${lower}（-EncodedCommand 的合法缩写，载荷读不懂）` }
+      // -File 的合法缩写：-f / -fi / -fil
+      if (/^-(f|fi|fil)$/.test(lower)) {
+        const next = list[j + 1]
+        if (next !== undefined && !String(next).startsWith('-')) return { hit: true, label: `pwsh 短旗标 ${lower}（-File 的合法缩写，载荷在文件里）` }
+      }
+    }
+  }
+  return { hit: false }
+}
+
+/**
  * ── R17 安全审计（P1）：read-only 动词 + **带副作用的 API/方法调用** ──────────────
  *
  * 现场（独立复现，`.lead/logs/security-auditor/probe-red.log` B 段）：
@@ -3985,6 +4023,27 @@ export const SIDE_EFFECT_API_OPERATORS = Object.freeze([
      * `$s.Replace('a','b')` 是纯内存的字符串方法，收进来会把常见只读脚本误判。
      */
     pattern: /(?:::|\.)\s*(delete|move|copy)\s*\(/i,
+  },
+  {
+    /**
+     * ★ R19-B3：`[IO.File]::Open(` / `Create(` / `CreateText(` 是真实文件写入/截断入口。
+     *
+     * 现场（R19 实证）：`powershell -Command "Get-Date; [IO.File]::Open('out','Create') 然后 $s.Write(...)"`
+     * 旧实现判 READ_ONLY（`Open(` 不在任何表）⇒ 降级档一票放行 ⇒ 干净进程实证 out 文件被写。
+     * 限定在 `[IO.File]` 类型限定符之后（同 Replace 的收法），不碰 `$x.Open(` 这类实例方法。
+     * 注：`::Open(` 也可能是纯读（`[IO.File]::Open(p,'Open','Read')`）—— 这里按 fail-closed
+     * 收成"判不出来"（方向安全；只读脚本请改用 Get-Content 这类明确只读动词）。
+     */
+    label: '.NET 文件打开/创建 API（[IO.File]::Open / Create / CreateText）',
+    pattern: /\[\s*(?:system\.)?io\.file\s*\]\s*::\s*(open|create|createtext)\s*\(/i,
+  },
+  {
+    /**
+     * ★ R19-B3：`[IO.FileStream]::new(...)` / `New-Object System.IO.FileStream` 同样是
+     * 文件句柄入口（可写可读）。与上一条同理收成"判不出来"，避免"只读动词 + FileStream 写"漏放行。
+     */
+    label: '.NET 文件流构造（[IO.FileStream]::new / New-Object System.IO.FileStream）',
+    pattern: /\[\s*(?:system\.)?io\.filestream\s*\]\s*::\s*new\s*\(|\bnew-object\s+(?:-typename\s+)?(?:system\.)?io\.filestream\b/i,
   },
   {
     /**
@@ -4071,11 +4130,23 @@ export { tokenizeCommandLine }
  * 命令分隔符（cmd 与 PowerShell 两侧的拼接写法）。
  * PowerShell 常写成 `Get-Process; reg add …`（分号**贴在前一个 token 尾上**），
  * 因此"以 `;` 结尾"也要算分隔符边界 —— 否则分号后那条命令会被整条吞掉。
+ *
+ * ★ R19-B1：解释器载荷里的**换行**也被替换成这个显式 sentinel token（见
+ * `classifyCommandRisk` 的 NEWLINE_SEPARATOR）—— PowerShell/bash 里换行就是语句分隔符。
  */
+const NEWLINE_SEPARATOR_TOKEN = '__ws_nl__'
+
 function isCommandSeparator(token) {
   const text = String(token ?? '')
-  return /^[&|;]+$/.test(text) || /;$/.test(text)
+  return text === NEWLINE_SEPARATOR_TOKEN || /^[&|;]+$/.test(text) || /;$/.test(text)
 }
+
+/** PowerShell 控制流/块关键字（命令位出现时不是"未知程序"，只是语法结构）。 */
+const PS_CONTROL_KEYWORDS = new Set([
+  'if', 'elseif', 'else', 'foreach', 'for', 'while', 'do', 'until', 'switch', 'try', 'catch',
+  'finally', 'function', 'filter', 'param', 'return', 'throw', 'break', 'continue', 'begin',
+  'process', 'end', 'trap', 'data', 'class', 'enum', 'using', 'namespace',
+])
 
 /**
  * 把"分隔符粘在别的 token 上"的形态劈开：`x;reg` → `['x', ';', 'reg']`。
@@ -4118,7 +4189,29 @@ function baseNameLower(token) {
 export function classifyCommandRisk(command, args = [], options = {}) {
   const argv = [command, ...(Array.isArray(args) ? args : [])].filter((v) => v !== undefined && v !== null)
   const joined = argv.map((v) => String(v)).join(' ')
-  const tokens = tokenizeCommandLine(joined)
+  /**
+   * ★ R19-B1：解释器载荷里的**换行是语句分隔符**（PowerShell/bash 语义），必须当成命令位边界。
+   *
+   * 现场（R19 独立复现 + 干净进程实证）：`powershell -NoProfile -Command "Get-Date<换行>certutil -decode b64 out"`
+   *   · 没有写入型操作符；· `certutil` 不在写/只读表；· 首 token 是解释器；· `Get-Date` 只读
+   *   ⇒ 旧实现判 READ_ONLY ⇒ 降级档/`--read-only` 一票放行 ⇒ 真实落盘（out 文件生成）。
+   *
+   * 修法（刻意最小）：把换行替换成一个**显式分隔符 token**，让下文的"命令位"扫描把每条语句的
+   * 首个 token 都当成命令位检查（未知程序 ⇒ indeterminate）。**不重写首 token/只读动词判定**，
+   * 因此多行只读脚本（`$s = Get-Date` 换行 `$s.ToString()`）不会被误伤。
+   *
+   * 只对 PowerShell/pwsh/bash/sh/wsl 做换行切分，`cmd /c` 不切：R19 实测 cmd 单行命令里的换行
+   * **不被执行**（`cmd /c echo hi<换行>certutil …` 未落盘），切它只会误伤。
+   */
+  const NEWLINE_SEPARATOR = NEWLINE_SEPARATOR_TOKEN
+  const headBaseForNewline = baseNameLower(argv[0] ?? '')
+  const newlineIsSeparator =
+    INTERPRETER_COMMANDS.includes(headBaseForNewline) && headBaseForNewline !== 'cmd' && headBaseForNewline !== 'cmd.exe'
+  const scanText =
+    newlineIsSeparator && /[\r\n]/.test(joined)
+      ? joined.replace(/\r\n|\r|\n/g, ` ${NEWLINE_SEPARATOR} `)
+      : joined
+  const tokens = tokenizeCommandLine(scanText)
   const lowerTokens = tokens.map((t) => t.toLowerCase())
   /**
    * 分隔符**独立成 token** 的扫描序列（见 `splitCommandTokens` 的注释）。
@@ -4171,9 +4264,15 @@ export function classifyCommandRisk(command, args = [], options = {}) {
   if (writeHits.length > 0) reasons.push(`写类动词命中：${[...new Set(writeHits.map((t) => baseNameLower(t)))].join(', ')}`)
   // ③ 未知 Verb-Noun：写前缀 ⇒ 有风险；读前缀但不在只读表里 ⇒ 判不出来
   //    （前缀不是真实 PowerShell 动词的连字符单词只是普通参数，比如 `still-alive`）
+  //
+  // ★ R19-B5（精度）：只读动词计数改在 **scannedTokens**（分隔符已劈开）上做。
+  //   旧实现扫 `lowerTokens`，于是 `Get-Process;` 这种"分号粘在 token 尾上"的写法**不计入**
+  //   只读命中（`PS_VERB_NOUN_RE` 不允许尾部分号）⇒ 一条纯只读命令 `Get-Process; (Get-Date).Year`
+  //   被误判 indeterminate。计数口径与 ③c 的命令位扫描保持一致；这只影响"正向证明只读"的
+  //   灵敏度，不会放宽任何写/判不出来分支。
   const unknownVerbNoun = []
   let readOnlyHitCount = 0
-  for (const lower of lowerTokens) {
+  for (const lower of scannedTokens) {
     const verbNoun = PS_VERB_NOUN_RE.exec(lower)
     if (verbNoun && KNOWN_PS_VERB_PREFIXES.has(verbNoun[1])) {
       if (READ_ONLY_VERBS.includes(lower)) {
@@ -4232,12 +4331,53 @@ export function classifyCommandRisk(command, args = [], options = {}) {
    * 让 `x;reg` 变成 `x` + `;` + `reg`，命令位判定才对得上真实语义。
    */
   for (let i = 1; i < scannedTokens.length; i += 1) {
-    if (!isCommandSeparator(scannedTokens[i - 1])) continue
+    const prev = scannedTokens[i - 1]
+    /**
+     * 命令位 = 分隔符（`&` `|` `;` 换行）之后，或语句块 `{` 之后，或 PowerShell 赋值 `$x = <命令>`
+     * 的 `=` 之后（仅 newline 模式 + 赋值左侧是变量，避免把 `echo a = b` 这类实参误判）。
+     */
+    const assignContext =
+      newlineIsSeparator && prev === '=' && i >= 2 && /^[%$]/.test(String(scannedTokens[i - 2] ?? ''))
+    if (!isCommandSeparator(prev) && prev !== '{' && !assignContext) continue
     const raw = scannedTokens[i]
     if (isCommandSeparator(raw)) continue
     if (raw.startsWith('-') || raw.startsWith('/')) continue
+    const afterNewlineOrBlock = prev === NEWLINE_SEPARATOR || prev === '{'
+    /**
+     * ★ R19-B4：命令位上"不可静态解析"的形态 ⇒ 判不出来（fail-closed）。
+     *
+     * 现场（R19 干净进程实证）：`cmd /c echo hi & %comspec% /c certutil -decode b64.txt out.txt`
+     * 旧实现把 `%comspec%` 当成"不匹配标识符的普通实参"直接 continue，于是整条命令只剩首 token
+     * `echo`（只读）⇒ READ_ONLY ⇒ 降级档一票放行 ⇒ `%comspec%` 展开成 cmd.exe 后 certutil 真写盘。
+     * 同类形态：`$env:ComSpec` / `$c`（PowerShell 变量）、`!x!`（延迟展开）、`[<expr>]`
+     * （.NET 表达式语句，如 `[IO.File]::WriteAllText(…)`）、`{…}`（脚本块）、`.`（dot-source）。
+     * 其中"换行/语句块之后以 `$ [ { . @` 开头的**表达式/续行**"不按程序名处理（与修复前一致，
+     * 避免误伤 `$s.ToString()` 这类只读表达式；它们的写入面由 SIDE_EFFECT_API 全量扫描兜住），
+     * 但 `& $var` / `; $var` 这类**调用运算符**之后的变量是真调用 ⇒ 判不出来。
+     */
+    if (raw.startsWith('(')) {
+      // 调用运算符分组（`& (certutil …)`）：取括号内第一个程序名继续按同一判据判定。
+      const inner = raw.replace(/^\(+/, '')
+      const innerMatch = /^[a-z0-9_][a-z0-9_.\-]*/.exec(inner)
+      if (!innerMatch) {
+        unknownCommandTokens.push(raw)
+        continue
+      }
+      const innerToken = baseNameLower(innerMatch[0])
+      if (PS_CONTROL_KEYWORDS.has(innerToken)) continue
+      if (READ_ONLY_VERBS.includes(innerToken) || READ_ONLY_EXES.includes(innerToken)) continue
+      if (WRITE_VERBS.includes(innerToken) || INTERPRETER_COMMANDS.includes(innerToken)) continue
+      unknownCommandTokens.push(innerToken)
+      continue
+    }
+    if (/^[%$!@\[{]/.test(raw) || raw === '.') {
+      if (afterNewlineOrBlock) continue
+      unknownCommandTokens.push(raw)
+      continue
+    }
     // 命令位上的**程序名**：目录前缀不改变语义 ⇒ 先取基名再判定
     const token = baseNameLower(raw)
+    if (PS_CONTROL_KEYWORDS.has(token)) continue
     if (!/^[a-z0-9_][a-z0-9_.\-]*$/.test(token)) continue
     if (READ_ONLY_VERBS.includes(token) || READ_ONLY_EXES.includes(token)) continue
     if (WRITE_VERBS.includes(token) || INTERPRETER_COMMANDS.includes(token)) continue
@@ -4260,6 +4400,18 @@ export function classifyCommandRisk(command, args = [], options = {}) {
       risk: COMMAND_RISK.INDETERMINATE,
       reasons: opaque.map((entry) => `无法判定副作用：${entry.label}`),
       evidence: { command: String(command ?? ''), opaque: opaque.map((e) => e.label) },
+    }
+  }
+  /**
+   * ③b' ★ R19-B2：PowerShell 缩写旗标（`-ec`/`-en`/`-e` = -EncodedCommand；`-f` = -File）。
+   * 只在 powershell/pwsh 程序 token 之后扫描（见 `hasPwshOpaqueFlag` 注释），避免误伤 `grep -e`。
+   */
+  const pwshOpaque = hasPwshOpaqueFlag(scannedTokens)
+  if (pwshOpaque.hit) {
+    return {
+      risk: COMMAND_RISK.INDETERMINATE,
+      reasons: [`无法判定副作用：${pwshOpaque.label}`],
+      evidence: { command: String(command ?? ''), pwshOpaque: pwshOpaque.label },
     }
   }
   // ④ 首个 token 是不是一个"认识"的程序
@@ -5102,7 +5254,9 @@ export function repoRootPath() {
   return dirname(dirname(fileURLToPath(import.meta.url)))
 }
 
-/** 解析 T4 的三个产物路径（环境变量优先，其次仓库内规范位置） */
+/**
+ * 解析 T4 的三个产物路径（环境变量优先，其次仓库内规范位置）
+ */
 /** 把产物路径规范成绝对路径（子进程的 cwd 可能与宿主不同，相对路径必错） */
 export function resolveShimArtifacts(options = {}) {
   const shimDir = resolve(options.shimDir || process.env.WINSTAGE_SHIM_DIR || join(repoRootPath(), 'shim', 'out'))
@@ -5111,6 +5265,56 @@ export function resolveShimArtifacts(options = {}) {
     dllPath: resolve(options.dllPath || process.env.WINSTAGE_SHIM_DLL || join(shimDir, 'winstage-shim.dll')),
     injectorPath: resolve(options.injectorPath || process.env.WINSTAGE_SHIM_INJECTOR || join(shimDir, 'winstage-inject.exe')),
     probePath: resolve(options.probePath || process.env.WINSTAGE_SHIM_PROBE || join(shimDir, 'winstage-probe.exe')),
+  }
+}
+
+/* ═══════════════ R20②：注册表写尝试的**归因能力**（机读，不冒充已归因）═══════════════
+ *
+ * 问题（R19-FSREG-04 / R19-FSREG-02）：T1 档 = 受限令牌（RestrictedLauncher，**不注入
+ * shim**）。被拒的注册表写尝试由内核令牌拒绝，调用方只看到通用 `Access denied`，
+ * 审计里**没有任何"沙箱拒绝"记录**（没有 shim ⇒ 没有 WAL / HARD_DENY）。用户无法
+ * 区分"策略拒绝"与"本来就没权限"。这不是可以靠文案掩盖的 UX 问题，而是**归因能力**
+ * 的差异，必须作为**结构化数据**如实暴露：
+ *   · shim 档（TS）：写尝试被 shim 截获 ⇒ 暂存 / HARD_DENY 都进 WAL，**可归因**；
+ *   · T1（受限令牌）/ T0（AppContainer）：没有 shim ⇒ WAL 必然为空，**不可归因**。
+ * 本函数返回的对象只声明"能不能归因、为什么、残余面是什么"，**不**声称"已归因"。
+ * 放在 initReport 里 ⇒ `exec --json` 的 `sandboxInit.registryAttribution`、
+ * 面板 lane 报告、离线测试读到的都是同一份机读事实（单一投影）。
+ */
+export const REGISTRY_ATTRIBUTION_CODE = Object.freeze({
+  /** shim 档：被拒/被暂存的注册表写都有 WAL 记录，可归因。 */
+  ATTRIBUTABLE: 'REGISTRY_DENIALS_ATTRIBUTABLE_VIA_WAL',
+  /** 无 shim 档：拒绝来自内核令牌/AppContainer，审计面没有沙箱记录 ⇒ 不可归因。 */
+  NOT_ATTRIBUTABLE: 'REGISTRY_DENIALS_NOT_ATTRIBUTABLE_NO_SHIM',
+})
+
+/** 一个纯函数：launchMode → 归因能力声明（可离线断言，不依赖 Win32）。 */
+export function registryAttributionFor(launchMode) {
+  const shim = launchMode === 'shim'
+  const appcontainer = launchMode === 'appcontainer'
+  return {
+    version: 1,
+    /** ★ 唯一判据：本档是否有能力把"这次写被沙箱拒绝"写进可查审计。 */
+    attributable: shim,
+    code: shim ? REGISTRY_ATTRIBUTION_CODE.ATTRIBUTABLE : REGISTRY_ATTRIBUTION_CODE.NOT_ATTRIBUTABLE,
+    launchMode: launchMode ?? null,
+    mechanism: shim ? 'winstage-shim-iat' : appcontainer ? 'windows-appcontainer' : 'windows-acl-restricted-token',
+    /** 注册表写面的审计通道：shim 档有 WAL；无 shim 档**结构性地**没有。 */
+    wal: shim ? 'expected' : 'none-by-construction',
+    /** 残余面：即使 shim 档也拦不住的部分；无 shim 档额外多出"整面不可归因"。 */
+    residual: shim
+      ? ['raw syscall (no IAT slot; not attributable even in shim mode)']
+      : [
+          'no shim in this lane: refused registry writes are kernel-token/AppContainer denials',
+          'no WAL / HARD_DENY record by construction (registry staging audit requires the shim)',
+          'unhooked registry surface (no IAT interception at all in this lane)',
+          'raw syscall (no IAT slot)',
+        ],
+    summary: shim
+      ? '注册表写尝试经 shim 拦截：暂存与 HARD_DENY 都有 WAL 记录，可归因；raw syscall 除外。'
+      : '本档没有注入 WinStage shim：被拒的注册表写由内核令牌/AppContainer 拒绝，审计里不会有 WAL/HARD_DENY 记录。' +
+        '不要把 "Access denied" 读成"沙箱策略拒绝"，也不要把"没有 WAL"读成"没有尝试过写"——' +
+        '本字段只是声明"不可归因"，不是归因结果。',
   }
 }
 

@@ -58,7 +58,7 @@ import {
   shellProviderPlan,
   winStageEnabledFromProfile,
 } from '../dsh-plugin/assembly-toggle.ts'
-import { switchEnabledFromRows } from '../dsh-plugin/host-plugin.ts'
+import { switchEnabledFromRows, apply as hostApply } from '../dsh-plugin/host-plugin.ts'
 import { installBaselineWatch } from '../dsh-plugin/baseline-watch.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -483,6 +483,72 @@ process.stdout.write('\n[I] R18 KNOWN-08a：baseline-watch 随开关启停\n')
   const hostSrc2 = readFileSync(join(REPO, 'dsh-plugin', 'host-plugin.ts'), 'utf8')
   ok(!/if \(isEnabled\(\)\) \{\s*\n\s*installBaselineWatch/.test(hostSrc2), 'I20 host-plugin 不得再"只在开态装配"（旧缺陷形态）')
   ok(/installBaselineWatch\(ctx, \{[\s\S]{0,300}isEnabled,/.test(hostSrc2), 'I21 host-plugin 把现读开关 isEnabled 交给 watcher')
+}
+
+// ── J. R19 修复（P1）：关闭态零探测（关态不得调用 probeRuntime）─────────────────
+// 缺陷：`apply()` 的启动探测只判 `config.probeOnStart`，不判开关 ⇒ **关态 + 默认
+// `probeOnStart:true`** 的宿主每次启动仍调用 `probeRuntime()`。那不是纯查询：
+//   WindowsStageExecutor.capabilities() 加载 ACL/win32 模块 →
+//   probeWin32Abi() 在 dirname(tmpdir()) 下 mkdir+write+rm，尝试写 C:\Windows，
+//   派生 ping/node 子进程验 Job Object（src/capability.ts:218-236,340-367）。
+// 与 `enabled` 的描述"关闭后本插件不做任何检查"、与"关态对原 harness 零影响"冲突。
+// 先红后绿证据：`.t/r19-cordis/repro-offstate-probe.ts`（关态 probeRuntimeCalls 1→0）。
+process.stdout.write('\n[J] R19 关态零影响：关闭态不得跑启动能力探测\n')
+{
+  /** 用假 ctx 跑一次 host-plugin apply；返回它写出的日志行（并同步清理所有 effect）。 */
+  const runHostApply = (probeOnStart, enabled) => {
+    const logs = []
+    const disposers = []
+    const rows = [{ id: 'winstage-sandbox', config: { enabled } }]
+    const ctx = {
+      logger: {
+        info: (message) => logs.push(String(message)),
+        warn: (message) => logs.push(String(message)),
+        error: (message) => logs.push(String(message)),
+      },
+      effect: (fn) => {
+        const dispose = fn()
+        if (typeof dispose === 'function') disposers.push(dispose)
+        return dispose
+      },
+      inject: () => ({}),
+      // 与 loader 行表同形：isEnabled() 现读 entry.parent.data
+      fiber: { entry: { parent: { data: rows } } },
+    }
+    hostApply(ctx, { enabled, workspaceRoot: SCRATCH, probeOnStart, verboseLog: false })
+    for (const dispose of disposers.splice(0).reverse()) {
+      try {
+        dispose()
+      } catch {
+        /* 清理失败不影响断言 */
+      }
+    }
+    return logs
+  }
+
+  const offWithProbe = runHostApply(true, false)
+  const offNoProbe = runHostApply(false, false)
+  // 旧实现（红）在这里必然出现一条"能力探测通过/未通过"——两条分支都由 probeRuntime 的返回驱动。
+  ok(
+    !offWithProbe.some((line) => /能力探测(通过|未通过)/.test(line)),
+    'J1 关态 + probeOnStart:true ⇒ 不留"能力探测通过/未通过"日志（= probeRuntime 未被调用）',
+    JSON.stringify(offWithProbe.slice(-2)),
+  )
+  ok(
+    offWithProbe.some((line) => /跳过启动能力探测/.test(line)),
+    'J2 关态跳过探测必须**显式**记一条（不是静默跳过）',
+    JSON.stringify(offWithProbe.slice(-1)),
+  )
+  ok(
+    offNoProbe.some((line) => /probeOnStart=false/.test(line)) && !offNoProbe.some((line) => /能力探测(通过|未通过)/.test(line)),
+    'J3 probeOnStart=false 的既有语义不变（仍跳过探测）',
+    JSON.stringify(offNoProbe.slice(-1)),
+  )
+  const hostSrc3 = readFileSync(join(REPO, 'dsh-plugin', 'host-plugin.ts'), 'utf8')
+  ok(
+    /if \(config\.probeOnStart === false\)[\s\S]{0,5000}?if \(!isEnabled\(\)\)[\s\S]{0,500}?const probe = startupProbe \?\? probeRuntime\(\)/.test(hostSrc3),
+    'J4 静态接线：启动探测前必须有 `!isEnabled()` 守卫（防旧形态复活）',
+  )
 }
 
 const failed = failures > 0

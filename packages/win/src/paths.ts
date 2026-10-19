@@ -422,6 +422,16 @@ export const MASK_PROBES = [
   { id: 'probe-ssh-key', maskClass: 'ssh', path: join(USERPROFILE(), '.ssh', 'id_rsa'), label: 'SSH 私钥' },
   { id: 'probe-git-credentials', maskClass: 'git-credentials', path: join(USERPROFILE(), '.git-credentials'), label: 'Git 明文凭据' },
   { id: 'probe-npmrc', maskClass: 'npmrc', path: join(USERPROFILE(), '.npmrc'), label: 'npm 令牌' },
+  // R19-A5：ADS 流名写法必须与基文件同判。现场：`…\.npmrc:$DATA` / `…\.npmrc:stream`
+  // 归一化后仍是带 `:` 的 leaf ⇒ `\\.npmrc$` 不命中 ⇒ 读遮蔽放行（命名流内容可被原生读）。
+  // 这两条探针把"maskKey / ws_mask_normalize 剥离 leaf 的 ADS 说明符"钉死（两侧同一语义）。
+  { id: 'probe-npmrc-ads-default', maskClass: 'npmrc', path: `${join(USERPROFILE(), '.npmrc')}:$DATA`, label: 'npm 令牌（ADS 默认流写法）' },
+  { id: 'probe-npmrc-ads-stream', maskClass: 'npmrc', path: `${join(USERPROFILE(), '.npmrc')}:r19stream`, label: 'npm 令牌（ADS 命名流写法）' },
+  // 注：尾点/尾空格写法（`…\.npmrc.`）**不单列探针**：R19 用 shim 实测（对真实存在的文件）
+  // `GetLongPathNameW`/`GetFinalPathNameByHandleW` 已把它解回 `…\.npmrc` 并命中遮蔽；
+  // 而 `maskKey()` 的 `canonical()` 对**不存在**的对象只能回退词法路径（保留尾点），
+  // 把它写成探针会在"该文件不存在"的机器上假红（探针必须与"对象是否存在"解耦）。
+  // 判据以 shim 的实测为准：`mask-checkpath-battery.log` 的 tail.* 四条全部 deny。
   { id: 'probe-dsh-home', maskClass: 'dsh-home', path: join(USERPROFILE(), '.dsh', 'sessions'), label: 'DSH 主目录' },
   { id: 'probe-stage-store', maskClass: 'stage-store', path: join(USERPROFILE(), 'ws', '.dshstage', 'manifest.json'), label: '沙箱自身存储' },
   { id: 'probe-hosts', maskClass: 'hosts', path: 'C:\\Windows\\System32\\drivers\\etc\\hosts', label: 'hosts' },
@@ -556,7 +566,14 @@ export function maskKey(anyPath) {
   const c = canonical(anyPath)
   // 只对"盘符 + 分隔符"以上的长度去尾（`C:\` 这类根本身保留原样）
   const stripped = c.length > 3 ? c.replace(/[\\/]+$/, '') : c
-  return stripped.replace(/\//g, sep)
+  const unified = stripped.replace(/\//g, sep)
+  // ★ R19-A5：剥离 leaf 上的 ADS 流说明符（`…\.npmrc:$DATA` / `…\.npmrc:stream` → `…\.npmrc`）。
+  //   与 `shim/src/ws_mask.c::ws_mask_normalize()` 的同一步**必须同步**（两套实现是历史最痛缺陷形态）。
+  //   语义：遮蔽一个文件 = 遮蔽它的所有流；leaf 锚定的规则（`\\.npmrc$` 等）此前被 `:stream` 后缀绕过。
+  //   只剥 leaf 里的第一个 `:`（盘符冒号在 leaf 之外，普通文件名不含冒号）⇒ 单向收紧、不误伤。
+  const leafStart = unified.lastIndexOf(sep) + 1
+  const colonAt = unified.indexOf(':', leafStart)
+  return colonAt > leafStart ? unified.slice(0, colonAt) : unified
 }
 
 export function maskReason(anyPath, extraMasks = []) {
@@ -626,10 +643,11 @@ export function exportMaskList() {
         'canonical(): realpathSync.native — 解析 symlink/junction、8.3 短名、\\\\?\\ 长路径前缀、. 与 ..',
         'strip-trailing-separator（目录自身与“目录\\”得到同一个键）',
         'unify-separator：/ → \\',
+        'strip-ads-stream-specifier（R19-A5）：leaf 里第一个 `:` 起是 ADS 流说明符 ⇒ 剥到基文件（遮蔽基文件 = 遮蔽其所有流）',
         '盘符大小写统一由 lexical() 完成；其余大小写由各规则的 i 标志覆盖',
       ],
       // 消费方**必须**用同一语义；这里给出一条判据，便于跨语言实现自检
-      invariant: 'maskKey(directory) === maskKey(directory + "\\\\")，且短名/长名写法得到同一个键',
+      invariant: 'maskKey(directory) === maskKey(directory + "\\\\")，且短名/长名写法得到同一个键，maskKey(f) === maskKey(f + ":$DATA")',
     },
     matchModeDefault: 'casefold-regex',
     entries: MASK_CLASSES.map((rule) => ({

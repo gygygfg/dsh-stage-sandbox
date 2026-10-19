@@ -64,6 +64,17 @@ export const MASK_REASON = Object.freeze({
    * 单行判定看不到"上一行说这是凭据正文"这个上下文，因此由跨行状态机补上。
    */
   BLOCK_SCALAR: 'block-scalar',
+  /**
+   * URI/URL 里**内嵌的凭据**（R21-SENS-02 修）：
+   *   · userinfo 的密码段（`scheme://user:<pass>@host`）；
+   *   · userinfo 本身是 token 形状（`scheme://<token>@host`，如 `https://ghp_…@github.com`）；
+   *   · query/fragment 里的凭据键（`?access_token=` / `?token=` / `?api_key=` …，口径 = `isCredentialKey()`，
+   *     外加 AWS/SAS 的 `sig`/`X-Amz-*` 参数）；
+   *   · npmrc 形态的 `:_authToken=` / `:_auth=` / `:_password=` 段（出现在 URL 路径里时同样要遮）。
+   * 这些值以 `scheme://` 开头，但**不是"位置"** —— 旧的 `isLocationLike()/isPathForm()`
+   * 整值豁免把凭据原样放行（gate-runner 独立探针发现）。
+   */
+  URI_CREDENTIAL: 'uri-credential',
 })
 
 /** `len=` 只报长度，不报内容 */
@@ -272,6 +283,100 @@ export function isPathForm(value) {
   return false
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// R21-SENS-02：URI 内嵌凭据（**段级**遮蔽）
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 缺陷（gate-runner 独立探针 `.t/r21-gate/probe-g4.ts` C5 发现）：
+// `valueNeedsMask()` 对 location-like 的值走 `isPathForm()/SCHEME_RE` **整值豁免**，
+// 于是下面这些 URL —— 它们以 `scheme://` 开头但**里面嵌的是凭据** —— 原样进 payload：
+//   url=https://user:S3cr3t@host/path              → 密码明文
+//   webhook=https://hooks/x?access_token=<token>   → token 明文
+//   registry=https://registry/:_authToken=<token>  → token 明文
+//   proxy=http://user:S3cr3t@proxy:8080            → 密码明文
+// 「位置」豁免只能给**不含凭据**的真路径/URI；含凭据的 URI 必须段级遮蔽
+// （保留 scheme/host/path/参数名，只把凭据段换成 `<REDACTED len=N>`）。
+//
+// 判据刻意窄（误报方向要比漏报方向更保守）：
+//   · userinfo 里出现 `:` ⇒ `user:<pass>@`（遮冒号后的密码段）；
+//   · userinfo 无冒号但形状像 secret（`looksSecretLike`，如 `ghp_…`）⇒ 整段遮；
+//     短用户名（`user@host`）不动 —— 它不是秘密；
+//   · query/fragment 参数名命中 `isCredentialKey()`（`access_token`/`token`/`api_key`/
+//     `password`/`secret`…）或 AWS/SAS 签名参数 ⇒ 遮值；
+//   · `:_authToken=` / `:_auth=` / `:_password=`（npmrc 形态）⇒ 遮值。
+// 已含 `<REDACTED` 的段一律跳过（幂等：同一行可能先被已知形态/裸 token 判据遮过）。
+
+/** 段里已经出现占位符 ⇒ 不再二次遮蔽（幂等） */
+const HAS_REDACTED_RE = /<REDACTED\b/
+
+/** `scheme://userinfo@` 与协议相对 `//userinfo@`（scheme 可选） */
+const URI_USERINFO_RE = /((?:[A-Za-z][A-Za-z0-9+.-]*:)?\/\/)([^/?#@\s]*)(@)/g
+
+/** query/fragment 的 `key=value`（`?`/`&`/`#`/`;` 任一分隔，值到下一个分隔或空白） */
+const URI_QUERY_PAIR_RE = /([?&#;])([A-Za-z0-9_.\-[\]]+)=([^&#\s]*)/g
+
+/** npmrc 形态的凭据段：`:_authToken=` / `:_auth=` / `:_password=`（大小写不敏感） */
+const URI_AUTH_SEGMENT_RE = /(:\s*_?(?:authToken|auth|password)\s*=)([^&#;\s]*)/gi
+
+/**
+ * AWS/SAS 等云签名参数名：它们本身就是凭据（不靠值形状判断，也不在 `isCredentialKey()` 里）。
+ * 只收窄名单，避免 `?key=` 这种通用参数被误遮。
+ */
+const URI_SENSITIVE_PARAM_IDS = new Set(['sig', 'signature', 'x-amz-signature', 'x-amz-credential', 'x-amz-security-token', 'sas'])
+
+/**
+ * 一个 query/fragment 参数名是否携带凭据。
+ * 口径复用模块内**唯一**的凭据键名判据 `isCredentialKey()`（`access_token`/`token`/`api_key`/
+ * `password`/`secret`/`client_secret`… 都命中），外加云签名参数窄名单。
+ */
+export function isUriCredentialParam(name) {
+  const lower = String(name ?? '').toLowerCase()
+  if (lower.length === 0) return false
+  if (URI_SENSITIVE_PARAM_IDS.has(lower)) return true
+  return isCredentialKey(lower)
+}
+
+/**
+ * 对一段文本里的 URI 凭据做**段级**遮蔽（纯函数；不做整行判定）。
+ *
+ * @param {string} text 可能是 `key=value` 的值、也可能是整行/注释片段
+ * @returns {{text: string, segments: number}} `segments` = 被替换的凭据段数
+ */
+export function maskUriCredentials(text) {
+  let value = String(text ?? '')
+  let segments = 0
+
+  value = value.replace(URI_USERINFO_RE, (match, scheme, userinfo, at) => {
+    if (!userinfo || HAS_REDACTED_RE.test(userinfo)) return match
+    const colon = userinfo.indexOf(':')
+    if (colon > 0) {
+      const password = userinfo.slice(colon + 1)
+      if (!password || HAS_REDACTED_RE.test(password)) return match
+      segments += 1
+      return `${scheme}${userinfo.slice(0, colon)}:${redactedToken(password.length)}${at}`
+    }
+    // 无冒号的 userinfo：只有形状像 secret 才遮（`user@host` 不遮 —— 用户名不是秘密）
+    if (!looksSecretLike(userinfo)) return match
+    segments += 1
+    return `${scheme}${redactedToken(userinfo.length)}${at}`
+  })
+
+  value = value.replace(URI_QUERY_PAIR_RE, (match, separator, name, paramValue) => {
+    if (!paramValue || HAS_REDACTED_RE.test(paramValue)) return match
+    if (!isUriCredentialParam(name)) return match
+    segments += 1
+    return `${separator}${name}=${redactedToken(paramValue.length)}`
+  })
+
+  value = value.replace(URI_AUTH_SEGMENT_RE, (match, prefix, segmentValue) => {
+    if (!segmentValue || HAS_REDACTED_RE.test(segmentValue)) return match
+    segments += 1
+    return `${prefix}${redactedToken(segmentValue.length)}`
+  })
+
+  return { text: value, segments }
+}
+
 /** 是否存在 >=16 个连续相同字符（同形替换/填充块的特征；不遮它就会成段泄漏） */
 export function hasLongRepeat(text) {
   const value = String(text ?? '')
@@ -471,6 +576,24 @@ export function maskSensitiveLine(line) {
     tail = commented.text
     segments += 1
     if (!reasons.includes(MASK_REASON.CREDENTIAL_KEY)) reasons.push(MASK_REASON.CREDENTIAL_KEY)
+  }
+
+  /**
+   * ★ R21-SENS-02：URI 内嵌凭据（userinfo / query 凭据键 / `:_authToken=` 段）。
+   *
+   * 为什么放在最后补一遍：`key=https://user:pass@host` 这类行在上面的结构化分支里
+   * 走到 `valueNeedsMask()` 的 location-like **整值豁免**（那是给"真位置"的），
+   * 于是整行保持原样；本遍对**已经过前面判据的文本**再做段级遮蔽，
+   * 因而不会破坏"已知密钥/裸 token/结构化值"已有输出（已含 `<REDACTED` 的段自动跳过）。
+   * 正文与行内注释分别处理：注释里也可能贴 URL（`# see https://user:pass@…`）。
+   */
+  const coreMasked = maskUriCredentials(text)
+  const tailMasked = maskUriCredentials(tail)
+  if (coreMasked.segments + tailMasked.segments > 0) {
+    text = coreMasked.text
+    tail = tailMasked.text
+    segments += coreMasked.segments + tailMasked.segments
+    if (!reasons.includes(MASK_REASON.URI_CREDENTIAL)) reasons.push(MASK_REASON.URI_CREDENTIAL)
   }
 
   if (segments === 0) return { text: original, masked: false, segments: 0, reasons: [] }

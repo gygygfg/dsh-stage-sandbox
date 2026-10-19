@@ -27,6 +27,17 @@ rem  Clearing it here covers every child process of this run; src\testrunner.ts
 rem  deletes the same key for every suite it spawns (autotest.ts and the HTTP
 rem  test service included). Keep this file pure ASCII (residual boundary R11).
 set "WINSTAGE_ALLOW_UNSEALED="
+rem  R19 hermeticity fix: this is the OFFLINE deterministic gate, so it must not
+rem  depend on the host's live profile state. tests\policy-never-consistency.ts
+rem  reads the ACTIVE profile (<DSH_HOME>/profiles/<DSH_PROFILE>/cordis.patch.yml)
+rem  when those env vars are inherited: on a host whose profile has no explicit
+rem  `- id: permission` / defaultPreset row, checks 1.2-1.4 go RED even though the
+rem  plugin source is unchanged (R19 measured: 25 checks / 3 failures with env,
+rem  21/0/9 SKIP with env cleared; R18 baseline was the same). A gate whose colour
+rem  depends on the user's live profile is not a gate - clear both for this run.
+rem  Keep this file pure ASCII (residual boundary R11).
+set "DSH_HOME="
+set "DSH_PROFILE="
 set FAIL=0
 rem  The list below must match src\testrunner.ts OFFLINE_SUITES **id for id, in
 rem  the same order and with the same count** (tests\suite-wiring.ts enforces
@@ -81,7 +92,7 @@ rem  is now the profile switch. The suite pins the two `disabled: !!js` expressi
 rem  dsh-plugin\cordis.patch.yml as exact mutual inverses across env x profile, and
 rem  also pins the YAML shape (a scalar starting with `!` is parsed as a second tag
 rem  and skips the whole bundle patch).
-for %%S in (tests\selftest.ts tests\e2e-flow.ts tests\struct-layout.ts tests\appcontainer-layout.ts tests\resolve-exec.ts tests\executor-stub.ts tests\audit-parse.ts tests\paths-masks.ts tests\registry-guard.ts tests\workspace-regressions.ts tests\meta-runner.ts tests\appcontainer-runtime.ts tests\probe-selfkill-guard.ts tests\netpolicy.ts tests\mitigations.ts tests\limits.ts tests\integration-wiring.ts tests\wfp-layout.ts tests\suite-wiring.ts tests\residual-baseline.ts tests\policy-never-consistency.ts tests\baseline-integrity.ts tests\dsh-patch-guard.ts tests\boundary-degraded-failclosed.ts tests\whiteout-candidate-capture.ts tests\assembly-toggle-selftest.ts tests\session-enclosure-selftest.ts tests\sandbox-audit.ts tests\environment-gate.ts tests\plugin-approval-align.ts tests\crosscheck-boundaries.ts tests\crosscheck-r17.ts tests\cli-contract.ts) do (
+for %%S in (tests\selftest.ts tests\e2e-flow.ts tests\struct-layout.ts tests\appcontainer-layout.ts tests\resolve-exec.ts tests\executor-stub.ts tests\audit-parse.ts tests\paths-masks.ts tests\registry-guard.ts tests\workspace-regressions.ts tests\meta-runner.ts tests\appcontainer-runtime.ts tests\probe-selfkill-guard.ts tests\netpolicy.ts tests\mitigations.ts tests\limits.ts tests\integration-wiring.ts tests\wfp-layout.ts tests\suite-wiring.ts tests\residual-baseline.ts tests\policy-never-consistency.ts tests\baseline-integrity.ts tests\dsh-patch-guard.ts tests\boundary-degraded-failclosed.ts tests\whiteout-candidate-capture.ts tests\assembly-toggle-selftest.ts tests\session-enclosure-selftest.ts tests\sandbox-audit.ts tests\environment-gate.ts tests\plugin-approval-align.ts tests\crosscheck-boundaries.ts tests\crosscheck-r17.ts tests\cli-contract.ts tests\r19-file-boundaries.ts tests\r19-shim-boundaries.ts tests\r20-file-boundaries.ts tests\r20-registry-boundaries.ts tests\r20-managed-carrier.ts tests\build-shim-help.ts tests\r21-registry-apply.ts tests\r21-fs-policy.ts tests\r21-sensitive-e2e.ts tests\r21-file-adversarial.ts) do (
   rem R11 hermeticity fix: without an explicit per-suite root every suite in this
   rem loop shares %LOCALAPPDATA%\Temp\winstage-stage\<DSH_SESSION_ID>. Leftover
   rem staged files/candidates from an earlier suite then leak into a later one:
