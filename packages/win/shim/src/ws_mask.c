@@ -947,6 +947,70 @@ int ws_mask_decide_read(const wchar_t *path, wchar_t *outRule, DWORD outRuleCch)
     return decision;
 }
 
+/* R23：>MAX_PATH 长路径的**归一化一致性与 fail-closed**。
+ *
+ * 现场（gate-runner R23 P5b）：`\\?\C:\…\<长路径>\.npmrc`（503 字）在注入进程里被
+ * CreateFileW 读出了明文。根因方向：mask 归一化链路对长路径可能返回一个"看起来
+ * 成功但不可匹配/疑似截断"的键（或 normalize 失败后按 `readDenyFailClosed` 配置
+ * fail-open），于是 leaf 锚定的 `.npmrc$` 规则漏判。
+ *
+ * 判据：mask 已声明且**输入路径 ≥240 字**时，归一化结果必须是绝对路径、且**末段
+ * 名字（含 ADS 剥离后）与输入末段一致**（大小写不敏感；尾随空格/点按 Windows
+ * 语义忽略）。任一不满足 ⇒ 直接拒绝（不依赖 `readDenyFailClosed` 配置）。
+ * 这只是拒绝方向的收紧：正常长路径（非遮蔽）leaf 一致 ⇒ 照旧放行。 */
+static void ws_mask_leaf_of(const wchar_t *p, wchar_t *out, DWORD cch)
+{
+    out[0] = 0;
+    if (!p || !p[0]) {
+        return;
+    }
+    const wchar_t *s = p;
+    if (ws_starts_with_ci_w(s, L"\\\\?\\UNC\\")) {
+        s += 8;
+    } else if (ws_starts_with_ci_w(s, L"\\\\?\\")) {
+        s += 4;
+    }
+    const wchar_t *slash = wcsrchr(s, L'\\');
+    const wchar_t *leaf = slash ? slash + 1 : s;
+    ws_strlcpy_w(out, leaf, cch);
+    for (wchar_t *q = out; *q; q++) {
+        if (*q == L':') { /* ADS: mask the base file */
+            *q = 0;
+            break;
+        }
+    }
+    size_t n = wcslen(out);
+    while (n > 0 && (out[n - 1] == L' ' || out[n - 1] == L'.')) {
+        out[--n] = 0;
+    }
+}
+
+static int ws_mask_long_path_consistent(const wchar_t *path, const wchar_t *normalized)
+{
+    if (!path || wcslen(path) < 240) {
+        return 1; /* short path: existing pipeline decides */
+    }
+    if (!normalized || !normalized[0]) {
+        return 0; /* normalization failed for a long path -> deny */
+    }
+    int absolute = ((normalized[0] >= L'A' && normalized[0] <= L'Z') ||
+                    (normalized[0] >= L'a' && normalized[0] <= L'z')) &&
+                       normalized[1] == L':' && normalized[2] == L'\\';
+    int unc = normalized[0] == L'\\' && normalized[1] == L'\\' && normalized[2] && normalized[2] != L'?' &&
+              normalized[2] != L'.';
+    if (!absolute && !unc) {
+        return 0;
+    }
+    wchar_t inLeaf[256];
+    wchar_t normLeaf[256];
+    ws_mask_leaf_of(path, inLeaf, 256);
+    ws_mask_leaf_of(normalized, normLeaf, 256);
+    if (!inLeaf[0] || !normLeaf[0]) {
+        return 0;
+    }
+    return ws_wcscmp_ci(inLeaf, normLeaf) == 0;
+}
+
 static int ws_mask_decide_read_inner(const wchar_t *path, wchar_t *outRule, DWORD outRuleCch)
 {
     if (!g_mask.loaded) {
@@ -957,6 +1021,13 @@ static int ws_mask_decide_read_inner(const wchar_t *path, wchar_t *outRule, DWOR
     }
     wchar_t normalized[WS_PATH_MAX];
     ws_mask_normalize(path, normalized, WS_PATH_MAX);
+    if (!ws_mask_long_path_consistent(path, normalized)) {
+        ws_log("read mask: long-path normalization mismatch -> deny (fail-closed)");
+        if (outRule && outRuleCch) {
+            ws_strlcpy_w(outRule, L"<mask-long-path-mismatch>", outRuleCch);
+        }
+        return 1;
+    }
     if (!normalized[0]) {
         if (g_ws.readDenyFailMode == 0) {
             if (outRule && outRuleCch) {

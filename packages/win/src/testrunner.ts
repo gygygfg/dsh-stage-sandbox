@@ -220,6 +220,9 @@ export const OFFLINE_SUITES = [
   // R22 逐项修复（第一批）：R15 残余 5 个注册表变体接线；NtQueryDirectoryFileEx 枚举过滤。
   { id: 'r22-registry-hooked', script: 'tests/r22-registry-hooked.ts', title: 'R22 注册表残余面（ConnectRegistryEx/OverridePredefKey/OpenUserClassesRoot/OpenCurrentUser/SetKeySecurity；24 断言）' },
   { id: 'r22-file-advex', script: 'tests/r22-file-advex.ts', title: 'R22 文件侧残余面（NtQueryDirectoryFileEx 原地分批过滤 / single / 未知类透传；12 断言）' },
+  // R23 逐项修复（第二批）：面板路由鉴权（R21-LC-01）；>MAX_PATH 写面（R21-FS-06）。
+  { id: 'r23-panel-auth', script: 'tests/r23-panel-auth.ts', title: 'R23 面板路由鉴权（authorize 先于 buildPanelPayload / 失败 fail-closed / connection 注入静态守卫；18 断言）' },
+  { id: 'r23-long-path', script: 'tests/r23-long-path.ts', title: 'R23 >MAX_PATH 写面（\\\\?\\ 长路径写/建目录/rename/delete 进暂存、whiteout 跨进程、遮蔽读拒绝；13 断言）' },
 ]
 
 /** 需要未受限会话的套件 */

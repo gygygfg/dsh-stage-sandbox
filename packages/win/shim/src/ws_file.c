@@ -660,6 +660,54 @@ static const wchar_t *ws_api_path(const wchar_t *in, wchar_t *buf, DWORD cch)
     return buf;
 }
 
+/* ── R23：provider 路径（staged/wo/mapped）>MAX_PATH 的**真实 API 边界**包装 ──
+ * provider 侧（ws_stage.c/ws_util.c）已能算出长路径；但真实 Win32 API 在本机
+ * （LongPathsEnabled=0）仍需 `\\?\` 前缀。每个包装只做"补前缀 + 直调 original"，
+ * 不改变语义；短路径不补前缀（ws_api_path 内部判长）。 */
+static HANDLE ws_create_api(const wchar_t *path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
+                            DWORD disp, DWORD flags, HANDLE tmpl)
+{
+    wchar_t b[WS_PATH_MAX];
+    return g_orig.CreateFileW(ws_api_path(path, b, WS_PATH_MAX), access, share, sa, disp, flags, tmpl);
+}
+static BOOL ws_mkdir_api(const wchar_t *path, LPSECURITY_ATTRIBUTES sa)
+{
+    wchar_t b[WS_PATH_MAX];
+    return g_orig.CreateDirectoryW(ws_api_path(path, b, WS_PATH_MAX), sa);
+}
+static BOOL ws_delete_api(const wchar_t *path)
+{
+    wchar_t b[WS_PATH_MAX];
+    return g_orig.DeleteFileW(ws_api_path(path, b, WS_PATH_MAX));
+}
+static BOOL ws_rmdir_api(const wchar_t *path)
+{
+    wchar_t b[WS_PATH_MAX];
+    return g_orig.RemoveDirectoryW(ws_api_path(path, b, WS_PATH_MAX));
+}
+static BOOL ws_move_api(const wchar_t *src, const wchar_t *dst, DWORD flags)
+{
+    wchar_t a[WS_PATH_MAX], b[WS_PATH_MAX];
+    return g_orig.MoveFileExW(ws_api_path(src, a, WS_PATH_MAX), ws_api_path(dst, b, WS_PATH_MAX), flags);
+}
+static BOOL ws_copy_api(const wchar_t *src, const wchar_t *dst, BOOL failIfExists)
+{
+    wchar_t a[WS_PATH_MAX], b[WS_PATH_MAX];
+    return g_orig.CopyFileW ? g_orig.CopyFileW(ws_api_path(src, a, WS_PATH_MAX), ws_api_path(dst, b, WS_PATH_MAX), failIfExists)
+                            : FALSE;
+}
+static DWORD ws_attrs_api(const wchar_t *path)
+{
+    wchar_t b[WS_PATH_MAX];
+    return g_orig.GetFileAttributesW ? g_orig.GetFileAttributesW(ws_api_path(path, b, WS_PATH_MAX))
+                                     : INVALID_FILE_ATTRIBUTES;
+}
+static BOOL ws_setattrs_api(const wchar_t *path, DWORD attrs)
+{
+    wchar_t b[WS_PATH_MAX];
+    return g_orig.SetFileAttributesW(ws_api_path(path, b, WS_PATH_MAX), attrs);
+}
+
 /* Real-API accessors for the stat family. These MUST NOT re-enter the hooks:
  * they are used by ws_file_exists() (a CoW/whiteout decision about the REAL
  * file) and as the tail of the overlay-aware wrappers. The captured original is
@@ -1339,7 +1387,7 @@ static NTSTATUS ws_hardlink_stage(const wchar_t *srcNorm, const wchar_t *dstNorm
     if (replaceIfExists) {
         if (dstStagedExists) {
             t_wsFileBusy++;
-            if (g_orig.DeleteFileW) g_orig.DeleteFileW(stagedDst);
+            if (g_orig.DeleteFileW) ws_delete_api(stagedDst);
             t_wsFileBusy--;
         }
     } else if (dstStagedExists || dstRealExists) {
@@ -2465,9 +2513,9 @@ static void ws_clear_whiteout(const wchar_t *norm)
         return;
     }
     t_wsFileBusy++;
-    DWORD attrs = g_orig.GetFileAttributesW ? g_orig.GetFileAttributesW(wo) : INVALID_FILE_ATTRIBUTES;
+    DWORD attrs = g_orig.GetFileAttributesW ? ws_attrs_api(wo) : INVALID_FILE_ATTRIBUTES;
     if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-        if (g_orig.DeleteFileW(wo)) {
+        if (ws_delete_api(wo)) {
             ws_log_w(L"whiteout cleared after recreate", norm);
         }
     }
@@ -2732,7 +2780,7 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
                 SetLastError(ERROR_ACCESS_DENIED);
                 return INVALID_HANDLE_VALUE;
             }
-            HANDLE ph = g_orig.CreateFileW(staged, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            HANDLE ph = ws_create_api(staged, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                            NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             if (ph == INVALID_HANDLE_VALUE) {
                 ws_log_w(L"fail-closed CreateFileW (masked write-intent placeholder failed)", staged);
@@ -2769,7 +2817,7 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
                 return INVALID_HANDLE_VALUE;
             }
             ws_log_w(L"CreateFileW stage-directory", staged);
-        } else if (!g_orig.CopyFileW(norm, staged, FALSE)) {
+        } else if (!ws_copy_api(norm, staged, FALSE)) {
             ws_log_w(L"fail-closed CreateFileW (copy-on-write failed)", norm);
             SetLastError(ERROR_ACCESS_DENIED);
             return INVALID_HANDLE_VALUE;
@@ -2778,8 +2826,8 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
             ws_log_w(L"CreateFileW copy-on-write", staged);
         }
     }
-    HANDLE h = g_orig.CreateFileW(staged, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
-                                  dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+    HANDLE h = ws_create_api(staged, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+                             dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
     /* R18-KNOWN-06: register the copy so CloseHandle can revoke it when this open
      * never writes/truncates anything (the plaintext-copy-up leak). */
     if (copiedForDeferredCoW && h != INVALID_HANDLE_VALUE) {
@@ -2845,7 +2893,7 @@ BOOL WINAPI ws_CreateDirectoryW(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecu
         SetLastError(ERROR_ACCESS_DENIED);
         return FALSE;
     }
-    BOOL ok = g_orig.CreateDirectoryW(mapped, lpSecurityAttributes);
+    BOOL ok = ws_mkdir_api(mapped, lpSecurityAttributes);
     DWORD lastErr = GetLastError();
     if (ok) {
         ws_clear_whiteout(norm); /* R21: delete dir -> recreate dir */
@@ -2889,7 +2937,7 @@ BOOL WINAPI ws_DeleteFileW(LPCWSTR lpFileName)
     if (stagedExists) {
         /* see t_wsFileBusy: kernelbase's internals re-enter our Nt hook */
         t_wsFileBusy++;
-        deletedStaged = g_orig.DeleteFileW(mapped);
+        deletedStaged = ws_delete_api(mapped);
         t_wsFileBusy--;
     }
     if (!realExists && !stagedExists) {
@@ -2944,7 +2992,7 @@ static BOOL ws_move_locked(LPCWSTR src, LPCWSTR dst, DWORD flags)
     BOOL ok;
     if (stagedSrcExists) {
         t_wsFileBusy++; /* kernelbase's MoveFileExW reaches NtSetInformationFile */
-        ok = g_orig.MoveFileExW(stagedSrc, stagedDst, flags);
+        ok = ws_move_api(stagedSrc, stagedDst, flags);
         t_wsFileBusy--;
     } else {
         /* materialize the real source into the overlay, then hide the original */
@@ -2959,7 +3007,7 @@ static BOOL ws_move_locked(LPCWSTR src, LPCWSTR dst, DWORD flags)
         }
         DWORD copyFlags = flags;
         (void)copyFlags;
-        ok = g_orig.CopyFileW ? g_orig.CopyFileW(normSrc, stagedDst, FALSE) : FALSE;
+        ok = ws_copy_api(normSrc, stagedDst, FALSE);
         if (ok && g_wsStage.file_whiteout) {
             g_wsStage.file_whiteout(normSrc);
         }
@@ -3030,7 +3078,7 @@ static BOOL ws_remove_directory_locked(LPCWSTR path)
     }
     if (stagedExists) {
         t_wsFileBusy++; /* RemoveDirectoryW also reaches NtSetInformationFile(kernelbase) */
-        BOOL okDir = g_orig.RemoveDirectoryW(staged);
+        BOOL okDir = ws_rmdir_api(staged);
         t_wsFileBusy--;
         if (!okDir) {
             return FALSE; /* e.g. ERROR_DIR_NOT_EMPTY, same as the real API */
@@ -3145,7 +3193,7 @@ static BOOL ws_copy_file_locked(LPCWSTR src, LPCWSTR dst, BOOL failIfExists)
         SetLastError(ERROR_FILE_EXISTS);
         return FALSE;
     }
-    BOOL copied = g_orig.CopyFileW(stagedSrc, stagedDst, FALSE);
+    BOOL copied = ws_copy_api(stagedSrc, stagedDst, FALSE);
     if (copied) {
         ws_clear_whiteout(normDst); /* R21: copy onto a logically-deleted path recreates it */
     }
@@ -3286,11 +3334,11 @@ BOOL WINAPI ws_SetFileAttributesW(LPCWSTR lpFileName, DWORD dwFileAttributes)
                 return FALSE;
             }
         }
-        if (!g_orig.CopyFileW(norm, mapped, FALSE)) {
+        if (!ws_copy_api(norm, mapped, FALSE)) {
             return FALSE;
         }
     }
-    BOOL ok = g_orig.SetFileAttributesW(mapped, dwFileAttributes);
+    BOOL ok = ws_setattrs_api(mapped, dwFileAttributes);
     DWORD lastErr = GetLastError();
     ws_log_w(ok ? L"SetFileAttributesW staged" : L"SetFileAttributesW staged FAILED", mapped);
     SetLastError(lastErr);
@@ -3672,9 +3720,9 @@ static int ws_record_delete(const wchar_t *norm, int isDir)
     DWORD attrs = GetFileAttributesW(staged);
     if (attrs != INVALID_FILE_ATTRIBUTES) {
         if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
-            g_orig.RemoveDirectoryW(staged);
+            ws_rmdir_api(staged);
         } else {
-            g_orig.DeleteFileW(staged);
+            ws_delete_api(staged);
         }
     }
     t_wsFileBusy--;

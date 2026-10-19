@@ -942,14 +942,37 @@ export function buildPanelPayload({ pathname, query, workspaceRoot, sessionId, e
 /**
  * 造面板路由处理器（`ctx.webServer.register({kind:'prefix', path: PANEL_ROUTE_PREFIX, handler})`）。
  *
- * @param {{workspaceRoot: string, isEnabled?: Function, env?: object, sessionOf?: Function, log?: Function}} options
+ * @param {{workspaceRoot: string, isEnabled?: Function, env?: object, sessionOf?: Function, log?: Function, authorize?: Function}} options
  *   `sessionOf(invocation)`：本路由没有 command invocation，面④需要调用方给一个"当前会话"
  *   的取法；拿不到就如实标"未知"，**不猜**。
+ *   `authorize(req, res)`：**R23-A 鉴权钩子**（生产必须传）。命名前缀路由先于宿主前端静态兜底，
+ *   宿主的 `Connection.authorizeIndex()` 只在兜底里执行 ⇒ 不在这里显式鉴权，本机任意进程可无
+ *   token/cookie 读审阅快照。调用发生在 `buildPanelPayload()` **之前**（未鉴权零读盘）；
+ *   返回 false 表示授权方已自行写完响应（401/403），本函数直接返回。
  */
 export function createPanelHandler(options = {}) {
   const isEnabled = typeof options.isEnabled === 'function' ? options.isEnabled : () => true
   const log = typeof options.log === 'function' ? options.log : () => {}
   return async function winStagePanelHandler(req, res) {
+    /* ★ R23-A（R21-LC-01）：鉴权必须先于 payload 构建。失败/异常都 fail-closed（不构建、不泄任何
+     * 快照数据）；`authorize` 缺省 = 兼容离线单测/旧装配，**生产接线在 apply() 里强制传入**
+     * （tests/r23-panel-auth.ts 有静态守卫）。 */
+    if (typeof options.authorize === 'function') {
+      let allowed
+      try {
+        allowed = await options.authorize(req, res)
+      } catch (error) {
+        log(`面板路由鉴权失败（fail-closed，不构建 payload）：${error?.message ?? error}`)
+        try {
+          res.writeHead(503, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          res.end(JSON.stringify({ ok: false, code: 'auth-unavailable' }))
+        } catch {
+          /* 响应已被授权方部分写入时不再二次写 */
+        }
+        return
+      }
+      if (!allowed) return /* 授权方已写完 401/403 响应 */
+    }
     let url
     try {
       url = new URL(String(req?.url ?? '/'), 'http://localhost')
@@ -1665,7 +1688,7 @@ export function apply(ctx, config = {}) {
   //
   // 失败必须响（error 级日志）但**不影响**插件其余部分：拿不到 webServer 时命令面照常工作，
   // 面板则退回"兼容旧布局"的读法（`client.js` 里那条**唯一**的兼容分支）。
-  ctx.inject(['webServer'], (webScope) => {
+  ctx.inject(['webServer', 'connection'], (webScope) => {
     // **本装配没有 webServer**（headless / ACP / 自测桩）不是故障：面板那时会走
     // `client.js` 那条被注释说明的兼容读法。这里用 info 级如实说明 —— 把正常形态
     // 记成 error 级会让"失败必须响"变成噪声，真正的失败（register 抛错）才进 error。
@@ -1673,11 +1696,28 @@ export function apply(ctx, config = {}) {
       log.info('本装配没有 webServer：面板读侧路由未注册；面板将退回兼容旧布局的读法（命令面不受影响）。')
       return
     }
+    /* ★ R23-A（R21-LC-01）：命名前缀路由**先于**宿主前端静态兜底被匹配，而宿主的
+     * BrowserAuth 只在兜底里调用 `Connection.authorizeIndex()` ⇒ 不在这里显式鉴权，
+     * 本机任意进程无 token/cookie 即可读审阅快照（路径/diff 统计/可信性卡）。
+     * `connection` 是宿主提供的认证服务（`inject = ['webServer','connection']` 与
+     * dsh-host-frontend-static 同源）；拿不到就 **fail-closed 不注册路由**，绝不退化成
+     * "无鉴权的面板路由"（宁可面板不可用，也不静默暴露快照）。 */
+    const connection = webScope.connection
+    if (typeof connection?.authorizeIndex !== 'function') {
+      const message = '面板路由缺少宿主 connection.authorizeIndex（本装配无认证服务）：拒绝注册无鉴权路由（fail-closed）'
+      logError(message)
+      log.warn(message)
+      return
+    }
+    // 与 dsh-host-frontend-static 同口径：Cookie 的 Secure 语义只由本监听器协议决定。
+    const secureListener = webScope.webServer.protocol === 'https:'
     try {
       const handler = createPanelHandler({
         workspaceRoot,
         isEnabled,
         log: (message) => log.warn(message),
+        // R23-A：把宿主 BrowserAuth 的会话校验搬进命名路由（401 响应由授权方拥有）。
+        authorize: (req, res) => connection.authorizeIndex(req, res, secureListener),
         // 面④（未结算审批）需要"当前会话"的事件流。本路由没有 command invocation，
         // 拿不到就如实标"未知" —— 绝不用"最近一次命令的会话"冒充当前会话。
       })

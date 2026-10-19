@@ -678,12 +678,48 @@ void ws_config_from_env(void)
     }
 }
 
+/* ── R23：provider 侧 >MAX_PATH 支持 ────────────────────────────────────────
+ * 本机 LongPathsEnabled=0：归一化后的普通 Win32 路径在 ≥MAX_PATH 时，所有
+ * 真实文件 API（CreateFileW/GetFileAttributesW/CreateDirectoryW/DeleteFileW/
+ * MoveFileExW）都会失败。暂存树根 + 长相对路径很容易越过 260，因此 provider
+ * 在**调用真实 API 的边界**补 `\\?\` / `\\?\UNC\`；布局/比较仍用普通路径。
+ * 阈值 240 留出余量（MAX_PATH 含驱动器/尾空），短路径行为完全不变。 */
+const wchar_t *ws_path_api_w(const wchar_t *in, wchar_t *buf, DWORD cch)
+{
+    if (!in || !in[0] || !buf) {
+        return in;
+    }
+    size_t n = wcslen(in);
+    if (n < 240 || ws_starts_with_ci_w(in, L"\\\\?\\")) {
+        return in;
+    }
+    wchar_t c0 = in[0];
+    int drive = ((c0 >= L'A' && c0 <= L'Z') || (c0 >= L'a' && c0 <= L'z')) && in[1] == L':' &&
+                (in[2] == L'\\' || in[2] == 0);
+    int unc = in[0] == L'\\' && in[1] == L'\\' && in[2] && in[2] != L'?' && in[2] != L'.';
+    if (!drive && !unc) {
+        return in;
+    }
+    size_t pos = 0;
+    buf[0] = 0;
+    if (unc) {
+        if (!(ws_append_w(buf, cch, &pos, L"\\\\?\\UNC\\") && ws_append_w(buf, cch, &pos, in + 2))) {
+            return in;
+        }
+    } else if (!(ws_append_w(buf, cch, &pos, L"\\\\?\\") && ws_append_w(buf, cch, &pos, in))) {
+        return in;
+    }
+    return buf;
+}
+
 void *ws_open_file_raw_flags(const wchar_t *path, DWORD access, DWORD share, DWORD disposition, DWORD flags)
 {
+    wchar_t apiBuf[WS_PATH_MAX];
+    const wchar_t *api = ws_path_api_w(path, apiBuf, WS_PATH_MAX);
     if (g_orig.CreateFileW) {
-        return g_orig.CreateFileW(path, access, share, NULL, disposition, flags, NULL);
+        return g_orig.CreateFileW(api, access, share, NULL, disposition, flags, NULL);
     }
-    return CreateFileW(path, access, share, NULL, disposition, flags, NULL);
+    return CreateFileW(api, access, share, NULL, disposition, flags, NULL);
 }
 
 HANDLE ws_open_file_raw(const wchar_t *path, DWORD access, DWORD share, DWORD disposition)
@@ -880,7 +916,9 @@ int ws_ensure_dirs(const wchar_t *path, int asDir)
             /* Skip only the bare drive root "C:" (it always exists); every other
              * prefix, including "C:\Users", must be created. */
             if (len >= 2 && !(len == 2 && tmp[1] == L':')) {
-                CreateDirectoryW(tmp, NULL);
+                wchar_t apiBuf[WS_PATH_MAX];
+                const wchar_t *api = ws_path_api_w(tmp, apiBuf, WS_PATH_MAX);
+                CreateDirectoryW(api, NULL);
             }
             tmp[i] = save;
         }
@@ -889,7 +927,9 @@ int ws_ensure_dirs(const wchar_t *path, int asDir)
      * "staging tree is broken" into a detectable provider failure (and hence a
      * fail-closed ERROR_ACCESS_DENIED at the hook) instead of a silent partial
      * staging path. */
-    DWORD attrs = GetFileAttributesW(target);
+    wchar_t targetApiBuf[WS_PATH_MAX];
+    const wchar_t *targetApi = ws_path_api_w(target, targetApiBuf, WS_PATH_MAX);
+    DWORD attrs = GetFileAttributesW(targetApi);
     if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
         /* 注意顺序：真正的原因（GetLastError）必须在**还原之前**被日志取走 */
         ws_log("ensure_dirs failed: target missing (attrs=0x%lx err=%lu)", (unsigned long)attrs,

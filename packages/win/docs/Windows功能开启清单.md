@@ -511,7 +511,7 @@ dism /online /get-featureinfo /featurename:Containers-DisposableClientVM
 > R21-FS-06（>MAX_PATH 写/建/rename/delete 仍 fail-closed；读已透传）、R21-FS-07（跨进程 apply 无锁）、
 > R21-FS-08（apply 属性面：hidden/system 不还原、ACL 继承）、R21-FS-R1（`readPolicy:'block'` 生产装配不可达）、
 > R21-SENS-R1（自定义 mask 无生产来源；内置危险类"整份省略"链路仍有效）、
-> G5 复核后编号：R21-LC-01（P1，`/winstage-panel/*` 不受宿主 BrowserAuth 围栏、本机进程无 token 可读审阅快照，敏感值仍掩码）、R21-LC-04（P2，remove 后 node_modules junction 残留）、R21-LC-05（P2，二次 remove 退出码非幂等）、
+> G5 复核后编号：R21-LC-01（P1；**R23 已修**：面板路由接入宿主 `connection.authorizeIndex`，裸请求 401、带 cookie 正常、关态 503 不泄快照；见 round23 报告）、R21-LC-04（P2，remove 后 node_modules junction 残留）、R21-LC-05（P2，二次 remove 退出码非幂等）、
 > 注册表 apply 设计边界（delete-key 恒 recursive、>1MiB 值读取受 C 侧缓冲限制未真机验证、volatile 语义、链接类永久 fail-closed）。
 > 3 项非产品口径（`file-cow 16/19` / `read-security-evtx` / `diag-bindings ace-not-verifiable`）已由 gate-runner
 > 独立复核为**载体/OS ACL/环境残留**，无产品缺陷（见 round21 报告 §3）。

@@ -157,18 +157,19 @@ if (process.platform !== 'win32' || !existsSync(DLL) || !existsSync(INJECTOR)) {
       )
     }
 
-    // ── A2 长路径 >MAX_PATH：R21 设计边界 fail-closed ───────────────────────
+    // ── A2 长路径 >MAX_PATH：R23 已从 fail-closed 收窄为**写也进暂存** ──────
     {
       let rel = 'longroot'
       for (let i = 0; i < 12; i++) rel = join(rel, `segment-depth-${i}-xxxxxxxxxxxx`)
       const longDirAbs = join(WS, rel)
       const longAbs = join(longDirAbs, 'f.txt')
       const longPref = `\\\\?\\${longAbs}`
-      const w = inject('long-write', `const fs=require('fs');try{fs.mkdirSync(${JSON.stringify(`\\\\?\\${longDirAbs}`)},{recursive:true});fs.writeFileSync(${JSON.stringify(longPref)},'R21-LONG')}catch(e){process.stderr.write('ERR:'+e.code);process.exit(9)}`)
+      const w = inject('long-write', `const fs=require('fs');try{fs.mkdirSync(${JSON.stringify(`\\\\?\\${longDirAbs}`)},{recursive:true});fs.writeFileSync(${JSON.stringify(longPref)},'R21-LONG');process.stdout.write('WROTE')}catch(e){process.stderr.write('ERR:'+e.code);process.exit(9)}`)
+      const back = inject('long-write-back', `try{process.stdout.write(require('fs').readFileSync(${JSON.stringify(longPref)},'utf8'))}catch(e){process.stderr.write('ERR:'+e.code);process.exit(9)}`)
       check(
-        'A2.1 长路径 >MAX_PATH：**fail-closed**（写入失败、真实盘零写、暂存树无内容）——R21 登记的设计边界（需 provider 全面 `\\\\?\\` 才能支持）',
-        w.status !== 0 && !existsSync(longAbs) && stagedHas('R21-LONG') === 0,
-        `len=${longAbs.length} write=${w.status} realExists=${existsSync(longAbs)} staged=${stagedHas('R21-LONG')} text=${w.text.replace(/\r?\n/g, ' | ').slice(0, 160)}`,
+        'A2.1 长路径 >MAX_PATH：R23 收窄后**写进暂存**（真实盘零写、暂存树有内容、可读回）——不再是 fail-closed 设计边界',
+        w.status === 0 && !existsSync(longAbs) && stagedHas('R21-LONG') > 0 && back.text.includes('R21-LONG'),
+        `len=${longAbs.length} write=${w.status} realExists=${existsSync(longAbs)} staged=${stagedHas('R21-LONG')} readBack=${back.status} text=${w.text.replace(/\r?\n/g, ' | ').slice(0, 160)}`,
       )
     }
 

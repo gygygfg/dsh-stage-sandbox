@@ -20,6 +20,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* R23：provider 侧 >MAX_PATH 支持（定义在 ws_util.c）。暂存树路径
+ * （root + 长相对路径）会超过 MAX_PATH；真实 API 边界需要扩展前缀。 */
+extern const wchar_t *ws_path_api_w(const wchar_t *in, wchar_t *buf, DWORD cch);
+
 /* --------------------------------------------------------------- helpers */
 
 static int ws_stage_root_path(wchar_t *out, DWORD cch)
@@ -99,7 +103,9 @@ static int ws_wo_path(const wchar_t *real, wchar_t *out, DWORD cch)
 static int ws_exists(const wchar_t *path)
 {
     DWORD ws_saved_last_error = GetLastError();
-    DWORD a = GetFileAttributesW(path);
+    wchar_t apiBuf[WS_PATH_MAX];
+    const wchar_t *api = ws_path_api_w(path, apiBuf, WS_PATH_MAX);
+    DWORD a = GetFileAttributesW(api);
     SetLastError(ws_saved_last_error);
     return a != INVALID_FILE_ATTRIBUTES;
 }
@@ -121,7 +127,9 @@ static int ws_marker_exists(const wchar_t *path)
     /* 同 `ws_exists()`：探测结果由返回值表达，不能让 GetFileAttributesW 的
      * "缺件"错误留在调用线程上（whiteout 判定每次打开都会问一次）。 */
     DWORD ws_saved_last_error = GetLastError();
-    DWORD a = GetFileAttributesW(path);
+    wchar_t apiBuf[WS_PATH_MAX];
+    const wchar_t *api = ws_path_api_w(path, apiBuf, WS_PATH_MAX);
+    DWORD a = GetFileAttributesW(api);
     SetLastError(ws_saved_last_error);
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
