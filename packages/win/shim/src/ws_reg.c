@@ -2642,6 +2642,118 @@ LONG WINAPI ws_RegConnectRegistryA(LPCSTR lpMachineName, HKEY hKey, PHKEY phkRes
     return ws_RegConnectRegistryW(lpMachineName ? machine : NULL, hKey, phkResult);
 }
 
+/* ── R22 / R15: the last hookable registry variants ──────────────────────────
+ * Contract (r22 §2 R22-A):
+ *   · RegConnectRegistryExW/A : local machine (NULL / own name / ".") ⇒ read-class
+ *     passthrough (same as RegConnectRegistryW/A). A REMOTE hive cannot be redirected
+ *     to the local overlay at all ⇒ fail-closed HARD_DENY(reason=7) + WAL.
+ *   · RegOverridePredefKey : redirects a PREDEFINED HKEY for the CURRENT process so
+ *     that every later path resolves somewhere else. The overlay has no way to replay
+ *     "this process's predefined HKEY mapping" (it is process-global state, not a key),
+ *     and silently honouring it would make real writes land under the redirect target
+ *     with neither staging nor audit ⇒ fail-closed HARD_DENY(reason=5) + WAL.
+ *   · RegOpenUserClassesRoot / RegOpenCurrentUser : pure READ opens. They are passed
+ *     through to the real API; any later WRITE through the returned handle still goes
+ *     through the ws_Reg* hooks (real handles are mapped back to a canonical path by
+ *     ws_handle_reg_path), so the write surface stays staged/denied as before.
+ *   · RegSetKeySecurity : a security-descriptor write has no overlay representation
+ *     (the app hive shares one SD and [official] forbids RegSetKeySecurity on app-hive
+ *     keys) ⇒ fail-closed HARD_DENY(reason=5) + WAL.
+ *
+ * Reason 5 = TREE_OPERATION_NOT_STAGEABLE was defined in R19 for copy/rename; R22 uses
+ * it for the same CLASS of calls: operations that change an object's identity/security
+ * semantics rather than a value that can be replayed.
+ */
+LONG WINAPI ws_RegConnectRegistryExW(LPCWSTR lpMachineName, HKEY hKey, ULONG flags, PHKEY phkResult)
+{
+    DWORD saved = GetLastError();
+    if (ws_reg_is_local_machine(lpMachineName) && g_orig.RegConnectRegistryExW) {
+        LONG rc = g_orig.RegConnectRegistryExW(lpMachineName, hKey, flags, phkResult);
+        SetLastError(saved);
+        return rc;
+    }
+    if (phkResult) *phkResult = NULL;
+    return ws_reg_deny_reg_write(hKey, NULL, WS_HARD_DENY_REMOTE_HIVE_NOT_STAGEABLE, saved);
+}
+
+LONG WINAPI ws_RegConnectRegistryExA(LPCSTR lpMachineName, HKEY hKey, ULONG flags, PHKEY phkResult)
+{
+    wchar_t machine[256];
+    ws_reg_widen(lpMachineName, machine, 256);
+    return ws_RegConnectRegistryExW(lpMachineName ? machine : NULL, hKey, flags, phkResult);
+}
+
+/* Audited fail-closed for handle-based calls that have no stageable representation. */
+static LONG ws_reg_deny_handle_op(HKEY hKey, const wchar_t *placeholder, UINT16 reason, DWORD savedLastError)
+{
+    wchar_t path[WS_PATH_MAX];
+    ws_reg_path_for_audit(hKey, NULL, placeholder, path, WS_PATH_MAX);
+    ws_reg_hard_deny_reason(path, reason);
+    SetLastError(savedLastError);
+    return ERROR_ACCESS_DENIED;
+}
+
+LONG WINAPI ws_RegOverridePredefKey(HKEY hKey, HKEY hNewHKey)
+{
+    DWORD saved = GetLastError();
+    if (hNewHKey) {
+        wchar_t src[WS_PATH_MAX];
+        wchar_t dst[WS_PATH_MAX];
+        ws_reg_path_for_audit(hKey, NULL, L"<RegOverridePredefKey>", src, WS_PATH_MAX);
+        ws_reg_path_for_audit(hNewHKey, NULL, L"", dst, WS_PATH_MAX);
+        if (dst[0] && !ws_starts_with_ci_w(dst, L"<")) {
+            wchar_t both[WS_PATH_MAX];
+            size_t pos = 0;
+            both[0] = 0;
+            ws_append_w(both, WS_PATH_MAX, &pos, src);
+            ws_append_w(both, WS_PATH_MAX, &pos, L" -> ");
+            ws_append_w(both, WS_PATH_MAX, &pos, dst);
+            ws_reg_hard_deny_reason(both, WS_HARD_DENY_TREE_OP_NOT_STAGEABLE);
+            SetLastError(saved);
+            return ERROR_ACCESS_DENIED;
+        }
+    }
+    return ws_reg_deny_handle_op(hKey, L"<RegOverridePredefKey>",
+                                 WS_HARD_DENY_TREE_OP_NOT_STAGEABLE, saved);
+}
+
+LONG WINAPI ws_RegOpenUserClassesRoot(HANDLE hToken, DWORD dwOptions, REGSAM samDesired, PHKEY phkResult)
+{
+    DWORD saved = GetLastError();
+    if (g_orig.RegOpenUserClassesRoot) {
+        LONG rc = g_orig.RegOpenUserClassesRoot(hToken, dwOptions, samDesired, phkResult);
+        SetLastError(saved);
+        return rc;
+    }
+    /* No captured original: an un-honoured open must fail closed + be audited. */
+    if (phkResult) *phkResult = NULL;
+    return ws_reg_deny_handle_op(NULL, L"<RegOpenUserClassesRoot:no-original>",
+                                 WS_HARD_DENY_TREE_OP_NOT_STAGEABLE, saved);
+}
+
+LONG WINAPI ws_RegOpenCurrentUser(REGSAM samDesired, PHKEY phkResult)
+{
+    DWORD saved = GetLastError();
+    if (g_orig.RegOpenCurrentUser) {
+        LONG rc = g_orig.RegOpenCurrentUser(samDesired, phkResult);
+        SetLastError(saved);
+        return rc;
+    }
+    if (phkResult) *phkResult = NULL;
+    return ws_reg_deny_handle_op(NULL, L"<RegOpenCurrentUser:no-original>",
+                                 WS_HARD_DENY_TREE_OP_NOT_STAGEABLE, saved);
+}
+
+LONG WINAPI ws_RegSetKeySecurity(HKEY hKey, SECURITY_INFORMATION SecurityInformation,
+                                 PSECURITY_DESCRIPTOR pSecurityDescriptor)
+{
+    (void)SecurityInformation;
+    (void)pSecurityDescriptor;
+    DWORD saved = GetLastError();
+    return ws_reg_deny_handle_op(hKey, L"<RegSetKeySecurity>",
+                                 WS_HARD_DENY_TREE_OP_NOT_STAGEABLE, saved);
+}
+
 /* ---- ntdll write surface -------------------------------------------------- */
 NTSTATUS NTAPI ws_NtCreateKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
                               ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)

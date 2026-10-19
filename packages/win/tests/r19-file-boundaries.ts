@@ -266,15 +266,15 @@ const hookTargets = new Set([...hookSource.matchAll(/WS_TARGET\(([A-Za-z0-9_]+)\
     missing.length === 0,
     `missing=${missing.join(',') || '(none)'}`,
   )
-  // 仍未修的残余：`NtQueryDirectoryFileEx`（Win10+ 的 Ex 变体；node readdir 走的是
-  // 非 Ex 版）。谁要启用它必须同时更新本守卫、`docs/Windows功能开启清单.md` §13 与
-  // `tests/residual-baseline.ts`——"不得悄悄启用"。
-  const residualTargets = ['NtQueryDirectoryFileEx']
-  const leaked = residualTargets.filter((name) => hookTargets.has(name))
+  // R22-B：`NtQueryDirectoryFileEx` 已由 Lead 加入 WS_TARGET + `ws_file.c` 实现
+  // （R19 残留的 Ex 枚举泄漏已修，行为证据在 `tests/r22-file-advex.ts`）。
+  // 守卫翻转：它必须仍在 WS_TARGET，**回退即红**。
+  const enabledTargets = ['NtQueryDirectoryFileEx']
+  const stillMissing = enabledTargets.filter((name) => !hookTargets.has(name))
   check(
-    'B2.2 未修残余（NtQueryDirectoryFileEx）仍**不在** WS_TARGET（启用需同时更新残余文档与本守卫）',
-    leaked.length === 0,
-    leaked.length === 0 ? `${residualTargets.length} 项均未启用（与 R20 残余声明一致）` : `**已悄悄启用**: ${leaked.join(',')}`,
+    'B2.2 R22-B：NtQueryDirectoryFileEx 已在 WS_TARGET（R19 残余已修；回退即红）',
+    stillMissing.length === 0,
+    stillMissing.length === 0 ? '已启用（与 R22 修复一致）' : `**回退**: 不在 WS_TARGET（${stillMissing.join(',')}）`,
   )
 }
 

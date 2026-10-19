@@ -41,6 +41,7 @@ import {
   REG_STAGE_UNHOOKED_APIS,
   REG_STAGE_HARD_DENY_APIS,
   REG_STAGE_HARD_DENY_REASON,
+  REG_STAGE_PASSTHROUGH_OPEN_APIS,
   R19_HARD_DENY_REASON_BY_API,
   REG_STAGE_UNSUPPORTED_TYPES,
   REGISTERED_HARD_DENIALS,
@@ -253,11 +254,11 @@ export function runRegistryStageChecks(harness) {
         REG_STAGE_HOOKED_APIS.join(','),
       )
       check(
-        '除递归删除/R19 无法表示写类（fail-closed）外，被 hook 的 API 都可暂存',
-        REG_STAGE_HOOKED_APIS.filter((api) => !api.startsWith('RegDeleteTree') && REG_STAGE_HARD_DENY_APIS[api] === undefined && !(api in R19_HARD_DENY_REASON_BY_API)).every(
+        '除递归删除/R19-R22 无法表示写类（fail-closed）与只读打开透传外，被 hook 的 API 都可暂存',
+        REG_STAGE_HOOKED_APIS.filter((api) => !api.startsWith('RegDeleteTree') && REG_STAGE_HARD_DENY_APIS[api] === undefined && !(api in R19_HARD_DENY_REASON_BY_API) && !REG_STAGE_PASSTHROUGH_OPEN_APIS.includes(api)).every(
           (api) => classifyRegistryOperation({ api, path: 'HKLM\\Software\\Probe' }).stageable === true,
         ),
-        REG_STAGE_HOOKED_APIS.filter((api) => !api.startsWith('RegDeleteTree') && REG_STAGE_HARD_DENY_APIS[api] === undefined && !(api in R19_HARD_DENY_REASON_BY_API)).join(','),
+        REG_STAGE_HOOKED_APIS.filter((api) => !api.startsWith('RegDeleteTree') && REG_STAGE_HARD_DENY_APIS[api] === undefined && !(api in R19_HARD_DENY_REASON_BY_API) && !REG_STAGE_PASSTHROUGH_OPEN_APIS.includes(api)).join(','),
       )
       check(
         'R19 新增的 23 个被 hook 写类入口全部 fail-closed 且带原因码（不是"暂存成功"的假承诺）',
@@ -306,6 +307,48 @@ export function runRegistryStageChecks(harness) {
         REG_STAGE_UNHOOKED_APIS.includes('NtOpenKey') && REG_STAGE_UNHOOKED_APIS.includes('ZwOpenKey') &&
           [...r20WriteApis, ...r20HiveApis].every((api) => !REG_STAGE_UNHOOKED_APIS.includes(api)),
         REG_STAGE_UNHOOKED_APIS.join(','),
+      )
+      // ─── R22 / R15：最后 5 个可 hook 变体（6 个符号）──────────────────────────
+      const r22HardDenyApis = ['RegConnectRegistryExW', 'RegConnectRegistryExA', 'RegOverridePredefKey', 'RegSetKeySecurity']
+      const r22PassthroughApis = ['RegOpenUserClassesRoot', 'RegOpenCurrentUser']
+      check(
+        'R22：6 个变体符号全部在 REG_STAGE_HOOKED_APIS（Ex 的 W/A 是两个独立导出）',
+        [...r22HardDenyApis, ...r22PassthroughApis].length === 6 && [...r22HardDenyApis, ...r22PassthroughApis].every((api) => REG_STAGE_HOOKED_APIS.includes(api)),
+        `missing=${[...r22HardDenyApis, ...r22PassthroughApis].filter((api) => !REG_STAGE_HOOKED_APIS.includes(api)).join(',') || '(none)'}`,
+      )
+      check(
+        'R22：UNHOOKED 收窄为真残余 —— 只剩 NtOpenKey/ZwOpenKey（不再含任何 Reg* 变体）',
+        REG_STAGE_UNHOOKED_APIS.length === 2 && REG_STAGE_UNHOOKED_APIS.every((api) => api === 'NtOpenKey' || api === 'ZwOpenKey'),
+        REG_STAGE_UNHOOKED_APIS.join(','),
+      )
+      check(
+        'R22：RegConnectRegistryExW/A ⇒ HARD_DENY(reason=REMOTE_HIVE_NOT_STAGEABLE=7)',
+        ['RegConnectRegistryExW', 'RegConnectRegistryExA'].every((api) => {
+          const verdict = classifyRegistryOperation({ api, path: 'HKCU\\Software\\Probe' })
+          return verdict.stageable === false && verdict.status === HARD_DENY_STATUS && verdict.hardDenyReason === 'REMOTE_HIVE_NOT_STAGEABLE'
+        }),
+        'REMOTE_HIVE_NOT_STAGEABLE',
+      )
+      check(
+        'R22：RegOverridePredefKey / RegSetKeySecurity ⇒ HARD_DENY(reason=TREE_OPERATION_NOT_STAGEABLE=5)',
+        ['RegOverridePredefKey', 'RegSetKeySecurity'].every((api) => {
+          const verdict = classifyRegistryOperation({ api, path: 'HKCU\\Software\\Probe' })
+          return verdict.stageable === false && verdict.status === HARD_DENY_STATUS && verdict.hardDenyReason === 'TREE_OPERATION_NOT_STAGEABLE'
+        }),
+        'TREE_OPERATION_NOT_STAGEABLE',
+      )
+      check(
+        'R22：RegOpenUserClassesRoot/RegOpenCurrentUser ⇒ 只读打开透传（unstaged:true, status=0，不是 Access denied）',
+        r22PassthroughApis.every((api) => {
+          const verdict = classifyRegistryOperation({ api })
+          return verdict.stageable === false && verdict.unstaged === true && verdict.status === 0 && verdict.code === 'REG_STAGE_OPEN_PASSTHROUGH'
+        }),
+        r22PassthroughApis.map((api) => stableJson(classifyRegistryOperation({ api }))).join(' | '),
+      )
+      check(
+        'R22：透传打开清单与"可暂存"过滤互斥（不能被误判成可暂存或可写）',
+        REG_STAGE_PASSTHROUGH_OPEN_APIS.length === 2 && REG_STAGE_PASSTHROUGH_OPEN_APIS.every((api) => REG_STAGE_HOOKED_APIS.includes(api) && REG_STAGE_HARD_DENY_APIS[api] === undefined),
+        REG_STAGE_PASSTHROUGH_OPEN_APIS.join(','),
       )
       check(
         'RegDeleteTreeW/A 被 hook 但 fail-closed 硬拒（不再直落真实 hive）',
@@ -480,7 +523,7 @@ export function runRegistryStageChecks(harness) {
       )
 
       // ③ 硬拒清单现在分两类：**已进 WS_TARGET** ⇒ 硬拒真的会执行（必须可分类为 HARD_DENY）；
-      //    **仍未 hook** ⇒ 意图声明，当下直落真实 hive。R19 之前这里"全部未 hook"。
+      //    **仍未 hook** ⇒ 意图声明，当下直落真实 hive。R22 之后仍盲的只剩 NtOpenKey/ZwOpenKey。
       const denyApis = Object.keys(REG_STAGE_HARD_DENY_APIS)
       const denyReallyHooked = denyApis.filter((api) => targets.includes(api))
       const denyStillBlind = denyApis.filter((api) => !targets.includes(api))

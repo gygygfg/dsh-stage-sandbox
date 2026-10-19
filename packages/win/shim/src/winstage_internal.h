@@ -107,6 +107,9 @@ typedef struct WsOriginals {
     NTSTATUS(NTAPI *NtQueryDirectoryFile)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK,
                                           PVOID, ULONG, FILE_INFORMATION_CLASS, BOOLEAN,
                                           PUNICODE_STRING, BOOLEAN);
+    /* R22 / R19 residual: the Ex variant (QueryFlags) had the same enumeration leak. */
+    NTSTATUS(NTAPI *NtQueryDirectoryFileEx)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK,
+                                            PVOID, ULONG, FILE_INFORMATION_CLASS, ULONG, PUNICODE_STRING);
     /* Overlay-aware existence/stat hooks (added for the A1 stat gap): the
      * originals are captured like every other target. */
     DWORD(WINAPI *GetFileAttributesW)(LPCWSTR);
@@ -200,6 +203,14 @@ typedef struct WsOriginals {
     LONG(WINAPI *RegReplaceKeyA)(HKEY, LPCSTR, LPCSTR, LPCSTR);
     LONG(WINAPI *RegConnectRegistryW)(LPCWSTR, HKEY, PHKEY);
     LONG(WINAPI *RegConnectRegistryA)(LPCSTR, HKEY, PHKEY);
+    /* R22 / R15 残余：the last hookable unhooked registry variants (measured list in
+     * REG_STAGE_UNHOOKED_APIS before R22). Reads pass through, writes fail closed. */
+    LONG(WINAPI *RegConnectRegistryExW)(LPCWSTR, HKEY, ULONG, PHKEY);
+    LONG(WINAPI *RegConnectRegistryExA)(LPCSTR, HKEY, ULONG, PHKEY);
+    LONG(WINAPI *RegOverridePredefKey)(HKEY, HKEY);
+    LONG(WINAPI *RegOpenUserClassesRoot)(HANDLE, DWORD, REGSAM, PHKEY);
+    LONG(WINAPI *RegOpenCurrentUser)(REGSAM, PHKEY);
+    LONG(WINAPI *RegSetKeySecurity)(HKEY, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR);
     /* R19: ntdll registry write surface (direct imports bypass every Reg* hook). */
     NTSTATUS(NTAPI *NtCreateKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
     NTSTATUS(NTAPI *NtSetValueKey)(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID, ULONG);
@@ -537,6 +548,13 @@ LONG WINAPI ws_RegReplaceKeyW(HKEY, LPCWSTR, LPCWSTR, LPCWSTR);
 LONG WINAPI ws_RegReplaceKeyA(HKEY, LPCSTR, LPCSTR, LPCSTR);
 LONG WINAPI ws_RegConnectRegistryW(LPCWSTR, HKEY, PHKEY);
 LONG WINAPI ws_RegConnectRegistryA(LPCSTR, HKEY, PHKEY);
+/* R22 / R15 residual write/read variants (see ws_hook.c WS_TARGET). */
+LONG WINAPI ws_RegConnectRegistryExW(LPCWSTR, HKEY, ULONG, PHKEY);
+LONG WINAPI ws_RegConnectRegistryExA(LPCSTR, HKEY, ULONG, PHKEY);
+LONG WINAPI ws_RegOverridePredefKey(HKEY, HKEY);
+LONG WINAPI ws_RegOpenUserClassesRoot(HANDLE, DWORD, REGSAM, PHKEY);
+LONG WINAPI ws_RegOpenCurrentUser(REGSAM, PHKEY);
+LONG WINAPI ws_RegSetKeySecurity(HKEY, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR);
 NTSTATUS NTAPI ws_NtCreateKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
 NTSTATUS NTAPI ws_NtSetValueKey(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID, ULONG);
 NTSTATUS NTAPI ws_NtDeleteKey(HANDLE);
@@ -586,6 +604,8 @@ BOOL WINAPI ws_FindClose(HANDLE);
 NTSTATUS NTAPI ws_NtQueryDirectoryFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK,
                                        PVOID, ULONG, FILE_INFORMATION_CLASS, BOOLEAN,
                                        PUNICODE_STRING, BOOLEAN);
+NTSTATUS NTAPI ws_NtQueryDirectoryFileEx(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK,
+                                         PVOID, ULONG, FILE_INFORMATION_CLASS, ULONG, PUNICODE_STRING);
 
 /* --- ws_proc.c: CreateProcess* + child self-injection -------------------- */
 void ws_proc_set_self_module(HMODULE self);

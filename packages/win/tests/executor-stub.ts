@@ -35,6 +35,7 @@ import {
   hasPwshOpaqueFlag,
   isVersionOrHelpProbe,
   judgeCanary,
+  judgeInjectorInit,
   parseMarkerJson,
   parsePeExports,
   probeShimDll,
@@ -1099,6 +1100,12 @@ async function main() {
         probeTransparentShim: () => fakeProbe(true),
         spawnTransparentProcess: async (file, args, options) => {
           spawnCalls.push({ file, args, options })
+          // R22-C：真实注入器会写 `--report <json>`（含 `shimInitRc`）；替身必须同样写，
+          // 否则 ShimLauncher 的版本握手会把"没有报告"判成 fail-closed（这正是它的职责）。
+          const reportIndex = args.indexOf('--report')
+          if (reportIndex >= 0 && args[reportIndex + 1]) {
+            writeFileSync(args[reportIndex + 1], JSON.stringify({ ok: true, tool: 'winstage-inject', childPid: 9001, childExitCode: 0, shimInitRc: 0 }))
+          }
           // 模拟"写入被 shim 暂存"：自检要求暂存树里能找到那个文件
           const scriptText = args.join(' ')
           const match = /winstage-shim-selfcheck-(\w+)\.txt/.exec(scriptText)
@@ -1457,6 +1464,28 @@ async function main() {
       classifyCommandRisk('cmd', ['/d', '/c', 'echo hi\ncertutil -decode b64.txt o.bin']).risk === 'read-only',
       'cmd newline: 实测不执行第二行',
     )
+  }
+
+  /* ── R22-C：三件套版本握手（延迟初始化后"注入成功"≠"钩子已装"） ───────────── */
+  {
+    const noReport = judgeInjectorInit(undefined)
+    check('R22-C: injector report 缺失 ⇒ fail-closed(injector-report-missing)', noReport.ok === false && noReport.code === 'injector-report-missing', noReport.code)
+    const legacy = judgeInjectorInit({ ok: true, childExitCode: 0 })
+    check(
+      'R22-C: 旧注入器 report（无 shimInitRc）⇒ fail-closed(injector-version-mismatch)',
+      legacy.ok === false && legacy.code === 'injector-version-mismatch',
+      `${legacy.code} ${legacy.detail}`,
+    )
+    const initFailed = judgeInjectorInit({ ok: true, childExitCode: 0, shimInitRc: 1058 })
+    check(
+      'R22-C: shimInitRc 非 0 ⇒ fail-closed(shim-init-failed) 且带 rc',
+      initFailed.ok === false && initFailed.code === 'shim-init-failed' && String(initFailed.detail).includes('1058'),
+      `${initFailed.code} ${initFailed.detail}`,
+    )
+    const nullRc = judgeInjectorInit({ ok: true, shimInitRc: null })
+    check('R22-C: shimInitRc=null ⇒ fail-closed(injector-init-missing)', nullRc.ok === false && nullRc.code === 'injector-init-missing', nullRc.code)
+    const good = judgeInjectorInit({ ok: true, childExitCode: 0, shimInitRc: 0 })
+    check('R22-C: shimInitRc=0 ⇒ ok（旧成功路径语义等价）', good.ok === true && good.code === 'shim-init-ok', good.code)
   }
 
   rmSync(ROOT, { recursive: true, force: true })

@@ -70,6 +70,8 @@ static const WsHookTarget g_targets[] = {
      * through FindFirstFile* (measured). Core modules keep the real slot (see
      * ws_target_keeps_core_slot); user modules and dynamic resolution get ours. */
     WS_TARGET(NtQueryDirectoryFile),
+    /* R22 / R19 residual: the Ex variant (QueryFlags) had the same enumeration leak. */
+    WS_TARGET(NtQueryDirectoryFileEx),
     /* Added by A1: existence/stat queries must consult the overlay, otherwise a
      * staged write is invisible to Test-Path / File.Exists / `if exist`. */
     WS_TARGET(GetFileAttributesW),
@@ -159,6 +161,16 @@ static const WsHookTarget g_targets[] = {
     WS_TARGET(RegReplaceKeyA),
     WS_TARGET(RegConnectRegistryW),
     WS_TARGET(RegConnectRegistryA),
+    /* R22 / R15 residual: the last hookable unhooked registry variants. Reads
+     * (connect-local / open-user-classes / open-current-user) pass through; writes
+     * with no honest staging representation (OverridePredefKey / SetKeySecurity)
+     * are fail-closed + WAL (ws_reg.c). */
+    WS_TARGET(RegConnectRegistryExW),
+    WS_TARGET(RegConnectRegistryExA),
+    WS_TARGET(RegOverridePredefKey),
+    WS_TARGET(RegOpenUserClassesRoot),
+    WS_TARGET(RegOpenCurrentUser),
+    WS_TARGET(RegSetKeySecurity),
     /* R20 / R16: the ntdll registry write surface. In R19 it was deliberately
      * left out of WS_TARGET (the deny implementations existed but were
      * unreachable), so a direct ntdll/Zw call wrote the REAL hive with no WAL.
@@ -222,6 +234,7 @@ static const char *const g_targetNames[] = {
     "FindNextFileW", "FindNextFileA",
     "FindClose",
     "NtQueryDirectoryFile",
+    "NtQueryDirectoryFileEx",
     "GetFileAttributesW", "GetFileAttributesA", "GetFileAttributesExW", "GetFileAttributesExA",
     /* R18-KNOWN-06 (must mirror g_targets) */
     "CloseHandle", "WriteFile", "WriteFileEx", "SetEndOfFile", "SetFileInformationByHandle",
@@ -246,6 +259,9 @@ static const char *const g_targetNames[] = {
     "RegSaveKeyW", "RegSaveKeyA", "RegSaveKeyExW", "RegSaveKeyExA",
     "RegRestoreKeyW", "RegRestoreKeyA", "RegReplaceKeyW", "RegReplaceKeyA",
     "RegConnectRegistryW", "RegConnectRegistryA",
+    /* R22 / R15 residual (must mirror g_targets) */
+    "RegConnectRegistryExW", "RegConnectRegistryExA", "RegOverridePredefKey",
+    "RegOpenUserClassesRoot", "RegOpenCurrentUser", "RegSetKeySecurity",
     /* R20 / R16: ntdll registry write surface + Zw aliases (must mirror g_targets) */
     "NtCreateKey", "NtSetValueKey", "NtDeleteKey", "NtDeleteValueKey", "NtRenameKey",
     "NtLoadKey", "NtLoadKey2", "NtUnloadKey", "NtSaveKey", "NtSaveKeyEx",
@@ -442,6 +458,9 @@ static int ws_target_keeps_core_slot(const char *name, HMODULE base)
          * enum filter (and the filter itself calls the original). */
         return 1;
     }
+    if (strcmp(name, "NtQueryDirectoryFileEx") == 0) {
+        return 1; /* same reason as the non-Ex variant (R22) */
+    }
     /* R20 / R16 (measured): the staging engine itself materialises hive keys via
      * advapi32/kernelbase -> ntdll!NtCreateKey. Patching kernelbase's slot made the
      * shim's own internal call hit its own deny (reg.exe add => Access denied,
@@ -592,6 +611,7 @@ int ws_hook_init(void)
         { (void **)&g_orig.FindNextFileA, "FindNextFileA" },
         { (void **)&g_orig.FindClose, "FindClose" },
         { (void **)&g_orig.NtQueryDirectoryFile, "NtQueryDirectoryFile" },
+        { (void **)&g_orig.NtQueryDirectoryFileEx, "NtQueryDirectoryFileEx" },
         /* A1 stat/existence hooks: without these capture entries the new
          * replacements would call a NULL original (observed as 0xC0000005 in
          * cmd.exe and powershell.exe). */
@@ -645,6 +665,13 @@ int ws_hook_init(void)
         { (void **)&g_orig.RegOpenKeyTransactedA, "RegOpenKeyTransactedA" },
         { (void **)&g_orig.RegConnectRegistryW, "RegConnectRegistryW" },
         { (void **)&g_orig.RegConnectRegistryA, "RegConnectRegistryA" },
+        /* R22 / R15 residual originals (only ConnectExW has a real read-through use). */
+        { (void **)&g_orig.RegConnectRegistryExW, "RegConnectRegistryExW" },
+        { (void **)&g_orig.RegConnectRegistryExA, "RegConnectRegistryExA" },
+        { (void **)&g_orig.RegOverridePredefKey, "RegOverridePredefKey" },
+        { (void **)&g_orig.RegOpenUserClassesRoot, "RegOpenUserClassesRoot" },
+        { (void **)&g_orig.RegOpenCurrentUser, "RegOpenCurrentUser" },
+        { (void **)&g_orig.RegSetKeySecurity, "RegSetKeySecurity" },
         /* R20 / R16: ntdll registry write origins (resolved explicitly from ntdll,
          * but the shared order also works because only ntdll exports them). */
         { (void **)&g_orig.NtCreateKey, "NtCreateKey" },

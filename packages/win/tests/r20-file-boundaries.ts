@@ -156,12 +156,13 @@ const R20_FILE_TARGETS = [
   check('A3 五条 fail-closed / 过滤拒绝路径的文案仍在实现里（安全路径不得被静默删掉）', missing.length === 0, `missing=${missing.join(';') || '(none)'}`)
 }
 {
-  /* 未修残余：NtQueryDirectoryFileEx（Win10+ 的 Ex 变体；node 不走它）。这里钉住
-   * "不得悄悄启用"：谁要启用必须同步更新本守卫与 docs §13 / residual-baseline。 */
+  /* R22-B：`NtQueryDirectoryFileEx` 已由 Lead 加入 WS_TARGET + ws_file.c 实现。
+   * 守卫**翻转**：它必须保持在 WS_TARGET（回退即红）；行为证据在
+   * `tests/r22-file-advex.ts`（Ex 枚举过滤先红后绿）。 */
   check(
-    'A4 未修残余 NtQueryDirectoryFileEx 仍不在 WS_TARGET（启用需同时更新残余文档与本守卫）',
-    !hookTargets.has('NtQueryDirectoryFileEx'),
-    hookTargets.has('NtQueryDirectoryFileEx') ? '已悄悄启用 NtQueryDirectoryFileEx' : '未启用（与 R20 残余声明一致）',
+    'A4 R22-B：NtQueryDirectoryFileEx 已在 WS_TARGET（R19 残余已修；回退即红）',
+    hookTargets.has('NtQueryDirectoryFileEx'),
+    hookTargets.has('NtQueryDirectoryFileEx') ? '已启用（与 R22 修复一致）' : '**回退**: 不在 WS_TARGET',
   )
 }
 

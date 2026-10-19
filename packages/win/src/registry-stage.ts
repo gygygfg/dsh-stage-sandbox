@@ -1,4 +1,4 @@
-﻿// @ts-nocheck —— 全量 TS 化过渡脚手架：本文件由 .mjs 机械转换而来，类型待逐步补齐。
+// @ts-nocheck —— 全量 TS 化过渡脚手架：本文件由 .mjs 机械转换而来，类型待逐步补齐。
 /**
  * registry-stage —— 注册表**写入暂存**层（覆盖 hive + WAL 日志 + 候选 + 选择性应用）
  *
@@ -303,40 +303,13 @@ export const REG_STAGE_HOOKED_APIS = Object.freeze([
   'ZwSaveKeyEx',
   'ZwRestoreKey',
   'ZwReplaceKey',
-])
-
-/**
- * ★ 交叉验证实测（R17 起）：**不在 shim 拦截面上**的注册表 API ⇒ 当前**直落真实 hive**。
- *
- * 这条清单终结一句**假承诺**（`docs/T3-注册表暂存设计.md` §8.2 原话）：
- *     "任何不在被 hook 的 8 个 API 之内的调用**同样硬拒**（`REG_STAGE_API_NOT_HOOKED`）：
- *      白名单比黑名单诚实 —— 新 API 默认是'不覆盖'，而不是'悄悄放过去写真实 hive'。"
- * 实测不成立，原因在点-hook 的模型本身：
- *   · shim 是 **IAT 点钩**：只有出现在 `shim/src/ws_hook.c` 的 `WS_TARGET(...)` 名单里的
- *     符号才会被改写。没在名单里的 API，调用方的 IAT 项**原样指向系统 DLL**；
- *   · `classifyRegistryOperation()` 是 **TS 侧纯函数**，它只被 shim 的 `ws_Reg*` 实现调用。
- *     对未 hook 的 API，它**一次都不会被调用** ⇒ 它返回的 `REG_STAGE_API_NOT_HOOKED`
- *     / 硬拒状态**永远没人执行**；
- *   · 因此"不 hook"在 IAT 模型下等价于 **"不拦截"**，而"不拦截"= **写入直落真实 hive**，
- *     既不暂存、也不产生任何 `HARD_DENY`/`UNSTAGED` 审计记录。
- *
- * 当前**真残余**（R20 校准后）：
- *   · `NtOpenKey`/`ZwOpenKey`：纯打开/读面，不在 WS_TARGET。仅"打开"不产生写入；
- *     真正的写操作（NtSetValueKey/NtDeleteKey/...）已经被 deny，所以不构成写泄漏。
- *     保留在此是为了让"打开面仍可被利用于探测"这件事可查。
- *   · **raw `syscall` 指令**：结构性上限。任何 IAT 钩都拦不住直接 `syscall` 的代码；
- *     只有 T1 受限令牌（内核拒绝）或内核面能兜底。这里无法用 API 名表达，故以文档 +
- *     `REGISTERED_HARD_DENIALS.semantic` 登记。
- *   · 少数 Reg* 变体：远程 Ex、预定义键重定向、按令牌视图、SD 改写。
- * 本清单让"还漏了什么"保持可查；C 侧 deny 实现已启用（见 HOOKED/原因码），S2R17 的
- * 镜像测试会保证"补了 hook 却仍列盲区"立刻变红。
- */
-export const REG_STAGE_UNHOOKED_APIS = Object.freeze([
-  /* R20：ntdll 写类 + Zw 别名已全部进 WS_TARGET（见 REG_STAGE_HOOKED_APIS）⇒ 移出盲区。
-   * 只留纯打开/读的 NtOpenKey/ZwOpenKey。 */
-  'NtOpenKey',
-  'ZwOpenKey',
+  /* R22 / R15：最后 5 个可 hook 变体（6 个符号；Ex 有 W/A 两个独立导出）。
+   * · RegConnectRegistryExW/A：本机读类透传；远端 fail-closed（原因码 7）。
+   * · RegOverridePredefKey：预定义 HKEY 重定向是进程级状态，覆盖层无法表示 ⇒ fail-closed（原因码 5）。
+   * · RegOpenUserClassesRoot / RegOpenCurrentUser：纯读打开 ⇒ 透传，后续写仍由 Reg* / ntdll deny 管。
+   * · RegSetKeySecurity：SD 写无暂存表示 ⇒ fail-closed（原因码 5）。 */
   'RegConnectRegistryExW',
+  'RegConnectRegistryExA',
   'RegOverridePredefKey',
   'RegOpenUserClassesRoot',
   'RegOpenCurrentUser',
@@ -344,20 +317,45 @@ export const REG_STAGE_UNHOOKED_APIS = Object.freeze([
 ])
 
 /**
+ * ★ 交叉验证实测（R17 起）：**不在 shim 拦截面上**的注册表 API ⇒ 直落真实 hive。
+ *
+ * 为什么这张清单存在：shim 是 **IAT 点钩** —— 只有出现在 `shim/src/ws_hook.c` 的
+ * `WS_TARGET(...)` 名单里的符号才会被改写；"不 hook"在 IAT 模型下等价于"不拦截"，
+ * 而"不拦截"= 写入直落真实 hive，既不暂存、也不产生 `HARD_DENY`/`UNSTAGED` 审计记录。
+ * 清单让"还漏了什么"成为**可查的数据**；`tests/registry-stage.ts` 的 S2R17 镜像测试会保证
+ * "补了 hook 却仍列盲区"立刻变红。
+ *
+ * 当前**真残余**（R22 收窄后只剩 2 个 API 名 + 1 个结构性上限）：
+ *   · `NtOpenKey`/`ZwOpenKey`：纯打开/读面，**不**进 WS_TARGET。仅"打开"不产生写入；
+ *     真正的写操作（NtSetValueKey/NtDeleteKey/…）已被 deny，因此不构成写泄漏。
+ *     保留在此是为了让"打开面可被用于探测"这件事可查（hook 它会把所有组件的打开路径
+ *     都卷进钩子，行为面爆炸且没有安全收益）。
+ *   · **raw `syscall` 指令**：IAT 点钩的结构性上限；只有 T1 受限令牌（内核拒绝）或内核面
+ *     能兜底。无法用 API 名表达，故以文档 + `REGISTERED_HARD_DENIALS.semantic` 登记。
+ * R22 起以下 API 已全部从本清单移出并进入拦截面（见 `REG_STAGE_HOOKED_APIS`）：
+ * `RegConnectRegistryExW/A`、`RegOverridePredefKey`、`RegOpenUserClassesRoot`、
+ * `RegOpenCurrentUser`、`RegSetKeySecurity`。
+ */
+export const REG_STAGE_UNHOOKED_APIS = Object.freeze([
+  'NtOpenKey',
+  'ZwOpenKey',
+])
+
+/**
  * 明确**不**支持、且必须 fail-closed 的 API。
  *
- * ⚠ 生效前提（交叉验证实测，R17；R20 校准）：本清单是**意图声明**，不是拦截生效的证据。
+ * ⚠ 生效前提（交叉验证实测，R17；R20/R22 校准）：本清单是**意图声明**，不是拦截生效的证据。
  *   只有当某个 API **真的在** `WS_TARGET` 名单里（见 `REG_STAGE_UNHOOKED_APIS` 的说明），
  *   shim 才会截获它、才会调用 `classifyRegistryOperation()`、本清单的硬拒才会被执行。
- *   R20 之后本清单**分成两类**（测试 S2R17③ 会机器区分）：
- *     · 已进 `WS_TARGET`（RegRenameKey / RegCreateKeyTransactedW / RegConnectRegistryW …）
+ *   R22 之后本清单**几乎全部已 hook**（R22 把最后 5 个可 hook 变体接进拦截面）：
+ *     · 已进 `WS_TARGET`（RegRenameKey / transacted / hive-file / RegConnectRegistryW /
+ *       `RegSetKeySecurity` / `RegOverridePredefKey` / `RegConnectRegistryExW` …）
  *       ⇒ 硬拒真的执行 = `HARD_DENY` + WAL；
- *     · 真盲区（NtOpenKey/ZwOpenKey/RegSetKeySecurity/远程 Ex/预定义键重定向/按令牌视图）
- *       ⇒ 这些名字"在清单上"不等于"已经拦住"，当下的真实结局仍是直落真实 hive。
- *   把两者分开列（硬拒意图 vs 未 hook 盲区）正是为了不再让"清单上有名字"被读成"已经拦住了"。
+ *     · 真盲区只剩 `NtOpenKey`/`ZwOpenKey`（纯打开/读面，不是写泄漏；见 UNHOOKED 说明）。
+ *   测试 S2R17③ 会机器区分"已 hook（会执行）"与"仍盲（意图声明）"。
  *
  * 为什么不能"尽力而为"地放过：这些调用的语义覆盖层复现不了
- * （整棵 hive 的加载/保存/替换、事务、重命名、SD 改写、远程 hive），
+ * （整棵 hive 的加载/保存/替换、事务、重命名、SD 改写、远程 hive、预定义 HKEY 重定向），
  * 放过它们会让"暂存成功"与"真实结果"分叉 —— 比直接失败更糟。
  */
 export const REG_STAGE_HARD_DENY_APIS = Object.freeze({
@@ -378,8 +376,8 @@ export const REG_STAGE_HARD_DENY_APIS = Object.freeze({
   RegConnectRegistryExW: '远程注册表句柄不可能被重定向到本地覆盖层',
   RegOverridePredefKey:
     '预定义键重定向会把覆盖层的路径映射整体打乱（它是"另一个 8.3 级别的重定向器"，与覆盖层叠加无法推理）',
-  RegOpenUserClassesRoot: '按令牌打开的 HKCR 视图没有稳定的可暂存路径身份',
-  RegOpenCurrentUser: '按令牌打开的 HKCU 视图没有稳定的可暂存路径身份',
+  /* R22：`RegOpenUserClassesRoot`/`RegOpenCurrentUser` 已进 WS_TARGET，但它们是**只读打开**
+   * ⇒ 透传（见 REG_STAGE_PASSTHROUGH_OPEN_APIS），不再属于"硬拒意图"清单。 */
   /* R20：ntdll 写类已在 WS_TARGET 内由 shim 直接 fail-closed（原因码 8/6），
    * 不再需要这里的"意图声明"。只保留纯打开面 NtOpenKey/ZwOpenKey：它们本身不写，
    * 但不在拦截面内（见 REG_STAGE_UNHOOKED_APIS）。 */
@@ -490,7 +488,9 @@ export const REG_STAGE_HARD_DENY_REASON = Object.freeze({
   RECURSIVE_DELETE_NOT_STAGEABLE: 3,
   /** R19：事务注册表 API（Create/Open/DeleteKeyTransactedW/A）无事务语义 ⇒ 硬拒。 */
   TRANSACTED_WRITE_NOT_STAGEABLE: 4,
-  /** R19：整树复制 / 键重命名（RegCopyTreeW/A、RegRenameKey）无路径身份语义 ⇒ 硬拒。 */
+  /** R19：整树复制 / 键重命名（RegCopyTreeW/A、RegRenameKey）无路径身份语义 ⇒ 硬拒。
+   *  R22 扩展：预定义 HKEY 重定向（`RegOverridePredefKey`，进程级状态）与安全描述符写
+   *  （`RegSetKeySecurity`）同样改的是"对象身份/安全语义"而不是可重放的值 ⇒ 同一类硬拒。 */
   TREE_OPERATION_NOT_STAGEABLE: 5,
   /** R19：整 hive 的加载/卸载/保存/还原/替换 ⇒ 硬拒（绝不把覆盖层当真实 hive 落盘）。 */
   HIVE_FILE_OPERATION_NOT_STAGEABLE: 6,
@@ -505,11 +505,13 @@ const HARD_DENY_REASON_NAME = Object.freeze(
   Object.fromEntries(Object.entries(REG_STAGE_HARD_DENY_REASON).map(([name, value]) => [value, name])),
 )
 
-/** R19/R20：这些入口进了 WS_TARGET 但**无法暂存** ⇒ API → 硬拒原因码。
+/** R19/R20/R22：这些入口进了 WS_TARGET 但**无法暂存** ⇒ API → 硬拒原因码。
  *  与 C 侧 `shim/src/ws_reg.c` 的 `WS_HARD_DENY_*` 数值一一对应。
  *  R19 = advapi32 transacted/copy/rename/hive-file/connect（23 个）；
  *  R20 = ntdll 写面（12 个 Nt* + 12 个 Zw* 别名：5 个写操作 → 8，
- *        7 个 hive-file 操作 → 6）。 */
+ *        7 个 hive-file 操作 → 6）；
+ *  R22 = `RegConnectRegistryExW/A`（远端 → 7）、`RegOverridePredefKey` / `RegSetKeySecurity`（→ 5）。
+ *  （`RegOpenUserClassesRoot` / `RegOpenCurrentUser` 是只读打开 ⇒ 透传，不在此表。） */
 export const R19_HARD_DENY_REASON_BY_API = Object.freeze({
   RegCreateKeyTransactedW: 'TRANSACTED_WRITE_NOT_STAGEABLE',
   RegCreateKeyTransactedA: 'TRANSACTED_WRITE_NOT_STAGEABLE',
@@ -534,6 +536,14 @@ export const R19_HARD_DENY_REASON_BY_API = Object.freeze({
   RegReplaceKeyA: 'HIVE_FILE_OPERATION_NOT_STAGEABLE',
   RegConnectRegistryW: 'REMOTE_HIVE_NOT_STAGEABLE',
   RegConnectRegistryA: 'REMOTE_HIVE_NOT_STAGEABLE',
+  /* R22 / R15：最后 5 个可 hook 变体里的硬拒面。
+   * `RegConnectRegistryExW/A` 的本地连接在 C 侧按"读类透传"处理，只有远端才落到
+   * 原因码 7；这里按"远端"登记（与 RegConnectRegistryW/A 同一口径，条件语义在 C 侧）。
+   * `RegOpenUserClassesRoot`/`RegOpenCurrentUser` 是只读打开 ⇒ 不在本表（见 PASSTHROUGH_OPEN）。 */
+  RegConnectRegistryExW: 'REMOTE_HIVE_NOT_STAGEABLE',
+  RegConnectRegistryExA: 'REMOTE_HIVE_NOT_STAGEABLE',
+  RegOverridePredefKey: 'TREE_OPERATION_NOT_STAGEABLE',
+  RegSetKeySecurity: 'TREE_OPERATION_NOT_STAGEABLE',
   /* R20 / R16：ntdll 写面（Nt* 与 Zw* 是 ntdll 的两个独立导出，必须分别列出）。 */
   NtCreateKey: 'NT_SYSCALL_WRITE_NOT_STAGEABLE',
   NtSetValueKey: 'NT_SYSCALL_WRITE_NOT_STAGEABLE',
@@ -712,6 +722,21 @@ export function registryValueUnitPath(keyPath, valueName) {
   return typeof valueName === 'string' && valueName.length > 0 ? `${keyPath}\\${valueName}` : `${keyPath}${DEFAULT_VALUE_SUFFIX}`
 }
 
+/**
+ * R22 / R15：**只读打开 ⇒ 透传**的注册表 API（进了 WS_TARGET，但没有可暂存的写入语义）。
+ *
+ * `RegOpenUserClassesRoot` / `RegOpenCurrentUser` 只返回一个打开句柄：
+ *   · 打开本身没有副作用（不是写入），覆盖层没有"打开"这个可重放对象；
+ *   · 调用方随后通过**返回句柄**做的写，仍会进入 `ws_Reg*` 写钩子（真实句柄会被
+ *     `ws_handle_reg_path` 映射回规范路径，照常 staged/HARD_DENY）或 ntdll deny ⇒ 不会漏。
+ * 因此分类结果是"不可暂存但**不是**拒绝"（`unstaged:true, status=0`），与硬拒明确区分：
+ * 把这类调用报成 `Access denied` 会无谓打断正常组件（CLR/安装器大量用它们取 HKCR/HKCU 视图）。
+ */
+export const REG_STAGE_PASSTHROUGH_OPEN_APIS = Object.freeze([
+  'RegOpenUserClassesRoot',
+  'RegOpenCurrentUser',
+])
+
 // ──────────────────── 纯函数：策略（哪些仍是硬拒）────────────────────
 
 /**
@@ -757,6 +782,21 @@ export function classifyRegistryOperation(operation = {}) {
     api,
     ...extra,
   })
+
+  /* R22 / R15：只读打开 ⇒ 透传（不是硬拒；见 REG_STAGE_PASSTHROUGH_OPEN_APIS 的说明）。
+   * 放在硬拒分支之前：它们既不在硬拒表，也不该走到"路径解析/可暂存"逻辑。 */
+  if (REG_STAGE_PASSTHROUGH_OPEN_APIS.includes(api)) {
+    return {
+      stageable: false,
+      unstaged: true,
+      code: 'REG_STAGE_OPEN_PASSTHROUGH',
+      status: REG_STATUS.ERROR_SUCCESS,
+      reason:
+        `${api}: 只读打开 API —— 打开本身无副作用、覆盖层没有"打开句柄"这个可重放对象 ⇒ ` +
+        '透传真实 API；通过返回句柄的后续写仍由 Reg* / ntdll 写钩子暂存或拒绝',
+      api,
+    }
+  }
 
   /* R19：新进 WS_TARGET 的写类入口 —— 无法暂存 ⇒ HARD_DENY 且必须带原因码
    * （WAL kind=5 `type`；C 侧 WS_HARD_DENY_* 数值与下方原因码逐字一致）。

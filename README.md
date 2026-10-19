@@ -217,12 +217,18 @@ TS2307，**不会静默假绿**。
 
 这些内容必须与任何"测试通过"一起读。完整清单见各包文档。
 
-**Windows**（[`packages/win/docs/Windows功能开启清单.md`](packages/win/docs/Windows功能开启清单.md) 的 R1–R17）：
+**Windows**（[`packages/win/docs/Windows功能开启清单.md`](packages/win/docs/Windows功能开启清单.md) 的 **R1–R20**，
+R19 新增 R16–R20 已由 R20 修复轮收口；R21 另登记若干"证据缺口收口后"的新残余，见
+[`docs/round20`](packages/win/docs/round20/R20-残余修复报告.md) 与
+[`docs/round21`](packages/win/docs/round21/R21-证据缺口收口报告.md)）：
 
 - **R1 读取面不收敛**：后端限制写/删，**不限制读**。读取收敛只能靠 AppContainer（默认档位是 `T1`）或工具层硬拒绝清单。
 - **R2 网络面不收敛**：网络策略层存在且 OFFLINE 档位 fail-closed，但本机未安装真实 WFP 过滤器 ⇒ 沙箱内仍可开 socket。
 - **R6 嵌套隔离不可用**：已受限进程无法再建受限令牌 ⇒ 沙箱必须由**未受限宿主进程**建立。
 - **R7 环境块需运行时注入**：依赖包受限 spawn 固定传 `lpEnvironment=NULL`；本实现注入显式环境块，结构不符时 fail-closed。
+- **R13/R14**：32 位注册表视图写入只 fail-closed（不支持暂存）；候选批量应用**跨文件非原子**（单文件原子，未落盘者重新入队）。
+- **RAW `syscall` / 未 hook 面 / T1·T0 无 WAL**：IAT 钩子模型的结构性上限，只有 T1 受限令牌 / T0 AppContainer 兜底；
+  实际残余清单（含 R21 新登记项）以 `Windows功能开启清单.md` §13 为准。
 - **shim 未随包发布**：发行包只带 C 源码，未构建时退化为受限令牌档（透明暂存不可用）。
 
 **Linux**：

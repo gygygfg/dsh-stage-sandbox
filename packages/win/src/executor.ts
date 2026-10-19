@@ -5786,6 +5786,48 @@ function transparentProbeCacheKey(options, artifacts, stageRoot, captureDir) {
 }
 
 /**
+ * R22-C：三件套版本握手（纯函数，可离线断言）。
+ *
+ * R20 把 shim 初始化从 DllMain 挪到注入器的第二步（远程 `WinstageShimInit`），
+ * injector report 因此多了一个 `shimInitRc` 字段。但**旧注入器 + 新 DLL** 的组合
+ * 会出现"远程 LoadLibraryW 成功、DllMain 惰性所以不初始化、旧注入器也不调 Init"
+ * ⇒ 进程看似注入成功、实际一个钩子都没装。`injectorHealthy` 只看 report.ok，
+ * 无法区分这种形态；本函数把三种可判定形态变成 fail-closed 结论：
+ *
+ *   · report 缺失 / 没有 `shimInitRc` 字段  ⇒ `injector-version-mismatch`（三件套必须同版）
+ *   · `shimInitRc` 是非 0 数值             ⇒ `shim-init-failed: rc=N`（注入成功但初始化失败）
+ *   · `shimInitRc === 0`                    ⇒ ok（与 R20 前语义等价）
+ *
+ * 只有 ok 才允许把该次启动/探测算作"shim 已生效"；失败时调用方一律 fail-closed
+ * （不把"加载成功"读成"钩子已装"）。
+ */
+export function judgeInjectorInit(report) {
+  if (report === null || report === undefined || typeof report !== 'object') {
+    return { ok: false, code: 'injector-report-missing', detail: 'injector report is missing (cannot prove shim initialization)' }
+  }
+  if (!Object.prototype.hasOwnProperty.call(report, 'shimInitRc')) {
+    return {
+      ok: false,
+      code: 'injector-version-mismatch',
+      detail:
+        'injector report has no shimInitRc field (old injector + new DLL: three-piece versions must match; refusing to treat the load as initialized)',
+    }
+  }
+  const rc = report.shimInitRc
+  if (rc === null || rc === undefined) {
+    return { ok: false, code: 'injector-init-missing', detail: 'shimInitRc=null (injection did not report initialization; fail-closed)' }
+  }
+  if (typeof rc !== 'number' || rc !== 0) {
+    return {
+      ok: false,
+      code: 'shim-init-failed',
+      detail: `shim initialization failed rc=${String(rc)} (hooks not installed; refusing to claim the shim is active)`,
+    }
+  }
+  return { ok: true, code: 'shim-init-ok', detail: 'shim initialization succeeded (shimInitRc=0)' }
+}
+
+/**
  * 透明档位探测（带进程内缓存）。见 `transparentProbeCache` 的说明。
  *
  * @param {object} [options] 透传给 `probeTransparentShimUncached()`；另有
@@ -6043,6 +6085,13 @@ function probeTransparentShimUncached(options = {}) {
       ? `${CARRIER_INIT_FAILED_PREFIX}: injectorOk=true childExit=${canaryRun.code} (${formatExitCode(canaryRun.code)}); the injector succeeded but the carrier process (target=${canaryTarget}) died during its own initialization; ${injectorDetail} ${clipDiagnostic(injectReport?.error ?? canaryRun.err)}`
       : `${injectorDetail} ${clipDiagnostic(injectReport?.error ?? canaryRun.err)}`,
   )
+  /* R22-C：三件套版本握手 —— "注入成功"不等于"钩子已装"（延迟初始化后尤其如此）。
+   * 缺 `shimInitRc`（旧注入器）或非 0（初始化失败）都让本项 check 变红 ⇒ available=false。
+   * detail 必须带**机读前缀**（`<code>: <detail>`）：probe 的 `reason` 取第一个失败 check 的
+   * detail，调用方/审计要能按 `injector-version-mismatch:` / `shim-init-failed:` /
+   * `injector-report-missing:` 精确分类，而不是只能解析人读文案。 */
+  const injectorInitJudgement = judgeInjectorInit(injectReport)
+  record('shim-inject-init', injectorInitJudgement.ok, `${injectorInitJudgement.code}: ${injectorInitJudgement.detail}`)
   const logExists = existsSync(logPath)
   let logTail = ''
   try {
@@ -6147,6 +6196,17 @@ export class ShimLauncher {
         'TS_INJECTION_FAILED',
         `winstage-inject.exe refused to start the child (exit ${outcome.code}, report.ok=${report?.ok}): ` +
           `${report?.error ?? outcome.err.slice(0, 300)} — refusing to continue unconfined (fail-closed)`,
+      )
+    }
+    /** R22-C：注入器"成功"只代表 DLL 映射成功；延迟初始化下钩子可能一个都没装。
+     *  三件套版本不匹配 / 初始化失败必须在这里 fail-closed，否则子进程会在**没有钩子**
+     *  的情况下跑完，而调用方以为它是透明暂存档（安全声明与实际相反）。 */
+    const launchInitJudgement = judgeInjectorInit(report)
+    if (!launchInitJudgement.ok) {
+      throw fail(
+        'TS_INJECTION_FAILED',
+        `winstage-inject.exe loaded the DLL but the shim was not initialized (${launchInitJudgement.code}: ${launchInitJudgement.detail}) — ` +
+          `refusing to run the child unconfined (fail-closed)`,
       )
     }
     return {

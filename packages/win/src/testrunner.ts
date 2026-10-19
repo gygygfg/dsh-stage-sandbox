@@ -217,6 +217,9 @@ export const OFFLINE_SUITES = [
   // R21 证据缺口收口（G3）：文件侧对抗审计（UNC/\\?\UNC/subst/8.3 短名/删除后重建/
   //   只读位保留/部分失败幂等重试/并发 apply 口径/长路径读透传）。
   { id: 'r21-file-adversarial', script: 'tests/r21-file-adversarial.ts', title: 'R21 文件侧对抗审计（UNC/subst/8.3/删除重建/只读位/部分失败重试/并发 apply/长路径读；24 断言）' },
+  // R22 逐项修复（第一批）：R15 残余 5 个注册表变体接线；NtQueryDirectoryFileEx 枚举过滤。
+  { id: 'r22-registry-hooked', script: 'tests/r22-registry-hooked.ts', title: 'R22 注册表残余面（ConnectRegistryEx/OverridePredefKey/OpenUserClassesRoot/OpenCurrentUser/SetKeySecurity；24 断言）' },
+  { id: 'r22-file-advex', script: 'tests/r22-file-advex.ts', title: 'R22 文件侧残余面（NtQueryDirectoryFileEx 原地分批过滤 / single / 未知类透传；12 断言）' },
 ]
 
 /** 需要未受限会话的套件 */

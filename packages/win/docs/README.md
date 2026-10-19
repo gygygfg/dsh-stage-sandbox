@@ -67,6 +67,9 @@
   （RegCopyTree/RegRenameKey 生产 lane 复验、注册表 apply 对抗样本、文件侧对抗审计、readPolicy 双档 +
   sensitive-content 端到端脱敏、GUI/DOM 实况与 `dsh plugin remove` 实跑、`build-shim --help` 工具链修复），
   过程中新修 13 处缺陷；附 3 项非产品口径的独立复核结论与 R21 新登记残余。
+- [`round22/R22-剩余项修复报告.md`](round22/R22-剩余项修复报告.md)：逐项修复剩余可修项（第一批）——
+  R15 最后 6 个可 hook 注册表变体接入拦截面、`NtQueryDirectoryFileEx` 枚举过滤、
+  三件套版本握手（`shimInitRc` 三态 fail-closed）、根 README/§13 文档同步；附残余与下一批建议。
 
 ## 5. archive —— 历史归档（不代表现行口径）
 

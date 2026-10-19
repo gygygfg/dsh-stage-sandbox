@@ -2171,43 +2171,88 @@ static int ws_handle_is_unmapped_device(HANDLE h)
     return ws_is_nt_alias(raw);
 }
 
-NTSTATUS NTAPI ws_NtQueryDirectoryFile(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
-                                       PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
-                                       ULONG Length, FILE_INFORMATION_CLASS FileInformationClass,
-                                       BOOLEAN ReturnSingleEntry, PUNICODE_STRING FileName, BOOLEAN RestartScan)
+/* R22: shared real-call shim so the classic (NtQueryDirectoryFile) and Ex
+ * (NtQueryDirectoryFileEx, QueryFlags) variants run the identical in-place
+ * batch filter. `extraFlags` carries QueryFlags bits we already validated as
+ * replay-safe (only SL_RESTART_SCAN / SL_RETURN_SINGLE_ENTRY are synthesized
+ * from restart/single; everything else is passed through only after the caller
+ * decided the flags are replay-safe). */
+static NTSTATUS ws_dir_query_real(int useEx, ULONG extraFlags, HANDLE fh, HANDLE ev, PIO_APC_ROUTINE apc,
+                                  PVOID ctx, PIO_STATUS_BLOCK iosb, PVOID info, ULONG len,
+                                  FILE_INFORMATION_CLASS cls, BOOLEAN single, PUNICODE_STRING name, BOOLEAN restart)
 {
-    ws_callhit_named("NtQueryDirectoryFile");
+    if (useEx) {
+        ULONG qf = (restart ? 0x1UL : 0UL) | (single ? 0x2UL : 0UL) | (extraFlags & ~0x3UL);
+        if (g_orig.NtQueryDirectoryFileEx) {
+            return g_orig.NtQueryDirectoryFileEx(fh, ev, apc, ctx, iosb, info, len, cls, qf, name);
+        }
+        if (g_orig.NtQueryDirectoryFile) {
+            return g_orig.NtQueryDirectoryFile(fh, ev, apc, ctx, iosb, info, len, cls, single, name, restart);
+        }
+        if (iosb) {
+            iosb->Status = (NTSTATUS)0xC0000002L; /* STATUS_NOT_IMPLEMENTED */
+            iosb->Information = 0;
+        }
+        return (NTSTATUS)0xC0000002L;
+    }
+    if (g_orig.NtQueryDirectoryFile) {
+        return g_orig.NtQueryDirectoryFile(fh, ev, apc, ctx, iosb, info, len, cls, single, name, restart);
+    }
+    if (iosb) {
+        iosb->Status = (NTSTATUS)0xC0000002L;
+        iosb->Information = 0;
+    }
+    return (NTSTATUS)0xC0000002L;
+}
+
+static NTSTATUS ws_dir_query_filtered_common(int useEx, ULONG exQueryFlags, const char *apiName, HANDLE FileHandle,
+                                             HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+                                             PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+                                             FILE_INFORMATION_CLASS FileInformationClass, BOOLEAN ReturnSingleEntry,
+                                             PUNICODE_STRING FileName, BOOLEAN RestartScan)
+{
     ULONG nameLenOff = 0;
     ULONG nameOff = 0;
     wchar_t dir[WS_PATH_MAX];
-    if (!g_orig.NtQueryDirectoryFile || t_wsFileBusy || t_dirQueryBusy || !ws_mask_declared() ||
-        !FileHandle || FileHandle == INVALID_HANDLE_VALUE || !FileInformation || Length < 64 ||
-        !ws_dir_entry_layout((ULONG)FileInformationClass, &nameLenOff, &nameOff)) {
-        return g_orig.NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
-                                           FileInformation, Length, FileInformationClass, ReturnSingleEntry,
-                                           FileName, RestartScan);
+    if ((useEx ? !g_orig.NtQueryDirectoryFileEx : !g_orig.NtQueryDirectoryFile) || t_wsFileBusy ||
+        t_dirQueryBusy || !ws_mask_declared() || !FileHandle || FileHandle == INVALID_HANDLE_VALUE ||
+        !FileInformation || Length < 64) {
+        return ws_dir_query_real(useEx, exQueryFlags, FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                 FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName,
+                                 RestartScan);
+    }
+    if (!ws_dir_entry_layout((ULONG)FileInformationClass, &nameLenOff, &nameOff)) {
+        /* R22: no safe (NextEntryOffset/FileNameLength/FileName) layout for this
+         * info class ⇒ never guess: pass the caller's buffer through untouched and
+         * leave a measurable breadcrumb (the residual is "unknown class not
+         * filtered", not "silently corrupted"). */
+        ws_log("%s: unsupported FileInformationClass %lu -> pass-through", apiName,
+               (unsigned long)FileInformationClass);
+        return ws_dir_query_real(useEx, exQueryFlags, FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                 FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName,
+                                 RestartScan);
     }
     if (!ws_dir_path_of_handle(FileHandle, dir, WS_PATH_MAX)) {
         /* R20 FOLLOW-UP（P0）：句柄来自映射不了的设备/卷命名空间 ⇒ 无法重建目录项
          * 全路径 ⇒ 过滤不了。mask 生效时 fail-closed（拒绝），绝不静默返回未过滤
          * 的名字；其它情况（非目录句柄/临时失败）保持透传。 */
         if (ws_handle_is_unmapped_device(FileHandle)) {
-            ws_log("fail-closed NtQueryDirectoryFile: unmapped device-path handle cannot be filtered");
+            ws_log("fail-closed %s: unmapped device-path handle cannot be filtered", apiName);
             if (IoStatusBlock) {
                 IoStatusBlock->Status = WS_R20_STATUS_ACCESS_DENIED;
                 IoStatusBlock->Information = 0;
             }
             return WS_R20_STATUS_ACCESS_DENIED;
         }
-        return g_orig.NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
-                                           FileInformation, Length, FileInformationClass, ReturnSingleEntry,
-                                           FileName, RestartScan);
+        return ws_dir_query_real(useEx, exQueryFlags, FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                 FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName,
+                                 RestartScan);
     }
     BYTE *tmp = (BYTE *)HeapAlloc(GetProcessHeap(), 0, Length);
     if (!tmp) {
-        return g_orig.NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
-                                           FileInformation, Length, FileInformationClass, ReturnSingleEntry,
-                                           FileName, RestartScan);
+        return ws_dir_query_real(useEx, exQueryFlags, FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                 FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName,
+                                 RestartScan);
     }
     NTSTATUS result = WS_R20_STATUS_ACCESS_DENIED;
     BOOLEAN restart = RestartScan;
@@ -2219,9 +2264,9 @@ NTSTATUS NTAPI ws_NtQueryDirectoryFile(HANDLE FileHandle, HANDLE Event, PIO_APC_
             memset(&localIosb, 0, sizeof(localIosb));
             iosb = &localIosb;
         }
-        NTSTATUS st = g_orig.NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, iosb,
-                                                  FileInformation, Length, FileInformationClass, ReturnSingleEntry,
-                                                  FileName, restart);
+        NTSTATUS st = ws_dir_query_real(useEx, exQueryFlags, FileHandle, Event, ApcRoutine, ApcContext, iosb,
+                                        FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName,
+                                        restart);
         restart = FALSE; /* only the caller's first request may restart the scan */
         if (st == WS_R20_STATUS_PENDING && Event && !ApcRoutine) {
             if (WaitForSingleObject(Event, 30000) == WAIT_OBJECT_0) {
@@ -2231,7 +2276,7 @@ NTSTATUS NTAPI ws_NtQueryDirectoryFile(HANDLE FileHandle, HANDLE Event, PIO_APC_
         if (st == WS_R20_STATUS_PENDING) {
             /* Async completion we cannot filter without breaking the contract.
              * Documented residual: this call is left untouched. */
-            ws_log("NtQueryDirectoryFile: async completion cannot be filtered (pass-through)");
+            ws_log("%s: async completion cannot be filtered (pass-through)", apiName);
             result = st;
             break;
         }
@@ -2312,9 +2357,49 @@ NTSTATUS NTAPI ws_NtQueryDirectoryFile(HANDLE FileHandle, HANDLE Event, PIO_APC_
     t_dirQueryBusy = 0;
     HeapFree(GetProcessHeap(), 0, tmp);
     if (result == 0) {
-        ws_log_w(L"NtQueryDirectoryFile filtered response", dir);
+        ws_log("%s filtered response", apiName);
+        ws_log_w(L"filtered directory", dir);
     }
     return result;
+}
+
+NTSTATUS NTAPI ws_NtQueryDirectoryFile(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
+                                       PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
+                                       ULONG Length, FILE_INFORMATION_CLASS FileInformationClass,
+                                       BOOLEAN ReturnSingleEntry, PUNICODE_STRING FileName, BOOLEAN RestartScan)
+{
+    ws_callhit_named("NtQueryDirectoryFile");
+    return ws_dir_query_filtered_common(0, 0, "NtQueryDirectoryFile", FileHandle, Event, ApcRoutine, ApcContext,
+                                        IoStatusBlock, FileInformation, Length, FileInformationClass,
+                                        ReturnSingleEntry, FileName, RestartScan);
+}
+
+/* R22 / R19 residual: NtQueryDirectoryFileEx (Win10+) had the same enumeration
+ * leak (the R19 filter only covered the classic variant). QueryFlags handling:
+ *   · SL_RESTART_SCAN(0x1) / SL_RETURN_SINGLE_ENTRY(0x2) are synthesized per
+ *     replay by the shared filter loop (only the first call restarts the scan);
+ *   · every other flag bit (SL_INDEX_SPECIFIED, SL_RETURN_ON_DISK_ENTRIES_ONLY,
+ *     future bits) cannot be replayed safely → **pass through unchanged** and log
+ *     a breadcrumb (never guess, never corrupt the caller's enumeration context).
+ */
+NTSTATUS NTAPI ws_NtQueryDirectoryFileEx(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine,
+                                         PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
+                                         ULONG Length, FILE_INFORMATION_CLASS FileInformationClass, ULONG QueryFlags,
+                                         PUNICODE_STRING FileName)
+{
+    ws_callhit_named("NtQueryDirectoryFileEx");
+    ULONG replaySafeBits = QueryFlags & (ULONG)~(0x1UL | 0x2UL);
+    if (replaySafeBits) {
+        ws_log("NtQueryDirectoryFileEx: QueryFlags 0x%lx not replay-safe -> pass-through", (unsigned long)QueryFlags);
+        return ws_dir_query_real(1, QueryFlags, FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                 FileInformation, Length, FileInformationClass,
+                                 (QueryFlags & 0x2UL) ? TRUE : FALSE, FileName,
+                                 (QueryFlags & 0x1UL) ? TRUE : FALSE);
+    }
+    return ws_dir_query_filtered_common(1, QueryFlags, "NtQueryDirectoryFileEx", FileHandle, Event, ApcRoutine,
+                                        ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass,
+                                        (QueryFlags & 0x2UL) ? TRUE : FALSE, FileName,
+                                        (QueryFlags & 0x1UL) ? TRUE : FALSE);
 }
 
 /* --------------------------------------------------------------- hooks */
