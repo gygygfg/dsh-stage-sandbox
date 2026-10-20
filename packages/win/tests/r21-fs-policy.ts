@@ -475,9 +475,9 @@ try {
   }
 
   // ═════════════════════════════════════════════════════════════════════════
-  // 5. 策略归一（非 block 的任何取值 → record；不做隐式第三条路）
+  // 5. 策略归一（R24-A1 起：未设=record；block=block；其它非空=fail-safe block + warn）
   // ═════════════════════════════════════════════════════════════════════════
-  section('5. 策略归一与生产接线缺口（如实登记）')
+  section('5. 策略归一与生产接线（R24-A1：WINSTAGE_READ_POLICY 已接线）')
   {
     const wsNorm = join(SCRATCH, 'ws-normalize')
     mkdirSync(wsNorm, { recursive: true })
@@ -485,15 +485,19 @@ try {
     const def = makeHarness({ tag: 'r21-g4a-default', wsRoot: wsNorm, storeDir: join(SCRATCH, 'store-default') }).fs
     const bogus = makeHarness({ tag: 'r21-g4a-bogus', readPolicy: 'deny', wsRoot: wsNorm, storeDir: join(SCRATCH, 'store-bogus') }).fs
     const blocked = makeHarness({ tag: 'r21-g4a-blocked', readPolicy: 'block', wsRoot: wsNorm, storeDir: join(SCRATCH, 'store-blocked') }).fs
-    check('未传 readPolicy ⇒ 默认 record（产品决策：只记不拦）', def.readPolicy === 'record', def.readPolicy)
-    check('未知取值 readPolicy=\'deny\' ⇒ 归一为 record（fail-safe，不静默变成第三条路）', bogus.readPolicy === 'record', bogus.readPolicy)
+    check('未传 readPolicy ⇒ 默认 record（产品决策：只记不拦）', def.readPolicy === 'record' && def.readPolicySource === 'default', JSON.stringify({ policy: def.readPolicy, source: def.readPolicySource }))
+    check(
+      "未知取值 readPolicy='deny' ⇒ **fail-safe 到 block**（R24-A1 语义：显式配置了却拼错，不得静默退回只记不拦）",
+      bogus.readPolicy === 'block' && bogus.readPolicySource === 'invalid-fail-safe',
+      JSON.stringify({ policy: bogus.readPolicy, source: bogus.readPolicySource, raw: bogus.readPolicyRaw }),
+    )
     check('显式 readPolicy=\'block\' ⇒ 生效', blocked.readPolicy === 'block', blocked.readPolicy)
     const entryText = readFileSync(join(PKG, 'dsh-plugin', 'fs-entry.ts'), 'utf8')
-    residual('readPolicy 在生产装配面不可达：dsh-plugin/fs-entry.ts 的 createStagingFileSystem() 只传 stageOutside/base，没有 readPolicy 透传（profile/env 也无通道）⇒ block 档目前只能程序化构造。登记给 Lead 决定是否补接线。')
+    residual('R21-FS-R1 已由 R24-A1 修复：生产入口 fs-entry.ts 读 `WINSTAGE_READ_POLICY` 并透传给 createStagingFileSystem；归一/日志在 staging-fs.ts::normalizeReadPolicy()。')
     check(
-      '（缺口登记为机器可读断言）fs-entry.ts 未出现 readPolicy',
-      !/readPolicy/.test(entryText),
-      '若本轮后续补了生产接线，此断言会变红 ⇒ 提醒同步更新 findings/套件',
+      '（R24-A1 接线为机器可读断言）fs-entry.ts 出现 WINSTAGE_READ_POLICY / readPolicy 透传',
+      /WINSTAGE_READ_POLICY/.test(entryText) && /readPolicy/.test(entryText),
+      '若接线被移除，此断言会变红 ⇒ 提醒同步 findings/套件',
     )
   }
 } finally {

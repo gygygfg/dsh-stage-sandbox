@@ -182,13 +182,14 @@ try {
       JSON.stringify({ bodyA: perLine.includes(MARK.blockBodyA), bodyB: perLine.includes(MARK.blockBodyB) }),
     )
     const others = readdirSync(join(PKG, 'tests'))
-      .filter((name) => name.endsWith('.ts') && !['r21-fs-policy.ts', 'r21-sensitive-e2e.ts'].includes(name))
+      // `r24-fs-config.ts` 是 R24 新增的生产接线套件（它会打自定义 mask 进链路是**预期**的）
+      .filter((name) => name.endsWith('.ts') && !['r21-fs-policy.ts', 'r21-sensitive-e2e.ts', 'r24-fs-config.ts'].includes(name))
       .map((name) => readFileSync(join(PKG, 'tests', name), 'utf8'))
     const chainSuites = others.filter((text) => /extraMasks|sensitiveMasked|redactions/.test(text)).length
     check(
-      '本轮之前没有任何 tests 套件把自定义 mask 打进 ReviewService.publish() 的真实链路',
+      'R21 轮之前没有任何 tests 套件把自定义 mask 打进 ReviewService.publish() 的真实链路（R24 由 r24-fs-config.ts 正式覆盖）',
       chainSuites === 0,
-      chainSuites ? `已有 ${chainSuites} 个套件提到相关符号` : '0 个既有套件覆盖该链路（R17 只覆盖 maskSensitiveLines 多行单测）',
+      chainSuites ? `已有 ${chainSuites} 个 R21 既有套件提到相关符号` : '0 个 R21 既有套件覆盖该链路（R17 只覆盖 maskSensitiveLines 多行单测）',
     )
   }
 
@@ -560,26 +561,39 @@ try {
   }
 
   // ═════════════════════════════════════════════════════════════════════════
-  // 4. 生产接线缺口（如实登记；本轮不擅自补）
+  // 4. 生产接线（R21-SENS-R1 已由 R24-A2 修复；这里钉住接线点仍存在）
   // ═════════════════════════════════════════════════════════════════════════
-  section('4. 生产接线缺口（登记给 Lead 决定）')
+  section('4. 生产接线（R24-A2：host config.masks → Workspace.masks 透传已接线）')
   {
     const wsRoot = join(SCRATCH, 'ws-probe')
     mkdirSync(wsRoot, { recursive: true })
     const probe = makeService({ wsRoot, storeDir: join(SCRATCH, 'store-probe'), sessionId: 'r21-g4b-probe', masks: [CUSTOM_RULE] })
     check(
-      '（缺口钉）即使给 ReviewService 传 options.masks，也没有透传到 Workspace（ctor 忽略该键）',
-      probe.svc.workspace.extraMasks.length === 0,
-      `extraMasks=${JSON.stringify(probe.svc.workspace.extraMasks)}`,
+      '（R24-A2 接线）给 ReviewService 传 options.masks ⇒ 透传到 Workspace.extraMasks',
+      probe.svc.workspace.extraMasks.length === 1 && probe.svc.workspace.extraMasks[0].id === CUSTOM_RULE.id,
+      `extraMasks=${JSON.stringify(probe.svc.workspace.extraMasks.map((rule) => rule.id))}`,
     )
-    const sourceTexts = ['dsh-plugin/review-service.ts', 'dsh-plugin/fs-entry.ts', 'dsh-plugin/host-plugin.ts'].map((rel) => readFileSync(join(PKG, rel), 'utf8'))
+    const sourceTexts = {
+      review: readFileSync(join(PKG, 'dsh-plugin', 'review-service.ts'), 'utf8'),
+      host: readFileSync(join(PKG, 'dsh-plugin', 'host-plugin.ts'), 'utf8'),
+      config: readFileSync(join(PKG, 'plugin', 'config.ts'), 'utf8'),
+    }
     check(
-      '（缺口钉）生产装配面没有任何 `masks:` 生产点（review-service 构造 Workspace 时不传 masks）',
-      !/new Workspace\(\{[\s\S]{0,400}?masks\s*[:=]/.test(sourceTexts[0]),
-      'ReviewService 构造 Workspace 的选项里没有 masks',
+      '（R24-A2 接线为机器可读断言）review-service 构造 Workspace 时传 masks；host-plugin 有 compileConfiguredMasks + masks 透传；config schema 声明 masks: string[]',
+      /new Workspace\(/.test(sourceTexts.review) &&
+        /masks:\s*options\.masks/.test(sourceTexts.review) &&
+        /compileConfiguredMasks/.test(sourceTexts.host) &&
+        /masks:\s*configuredMasks/.test(sourceTexts.host) &&
+        /masks:\s*z\s*\.array\(z\.string\(\)\)/.test(sourceTexts.config),
+      JSON.stringify({
+        reviewMasks: /masks:\s*options\.masks/.test(sourceTexts.review),
+        compile: /compileConfiguredMasks/.test(sourceTexts.host),
+        hostPass: /masks:\s*configuredMasks/.test(sourceTexts.host),
+        schema: /masks:\s*z\s*\.array\(z\.string\(\)\)/.test(sourceTexts.config),
+      }),
     )
-    residual('值级脱敏（sensitive-content）只在“调用方自定义 mask”时可达；生产没有 masks 生产者（无 profile/env 通道）⇒ 该分支当前生产不可达。R17 的 P0 修复（内置遮蔽类整份省略）在生产可达且本套件已用默认装配验证。是否接一个“自定义 mask”来源属于产品决策（需要 schema/profile 面），本轮不擅自补。')
-    residual('生产可配置的 readPolicy 也缺失（见 tests/r21-fs-policy.ts 的 RESIDUAL）：fs-entry.ts 未透传 readPolicy。')
+    residual('R21-SENS-R1 已由 R24-A2 修复：host 行 config 新增 `masks: string[]`（默认 []），apply 期编译 + 非法正则 fail-closed，经 ReviewService 透传到 Workspace；默认空行为不变（内置危险类仍整份省略）。')
+    residual('R21-FS-R1 已由 R24-A1 修复：`WINSTAGE_READ_POLICY` 显式通道（未设=record；block=block；其它非空=fail-safe block + warn）。')
     residual('命令文本（shell 命令行/环境变量）不经过 sensitive-content，也不进 review.json / sandbox-audit.json；命令的 stdout/stderr 由 shell-executor 逐字节原样交给模型（设计），不在本套件脱敏链路内。')
     residual('非遮蔽路径的正文不做值级掩码（路径黑名单式设计）：普通文件里的凭据会出现在 review.json（本套件用阳性对照钉住该事实）。')
     void probe

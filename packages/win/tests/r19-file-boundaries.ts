@@ -168,9 +168,9 @@ section('A. 文件侧行为回归（真实 Workspace + 真实磁盘）')
       JSON.stringify({ evidence: readFileSync(join(outside, 'evidence.txt'), 'utf8'), newExists: existsSync(join(outside, 'new.txt')) }),
     )
     check(
-      'A3.3 对照：同一候选里的普通工作区写仍成功 apply',
-      (result.applied ?? []).some((a) => a.path === 'normal.txt') && readFileSync(join(root, 'normal.txt'), 'utf8') === 'NORMAL',
-      JSON.stringify(result.applied),
+      'A3.3 R24 原子化后的对照：junction 逃逸条失败 ⇒ 整批 rolled-back、applied=[]；普通写（本批新建的 normal.txt）也被回滚删除',
+      result.status === 'rolled-back' && (result.applied ?? []).length === 0 && !existsSync(join(root, 'normal.txt')),
+      JSON.stringify({ status: result.status, applied: result.applied, normalExists: existsSync(join(root, 'normal.txt')) }),
     )
   }
 }

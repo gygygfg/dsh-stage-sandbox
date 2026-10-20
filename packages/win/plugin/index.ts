@@ -24,7 +24,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { Config, boolOf, stringOf } from './config.ts'
+import { Config, boolOf, stringArrayOf, stringOf } from './config.ts'
 import type { Config as ConfigShape } from './config.ts'
 import {
   apply as applyImpl,
@@ -64,6 +64,9 @@ export function normalizeConfig(raw: unknown): ConfigShape {
     workspaceRoot: stringOf(source.workspaceRoot, ''),
     probeOnStart: boolOf(source.probeOnStart, true),
     verboseLog: boolOf(source.verboseLog, false),
+    // R24-A2：自定义 mask 正则字符串数组（默认 [] = 不启用，行为不变）。
+    // 这里只做形态归一；正则合法性与 fail-closed 在 host-plugin.compileConfiguredMasks()。
+    masks: stringArrayOf(source.masks, []),
   }
 }
 

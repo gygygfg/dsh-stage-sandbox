@@ -462,21 +462,22 @@ function makeWs(tag) {
   rmSync(ws.store.blobPath(bChange.after.hash), { force: true })
   const result = ws.applyCandidate(frozen.candidate.id)
   check(
-    'B2.1 批量 apply 中途失败：applied=[a] / failed=[b:BLOB_MISSING] / remaining=[b]；真实盘 a 新、b 旧（已落盘不回滚，未落盘不动）',
-    result.status === 'partially-applied' &&
-      result.applied.map((x) => x.path).join(',') === 'a.txt' &&
+    'B2.1 R24 原子化后：批量 apply 中途失败 ⇒ status=rolled-back、applied=[]、failed=[b:BLOB_MISSING]，真实盘 a/b 都回到原内容（全有或全无）',
+    result.status === 'rolled-back' &&
+      (result.applied || []).length === 0 &&
       result.failed.some((x) => x.path === 'b.txt' && x.code === 'BLOB_MISSING') &&
-      content(join(root, 'a.txt')) === 'A-NEW' &&
+      content(join(root, 'a.txt')) === 'A-BASE' &&
       content(join(root, 'b.txt')) === 'B-BASE',
     JSON.stringify({ status: result.status, applied: result.applied, failed: result.failed, a: content(join(root, 'a.txt')), b: content(join(root, 'b.txt')) }).slice(0, 320),
   )
   const again = ws.applyCandidate(frozen.candidate.id)
   check(
-    'B2.2 再次 apply 同一候选：已落盘条目走幂等快路径（**不再误报 STALE_BASELINE**、也不计 applied），只剩 b 的 BLOB_MISSING',
+    'B2.2 R24 原子化后：再次 apply 仍 rolled-back（失败仍只报 BLOB_MISSING，不误报 STALE），真实盘保持原内容',
     (again.failed || []).length === 1 &&
       again.failed[0].code === 'BLOB_MISSING' &&
       (again.applied || []).length === 0 &&
-      content(join(root, 'a.txt')) === 'A-NEW' &&
+      again.status === 'rolled-back' &&
+      content(join(root, 'a.txt')) === 'A-BASE' &&
       content(join(root, 'b.txt')) === 'B-BASE',
     JSON.stringify({ status: again.status, applied: again.applied, failed: (again.failed || []).map((x) => x.code), remaining: again.remaining }),
   )

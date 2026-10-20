@@ -44,9 +44,25 @@ const stageOutsideFromEnv = (() => {
   return typeof raw === 'string' && STAGE_OUTSIDE_VALUES.has(raw) ? raw : 'stage'
 })()
 
+/**
+ * `WINSTAGE_READ_POLICY` → `readPolicy`（R24-A1 的**显式读侧通道**）。
+ *
+ * 本文件只做"env → 构造选项"的**白名单形态透传**：非空字符串原样交给
+ * `staging-fs.ts`；未设/空串 ⇒ 不传（= 默认 `record`，行为与 R21 逐字一致）。
+ * **归一 / fail-safe / warn 全在 `staging-fs.ts::normalizeReadPolicy()`**：
+ *   · 未设/空 ⇒ `record`；
+ *   · `record` / `block` ⇒ 对应档；
+ *   · 其它**非空**值 ⇒ fail-safe 到 `block` + error 级日志（拼错不得静默退回只记不拦）。
+ * 两处都写一套归一判据才会漂移（与 `WINSTAGE_STAGE_OUTSIDE` 同一条纪律），故这里不判合法值。
+ */
+const READ_POLICY_RAW = process.env.WINSTAGE_READ_POLICY
+const readPolicyFromEnv =
+  typeof READ_POLICY_RAW === 'string' && READ_POLICY_RAW.trim().length > 0 ? READ_POLICY_RAW : undefined
+
 const StagingFileSystem = createStagingFileSystem({
   stageOutside: stageOutsideFromEnv,
   base: SandboxedFileSystem,
+  ...(readPolicyFromEnv === undefined ? {} : { readPolicy: readPolicyFromEnv }),
 })
 
 export default StagingFileSystem

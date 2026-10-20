@@ -27,7 +27,7 @@
 
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, normalize, relative, sep } from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   CANDIDATE_STATUS,
   CANDIDATE_VERSION,
@@ -1760,6 +1760,46 @@ export class Workspace {
       }
     }
 
+    /**
+     * ── R24 / R14 收窄：应用前为**本批所有将写路径**建回滚快照 ──────────────────
+     * 快照只放内存（原 bytes/mode/不存在标记；目录树递归）。超限/不可读/符号链接 ⇒
+     * **应用前 fail-closed**（一个字节都不写），绝不"先写再放弃回滚"。
+     * `maxSnapshotBytes` 可注入（离线测试用；缺省 64 MiB）。
+     */
+    const snapshotBudget = { used: 0, limit: Number.isFinite(opts.maxSnapshotBytes) ? Number(opts.maxSnapshotBytes) : 64 * 1024 * 1024 }
+    const snapshots = new Map()
+    try {
+      for (const change of chosen) {
+        const abs = this.absolute(change.path)
+        if (abs && !snapshots.has(abs)) snapshots.set(abs, this._snapshotPathForRollback(abs, snapshotBudget))
+      }
+    } catch (error) {
+      const snapPath = error?.detail?.path ? this._rollbackRel(String(error.detail.path)) : undefined
+      return {
+        id: candidate.id,
+        status: candidate.status,
+        applied: [],
+        failed: [
+          {
+            path: snapPath,
+            op: 'snapshot',
+            code: error.code || 'ROLLBACK_SNAPSHOT_UNAVAILABLE',
+            message: error.message,
+          },
+        ],
+        blockedByMask: [],
+        maskWarnings: [],
+        conflicts: [],
+        remaining: chosen.map((change) => change.path),
+        totalChanged: candidate.changes.length,
+        requeued: true,
+        rolledBack: true,
+        rollback: [],
+        note: 'rollback-snapshot-unavailable: refused to write anything (all-or-nothing cannot be guaranteed)',
+      }
+    }
+
+    let firstFailure = null
     for (const change of chosen) {
       const abs = this.absolute(change.path)
       const mask = this.maskOf(abs)
@@ -1812,6 +1852,101 @@ export class Workspace {
           // （`driftReason`）⇒ 只加不改地透出给命令面；旧调用方读不到也照旧工作。
           ...(error?.detail?.driftReason ? { driftReason: error.detail.driftReason } : {}),
         })
+        // R24：任一条失败 ⇒ 停止后续写入并回滚本批已写条目（全有或全无）
+        firstFailure = { change, error }
+        break
+      }
+    }
+
+    let rollbackReport = null
+    let rolledBack = false
+    if (firstFailure) {
+      /**
+       * R24 并发收尾：同一候选可能被另一个进程**已经成功 applied**（跨进程无锁）。
+       * 此时回滚会把对方刚落盘的内容打回旧基线 ⇒ 先重读持久化候选；若状态已是
+       * APPLIED，则本进程不再回滚，按幂等 successful 返回（残余：仍存在极窄的
+       * "对方已写内容但尚未 saveCandidate" 窗口，见 findings §3）。
+       */
+      const reloaded = this.store.loadCandidate(candidate.id)
+      if (reloaded && reloaded.status === CANDIDATE_STATUS.APPLIED) {
+        this.queue = this.store.loadQueue()
+        return {
+          id: candidate.id,
+          idempotent: 'ALREADY_APPLIED',
+          status: CANDIDATE_STATUS.APPLIED,
+          applied: [],
+          failed,
+          blockedByMask,
+          maskWarnings,
+          conflicts: [],
+          remaining: [],
+          totalChanged: candidate.changes.length,
+          requeued: false,
+          rolledBack: false,
+          rollback: [],
+          note: 'another process already applied this candidate; skipped local rollback (no cross-process lock)',
+        }
+      }
+      const attempted = [...applied.map((item) => this.absolute(item.path)), this.absolute(firstFailure.change.path)]
+      const results = []
+      for (const abs of [...new Set(attempted)].reverse()) {
+        const snap = snapshots.get(abs)
+        if (!snap) continue
+        const change = chosen.find((c) => this.absolute(c.path) === abs)
+        // R24：并发守卫 —— 当前内容不再是我们写下的那份时拒绝覆盖（如实回滚失败）
+        const guard = this._rollbackGuard(snap, abs, change)
+        const rel = this._rollbackRel(abs)
+        if (!guard.ok) {
+          results.push({ path: rel, abs, ok: false, action: 'skipped', code: guard.code, message: guard.message })
+          continue
+        }
+        if (!guard.needed) {
+          results.push({ path: rel, abs, ok: true, action: 'noop' })
+          continue
+        }
+        results.push(this._restoreRollbackSnapshot(snap, opts))
+      }
+      const failedRollbacks = results.filter((r) => !r.ok)
+      rollbackReport = results
+      if (failedRollbacks.length === 0) {
+        rolledBack = true
+        // 全部恢复成功：真实盘回到 apply 前；候选保持可重试（pending）
+        candidate.status = CANDIDATE_STATUS.PENDING
+        candidate.lastApply = { applied: [], failed: [...failed], blockedByMask, maskWarnings, conflicts: [], rollback: results, rolledBack: true }
+        this.store.saveCandidate(candidate)
+        this.queue = this.store.loadQueue()
+        this.queue.candidates[candidate.id] = {
+          ...this.queue.candidates[candidate.id],
+          status: CANDIDATE_STATUS.PENDING,
+          appliedFiles: 0,
+          remainingFiles: chosen.length,
+        }
+        this.store.saveQueue(this.queue)
+        return {
+          id: candidate.id,
+          status: 'rolled-back',
+          applied: [],
+          failed,
+          blockedByMask,
+          maskWarnings,
+          conflicts: [],
+          remaining: chosen.map((change) => change.path),
+          totalChanged: candidate.changes.length,
+          requeued: true,
+          rolledBack: true,
+          rollback: results,
+          note: 'atomic-rollback: mid-batch failure rolled back every applied change (real workspace restored byte-for-byte)',
+        }
+      }
+      // 回滚本身失败：如实 partially-applied —— 未恢复的条目仍是"已落盘"
+      for (const r of failedRollbacks) {
+        const change = chosen.find((c) => this.absolute(c.path) === r.abs)
+        failed.push({ path: r.path, op: 'rollback', code: 'ROLLBACK_FAILED', message: `${r.code}: ${r.message}${change ? ` (change op=${change.op})` : ''}` })
+      }
+      applied.length = 0
+      for (const r of failedRollbacks) {
+        const change = chosen.find((c) => this.absolute(c.path) === r.abs)
+        if (change) applied.push({ path: change.path, op: change.op })
       }
     }
 
@@ -1828,10 +1963,14 @@ export class Workspace {
     } else {
       status = CANDIDATE_STATUS.APPLIED
     }
+    // R24：回滚本身失败 ⇒ 必须如实 partial（即使 applied 恰好为空也不得降级成 pending/stale）
+    if (rollbackReport && !rolledBack) {
+      status = CANDIDATE_STATUS.PARTIALLY_APPLIED
+    }
     candidate.status = status
     candidate.appliedAt = new Date().toISOString()
     candidate.appliedPaths = [...(candidate.appliedPaths || []), ...applied.map((a) => a.path)]
-    candidate.lastApply = { applied, failed, blockedByMask, maskWarnings, conflicts: [] }
+    candidate.lastApply = { applied, failed, blockedByMask, maskWarnings, conflicts: [], rollback: rollbackReport || [], rolledBack }
     this.store.saveCandidate(candidate)
     this.queue.candidates[candidate.id] = {
       ...this.queue.candidates[candidate.id],
@@ -1890,6 +2029,233 @@ export class Workspace {
       totalChanged: allChanged.size,
       // 未选部分重新入队为可追踪修订（#12.2）
       requeued: remaining.length > 0,
+      // R24：回滚明细（rolled-back 时全部 ok；回滚失败时如实列出失败条目）
+      rolledBack,
+      rollback: rollbackReport || [],
+    }
+  }
+
+  /** 回滚报告里的路径：工作区内给相对路径；工作区外/junction 逃逸路径原样，绝不因报告而抛错。 */
+  _rollbackRel(abs) {
+    try {
+      return relativeTo(this.root, abs) || abs
+    } catch {
+      return abs
+    }
+  }
+
+  /** 目录树内容哈希（仅用于回滚前的"并发改写"守卫；排序稳定）。 */
+  _hashTreeOfDir(dir) {
+    const h = createHash('sha256')
+    const walk = (d, rel) => {
+      let items
+      try {
+        items = readdirSync(d, { withFileTypes: true })
+      } catch {
+        return
+      }
+      items.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+      for (const item of items) {
+        const childAbs = join(d, item.name)
+        const childRel = rel ? `${rel}/${item.name}` : item.name
+        if (item.isSymbolicLink()) {
+          h.update(`L:${childRel}\n`)
+        } else if (item.isDirectory()) {
+          h.update(`D:${childRel}\n`)
+          walk(childAbs, childRel)
+        } else if (item.isFile()) {
+          h.update(`F:${childRel}:${hashFile(childAbs)}\n`)
+        } else {
+          h.update(`S:${childRel}\n`)
+        }
+      }
+    }
+    walk(dir, '')
+    return h.digest('hex')
+  }
+
+  /**
+   * 回滚前的并发守卫：只有"当前状态仍是本批 apply 写下的那份"才允许恢复快照；
+   * 若当前内容已被另一个进程/用户改写（与快照不同、也与本批期望不同）⇒ 拒绝恢复，
+   * 如实报 `ROLLBACK_CONCURRENT_MODIFICATION`（绝不覆盖并发写入，也不谎称已回滚）。
+   * 返回 {needed:boolean, ok:boolean, code?, message?}。
+   */
+  _rollbackGuard(snap, abs, change) {
+    const kindNow = existsSync(abs) ? statKind(abs)?.kind : undefined
+    const expected = change && change.op !== 'delete' ? change.after?.hash : undefined
+    if (snap.kind === 'absent') {
+      if (kindNow === undefined) return { needed: false, ok: true }
+      // 本批新建的路径（apply 前不存在，事实基线清楚）：删除它就是回滚
+      return { needed: true, ok: true }
+    }
+    if (snap.kind === 'file') {
+      if (kindNow === undefined) return { needed: true, ok: true } // 本批删除/移走了它 ⇒ 恢复
+      if (kindNow !== 'file')
+        return { needed: true, ok: false, code: 'ROLLBACK_CONCURRENT_MODIFICATION', message: 'path kind changed concurrently; refusing rollback' }
+      const nowHash = hashFile(abs)
+      if (nowHash === snap.hash) return { needed: false, ok: true }
+      if (expected && nowHash === expected) return { needed: true, ok: true } // 我们的写入 ⇒ 恢复
+      return { needed: true, ok: false, code: 'ROLLBACK_CONCURRENT_MODIFICATION', message: 'content changed concurrently; refusing rollback overwrite' }
+    }
+    if (snap.kind === 'dir') {
+      if (kindNow === undefined) return { needed: true, ok: true }
+      if (kindNow !== 'dir')
+        return { needed: true, ok: false, code: 'ROLLBACK_CONCURRENT_MODIFICATION', message: 'path kind changed concurrently; refusing rollback' }
+      if (this._hashTreeOfDir(abs) === snap.treeHash) return { needed: false, ok: true }
+      return { needed: true, ok: false, code: 'ROLLBACK_CONCURRENT_MODIFICATION', message: 'directory changed concurrently; refusing recursive restore' }
+    }
+    return { needed: true, ok: true }
+  }
+
+  /**
+   * ── R24 / R14 收窄：批量 apply 的回滚快照与恢复 ────────────────────────────────
+   *
+   * 设计约束（合同 §2 R24-B）：
+   *   · **应用前**为本批所有将写路径建快照；全部成功才丢弃；
+   *   · 内容快照放**内存**（不落临时文件）：单文件/目录树字节受 `maxSnapshotBytes` 限制，
+   *     超限 ⇒ 应用前 fail-closed（`ROLLBACK_SNAPSHOT_TOO_LARGE`），绝不静默放弃回滚；
+   *   · 读不了/类型不支持（符号链接等）⇒ `ROLLBACK_SNAPSHOT_UNAVAILABLE` fail-closed；
+   *   · 恢复顺序：先删掉当前状态，再按快照重建内容/mode；本批新建的父目录在回滚后
+   *     若为空则一并删除（`newParents` 记录 apply 前不存在的祖先）。
+   */
+  _snapshotPathForRollback(abs, budget) {
+    let st
+    try {
+      st = lstatSync(abs)
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        // 记录"apply 前不存在"的祖先链（最近的在最前），回滚时清空删除
+        const newParents = []
+        let dir = dirname(abs)
+        const rootAbs = canonical(this.root)
+        for (let guard = 0; guard < 512; guard++) {
+          if (!existsSync(dir)) {
+            newParents.push(dir)
+            const parent = dirname(dir)
+            if (parent === dir) break
+            dir = parent
+            continue
+          }
+          break
+        }
+        return { kind: 'absent', abs, newParents }
+      }
+      throw new SandboxError('ROLLBACK_SNAPSHOT_UNAVAILABLE', `cannot snapshot ${abs} for rollback: ${error.message}`, { path: abs })
+    }
+    if (st.isSymbolicLink()) {
+      throw new SandboxError('ROLLBACK_SNAPSHOT_UNAVAILABLE', `cannot snapshot symbolic link ${abs} for rollback`, { path: abs })
+    }
+    const mode = st.mode & 0o777
+    if (st.isFile()) {
+      budget.used += st.size
+      if (budget.used > budget.limit) {
+        throw new SandboxError('ROLLBACK_SNAPSHOT_TOO_LARGE', `rollback snapshot exceeds ${budget.limit} bytes at ${abs}`, { path: abs, limit: budget.limit })
+      }
+      let bytes
+      try {
+        bytes = readFileSync(abs)
+      } catch (error) {
+        throw new SandboxError('ROLLBACK_SNAPSHOT_UNAVAILABLE', `cannot read ${abs} for rollback: ${error.message}`, { path: abs })
+      }
+      return { kind: 'file', abs, mode, bytes, hash: hashFile(abs) }
+    }
+    if (st.isDirectory()) {
+      /** @type {Array<{rel:string, kind:'file'|'dir', mode:number, bytes?:Buffer}>} */
+      const entries = []
+      const walk = (dir, rel) => {
+        let items
+        try {
+          items = readdirSync(dir, { withFileTypes: true })
+        } catch (error) {
+          throw new SandboxError('ROLLBACK_SNAPSHOT_UNAVAILABLE', `cannot list ${dir} for rollback: ${error.message}`, { path: dir })
+        }
+        for (const item of items) {
+          const childAbs = join(dir, item.name)
+          const childRel = rel ? `${rel}/${item.name}` : item.name
+          if (item.isSymbolicLink()) {
+            throw new SandboxError('ROLLBACK_SNAPSHOT_UNAVAILABLE', `cannot snapshot symbolic link ${childAbs} for rollback`, { path: childAbs })
+          }
+          const childStat = lstatSync(childAbs)
+          if (childStat.isDirectory()) {
+            entries.push({ rel: childRel, kind: 'dir', mode: childStat.mode & 0o777 })
+            walk(childAbs, childRel)
+          } else if (childStat.isFile()) {
+            budget.used += childStat.size
+            if (budget.used > budget.limit) {
+              throw new SandboxError('ROLLBACK_SNAPSHOT_TOO_LARGE', `rollback snapshot exceeds ${budget.limit} bytes at ${childAbs}`, { path: childAbs, limit: budget.limit })
+            }
+            entries.push({ rel: childRel, kind: 'file', mode: childStat.mode & 0o777, bytes: readFileSync(childAbs) })
+          } else {
+            throw new SandboxError('ROLLBACK_SNAPSHOT_UNAVAILABLE', `cannot snapshot special file ${childAbs} for rollback`, { path: childAbs })
+          }
+        }
+      }
+      walk(abs, '')
+      return { kind: 'dir', abs, mode, entries, treeHash: this._hashTreeOfDir(abs) }
+    }
+    throw new SandboxError('ROLLBACK_SNAPSHOT_UNAVAILABLE', `cannot snapshot ${abs} (unsupported type) for rollback`, { path: abs })
+  }
+
+  _restoreRollbackSnapshot(snap, opts = {}) {
+    const rel = this._rollbackRel(snap.abs)
+    const override = typeof opts.rollbackRestoreOverride === 'function' ? opts.rollbackRestoreOverride(snap) : null
+    if (override && override.ok === false) {
+      return { path: rel, abs: snap.abs, ok: false, action: 'restore', code: override.code || 'ROLLBACK_FAILED', message: override.message || 'rollback restore refused by injected override' }
+    }
+    try {
+      if (existsSync(snap.abs)) {
+        rmSync(snap.abs, { recursive: true, force: true })
+      }
+      if (snap.kind === 'absent') {
+        for (const dir of snap.newParents || []) {
+          try {
+            rmdirSync(dir)
+          } catch {
+            /* not empty / already gone: leave it (reported as restored still) */
+          }
+        }
+        return { path: rel, abs: snap.abs, ok: true, action: 'deleted' }
+      }
+      if (snap.kind === 'file') {
+        mkdirSync(dirname(snap.abs), { recursive: true })
+        writeFileSync(snap.abs, snap.bytes)
+        try {
+          chmodSync(snap.abs, snap.mode)
+        } catch {
+          /* best-effort attribute restore; bytes are the contract */
+        }
+        return { path: rel, abs: snap.abs, ok: true, action: 'restored' }
+      }
+      if (snap.kind === 'dir') {
+        mkdirSync(snap.abs, { recursive: true })
+        const dirs = []
+        for (const entry of snap.entries) {
+          const target = join(snap.abs, entry.rel)
+          if (entry.kind === 'file') {
+            mkdirSync(dirname(target), { recursive: true })
+            writeFileSync(target, entry.bytes)
+            try {
+              chmodSync(target, entry.mode)
+            } catch {}
+          } else {
+            mkdirSync(target, { recursive: true })
+            dirs.push(target)
+          }
+        }
+        // modes after content creation (deepest first so parent chmod cannot block writes)
+        for (const dir of dirs.reverse()) {
+          try {
+            chmodSync(dir, snap.entries.find((e) => join(snap.abs, e.rel) === dir)?.mode ?? snap.mode)
+          } catch {}
+        }
+        try {
+          chmodSync(snap.abs, snap.mode)
+        } catch {}
+        return { path: rel, abs: snap.abs, ok: true, action: 'restored' }
+      }
+      return { path: rel, abs: snap.abs, ok: false, action: 'restore', code: 'ROLLBACK_FAILED', message: 'unknown snapshot kind' }
+    } catch (error) {
+      return { path: rel, abs: snap.abs, ok: false, action: 'restore', code: error.code || 'ROLLBACK_FAILED', message: error.message }
     }
   }
 

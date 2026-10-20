@@ -223,6 +223,9 @@ export const OFFLINE_SUITES = [
   // R23 逐项修复（第二批）：面板路由鉴权（R21-LC-01）；>MAX_PATH 写面（R21-FS-06）。
   { id: 'r23-panel-auth', script: 'tests/r23-panel-auth.ts', title: 'R23 面板路由鉴权（authorize 先于 buildPanelPayload / 失败 fail-closed / connection 注入静态守卫；18 断言）' },
   { id: 'r23-long-path', script: 'tests/r23-long-path.ts', title: 'R23 >MAX_PATH 写面（\\\\?\\ 长路径写/建目录/rename/delete 进暂存、whiteout 跨进程、遮蔽读拒绝；13 断言）' },
+  // R24 逐项修复（第三批）：readPolicy 生产通道 + 自定义 mask 来源；批量 apply 原子性（回滚）。
+  { id: 'r24-fs-config', script: 'tests/r24-fs-config.ts', title: 'R24 fs 生产接线（WINSTAGE_READ_POLICY 三态 + config.masks 值级脱敏 + 非法正则 fail-closed；68 断言）' },
+  { id: 'r24-atomic-apply', script: 'tests/r24-atomic-apply.ts', title: 'R24 批量 apply 原子性（回滚快照 / 全有或全无 / 回滚失败如实 partial；13 断言）' },
 ]
 
 /** 需要未受限会话的套件 */

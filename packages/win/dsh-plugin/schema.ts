@@ -62,6 +62,26 @@ const SCHEMASTER_BRAND = Symbol.for('schemastery')
  * @param {'boolean'|'string'} type
  * @param {{default?: unknown, description?: string}} meta
  */
+/**
+ * 一个**可独立水合**的字段文档（`{uid, refs}`）—— `plainSchema()` 对字段节点会
+ * `new z(schema.toJSON())`，而 schemastery 的 `Schema(options)` 只认 `{uid, refs}` 文档。
+ * R24-A2 新增数组字段后，`list` 必须是**元素 uid 的数组**（`options.list.map(getRef)`），
+ * 故这里为数组字段额外发一个 inner ref（否则水合报 `options.list.map is not a function`）。
+ */
+function singleFieldDocument(type, meta) {
+  const baseMeta = { volatile: true, ...meta }
+  if (type === 'array') {
+    return {
+      uid: 1,
+      refs: {
+        1: { type: 'array', meta: baseMeta, inner: 2 },
+        2: { type: meta.items ?? 'string', meta: {} },
+      },
+    }
+  }
+  return { uid: 1, refs: { 1: { type, meta: baseMeta } } }
+}
+
 function field(type, meta) {
   return {
     type,
@@ -71,13 +91,14 @@ function field(type, meta) {
     [SCHEMASTER_BRAND]: true,
     /** (c) 字段级别的序列化，供 `plainSchema` 的 `new z(node.toJSON())` 使用 */
     toJSON() {
-      return { type, meta: { volatile: true, ...meta } }
+      return singleFieldDocument(type, meta)
     },
   }
 }
 
 /** 把字段定义展开成 schemastery 文档节点（用于 `toJSON()`，即 (d)） */
 function nodeOf(spec) {
+  // 数组字段由 `encodeDocument()` 单独构造（`type:'array' + inner:<uid>`），不走这里
   return { type: spec.type, meta: { ...spec.meta } }
 }
 
@@ -87,6 +108,16 @@ function encodeDocument(dict) {
   const uidDict = {}
   let next = 1
   for (const [key, spec] of Object.entries(dict)) {
+    if (spec.type === 'array') {
+      // 数组：元素 schema 挂在 `inner`（uid 引用）；`list` 是 tuple/union 的字段，不能混用
+      const innerUid = next
+      refs[String(innerUid)] = { type: spec.meta.items ?? 'string', meta: {} }
+      next += 1
+      refs[String(next)] = { type: 'array', meta: { ...spec.meta }, inner: innerUid }
+      uidDict[key] = next
+      next += 1
+      continue
+    }
     refs[String(next)] = nodeOf(spec)
     uidDict[key] = next
     next += 1
@@ -104,8 +135,21 @@ function validateObject(dict, input) {
   for (const [key, spec] of Object.entries(dict)) {
     const raw = source[key]
     if (raw === undefined || raw === null) {
-      if ('default' in spec.meta) value[key] = spec.meta.default
+      if ('default' in spec.meta) {
+        // 数组默认值必须**复制**：共享同一个 `[]` 会让调用方的 push 污染 schema 默认值
+        value[key] = Array.isArray(spec.meta.default) ? [...spec.meta.default] : spec.meta.default
+      }
       // 无 default 的可选字段保持缺省，与 schemastery 行为一致
+      continue
+    }
+    if (spec.type === 'array') {
+      // R24-A2：`string[]`（`meta.items` 指定元素类型；目前只支持 string）
+      const itemType = spec.meta.items ?? 'string'
+      if (!Array.isArray(raw) || raw.some((item) => typeof item !== itemType)) {
+        issues.push({ message: `expected array of ${itemType}`, path: [key] })
+        continue
+      }
+      value[key] = [...raw]
       continue
     }
     if (typeof raw !== spec.type) {
@@ -177,6 +221,18 @@ const DICT = {
   verboseLog: field('boolean', {
     default: false,
     description: '把完整探测报告写入日志。',
+  }),
+  /**
+   * R24-A2：自定义遮蔽规则（正则字符串数组，默认 `[]`）。
+   *
+   * 声明在**手写 schema** 里只为与生产 schema（`plugin/config.ts`）保持一致；
+   * `[]` 时行为与"没有该字段"逐字节一致。正则合法性校验在
+   * `dsh-plugin/host-plugin.ts::compileConfiguredMasks()`（fail-closed 单一入口）。
+   */
+  masks: field('array', {
+    default: [],
+    items: 'string',
+    description: '自定义遮蔽规则（正则字符串数组；空 = 不启用）。命中条目的内容按值级掩码写入审阅快照。',
   }),
 }
 

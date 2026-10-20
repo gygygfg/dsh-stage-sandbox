@@ -716,6 +716,18 @@ export class ReviewService {
       // 否则 `Workspace` → `Store` 也会走同一个 `resolveStageRoot()`（`src/store.ts`）。
       ...(options.storeDir ? { storeDir: options.storeDir } : {}),
       ...(options.env ? { env: options.env } : {}),
+      /**
+       * ★ R24-A2：host 行 config.masks → `Workspace.masks`（= `extraMasks`）透传。
+       *
+       * 为什么必须在这里落：`renderChange()` 的**值级掩码**分支只在
+       * `sensitiveMasked = !sensitiveOmitted && verdict.risk === 'sensitive'` 时可达，
+       * 而 `verdict` 的 mask 判据来自 `ws.extraMasks`。此前 `ReviewService` 从不传
+       * `masks` ⇒ 该分支生产恒不可达（R21-SENS-R1）。
+       * 默认 `[]`：不传时 Workspace 的 `extraMasks` 仍是 `[]`，review 输出与 R21 逐字节一致。
+       * 规则对象（`{id, pattern, reason, hard}`）由 `host-plugin.ts::compileConfiguredMasks()`
+       * 在 apply 期把 config 正则字符串**编译并 fail-closed 校验**后传入。
+       */
+      ...(Array.isArray(options.masks) && options.masks.length > 0 ? { masks: options.masks } : {}),
     })
     this.workspace.init({ origin: 'host-plugin' })
     this.markFresh()
@@ -2519,8 +2531,26 @@ export function getReviewService(options = {}) {
     if (storeDir && options.claimShared !== false) adoptLegacyStore(root, storeDir)
     service = new ReviewService({ ...options, workspaceRoot: root, storeDir })
     SERVICES.set(key, service)
-  } else if (options.log && !service.log) {
-    service.log = options.log
+  } else {
+    if (options.log && !service.log) service.log = options.log
+    /**
+     * ★ R24-A2：单例可能**先**由 fs 半边（`staging-fs` 的开态 prewarm / 首次读）创建，
+     * 那时还没有 host 行 config 的 masks ⇒ 这里把后到的显式规则补到既有实例上。
+     * config.masks 是启动期静态量（改它需重启），因此"后到者覆盖"是安全的；
+     * 不传 masks 的调用方不会清空已有规则（`[]`/undefined 视为"不表态"）。
+     */
+    if (Array.isArray(options.masks) && options.masks.length > 0) {
+      try {
+        service.workspace.extraMasks = options.masks
+      } catch (error) {
+        // 补规则失败不能静默：读侧值级档会退回"不可达"，必须可见（不影响服务可用性）
+        try {
+          service.logError?.(`把 config.masks 补到既有审阅服务失败（值级脱敏本会话可能不生效）：${error?.message ?? error}`)
+        } catch {
+          /* best effort */
+        }
+      }
+    }
   }
   // 后到的调用方补 logger（`staging-fs` 传的是 `ctx.logger`）：只补不覆盖
   if (options.logger && !service.logger) service.logger = options.logger

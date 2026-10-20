@@ -49,6 +49,14 @@ export interface Config {
   probeOnStart: boolean
   /** 把完整探测报告写入日志。 */
   verboseLog: boolean
+  /**
+   * 自定义遮蔽规则（正则字符串数组，默认 `[]`，R24-A2）。
+   *
+   * 命中这些规则的暂存条目走 `sensitive-content.ts` 的**值级掩码**
+   * （`<REDACTED len=N>`；结构/键名/长度保留）。`[]` ⇒ 与该字段不存在时**行为完全一致**
+   * （内置危险类仍走 R17 的"整份省略"）。非法正则 ⇒ 装配期 fail-closed（见 host-plugin）。
+   */
+  masks: string[]
 }
 
 /**
@@ -77,10 +85,21 @@ export const Config = z.object({
     .default(false)
     .extra('volatile', true)
     .description('把完整探测报告写入日志。'),
+  /**
+   * R24-A2：自定义遮蔽规则（正则字符串数组，默认 []）。
+   *
+   * 数组字段同样是**叶子**（其元素是标量），因此也标 volatile 以进入设置页投影；
+   * 值为 `[]` 时行为与"没有这个字段"逐字节一致（默认行为不变）。
+   */
+  masks: z
+    .array(z.string())
+    .default([])
+    .extra('volatile', true)
+    .description('自定义遮蔽规则（正则字符串数组；空 = 不启用）。命中条目的内容按值级掩码写入审阅快照。'),
 })
 
 /** 字段名清单（便于测试与文档；顺序与 schema 一致）。 */
-export const FIELD_NAMES = ['enabled', 'workspaceRoot', 'probeOnStart', 'verboseLog'] as const
+export const FIELD_NAMES = ['enabled', 'workspaceRoot', 'probeOnStart', 'verboseLog', 'masks'] as const
 
 /**
  * 读取一个配置字段的**普通值**，兼容两种运行期形态。
@@ -122,4 +141,19 @@ export function boolOf(value: unknown, fallback: boolean): boolean {
 export function stringOf(value: unknown, fallback = ''): string {
   const resolved = readConfigValue(value)
   return typeof resolved === 'string' ? resolved : fallback
+}
+
+/**
+ * 读取字符串数组字段（R24-A2 的 `masks`；非数组/缺省则回退）。
+ *
+ * 为什么**不**在这里逐元素过滤掉非字符串：那会让"配置里混了非字符串"在归一阶段被
+ * **静默丢弃**（用户以为规则生效、实际少了条）—— 与 R24-A2 的 fail-closed 纪律相反。
+ * 这里只做形态归一（Volatile 解引用 + 非数组回退）；元素类型/正则合法性由
+ * `dsh-plugin/host-plugin.ts::compileConfiguredMasks()` **单一入口**校验并在装配期抛错。
+ * 生产路径上真 schemastery 的 `z.array(z.string())` 已经先挡过一层，这里是第二道门。
+ */
+export function stringArrayOf(value: unknown, fallback: string[] = []): string[] {
+  const resolved = readConfigValue(value)
+  if (!Array.isArray(resolved)) return [...fallback]
+  return resolved.slice() as string[]
 }

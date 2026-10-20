@@ -541,6 +541,36 @@ function applyLiteralEdit(text, edit, displayPath) {
 }
 
 /**
+ * 读侧策略的合法取值（R24-A1）。`normalizeReadPolicy()` 是**唯一**归一入口。
+ */
+export const READ_POLICY_VALUES = Object.freeze(['record', 'block'])
+
+/**
+ * `readPolicy` 三态归一（R24-A1；**唯一**的归一/日志入口）。
+ *
+ * 语义（与 `WINSTAGE_STAGE_OUTSIDE` 同风格，**显式通道**）：
+ *   · 未设 / 空串 / 纯空白 ⇒ `record`（产品默认 = 只记不拦，读取面边界不变）；
+ *   · `'record'` / `'block'`（去首尾空白后逐字匹配）⇒ 对应档；
+ *   · **其它任何非空值 ⇒ fail-safe 到 `block`**（`source:'invalid-fail-safe'`）：
+ *     显式配置了却拼错时，**不得静默退回"只记不拦"**（那会把一次配置失误伪造成
+ *     "读侧策略已生效"）。调用方（`staging-fs` 构造函数）对这一档记一条 error 级日志。
+ *
+ * 为什么归一放在 `staging-fs.ts` 而不是 `fs-entry.ts`：`fs-entry.ts` 只做"env → 选项"
+ * 的**白名单形态透传**（非空字符串原样交给本文件），这样生产装配与自测构造**同一条**
+ * 归一判据，不会出现"entry 归一一套、构造函数另一套"的漂移。
+ *
+ * @param {unknown} raw `options.readPolicy`（生产来自 `WINSTAGE_READ_POLICY`）
+ * @returns {{policy:'record'|'block', raw:string|undefined, source:'default'|'explicit'|'invalid-fail-safe'}}
+ */
+export function normalizeReadPolicy(raw) {
+  if (raw === undefined || raw === null) return { policy: 'record', raw: undefined, source: 'default' }
+  const value = typeof raw === 'string' ? raw.trim() : String(raw).trim()
+  if (value.length === 0) return { policy: 'record', raw: undefined, source: 'default' }
+  if (value === 'record' || value === 'block') return { policy: value, raw: value, source: 'explicit' }
+  return { policy: 'block', raw: value, source: 'invalid-fail-safe' }
+}
+
+/**
  * 构造暂存文件系统类。
  *
  * 返回的类就是 loader 行的插件本身（与 `SandboxedFileSystem` 同构）：
@@ -558,9 +588,10 @@ function applyLiteralEdit(text, edit, displayPath) {
  *       `docs/archive/round10/fileio/修复-工具面.md` §1.3 的实测与读码）。
  *     · `'direct'`：显式逃生口，直通真实磁盘。
  *   任何**其它**取值一律 fail-safe 归一为 `'stage'`（不静默变成拒绝，也不静默直写）。
- *   ⚠ 环境变量通路（`fs-entry.ts` 读 `WINSTAGE_STAGE_OUTSIDE`）当前只认 `direct`，
- *     **要经 env 启用 `deny` 必须改 `fs-entry.ts` 一行**；该文件不在本次写范围，
- *     处方见 `docs/archive/round10/fileio/修复-工具面.md` §1.4。
+ *   `readPolicy` 三态**显式通道**（R24-A1，生产来自 `WINSTAGE_READ_POLICY`）：
+ *   未设/空 ⇒ `record`（默认不变）；`record`/`block` ⇒ 对应档；
+ *   **其它非空值 ⇒ fail-safe 到 `block` + error 级日志**（不得静默退回只记不拦）。
+ *   归一判据只有 `normalizeReadPolicy()` 一处（见其上注释）。
  */
 export function createStagingFileSystem(options = {}) {
   const rawStageOutside = options.stageOutside
@@ -712,10 +743,23 @@ export function createStagingFileSystem(options = {}) {
        * 为什么默认只记：`src/paths.ts` 的 29 条 `MASK_CLASSES` 是**黑名单**
        * （换个文件名就绕过），把它当读边界会给出"已经挡住了"的假承诺。
        * owner 决定：默认只记 + 用户侧可见；`'block'` 作为**显式**开关保留，
-       * 但它同样不是边界（它只覆盖本插件的四个读入口）。
-       * 非 `'block'` 的任何取值都归一为 `'record'`（不做隐式第三条路）。
+       * 但它同样不是边界（它只覆盖本插件的六个读入口）。
+       *
+       * R24-A1：生产通道 = `WINSTAGE_READ_POLICY`（`fs-entry.ts` 透传 → 本构造参数）。
+       * 归一**只**走 `normalizeReadPolicy()`：未设 = record（默认不变）；block = block；
+       * **其它非空值 = fail-safe 到 block + 这里一条 error 级日志**（显式配置了却拼错，
+       * 不得静默退回"只记不拦"）。`readPolicyRaw/source` 留作机读诊断。
        */
-      this.readPolicy = options.readPolicy === 'block' ? 'block' : 'record'
+      const readPolicy = normalizeReadPolicy(options.readPolicy)
+      this.readPolicy = readPolicy.policy
+      this.readPolicyRaw = readPolicy.raw
+      this.readPolicySource = readPolicy.source
+      if (readPolicy.source === 'invalid-fail-safe') {
+        this.logError(
+          `读策略配置非法（WINSTAGE_READ_POLICY=${JSON.stringify(readPolicy.raw)}）：fail-safe 到 'block'。` +
+            '显式配置了却拼错时不得静默退回"只记不拦"；合法值：record | block（未设 = record）。',
+        )
+      }
       /**
        * 已就"暂存落点分裂"报过警的逻辑目标（BUG-2）。只报一次：同一个目标每写一次就刷一条
        * error 级日志会把真正的新问题淹掉；但**绝不静默**（第一次一定响）。

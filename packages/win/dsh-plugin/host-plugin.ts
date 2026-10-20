@@ -1503,6 +1503,88 @@ export function switchEnabledFromRows(rows) {
   return row.config.enabled !== false
 }
 
+/**
+ * host 行 config `masks: string[]` → `Workspace.masks`（`extraMasks`）规则对象（R24-A2）。
+ *
+ * ── 语义 ────────────────────────────────────────────────────────────────────
+ *   · 默认/`undefined`/`[]` ⇒ `[]`（**不改变任何行为**：值级档仍不可达，内置危险类仍走
+ *     R17 的"整份省略"）；
+ *   · 每一项是**正则字符串**：既支持 `new RegExp` 源码串（如 `\\\\.npmrc$`），
+ *     也支持字面量写法 `/\\\\.npmrc$/i`；编译为 `{id, pattern, reason, hard:false}`。
+ *     `hard:false` 是刻意的：config mask 属于"调用方责任的窄规则"，走 **sensitive/risk**
+ *     （值级 `<REDACTED len=N>`），不能被抬成 danger 档的"整份省略"；
+ *   · **非法配置 ⇒ fail-closed**：空串/非字符串/非法正则全部收集后**抛错**
+ *     （`code = WINSTAGE_CONFIG_MASKS_INVALID`），并在抛之前先 `logError` 一条。
+ *
+ * ── 取舍：为什么是"apply 抛错使 host 行不装配"而不是"跳过坏条目继续跑" ──────────
+ *   · 静默跳过 = 用户显式配了规则却实际没生效，而面板上"没有掩码"读起来像"没有敏感内容"；
+ *   · 只跳过坏条目、保留好条目 = 半套规则生效，用户无法从界面判断哪几条在跑；
+ *   · 抛错 = 启动期就失败、错误文案里逐条点名哪一项非法（含 index），配置可修。
+ *   与 R19 环境门同一条纪律："显式配置了却不可用时，宁可拒绝启动，也不静默降级"。
+ *
+ * @param {unknown} raw config.masks
+ * @param {{logError?: (msg: string) => void}} [options] 抛错前的 error 级日志通道
+ * @returns {Array<{id:string, pattern:RegExp, reason:string, hard:boolean}>}
+ */
+export function compileConfiguredMasks(raw, options = {}) {
+  const logError = typeof options.logError === 'function' ? options.logError : () => {}
+  if (raw === undefined || raw === null) return []
+  if (!Array.isArray(raw)) {
+    const message = `WinStage 配置 masks 非法（fail-closed，拒绝装配）：应为正则字符串数组，实际是 ${typeof raw}`
+    try {
+      logError(message)
+    } catch {
+      /* best effort */
+    }
+    const error = new Error(message)
+    error.code = 'WINSTAGE_CONFIG_MASKS_INVALID'
+    error.problems = [message]
+    throw error
+  }
+  const rules = []
+  const problems = []
+  raw.forEach((entry, index) => {
+    if (entry instanceof RegExp) {
+      // 自测/程序化调用可直接给 RegExp；生产 config 走字符串分支。
+      rules.push({ id: `config-mask-${index + 1}`, pattern: entry, reason: `host config masks[${index}]`, hard: false })
+      return
+    }
+    if (typeof entry !== 'string' || entry.trim().length === 0) {
+      problems.push(`#${index + 1}: 不是非空正则字符串（实际 ${JSON.stringify(entry)}）`)
+      return
+    }
+    const text = entry.trim()
+    let pattern
+    try {
+      // `/pattern/flags` 字面量写法（允许 flags：i / m / s / u / g）
+      const literal = /^\/([\s\S]*)\/([a-z]*)$/.exec(text)
+      pattern = literal ? new RegExp(literal[1], literal[2]) : new RegExp(text)
+    } catch (error) {
+      problems.push(`#${index + 1}: 非法正则 ${JSON.stringify(text)}（${error?.message ?? error}）`)
+      return
+    }
+    rules.push({
+      id: `config-mask-${index + 1}`,
+      pattern,
+      reason: `host config masks[${index}]（调用方责任的自定义窄规则）`,
+      hard: false,
+    })
+  })
+  if (problems.length > 0) {
+    const message = `WinStage 配置 masks 非法（fail-closed，拒绝装配）：${problems.join('；')}`
+    try {
+      logError(message)
+    } catch {
+      /* best effort */
+    }
+    const error = new Error(message)
+    error.code = 'WINSTAGE_CONFIG_MASKS_INVALID'
+    error.problems = problems
+    throw error
+  }
+  return rules
+}
+
 export function apply(ctx, config = {}) {
   const log = makeLog(ctx)
   /**
@@ -1527,6 +1609,17 @@ export function apply(ctx, config = {}) {
     else log.warn(message)
   }
   const workspaceRoot = config.workspaceRoot || new URL('..', import.meta.url).pathname.replace(/^\//, '')
+
+  /**
+   * ★ R24-A2：把 host 行 config 的 `masks` **编译并 fail-closed 校验**（规则对象 → Workspace）。
+   *
+   * 放在所有注册/探测之前：非法正则必须在**装配期**就炸（`WINSTAGE_CONFIG_MASKS_INVALID`，
+   * 先 logError 一条再 throw），而不是等到第一次 publish 才在某个条目上静默失效。
+   * 默认 `[]` ⇒ 不传 `masks`，`Workspace.extraMasks` 仍是 `[]`，
+   * review 输出与 R21 逐字节一致（内置危险类仍走 R17 的整份省略）。
+   * 编译后的规则经 `serviceFor()` 传给 `getReviewService({ …, masks })`。
+   */
+  const configuredMasks = compileConfiguredMasks(config.masks, { logError })
 
   /**
    * 开关的**唯一读法**：每次现读，绝不在这里冻结成常量。
@@ -1624,6 +1717,8 @@ export function apply(ctx, config = {}) {
       claimShared: isEnabled(),
       log: (message) => log.info(message),
       audit,
+      // R24-A2：编译后的 config.masks（空数组 = 不传，行为与 R21 一致）
+      ...(configuredMasks.length > 0 ? { masks: configuredMasks } : {}),
     })
     // 自愈：共享存储里可能积着"上一段拿不到会话身份"的条目（旧进程/agentless 调用）
     //
