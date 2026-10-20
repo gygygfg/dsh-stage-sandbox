@@ -39,7 +39,7 @@ typedef struct DSH_REG_STAGE_RECORD {
     UINT32 nameChars;  /* 16  UTF-16 code units, excluding NUL */
     UINT32 dataBytes;  /* 20 */
     UINT32 status;     /* 24  LSTATUS (HARD_DENY only; UNSTAGED keeps 0 = "we did not deny you") */
-    UINT32 reserved;   /* 28  must be 0 */
+    UINT32 reserved;   /* 28  view: 0 = default/64, 1 = WOW64-32 (R26) */
 } DSH_REG_STAGE_RECORD;
 
 typedef struct DSH_REG_STAGE_STATE {
@@ -938,7 +938,7 @@ static LSTATUS t3_journal_append_inner(const void *recordRaw, const wchar_t *pat
         return g_t3.lastStatus;
     }
     if (record->magic != DSH_WAL_MAGIC || record->version != DSH_WAL_VERSION ||
-        record->reserved != 0 || record->kind < 1 || record->kind > DSH_KIND_UNSTAGED) {
+        record->reserved > 1 || record->kind < 1 || record->kind > DSH_KIND_UNSTAGED) {
         g_t3.lastStatus = ERROR_INVALID_PARAMETER;
         return g_t3.lastStatus;
     }
@@ -1067,6 +1067,25 @@ LSTATUS __cdecl DshRegStageAttachState(void *outRaw)
 
 /* -------------------------------------------------- record-building helpers */
 
+/* R26 / R13: the synthetic 32-bit-view segment right after the short hive name.
+ * The overlay path itself already carries it; the record's `reserved` field is the
+ * cross-language view marker (0 = default/64, 1 = WOW64-32) the host/apply side
+ * needs to pass `/reg:32` to reg.exe. */
+static UINT32 t3_view_of_path(const wchar_t *canonical)
+{
+    static const wchar_t kPrefix[] = L"__DSH_WOW64_32__";
+    const size_t kLen = sizeof(kPrefix) / sizeof(wchar_t) - 1;
+    if (!canonical) {
+        return 0;
+    }
+    const wchar_t *bs = wcschr(canonical, L'\\');
+    if (!bs || !bs[1] || _wcsnicmp(bs + 1, kPrefix, kLen) != 0) {
+        return 0;
+    }
+    wchar_t after = bs[1 + kLen];
+    return (after == 0 || after == L'\\') ? 1u : 0u;
+}
+
 static LSTATUS t3_append(UINT16 kind, UINT16 type, UINT16 flags, const wchar_t *canonical,
                          const wchar_t *valueName, const void *data, UINT32 dataBytes, UINT32 status)
 {
@@ -1081,7 +1100,7 @@ static LSTATUS t3_append(UINT16 kind, UINT16 type, UINT16 flags, const wchar_t *
     rec.nameChars = valueName ? (UINT32)wcslen(valueName) : 0;
     rec.dataBytes = dataBytes;
     rec.status = status;
-    rec.reserved = 0;
+    rec.reserved = t3_view_of_path(canonical);
     return DshRegStageJournalAppend(&rec, canonical, valueName, data, NULL);
 }
 

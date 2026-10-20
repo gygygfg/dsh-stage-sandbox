@@ -1207,7 +1207,10 @@ export class ReviewService {
           verdict = { external: true, risk: 'outside', safety: 'normal', riskReason: 'registry change' }
         }
         const row = {
-          path: change.path,
+          /* ★ R26（R13）：32 位视图的暂存路径是内部合成路径（`HKCU\__DSH_WOW64_32__\...`）；
+           * 审阅面必须显示 `displayPath`（`[32] HKCU\...`），**绝不能**把 32 视图显示成 64 路径
+           * 而误导审批。内部 path 仍保留在 `registryPath` 之外供 apply 使用。 */
+          path: change.displayPath ?? change.path,
           op: change.op,
           kind: 'registry',
           registry: true,
@@ -1220,6 +1223,7 @@ export class ReviewService {
           riskReason: verdict.riskReason,
           candidateIds: [candidate.id],
           registryPath: change.registryPath ?? change.key,
+          ...(change.registryView !== undefined ? { registryView: change.registryView } : {}),
           note:
             '注册表变更：此刻只存在于覆盖层里（**真实注册表一个字节未变**）；' +
             '勾选并批准后才由宿主令牌写入真实 hive，拒绝则丢弃。',

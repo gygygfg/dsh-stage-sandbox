@@ -106,23 +106,23 @@ function createFakeRegistry(seed = []) {
     },
     writer: {
       createKey(registryPath, options = {}) {
-        log.writes.push(['create-key', registryPath, options?.dwOptions ?? 0])
+        log.writes.push(['create-key', registryPath, options?.dwOptions ?? 0, options?.view ?? 0])
         ensure(registryPath)
         return { status: REG_STATUS.ERROR_SUCCESS }
       },
-      setValue(registryPath, name, type, dataHex) {
-        log.writes.push(['set-value', registryPath, name, type, dataHex])
+      setValue(registryPath, name, type, dataHex, options = {}) {
+        log.writes.push(['set-value', registryPath, name, type, dataHex, options?.view ?? 0])
         ensure(registryPath).values.set(String(name).toLowerCase(), { name, type, data: decodeRegistryValue(type, dataHex, name) })
         return { status: REG_STATUS.ERROR_SUCCESS }
       },
-      deleteValue(registryPath, name) {
-        log.writes.push(['delete-value', registryPath, name])
+      deleteValue(registryPath, name, options = {}) {
+        log.writes.push(['delete-value', registryPath, name, options?.view ?? 0])
         const record = keys.get(registryPath.toLowerCase())
         if (record) record.values.delete(String(name).toLowerCase())
         return { status: REG_STATUS.ERROR_SUCCESS }
       },
       deleteKey(registryPath, options = {}) {
-        log.writes.push(['delete-key', registryPath, options?.recursive === true])
+        log.writes.push(['delete-key', registryPath, options?.recursive === true, options?.view ?? 0])
         deleteTree(registryPath)
         return { status: REG_STATUS.ERROR_SUCCESS }
       },
@@ -289,16 +289,44 @@ try {
     check('S5.3 apply 向 writer.createKey 传 dwOptions=REG_OPTION_VOLATILE', apply.failed.length === 0 && write !== undefined && write[2] === REG_OPTIONS.REG_OPTION_VOLATILE, JSON.stringify(real.log.writes))
   }
 
-  // ═══════════════════════ S6 32 位视图 ═══════════════════════
-  section('S6 32 位视图：写类 fail-closed（不许静默写另一个 hive 视图）')
+  // ═══════════════════════ S6 32 位视图（R26 起改为暂存化） ═══════════════════════
+  section('S6 32 位视图：写/删进暂存（合成前缀+WAL view），apply 只落 32 视图')
   {
     const real = seedRegistry()
     const stage = newStage(real, 's6')
-    const setErr = checkThrows('S6.1 stageSetValue + KEY_WOW64_32KEY fail-closed', () => stage.stageSetValue(KEY, 'V32', 'REG_SZ', 'x', { samDesired: KEY_WOW64.KEY_WOW64_32KEY }), 'REG_STAGE_HARD_DENY')
-    check('S6.2 status=5（不是"键不存在"之类的误导）', setErr?.status === REG_STATUS.ERROR_ACCESS_DENIED, `status=${setErr?.status}`)
-    checkThrows('S6.3 stageDeleteKey + KEY_WOW64_32KEY fail-closed', () => stage.stageDeleteKey(`${KEY}\\WithValues`, { samDesired: KEY_WOW64.KEY_WOW64_32KEY }), 'REG_STAGE_HARD_DENY')
-    checkThrows('S6.4 stageCreateKey + KEY_WOW64_32KEY fail-closed', () => stage.stageCreateKey(`${KEY}\\WowNew`, { samDesired: KEY_WOW64.KEY_WOW64_32KEY }), 'REG_STAGE_HARD_DENY')
-    check('S6.5 32 位视图被拒后真实 hive 零写入、零候选', real.log.writes.length === 0 && stage.freezeCandidate().enqueued === false, `writes=${real.log.writes.length}`)
+    const setRes = stage.stageSetValue(KEY, 'V32', 'REG_SZ', 'x', { samDesired: KEY_WOW64.KEY_WOW64_32KEY })
+    check(
+      'S6.1 stageSetValue + KEY_WOW64_32KEY 进暂存（合成前缀，不再硬拒）',
+      setRes?.net === true && String(setRes?.path).startsWith('HKCU\\__DSH_WOW64_32__\\'),
+      setRes ? setRes.path : 'no result',
+    )
+    check('S6.2 WAL 记录 reserved=1（视图字段）', setRes?.record?.reserved === 1, JSON.stringify(setRes?.record))
+    check('S6.3 64 视图看不到 32 视图的暂存值（命名空间隔离）', stage.readValue(KEY, 'V32').status !== 0, JSON.stringify(stage.readValue(KEY, 'V32')))
+    const delRes = stage.stageDeleteKey(`${KEY}\\WithValues`, { samDesired: KEY_WOW64.KEY_WOW64_32KEY })
+    check('S6.4 stageDeleteKey + KEY_WOW64_32KEY 进暂存（仅 32 视图）', delRes?.net === true, delRes ? delRes.path : 'no result')
+    const createRes = stage.stageCreateKey(`${KEY}\\WowNew`, { samDesired: KEY_WOW64.KEY_WOW64_32KEY })
+    check('S6.5 stageCreateKey + KEY_WOW64_32KEY 进暂存（仅 32 视图）', createRes?.net === true, createRes ? createRes.path : 'no result')
+    check('S6.6 apply 前真实 hive 零写入', real.log.writes.length === 0, `writes=${real.log.writes.length}`)
+    const frozen = stage.freezeCandidate()
+    const viewChanges = (frozen.candidate?.changes ?? []).filter((change) => String(change.path).includes('__DSH_WOW64_32__'))
+    const wantedViewPaths = [`${KEY}\\WowNew`, `${KEY}\\WithValues`, `${KEY}\\V32`]
+    check(
+      'S6.7 候选能区分视图：3 个目标单元 displayPath 带 [32] 且 registryView=WOW64_32',
+      wantedViewPaths.every((wanted) =>
+        viewChanges.some(
+          (change) => change.registryView === 'WOW64_32' && String(change.displayPath) === `[32] ${wanted}`,
+        ),
+      ) && viewChanges.every((change) => change.registryView === 'WOW64_32' && String(change.displayPath).startsWith('[32] ')),
+      JSON.stringify(viewChanges.map((change) => [change.displayPath, change.registryView])),
+    )
+    const apply = stage.apply()
+    const writes = real.log.writes
+    check('S6.8 apply 成功（applied>0, failed=0）', apply.failed.length === 0 && apply.applied.length > 0, JSON.stringify(apply.failed))
+    check(
+      'S6.9 apply 的 writer 调用带 view=1 且路径是**真实路径**（无合成段）',
+      writes.length > 0 && writes.every((entry) => !String(entry[1]).includes('__DSH_WOW64_32__') && entry[entry.length - 1] === 1),
+      JSON.stringify(writes),
+    )
   }
 
   // ═══════════════════════ S7 重名值 / 类型冲突（R21 修复） ═══════════════════════

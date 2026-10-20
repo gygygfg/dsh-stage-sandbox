@@ -229,6 +229,8 @@ export const OFFLINE_SUITES = [
   // R25 逐项修复（第四批）：T1 真归因（T1S 可选档）；plugin remove 残留清理工具。
   { id: 'r25-t1s', script: 'tests/r25-t1s.ts', title: 'R25 T1S 可选档（受限令牌 + shim：opt-in 解析/装配失败 fail-closed/默认 T1 不变/静态守卫；48 断言）' },
   { id: 'r25-remove-cleanup', script: 'tests/r25-remove-cleanup.ts', title: 'R25 plugin remove 残留清理工具（dry-run/apply/幂等/护栏/越界拒绝；65 断言）' },
+  // R26 逐项修复（第五批）：R13 32 位注册表视图暂存化（/reg:32 写/删进 overlay、apply 落 32 视图）。
+  { id: 'r26-wow64-registry', script: 'tests/r26-wow64-registry.ts', title: 'R26 32 位注册表视图暂存（合成路径 + WAL view + apply /reg:32；41 断言）' },
 ]
 
 /** 需要未受限会话的套件 */
@@ -237,7 +239,7 @@ export const SANDBOX_SUITES = [
   // T6 接线：门禁收敛（去令牌化 TS）新增/重写的两个真产物闸门此前只被单独跑过。
   // 它们都要注入子进程（后者还要写真实 hive），因此归"需要未受限会话"一类，不进 verify.cmd。
   { id: 'file-cow-dispositions', script: 'tests/file-cow-dispositions.ts', title: '文件层 CoW/创建处置矩阵 + 沙箱内可观测性（逐字节）' },
-  { id: 'registry-unstaged-wow64', script: 'tests/registry-unstaged-wow64.ts', title: '注册表 WOW64（64KEY no-op / 32KEY UNSTAGED 透传）与 apply 忽略 UNSTAGED' },
+  { id: 'registry-unstaged-wow64', script: 'tests/registry-unstaged-wow64.ts', title: '注册表 WOW64（64KEY no-op / R26 起 32KEY 写进暂存、apply 落 32 视图；读透传）' },
   // 缺陷① 修复轮追加（finisher 收口）：TS 档四种删除写法（cmd del/erase、
   //   PowerShell Remove-Item、node fs.unlinkSync）必须"真实文件存活 + 白障已记"，
   //   同时钉住孙子进程自注入、move/ren 暂存与两条负面对照。

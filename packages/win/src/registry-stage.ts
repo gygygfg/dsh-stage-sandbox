@@ -158,7 +158,7 @@ export const REG_STAGE_JOURNAL_MAGIC = 0x47525344
  *     UINT32 nameChars;   // 16  UTF-16 码元数（不含 NUL）
  *     UINT32 dataBytes;   // 20  原始字节数
  *     UINT32 status;      // 24  LSTATUS（HARD_DENY 时=返回给调用方的值）
- *     UINT32 reserved;    // 28  必须为 0
+ *     UINT32 reserved;    // 28  视图：0 = 默认/64，1 = WOW64-32（R26；旧记录恒 0）
  * } DSH_REG_STAGE_RECORD; // 总大小 32
  * #pragma pack(pop)
  * ```
@@ -206,6 +206,69 @@ export const KEY_WOW64 = Object.freeze({
   KEY_WOW64_64KEY: 0x0100,
   KEY_WOW64_32KEY: 0x0200,
 })
+
+/**
+ * ── R26 / R13：32 位视图的暂存表示 ────────────────────────────────────────────
+ *
+ * overlay app hive 没有"hive 视图"概念。32 位视图的暂存状态用**合成的路径段**
+ * （紧跟短 hive 名）命名空间化：
+ *
+ *     HKCU\Software\X + KEY_WOW64_32KEY  ⇒  HKCU\__DSH_WOW64_32__\Software\X
+ *
+ * · 覆盖层（app hive）/ WAL / 墓碑都按 canonical 路径字符串工作，所以合成段天然
+ *   把 32 位视图的状态隔离在覆盖层里（真实 hive 的 32 视图由 apply 时 `/reg:32` 落地）；
+ * · journal 记录的 `reserved` 字段携带视图（0 = 默认/64，1 = WOW64-32），供宿主/apply
+ *   侧决定 `reg add|delete /reg:32`；TS/C 两侧必须同读同写；
+ * · 合成段本身在 **64 位视图**下被保留：64 视图操作若真的以它为首段 ⇒ fail-closed
+ *   （原因码 5），所以真实键不可能与合成命名空间冲突；
+ * · 句柄继承视图：`RegOpenKeyExW(KEY_WOW64_32KEY)` 返回的真实句柄在 shim 里登记了视图，
+ *   后续 `RegSetValueExW` 落在同一合成路径下。
+ */
+export const WOW64_32_VIEW_SEGMENT = '__DSH_WOW64_32__'
+
+/** WAL `reserved` 字段的视图取值（0 = 默认/64，1 = WOW64-32）。 */
+export const REG_STAGE_VIEW = Object.freeze({
+  DEFAULT: 0,
+  WOW64_32: 1,
+})
+
+/** 这条 canonical 路径是否已带 32 位视图的合成段？ */
+export function isRegistryViewPath(registryPath) {
+  if (typeof registryPath !== 'string' || registryPath.length === 0) return false
+  const index = registryPath.indexOf('\\')
+  if (index < 0) return false
+  const rest = registryPath.slice(index + 1)
+  const segment = WOW64_32_VIEW_SEGMENT
+  if (!rest.startsWith(segment)) return false
+  const after = rest.slice(segment.length)
+  return after.length === 0 || after.startsWith('\\')
+}
+
+/** `HIVE\rest` → `HIVE\__DSH_WOW64_32__[\rest]`（幂等）。 */
+export function registryViewPath(registryPath, view = REG_STAGE_VIEW.WOW64_32) {
+  const canonical = parseRegistryPath(registryPath).canonical
+  if (view !== REG_STAGE_VIEW.WOW64_32 || isRegistryViewPath(canonical)) return canonical
+  const index = canonical.indexOf('\\')
+  if (index < 0) return canonical
+  return `${canonical.slice(0, index)}\\${WOW64_32_VIEW_SEGMENT}${canonical.slice(index)}`
+}
+
+/**
+ * 解码一条（可能带视图的）canonical 路径：
+ *   `{ path, view, displayPath }`
+ * `path` = 去掉合成段后的真实路径（apply/真实 API 用）；`displayPath` = 审阅面文案
+ * （`[32] HKCU\...`），**绝不能**把 32 视图显示成 64 路径。
+ */
+export function decodeRegistryViewPath(registryPath) {
+  const canonical = typeof registryPath === 'string' ? registryPath : ''
+  if (!isRegistryViewPath(canonical)) {
+    return { path: canonical, view: REG_STAGE_VIEW.DEFAULT, displayPath: canonical }
+  }
+  const index = canonical.indexOf('\\')
+  const rest = canonical.slice(index + 1)
+  const stripped = rest.length === WOW64_32_VIEW_SEGMENT.length ? canonical.slice(0, index) : `${canonical.slice(0, index)}\\${rest.slice(WOW64_32_VIEW_SEGMENT.length + 1)}`
+  return { path: stripped, view: REG_STAGE_VIEW.WOW64_32, displayPath: `[32] ${stripped}` }
+}
 
 /** 可暂存的 hive（其余走硬拒） */
 export const REG_HIVES_STAGEABLE = Object.freeze(['HKCR', 'HKCU', 'HKLM', 'HKU', 'HKCC'])
@@ -405,28 +468,24 @@ export const REG_STAGE_HARD_DENY_OPTIONS = Object.freeze([
 ])
 
 /**
- * `samDesired` 里**仍然是硬拒**的位（契约 v1.5 / R18 KNOWN-01）。
+ * `samDesired` 里**仍然是硬拒**的位（契约 v1.5 / R18 KNOWN-01；R26 更新）。
  *
- * 语义变更（R17 → R18）：WOW64 视图位原本是"不可暂存 ⇒ 透传 + `UNSTAGED`"。
- * 实测证明**写类**调用透传会改真实 hive（`reg delete /reg:32` 真删真实键；
- * `RegCreateKeyExW /reg:32` 留下真实空壳键），而审批面既看不见也救不回 ⇒ 对
- * **写/删类** API 改为 **fail-closed 硬拒**：`ERROR_ACCESS_DENIED` + `HARD_DENY`
- * 记录（`type` = `REG_STAGE_HARD_DENY_REASON` 码），真实 hive 一个字节不动。
- *
- * **读类**（`RegOpenKeyExW`/`RegQueryValueExW`/`RegEnumKeyExW`/`RegEnumValueW`）不受影响：
- * 读没有副作用，仍走 `UNSTAGED` 透传（`READ_ONLY_APIS`）——否则 32 位消费者（部分
- * COM/安装器/`reg query /reg:32`）会被无谓打断，而它们并不改任何东西。
+ * 语义变更（R26 / R13）：x64 进程里的 `KEY_WOW64_32KEY` **不再硬拒** —— 32 位视图的
+ * 写/删现在进覆盖层（合成前缀 `HKCU\__DSH_WOW64_32__\...` + WAL `reserved=1`），apply 时
+ * 带 `/reg:32` 落到真实 32 视图（真实 hive 在 apply 前零写）。仍硬拒的只剩：
+ *   · **WOW64 进程**里的视图位：x64 shim 不会被注入 WOW64 进程；这里的 fail-closed 是纵深防御
+ *     （该进程里任何视图都无法用本覆盖层表示）；
+ *   · 读类 + 视图位：读没有副作用，仍 `UNSTAGED` 透传（`READ_ONLY_APIS`），staging 不投影读。
  */
 export const REG_STAGE_HARD_DENY_SAM = Object.freeze([
   {
     flag: KEY_WOW64.KEY_WOW64_32KEY,
     name: 'KEY_WOW64_32KEY',
-    appliesTo: 'any',
+    appliesTo: 'wow64-process',
     hardDenyReason: 'WOW64_32KEY_WRITE_NOT_STAGEABLE',
     reason:
-      'KEY_WOW64_32KEY 指向**另一个 hive 位置**（32 位视图），覆盖层没有视图概念；' +
-      '写/删类调用若透传就会在 apply 之前改动真实 hive（实测：真删键 / 留空壳键）⇒ ' +
-      'fail-closed 硬拒（读类仍透传）',
+      'WOW64 进程里的 KEY_WOW64_32KEY 指向另一个 hive 位置，本覆盖层无法表示（x64 shim 正常不会 ' +
+      '被注入 WOW64 进程；此判定是纵深防御）⇒ 写/删类 fail-closed（x64 进程里 32 位视图已可暂存）',
   },
   {
     flag: KEY_WOW64.KEY_WOW64_64KEY,
@@ -840,6 +899,13 @@ export function classifyRegistryOperation(operation = {}) {
   }
   const wow64Process = operation.wow64Process === true
   const readOnlyApi = READ_ONLY_REGISTRY_APIS.includes(api)
+  /* R26：x64 进程里的 KEY_WOW64_32KEY 是可暂存的 32 位视图（合成前缀 + WAL view 字段）。
+   * WOW64 进程仍由下面的 REG_STAGE_HARD_DENY_SAM 判定 fail-closed。 */
+  // R26：视图可由 `samDesired & KEY_WOW64_32KEY` 或**合成路径段**（覆盖层内部表示）给出。
+  const view =
+    isRegistryViewPath(operation.path) || (!wow64Process && (samDesired & KEY_WOW64.KEY_WOW64_32KEY) !== 0)
+      ? REG_STAGE_VIEW.WOW64_32
+      : REG_STAGE_VIEW.DEFAULT
   for (const sam of REG_STAGE_HARD_DENY_SAM) {
     if ((samDesired & sam.flag) === 0) continue
     if (sam.appliesTo === 'wow64-process' && !wow64Process) continue // 64 位进程里它是 no-op
@@ -857,6 +923,15 @@ export function classifyRegistryOperation(operation = {}) {
       samDesired,
       hardDenyReason: sam.hardDenyReason,
     })
+  }
+  if (readOnlyApi && view === REG_STAGE_VIEW.WOW64_32) {
+    /* R26：读 + 32 位视图 ⇒ 读仍透传（staging 是"写后审"，读不投影 overlay）。 */
+    return unstaged(
+      'REG_STAGE_SAM_UNSTAGED',
+      `${api}: 读类 + 32 位视图 ⇒ 读仍透传真实 API（staging 不投影读；写/删才进覆盖层）`,
+      'WOW64_32KEY',
+      { flag: 'KEY_WOW64_32KEY', samDesired, view },
+    )
   }
   for (const sam of REG_STAGE_UNSTAGED_SAM) {
     if ((samDesired & sam.flag) === 0) continue
@@ -884,6 +959,7 @@ export function classifyRegistryOperation(operation = {}) {
     return deny('REG_STAGE_HIVE_HARD_DENY', `${api}: ${parsed.hive} 不在可暂存 hive 列表内`, { hive: parsed.hive })
   }
 
+
   let typeName
   if (operation.type !== undefined && operation.type !== null) {
     try {
@@ -909,11 +985,14 @@ export function classifyRegistryOperation(operation = {}) {
     hive: parsed.hive,
     subKey: parsed.subKey,
     canonical: parsed.canonical,
+    /** R26：0 = 默认/64 视图，1 = WOW64-32（写/删会以合成前缀暂存）。 */
+    view,
     type: typeName,
     flags: {
       volatile: (dwOptions & REG_OPTIONS.REG_OPTION_VOLATILE) !== 0,
       /** 裸 hive 根（`HKCU` 自身）：永远存在 ⇒ create-key 是净变化为零的"打开已有键" */
       bareRoot: parsed.subKey.length === 0,
+      view32: view === REG_STAGE_VIEW.WOW64_32,
     },
   }
 }
@@ -1767,6 +1846,10 @@ export function overlayChangesToCandidateChanges(diffResult) {
       throw stageError('REG_STAGE_DIFF_KIND_UNKNOWN', `unknown diff kind ${JSON.stringify(change.kind)}`)
     }
     const unitPath = change.valueName !== undefined ? registryValueUnitPath(change.key, change.valueName) : change.key
+    // R26：审阅面必须能区分 32 位视图。内部 `path` 保留合成段（apply/审批匹配需要），
+    // 展示字段（`displayPath`/`registryPath`）解码视图；绝不能把 32 视图写成 64 路径。
+    const decodedKey = decodeRegistryViewPath(change.key)
+    const decodedUnit = decodeRegistryViewPath(unitPath)
     const dedupeKey = `${op}|${fold(unitPath)}`
     if (seen.has(dedupeKey)) continue
     seen.add(dedupeKey)
@@ -1776,8 +1859,10 @@ export function overlayChangesToCandidateChanges(diffResult) {
       registry: true,
       external: true,
       path: unitPath,
-      registryPath: change.key,
-      hive: parseRegistryPath(change.key).hive,
+      registryPath: decodedKey.view === REG_STAGE_VIEW.WOW64_32 ? `[32] ${decodedKey.path}` : decodedKey.path,
+      displayPath: decodedUnit.displayPath,
+      registryView: decodedKey.view === REG_STAGE_VIEW.WOW64_32 ? 'WOW64_32' : 'DEFAULT',
+      hive: parseRegistryPath(decodedKey.path).hive,
       op,
       diffKind: change.kind,
       before: change.before ?? null,
@@ -1835,8 +1920,15 @@ export function journalRecordForOperation(operation = {}) {
   const op = operation.op
   const kind = KIND_BY_OP[op]
   if (kind === undefined) throw stageError('REG_STAGE_OP_UNKNOWN', `journalRecordForOperation: unknown op ${JSON.stringify(op)}`)
-  const canonical = parseRegistryPath(operation.path).canonical
-  const record = { kind, path: canonical, flags: 0, type: 0, valueName: null, data: null, status: 0 }
+  const parsedCanonical = parseRegistryPath(operation.path).canonical
+  // R26：视图既可由 `operation.view` 显式给出，也可从合成路径段推导；两者一致化后
+  // 记录里始终带**合成路径** + `reserved=view`（供 apply 侧 `/reg:32` 与审阅展示解码）。
+  const view =
+    operation.view === REG_STAGE_VIEW.WOW64_32 || isRegistryViewPath(parsedCanonical)
+      ? REG_STAGE_VIEW.WOW64_32
+      : REG_STAGE_VIEW.DEFAULT
+  const canonical = view === REG_STAGE_VIEW.WOW64_32 ? registryViewPath(parsedCanonical, view) : parsedCanonical
+  const record = { kind, path: canonical, flags: 0, type: 0, valueName: null, data: null, status: 0, reserved: view, view }
   if (op === 'set-value') {
     record.type = REG_TYPES[registryTypeName(operation.type)]
     record.valueName = typeof operation.valueName === 'string' ? operation.valueName : ''
@@ -1990,7 +2082,15 @@ export function registryDataHex(type, wireBuffer) {
  */
 export function encodeJournalRecord(record) {
   assertJournalRecord(record)
-  const pathBuffer = Buffer.from(record.path, 'utf16le')
+  // R26 / R13: the view travels in the `reserved` field (0 = default/64, 1 = WOW64-32).
+  // A view=1 record always names the synthetic overlay path, so the two representations
+  // (path marker + reserved) can never disagree once written.
+  const view = record.view ?? record.reserved ?? (isRegistryViewPath(record.path) ? REG_STAGE_VIEW.WOW64_32 : REG_STAGE_VIEW.DEFAULT)
+  if (view !== REG_STAGE_VIEW.DEFAULT && view !== REG_STAGE_VIEW.WOW64_32) {
+    throw stageError('REG_STAGE_JOURNAL_INVALID', `journal record view must be 0 or 1, got ${String(view)}`)
+  }
+  const encodedPath = view === REG_STAGE_VIEW.WOW64_32 ? registryViewPath(record.path, view) : record.path
+  const pathBuffer = Buffer.from(encodedPath, 'utf16le')
   const nameBuffer = Buffer.from(record.valueName ?? '', 'utf16le')
   const dataHex = record.data ?? ''
   // 只有 SET_VALUE 携带数据；其余记录的数据字段长度恒为 0（结构里逐字节写明，不进歧义）。
@@ -2036,7 +2136,7 @@ export function encodeJournalRecord(record) {
   buffer.writeUInt32LE(nameBuffer.length / 2, O.nameChars)
   buffer.writeUInt32LE(dataBuffer.length, O.dataBytes)
   buffer.writeUInt32LE((record.status ?? 0) >>> 0, O.status)
-  buffer.writeUInt32LE(0, O.reserved)
+  buffer.writeUInt32LE(view >>> 0, O.reserved)
   let offset = REG_STAGE_RECORD_SIZE
   pathBuffer.copy(buffer, offset)
   offset += pathBuffer.length
@@ -2115,6 +2215,8 @@ export function decodeJournalRecords(buffer) {
       nameChars,
       dataBytes,
       reserved,
+      // R26：`reserved` 的语义现在是**视图字段**；`view` 是给宿主/apply 侧的可读别名。
+      view: reserved === REG_STAGE_VIEW.WOW64_32 ? REG_STAGE_VIEW.WOW64_32 : REG_STAGE_VIEW.DEFAULT,
       valueName: (flags & REG_STAGE_FLAGS.HAS_VALUE_NAME) !== 0 ? rawName : null,
       // `wireBytes` 是线格式原样字节（DLL 视角）；`data` 是快照口径的十六进制文本（宿主视角）。
       // 两者必须由同一对函数互转，否则"沙箱里写的"与"候选里记的"会分叉。
@@ -2290,7 +2392,13 @@ export function createRegistryStage(options = {}) {
       throw stageError('REG_READER_MISSING', 'registry-stage has no reader (see baselineFor)')
     }
     const canonical = parseRegistryPath(path).canonical
-    const raw = reader.read(canonical)
+    // R26：32 视图的基线必须从**真实 32 视图**读（去掉合成段）；候选的 path 仍保留
+    // 合成段（视图身份），但 reader 拿到的是真实路径 + view 选项。
+    const decodedView = decodeRegistryViewPath(canonical)
+    const raw = reader.read(decodedView.path, {
+      view: decodedView.view,
+      samDesired: decodedView.view === REG_STAGE_VIEW.WOW64_32 ? KEY_WOW64.KEY_WOW64_32KEY : 0,
+    })
     if (raw === undefined || raw === null) {
       throw stageError(
         'REG_READ_EMPTY',
@@ -2300,6 +2408,7 @@ export function createRegistryStage(options = {}) {
     }
     // WP12：`normalizeSnapshot` 会把"读取器没报"折成"确定为空/确定不存在"（见 `withBaselineKnowledge`），
     // 这里在归一化**之后**把"哪些维度其实没被报过"补记回快照，供 diffOverlay/overlayView 保守判定。
+    // R26：`root` 保留带视图前缀的 canonical（候选的路径身份），reader 只负责真实 32/64 视图数据。
     return withBaselineKnowledge(normalizeSnapshot({ root: canonical, ...raw }), raw, canonical)
   }
 
@@ -2374,15 +2483,20 @@ export function createRegistryStage(options = {}) {
   }
 
   function persistOperation(operation) {
-    const canonical = parseRegistryPath(operation.path).canonical
+    const canonicalReal = parseRegistryPath(operation.path).canonical
     const policy = classifyRegistryOperation({
       api: API_BY_OP[operation.op],
-      path: canonical,
+      path: canonicalReal,
       type: operation.type,
       dwOptions: operation.dwOptions,
       samDesired: operation.samDesired,
       wow64Process: operation.wow64Process,
     })
+    /* R26：32 位视图在覆盖层里用合成前缀命名空间化；后续 net-filter / WAL / 候选
+     * 全部以**带前缀的 path** 为准（这样 32/64 视图的状态不会互相覆盖）。 */
+    const view = policy.view ?? REG_STAGE_VIEW.DEFAULT
+    const canonical = view === REG_STAGE_VIEW.WOW64_32 ? registryViewPath(canonicalReal, view) : canonicalReal
+    const operationWithView = { ...operation, path: canonical, view }
     if (policy.unstaged === true) {
       // ── 不可暂存 ⇒ 透传（契约 v1.4）──────────────────────────────────────────────
       // 覆盖层复现不了这次调用（例如 KEY_WOW64_32KEY 的 32 位视图）。**不抛错、不写覆盖层**：
@@ -2420,7 +2534,7 @@ export function createRegistryStage(options = {}) {
     // 否则覆盖层会出现空壳，而"只列覆盖层"的枚举会把真实子键全部遮掉
     // （.NET 证书存储 ⇒ PowerShell 起不来）。同值写入同理（与文件侧"内容相同不入候选"一致）。
     // 这一层是**宿主侧参考实现**：DLL 必须按同一规则决定"要不要 Append"。
-    const net = filterOverlayNetOperations({ state, baselineFor, operation })
+    const net = filterOverlayNetOperations({ state, baselineFor, operation: operationWithView })
     if (net.effect === 'unknown') {
       // 基线读不到 ⇒ 连"这是打开还是创建"都判不了。此时**失败**比静默不暂存诚实。
       throw stageError(
@@ -2443,10 +2557,10 @@ export function createRegistryStage(options = {}) {
       }
     }
 
-    const record = journalRecordForOperation({ ...operation, path: canonical })
+    const record = journalRecordForOperation({ ...operationWithView })
     // 只把**净变化**的那几条记录进 WAL（容器链里"真实已存在"的层级是 no-op，必须丢掉）
     const kept = net.state.ops.slice(state.ops.length)
-    const bytes = kept.reduce((sum, entry) => sum + appendRecord(recordForOpEntry(entry, operation)), 0)
+    const bytes = kept.reduce((sum, entry) => sum + appendRecord(recordForOpEntry(entry, operationWithView)), 0)
     state = net.state
     return {
       status: REG_STATUS.ERROR_SUCCESS,
@@ -2493,6 +2607,15 @@ export function createRegistryStage(options = {}) {
     return policy.stageable === false || policy.unstaged === true
   }
 
+  /** R26：把一次 facade 调用的路径编码成覆盖层表示（32 视图加合成前缀）。 */
+  function viewCanonicalFor(path, opts = {}) {
+    const canonical = parseRegistryPath(path).canonical
+    const wantsView =
+      isRegistryViewPath(canonical) ||
+      (opts.wow64Process !== true && ((opts.samDesired ?? 0) & KEY_WOW64.KEY_WOW64_32KEY) !== 0)
+    return wantsView ? registryViewPath(canonical, REG_STAGE_VIEW.WOW64_32) : canonical
+  }
+
   /** 暂存"创建/打开键"（对齐 `RegCreateKeyExW`：中间键一并创建） */
   function stageCreateKey(path, opts = {}) {
     requireOpen()
@@ -2508,7 +2631,7 @@ export function createRegistryStage(options = {}) {
   /** 暂存"删除键"（对齐 `RegDeleteKeyExW`：**有子键就失败**，除非 `recursive`） */
   function stageDeleteKey(path, opts = {}) {
     requireOpen()
-    const canonical = parseRegistryPath(path).canonical
+    const canonical = viewCanonicalFor(path, opts)
     const operation = {
       op: REG_STAGE_OP.DELETE_KEY,
       path: canonical,
@@ -2540,7 +2663,7 @@ export function createRegistryStage(options = {}) {
   /** 暂存"写值"（对齐 `RegSetValueExW`：键不存在时失败） */
   function stageSetValue(path, valueName, type, value, opts = {}) {
     requireOpen()
-    const canonical = parseRegistryPath(path).canonical
+    const canonical = viewCanonicalFor(path, opts)
     const operation = {
       op: REG_STAGE_OP.SET_VALUE,
       path: canonical,
@@ -2564,7 +2687,7 @@ export function createRegistryStage(options = {}) {
   /** 暂存"删值"（对齐 `RegDeleteValueW`：值不存在时失败） */
   function stageDeleteValue(path, valueName, opts = {}) {
     requireOpen()
-    const canonical = parseRegistryPath(path).canonical
+    const canonical = viewCanonicalFor(path, opts)
     const operation = {
       op: REG_STAGE_OP.DELETE_VALUE,
       path: canonical,
@@ -2777,16 +2900,19 @@ export function createRegistryStage(options = {}) {
   function applyUnits() {
     const units = []
     for (const entry of state.ops) {
+      /* R26：视图跟随 WAL 路径里的合成段；apply 时再拆成 (真实路径, view)。 */
+      const unitView = decodeRegistryViewPath(entry.path).view
       if (entry.op === REG_STAGE_OP.CREATE_KEY) {
         units.push({
           op: 'create-key',
           path: entry.path,
           keyPath: entry.path,
+          view: unitView,
           // 保留 volatile 选项（WAL 里记了 VOLATILE 位）：否则"重启即失"的真实语义会在应用时丢失，
           // 而文档说"应用时保留该选项"就成了一句不成立的承诺。
           dwOptions: entry.volatile ? REG_OPTIONS.REG_OPTION_VOLATILE : 0,
         })
-      } else if (entry.op === REG_STAGE_OP.DELETE_KEY) units.push({ op: 'delete-key', path: entry.path, keyPath: entry.path })
+      } else if (entry.op === REG_STAGE_OP.DELETE_KEY) units.push({ op: 'delete-key', path: entry.path, keyPath: entry.path, view: unitView })
       else if (entry.op === REG_STAGE_OP.SET_VALUE) {
         units.push({
           op: 'set-value',
@@ -2795,6 +2921,7 @@ export function createRegistryStage(options = {}) {
           valueName: entry.valueName ?? '',
           type: entry.typeName,
           data: entry.data,
+          view: unitView,
         })
       } else if (entry.op === REG_STAGE_OP.DELETE_VALUE) {
         units.push({
@@ -2802,6 +2929,7 @@ export function createRegistryStage(options = {}) {
           path: registryValueUnitPath(entry.path, entry.valueName ?? ''),
           keyPath: entry.path,
           valueName: entry.valueName ?? '',
+          view: unitView,
         })
       }
     }
@@ -2980,10 +3108,14 @@ export function createRegistryStage(options = {}) {
       }
       let result
       try {
-        if (unit.op === 'create-key') result = activeWriter.createKey(unit.path, { dwOptions: unit.dwOptions ?? 0 })
-        else if (unit.op === 'delete-key') result = activeWriter.deleteKey(unit.path, { recursive: true })
-        else if (unit.op === 'set-value') result = activeWriter.setValue(unit.keyPath, unit.valueName, unit.type, unit.data)
-        else result = activeWriter.deleteValue(unit.keyPath, unit.valueName)
+        /* R26：writer 拿到的永远是**真实路径** + view 选项；合成前缀只是覆盖层表示。 */
+        const realPath = decodeRegistryViewPath(unit.path).path
+        const realKeyPath = decodeRegistryViewPath(unit.keyPath ?? unit.path).path
+        const viewOpts = { view: unit.view ?? REG_STAGE_VIEW.DEFAULT, samDesired: unit.view === REG_STAGE_VIEW.WOW64_32 ? KEY_WOW64.KEY_WOW64_32KEY : 0 }
+        if (unit.op === 'create-key') result = activeWriter.createKey(realPath, { dwOptions: unit.dwOptions ?? 0, ...viewOpts })
+        else if (unit.op === 'delete-key') result = activeWriter.deleteKey(realPath, { recursive: true, ...viewOpts })
+        else if (unit.op === 'set-value') result = activeWriter.setValue(realKeyPath, unit.valueName, unit.type, unit.data, viewOpts)
+        else result = activeWriter.deleteValue(realKeyPath, unit.valueName, viewOpts)
       } catch (error) {
         failed.push({ path: unit.path, op: unit.op, status: error.status ?? REG_STATUS.ERROR_ACCESS_DENIED, reason: String(error.message) })
         continue
@@ -3183,13 +3315,14 @@ export function createRegistryWriter(bindings) {
   return {
     createKey(path, opts = {}) {
       const { handle, subKey } = parseRegistryPath(path)
-      const created = bindings.regCreateKeyExW(handle, subKey, 0, null, opts.dwOptions ?? 0, REG_ACCESS.KEY_ALL_ACCESS)
+      // R26：视图位由调用方（apply 单元）传入；RegCreateKeyExW 在 open/create 时选择视图。
+      const created = bindings.regCreateKeyExW(handle, subKey, 0, null, opts.dwOptions ?? 0, REG_ACCESS.KEY_ALL_ACCESS | (opts.samDesired ?? 0))
       const status = (created?.status ?? created) >>> 0
       if (status === REG_STATUS.ERROR_SUCCESS) close(created.handle)
       return { status }
     },
-    setValue(path, valueName, type, dataHex) {
-      const keyHandle = openForWrite(path, REG_ACCESS.KEY_SET_VALUE)
+    setValue(path, valueName, type, dataHex, opts = {}) {
+      const keyHandle = openForWrite(path, REG_ACCESS.KEY_SET_VALUE | (opts.samDesired ?? 0))
       try {
         const typeNumber = REG_TYPES[registryTypeName(type)]
         // `dataHex` 是**快照口径**（`0x…` 文本或裸十六进制），必须走类型感知的线格式转换。
@@ -3202,8 +3335,8 @@ export function createRegistryWriter(bindings) {
         close(keyHandle)
       }
     },
-    deleteValue(path, valueName) {
-      const keyHandle = openForWrite(path, REG_ACCESS.KEY_SET_VALUE)
+    deleteValue(path, valueName, opts = {}) {
+      const keyHandle = openForWrite(path, REG_ACCESS.KEY_SET_VALUE | (opts.samDesired ?? 0))
       try {
         const result = bindings.regDeleteValueW(keyHandle, valueName ?? '')
         return { status: (result?.status ?? result ?? 0) >>> 0 }
@@ -3326,7 +3459,9 @@ export function validateJournalBuffer(buffer) {
 
   for (const [index, record] of decoded.records.entries()) {
     if (record.version !== REGISTRY_STAGE_VERSION) addProblem(problems, 'BAD_VERSION', `version=${record.version}`, index)
-    if (record.reserved !== 0) addProblem(problems, 'RESERVED_NONZERO', `reserved=${record.reserved} must be 0`, index)
+    // R26：reserved 现在是视图字段（0/1）。>1 仍是非法保留值；路径标记与字段必须一致。
+    if (record.reserved > 1) addProblem(problems, 'RESERVED_NONZERO', `reserved=${record.reserved} must be 0 or 1 (view)`, index)
+    if ((record.reserved === 1) !== isRegistryViewPath(record.path)) addProblem(problems, 'VIEW_PATH_MISMATCH', `reserved=${record.reserved} but path=${record.path}`, index)
     if (record.pathChars === 0) addProblem(problems, 'EMPTY_PATH', 'pathChars=0', index)
     // 占位名（`<unstaged:RegSetValueExW>`、`<unknown:NtSetValueKey>`、`<RegCreateKeyExW:unsupported-option>`）
     // 是**审计标签**，不是可解析路径：硬拒/透传记录的路径可能根本派生不出来

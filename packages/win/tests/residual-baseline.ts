@@ -147,12 +147,12 @@ const rowOf = (id) => residualRows.find((line) => /^\|\s*(R\d+)\s*\|/.exec(line)
 //   · R13 走 `effectiveIds`（整行被删）⇒ 证明"残余消失"会被抓到；
 //   · R13/R14/R15 这里的替换 ⇒ 证明"残余还在但被改写成笼统说法"也会被抓到。
 // 只测第一种的话，"把 R13 改成一句不可核对的印象"这种稀释照样能蒙混过关。
-const r13 = PLANT ? rowOf('R13').replace(/KEY_WOW64_32KEY/g, '32 位视图位') : rowOf('R13')
+const r13 = PLANT ? rowOf('R13').replace(/__DSH_WOW64_32__/g, '32 视图合成段') : rowOf('R13')
 const r14 = PLANT ? rowOf('R14').replace(/partially-applied/g, '部分应用') : rowOf('R14')
 const r15 = PLANT ? rowOf('R15').replace(/WS_TARGET/g, 'hook 名单') : rowOf('R15')
 check(
-  'R13 点名 KEY_WOW64_32KEY 与 UNSTAGED（不得改写成笼统的"部分注册表写入不暂存"）',
-  r13.includes('KEY_WOW64_32KEY') && r13.includes('UNSTAGED'),
+  'R13 点名 KEY_WOW64_32KEY 与 __DSH_WOW64_32__（R26 起"已暂存"的新口径也要可核对）',
+  r13.includes('KEY_WOW64_32KEY') && r13.includes('__DSH_WOW64_32__'),
   short(r13 || '(R13 行缺失)'),
 )
 check(

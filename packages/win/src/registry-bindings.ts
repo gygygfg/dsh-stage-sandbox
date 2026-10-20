@@ -296,9 +296,11 @@ function guessEncoding(buffer) {
  */
 export function createRegExeReader(options = {}) {
   const exec = options.exec ?? runReg
+  /** R26 / R13：32 位视图的**真实 hive**读取必须带 `/reg:32`（调用方传入的是真实路径）。 */
+  const viewFlags = (opts = {}) => (opts.view === 1 || ((opts.samDesired ?? 0) & 0x0000_0200) !== 0 ? ['/reg:32'] : [])
   return {
-    read(canonical) {
-      const r = exec(['query', canonical], options)
+    read(canonical, opts = {}) {
+      const r = exec(['query', canonical, ...viewFlags(opts)], options)
       if (r.status !== 0) return classifyQueryFailure(r, canonical)
       const values = {}
       const subKeys = []
@@ -356,6 +358,8 @@ export function createRegExeWriter(options = {}) {
   const log = options.log ?? (() => {})
   const REG_OPTION_VOLATILE = 0x0000_0001
   const wire = options.wireBytes // (type, dataHex) => Buffer, 由调用方注入（registry-stage.registryWireBytes）
+  /** R26：apply 单元带 view 时，真实 hive 的写/删必须落到 32 位视图（`/reg:32`）。 */
+  const viewFlags = (opts = {}) => (opts.view === 1 || ((opts.samDesired ?? 0) & 0x0000_0200) !== 0 ? ['/reg:32'] : [])
 
   const statusOf = (r) => {
     if (r.status === 0) return 0
@@ -369,10 +373,10 @@ export function createRegExeWriter(options = {}) {
         log(`writer: refusing REG_OPTION_VOLATILE via reg.exe (unsupported): ${path}`)
         return { status: 87, message: 'REG_OPTION_VOLATILE cannot be expressed through reg.exe' }
       }
-      const r = exec(['add', path, '/f'], options)
+      const r = exec(['add', path, '/f', ...viewFlags(opts)], options)
       return { status: statusOf(r) }
     },
-    setValue(path, valueName, type, dataHex) {
+    setValue(path, valueName, type, dataHex, opts = {}) {
       const typeName = typeof type === 'string' && type.startsWith('REG_') ? type : String(type)
       let rendered
       try {
@@ -384,19 +388,19 @@ export function createRegExeWriter(options = {}) {
         valueName === undefined || valueName === null || valueName === ''
           ? ['add', path, '/ve', '/t', typeName, '/d', rendered, '/f']
           : ['add', path, '/v', valueName, '/t', typeName, '/d', rendered, '/f']
-      const r = exec(args, options)
+      const r = exec([...args, ...viewFlags(opts)], options)
       return { status: statusOf(r) }
     },
-    deleteValue(path, valueName) {
+    deleteValue(path, valueName, opts = {}) {
       const args =
         valueName === undefined || valueName === null || valueName === ''
           ? ['delete', path, '/ve', '/f']
           : ['delete', path, '/v', valueName, '/f']
-      const r = exec(args, options)
+      const r = exec([...args, ...viewFlags(opts)], options)
       return { status: statusOf(r) }
     },
-    deleteKey(path) {
-      const r = exec(['delete', path, '/f'], options)
+    deleteKey(path, opts = {}) {
+      const r = exec(['delete', path, '/f', ...viewFlags(opts)], options)
       return { status: statusOf(r) }
     },
   }

@@ -53,6 +53,8 @@
 #define WS_HARD_DENY_WOW64_32KEY_WRITE_NOT_STAGEABLE 1u
 #define WS_HARD_DENY_WOW64_VIEW_WRITE_NOT_STAGEABLE  2u
 #define WS_HARD_DENY_RECURSIVE_DELETE_NOT_STAGEABLE  3u
+/* R26: reason 5 is also used for the reserved-namespace / view-path refusals below. */
+#define WS_HARD_DENY_TREE_OP_NOT_STAGEABLE           5u
 
 /* ── R18 / KNOWN-01（审计补洞）：写意图 open 上的 32KEY 拒绝也必须留痕 ──────────
  * `reg delete /reg:32` 的形态是：先 `RegOpenKeyExW(HKCU, sub, 0, DELETE|KEY_WOW64_32KEY)`
@@ -273,6 +275,266 @@ static int ws_reg_wow64_unrepresentable(REGSAM samDesired)
     return (samDesired & WS_SAM_WOW64_MASK) != 0;
 }
 
+/* ── R26 / R13: 32-bit view staging ────────────────────────────────────────────
+ *
+ * The overlay app hive has no hive-view concept. A 32-bit-view operation is
+ * represented by a SYNTHETIC PATH SEGMENT right after the short hive name:
+ *
+ *     RegSetValueExW(HKCU, "Software\X", KEY_WOW64_32KEY)  ->  HKCU\__DSH_WOW64_32__\Software\X
+ *
+ * Consequences (all deliberate, see .lead/findings/reg-shim-r26.md):
+ *   · overlay materialization / tombstones / journal replay are unchanged: they
+ *     already key on the canonical path string, so the synthetic segment simply
+ *     namespaces the staged 32-view state inside the app hive;
+ *   · the journal record carries the view in its `reserved` field (0 = default/64,
+ *     1 = WOW64-32; TS `REG_STAGE_VIEW`), which is how the host/apply side knows
+ *     to pass `/reg:32` to `reg add`/`reg delete`;
+ *   · the reserved segment is NOT writable through the 64-bit view: a 64-view
+ *     operation whose first subkey segment equals it is fail-closed (reason 5),
+ *     so a real key with that name can never collide with the synthetic namespace;
+ *   · handles retain the view: a real handle returned by an open/create with
+ *     KEY_WOW64_32KEY is recorded in a small table, so a later `RegSetValueExW`
+ *     on that handle is staged under the same synthetic path.
+ * WOW64 *processes* keep the old fail-closed behaviour (this x64 shim is not
+ * injected into them; the check stays as defence in depth).
+ */
+#define WS_WOW64_32_PREFIX L"__DSH_WOW64_32__"
+#define WS_WOW64_32_PREFIX_LEN (sizeof(WS_WOW64_32_PREFIX) / sizeof(wchar_t) - 1)
+
+static int ws_reg_is_wow64_process(void)
+{
+    if (g_wow64Process < 0) {
+        BOOL isWow = FALSE;
+        if (!IsWow64Process(GetCurrentProcess(), &isWow)) {
+            isWow = FALSE;
+        }
+        g_wow64Process = isWow ? 1 : 0;
+    }
+    return g_wow64Process == 1;
+}
+
+/** Does this operation ask for a view that is unrepresentable HERE (WOW64 proc)? */
+static int ws_reg_view_unrepresentable_here(REGSAM samDesired)
+{
+    return ws_reg_is_wow64_process() && (samDesired & WS_SAM_WOW64_MASK) != 0;
+}
+
+/** 64-bit process + KEY_WOW64_32KEY ⇒ the representable 32-bit view. */
+static int ws_reg_view_requested(REGSAM samDesired)
+{
+    return !ws_reg_is_wow64_process() && (samDesired & KEY_WOW64_32KEY) != 0;
+}
+
+/** First subkey segment == the synthetic marker? (`HIVE\__DSH_WOW64_32__[\...]`)
+ *  Also accepts the **relative** form (`__DSH_WOW64_32__[\...]`, no hive) because
+ *  `ws_reg_open_real`/materialize probes carry relative paths. */
+static int ws_reg_path_has_view(const wchar_t *path)
+{
+    if (!path) {
+        return 0;
+    }
+    if (_wcsnicmp(path, WS_WOW64_32_PREFIX, WS_WOW64_32_PREFIX_LEN) == 0) {
+        wchar_t afterRel = path[WS_WOW64_32_PREFIX_LEN];
+        if (afterRel == 0 || afterRel == L'\\') {
+            return 1;
+        }
+    }
+    const wchar_t *bs = wcschr(path, L'\\');
+    if (!bs || !bs[1]) {
+        return 0;
+    }
+    if (_wcsnicmp(bs + 1, WS_WOW64_32_PREFIX, WS_WOW64_32_PREFIX_LEN) != 0) {
+        return 0;
+    }
+    wchar_t after = bs[1 + WS_WOW64_32_PREFIX_LEN];
+    return after == 0 || after == L'\\';
+}
+
+/** Is this first path segment one of the short hive names? (distinguishes
+ *  canonical `HIVE\sub` from relative `sub` inside ws_reg_path_strip_view) */
+static int ws_reg_first_segment_is_hive(const wchar_t *path, size_t len)
+{
+    static const wchar_t *const kHives[] = {L"HKCU", L"HKLM", L"HKU", L"HKCR", L"HKCC", L"HKPD"};
+    if (len == 0 || len > 8) {
+        return 0;
+    }
+    for (size_t i = 0; i < sizeof(kHives) / sizeof(kHives[0]); i++) {
+        size_t hl = wcslen(kHives[i]);
+        if (hl == len && _wcsnicmp(path, kHives[i], len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/** `HIVE\rest` → `HIVE\__DSH_WOW64_32__[\rest]` (idempotent). */
+static int ws_reg_path_add_view(const wchar_t *canonical, wchar_t *out, DWORD cch)
+{
+    if (!canonical || !out || !cch) {
+        return 0;
+    }
+    if (ws_reg_path_has_view(canonical)) {
+        ws_strlcpy_w(out, canonical, cch);
+        return 1;
+    }
+    const wchar_t *bs = wcschr(canonical, L'\\');
+    size_t hiveLen = bs ? (size_t)(bs - canonical) : wcslen(canonical);
+    size_t pos = 0;
+    out[0] = 0;
+    wchar_t hivePart[128];
+    if (hiveLen >= 128) {
+        return 0;
+    }
+    memcpy(hivePart, canonical, hiveLen * sizeof(wchar_t));
+    hivePart[hiveLen] = 0;
+    if (!ws_append_w(out, cch, &pos, hivePart) ||
+        !ws_append_w(out, cch, &pos, L"\\") ||
+        !ws_append_w(out, cch, &pos, WS_WOW64_32_PREFIX)) {
+        return 0;
+    }
+    if (bs && bs[1]) {
+        if (!ws_append_w(out, cch, &pos, bs)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/** `HIVE\__DSH_WOW64_32__[\rest]` → (hive, `rest`, view=1)；相对形式
+ *  `__DSH_WOW64_32__[\rest]` → (hive="", `rest`, view=1)。Returns 1 if a view marker was present. */
+static int ws_reg_path_strip_view(const wchar_t *path, wchar_t *hiveOut, DWORD hiveCch,
+                                  wchar_t *relOut, DWORD relCch, int *viewOut)
+{
+    if (viewOut) {
+        *viewOut = 0;
+    }
+    if (!path) {
+        return 0;
+    }
+    /* 相对形式：合成段在**开头**（ws_reg_open_real / materialize 的 rel）。 */
+    if (_wcsnicmp(path, WS_WOW64_32_PREFIX, WS_WOW64_32_PREFIX_LEN) == 0 &&
+        (path[WS_WOW64_32_PREFIX_LEN] == 0 || path[WS_WOW64_32_PREFIX_LEN] == L'\\')) {
+        const wchar_t *rest = path + WS_WOW64_32_PREFIX_LEN;
+        if (*rest == L'\\') rest++;
+        if (hiveOut && hiveCch) hiveOut[0] = 0;
+        if (relOut && relCch) ws_strlcpy_w(relOut, rest, relCch);
+        if (viewOut) *viewOut = 1;
+        return 1;
+    }
+    const wchar_t *bs = wcschr(path, L'\\');
+    if (!bs || !bs[1]) {
+        if (hiveOut && hiveCch) ws_strlcpy_w(hiveOut, path ? path : L"", hiveCch);
+        if (relOut && relCch) relOut[0] = 0;
+        return 0;
+    }
+    /* 规范形式（`HIVE\...`）与相对形式（`Software\...`）的区分：首段是否为短 hive 名。 */
+    size_t firstLen = (size_t)(bs - path);
+    int canonicalForm = ws_reg_first_segment_is_hive(path, firstLen);
+    if (!ws_reg_path_has_view(path)) {
+        if (!canonicalForm) {
+            /* 相对路径：原样返回，**不要**剥掉第一段（旧实现会把 `Software\X` 变成 `X`）。 */
+            if (hiveOut && hiveCch) hiveOut[0] = 0;
+            if (relOut && relCch) ws_strlcpy_w(relOut, path, relCch);
+            return 0;
+        }
+        if (hiveOut && hiveCch) {
+            size_t n = firstLen;
+            if (n >= hiveCch) n = hiveCch - 1;
+            memcpy(hiveOut, path, n * sizeof(wchar_t));
+            hiveOut[n] = 0;
+        }
+        if (relOut && relCch) ws_strlcpy_w(relOut, bs + 1, relCch);
+        return 0;
+    }
+    size_t n = firstLen;
+    if (hiveOut && hiveCch) {
+        if (n >= hiveCch) n = hiveCch - 1;
+        memcpy(hiveOut, path, n * sizeof(wchar_t));
+        hiveOut[n] = 0;
+    }
+    if (relOut && relCch) {
+        const wchar_t *rest = bs + 1 + WS_WOW64_32_PREFIX_LEN;
+        if (*rest == L'\\') rest++;
+        ws_strlcpy_w(relOut, rest, relCch);
+    }
+    if (viewOut) *viewOut = 1;
+    return 1;
+}
+
+/* ---- handle → view table (see the block comment above) -------------------- */
+#define WS_MAX_HANDLE_VIEWS 128
+typedef struct WsHandleView {
+    HKEY key;
+    int view;
+    int used;
+} WsHandleView;
+static WsHandleView g_handleViews[WS_MAX_HANDLE_VIEWS];
+static SRWLOCK g_handleViewLock = SRWLOCK_INIT;
+
+static void ws_reg_note_handle_view(HKEY h, int view)
+{
+    if (!h || !view) {
+        return;
+    }
+    AcquireSRWLockExclusive(&g_handleViewLock);
+    for (int i = 0; i < WS_MAX_HANDLE_VIEWS; i++) {
+        if (g_handleViews[i].used && g_handleViews[i].key == h) {
+            g_handleViews[i].view = view;
+            ReleaseSRWLockExclusive(&g_handleViewLock);
+            return;
+        }
+    }
+    for (int i = 0; i < WS_MAX_HANDLE_VIEWS; i++) {
+        if (!g_handleViews[i].used) {
+            g_handleViews[i].used = 1;
+            g_handleViews[i].key = h;
+            g_handleViews[i].view = view;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_handleViewLock);
+}
+
+static int ws_reg_handle_view(HKEY h)
+{
+    int view = 0;
+    if (!h) {
+        return 0;
+    }
+    AcquireSRWLockShared(&g_handleViewLock);
+    for (int i = 0; i < WS_MAX_HANDLE_VIEWS; i++) {
+        if (g_handleViews[i].used && g_handleViews[i].key == h) {
+            view = g_handleViews[i].view;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_handleViewLock);
+    return view;
+}
+
+static void ws_reg_forget_handle_view(HKEY h)
+{
+    if (!h) {
+        return;
+    }
+    AcquireSRWLockExclusive(&g_handleViewLock);
+    for (int i = 0; i < WS_MAX_HANDLE_VIEWS; i++) {
+        if (g_handleViews[i].used && g_handleViews[i].key == h) {
+            g_handleViews[i].used = 0;
+            g_handleViews[i].key = NULL;
+            g_handleViews[i].view = 0;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_handleViewLock);
+}
+
+/* A 64-view path may never name the synthetic namespace itself. */
+static int ws_reg_path_hits_reserved_namespace(const wchar_t *canonical)
+{
+    return ws_reg_path_has_view(canonical);
+}
+
 static const wchar_t *ws_reg_unstaged_slug(UINT16 reason)
 {
     switch (reason) {
@@ -447,21 +709,40 @@ static WsWriteVerdict ws_reg_write_ctx(HKEY hKey, LPCWSTR lpSubKey, REGSAM samDe
         ws_rstore_hard_deny(canonical[0] ? canonical : L"<HKPD>", ERROR_ACCESS_DENIED);
         return WS_WRITE_FAIL_CLOSED;
     }
-    if (ws_reg_wow64_unrepresentable(samDesired)) {
-        /* ★ R18 / KNOWN-01: a 32-bit hive view CANNOT be represented by the app
-         * hive, and passing the WRITE through changed the real hive before any
-         * approval existed (`reg delete /reg:32` really deleted a real key;
-         * `reg add /reg:32` left real empty shell keys -- measured 3x in R17).
-         * "Cannot be staged" is still not "you lack permission", but for a WRITE
-         * the only honest outcomes are "stage it" or "refuse and record it".
-         * → fail-closed: ERROR_ACCESS_DENIED + HARD_DENY carrying the reason code.
-         * Reads keep their passthrough (ws_reg_read_ctx), because a read has no
-         * side effect and blocking it would break every 32-bit consumer. */
+    if (ws_reg_view_unrepresentable_here(samDesired)) {
+        /* WOW64 process: this x64 shim is not injected into WOW64 processes; keep the
+         * old fail-closed defence (both view bits are unrepresentable there). */
         UINT16 reason = (samDesired & KEY_WOW64_32KEY) ? WS_HARD_DENY_WOW64_32KEY_WRITE_NOT_STAGEABLE
                                                        : WS_HARD_DENY_WOW64_VIEW_WRITE_NOT_STAGEABLE;
         ws_reg_hard_deny_reason(canonical[0] ? canonical : L"<wow64-view>", reason);
-        WS_TRACE("%ls: WOW64 view write refused (fail-closed) %ls", api, canonical);
+        WS_TRACE("%ls: WOW64-process view write refused (fail-closed) %ls", api, canonical);
         return WS_WRITE_FAIL_CLOSED;
+    }
+    /* R26: 32-bit view (64-bit process) is now STAGEABLE through the synthetic
+     * namespace. The view comes from the pseudo handle's own path or from the
+     * handle table (a real handle returned by a KEY_WOW64_32KEY open/create). */
+    {
+        int view = isPseudo ? ws_reg_path_has_view(canonical) : ws_reg_handle_view(hKey);
+        if (!view && ws_reg_view_requested(samDesired)) {
+            view = 1;
+        }
+        if (view) {
+            wchar_t viewPath[WS_PATH_MAX];
+            if (!ws_reg_path_add_view(canonical, viewPath, WS_PATH_MAX)) {
+                ws_reg_hard_deny_reason(canonical[0] ? canonical : L"<wow64-view:path-too-long>",
+                                        WS_HARD_DENY_TREE_OP_NOT_STAGEABLE);
+                return WS_WRITE_FAIL_CLOSED;
+            }
+            ws_strlcpy_w(canonical, viewPath, canonicalCch);
+            WS_TRACE("%ls: staging under 32-bit view %ls", api, canonical);
+        } else if (!isPseudo && ws_reg_path_hits_reserved_namespace(canonical)) {
+            /* The synthetic namespace is reserved for the 32-bit view. A 64-view
+             * operation that literally names it is refused + recorded (reason 5),
+             * so a real key with that name can never collide with staged 32-view
+             * state (the prefix is therefore collision-free). */
+            ws_reg_hard_deny_reason(canonical, WS_HARD_DENY_TREE_OP_NOT_STAGEABLE);
+            return WS_WRITE_FAIL_CLOSED;
+        }
     }
     if (isBareHiveRoot && *isBareHiveRoot) {
         /* A value written straight onto a predefined root (`RegSetValueExW(HKCU,
@@ -554,8 +835,12 @@ static LONG ws_create_key_open_only(HKEY hKey, LPCWSTR lpSubKey, DWORD Reserved,
         }
     }
     if (found) {
-        return g_orig.RegCreateKeyExW(hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired,
-                                      sa, phkResult, lpdwDisposition);
+        LONG rc = g_orig.RegCreateKeyExW(hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired,
+                                         sa, phkResult, lpdwDisposition);
+        if (rc == ERROR_SUCCESS && phkResult && *phkResult && ws_reg_view_requested(samDesired)) {
+            ws_reg_note_handle_view(*phkResult, 1);
+        }
+        return rc;
     }
     ws_rstore_hard_deny(canonical && canonical[0] ? canonical : L"<RegCreateKeyExW:unresolvable>",
                         ERROR_ACCESS_DENIED);
@@ -599,9 +884,15 @@ static LONG ws_create_key_inner(HKEY hKey, LPCWSTR lpSubKey, DWORD Reserved, LPW
     int resolvable = ws_rstore_canonical(hKey, lpSubKey, hive, 64, canonical, WS_PATH_MAX,
                                          &isPseudo, &isBareRoot);
     if (isBareRoot) {
-        /* The hive root always exists: opening it is a no-op, never a WAL record. */
-        return g_orig.RegCreateKeyExW(hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired,
-                                      sa, phkResult, lpdwDisposition);
+        /* The hive root always exists: opening it is a no-op, never a WAL record.
+         * With a 32-bit view the returned handle still has to inherit the view for
+         * later writes, so record it in the handle→view table. */
+        LONG rc = g_orig.RegCreateKeyExW(hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired,
+                                         sa, phkResult, lpdwDisposition);
+        if (rc == ERROR_SUCCESS && phkResult && *phkResult && ws_reg_view_requested(samDesired)) {
+            ws_reg_note_handle_view(*phkResult, 1);
+        }
+        return rc;
     }
     if (!ws_t3_is_attached()) {
         /* No overlay and no journal: a create cannot be staged and cannot be
@@ -609,15 +900,32 @@ static LONG ws_create_key_inner(HKEY hKey, LPCWSTR lpSubKey, DWORD Reserved, LPW
         return ws_create_key_open_only(hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired, sa,
                                        phkResult, lpdwDisposition, resolvable, hive, canonical);
     }
-    if (ws_reg_wow64_unrepresentable(samDesired)) {
-        /* ★ R18 / KNOWN-01: `RegCreateKeyExW` is CREATE-or-open. Forwarding it for a
-         * 32-bit hive view really created empty shell keys in the REAL hive before
-         * approval (R17: real32=true / real64=true). Refuse + record instead.
-         * Reads/opens keep their passthrough: an open alone cannot create. */
+    if (ws_reg_view_unrepresentable_here(samDesired)) {
+        /* WOW64 process: keep the old fail-closed defence (see write_ctx). */
         UINT16 reason = (samDesired & KEY_WOW64_32KEY) ? WS_HARD_DENY_WOW64_32KEY_WRITE_NOT_STAGEABLE
                                                        : WS_HARD_DENY_WOW64_VIEW_WRITE_NOT_STAGEABLE;
         ws_reg_hard_deny_reason(canonical[0] ? canonical : L"<RegCreateKeyExW:wow64-view>", reason);
         return ERROR_ACCESS_DENIED;
+    }
+    /* R26: a 32-bit-view create is staged under the synthetic namespace. */
+    {
+        int view = isPseudo ? ws_reg_path_has_view(canonical) : ws_reg_handle_view(hKey);
+        if (!view && ws_reg_view_requested(samDesired)) {
+            view = 1;
+        }
+        if (view) {
+            wchar_t viewPath[WS_PATH_MAX];
+            if (!ws_reg_path_add_view(canonical, viewPath, WS_PATH_MAX)) {
+                ws_reg_hard_deny_reason(canonical[0] ? canonical : L"<RegCreateKeyExW:wow64-view:path-too-long>",
+                                        WS_HARD_DENY_TREE_OP_NOT_STAGEABLE);
+                return ERROR_ACCESS_DENIED;
+            }
+            ws_strlcpy_w(canonical, viewPath, WS_PATH_MAX);
+            WS_TRACE("RegCreateKeyExW: 32-bit view -> %ls", canonical);
+        } else if (!isPseudo && ws_reg_path_hits_reserved_namespace(canonical)) {
+            ws_reg_hard_deny_reason(canonical, WS_HARD_DENY_TREE_OP_NOT_STAGEABLE);
+            return ERROR_ACCESS_DENIED;
+        }
     }
     if (!resolvable) {
         /* "The overlay cannot represent this" is NOT "you lack permission". A path
@@ -650,17 +958,27 @@ static LONG ws_create_key_inner(HKEY hKey, LPCWSTR lpSubKey, DWORD Reserved, LPW
         if (lpdwDisposition) *lpdwDisposition = REG_OPENED_EXISTING_KEY;
         return ERROR_SUCCESS;
     }
-    /* Real hive already has the key -> pure open through the real API. */
+    /* Real hive already has the key?
+     *   · 64/default view: pure open through the real API (no staging; no WAL);
+     *   · 32 view: do NOT return a raw real handle here. reg.exe may close it and
+     *     reopen without the view bit, and a later Set/Delete would then lose the
+     *     view (R26-GATE-01). Instead keep the overlay representation (materialize
+     *     below) and return a pseudo handle whose canonical path carries the
+     *     synthetic segment, so every later write inherits view=1 deterministically. */
     const wchar_t *rel = ws_reg_rel_of(hive, canonical);
     HKEY realProbe = ws_reg_open_real(hive, rel, KEY_READ);
+    int realExists = realProbe != NULL;
     if (realProbe) {
         g_orig.RegCloseKey(realProbe);
-        WS_TRACE("RegCreateKeyExW: real key exists %ls -> passthrough (no staging)", canonical);
-        HKEY root = ws_reg_real_root(hive);
-        DWORD disp = REG_OPENED_EXISTING_KEY;
-        LONG rc = g_orig.RegCreateKeyExW(root, rel, Reserved, lpClass, dwOptions, samDesired, sa,
-                                         phkResult, lpdwDisposition ? lpdwDisposition : &disp);
-        return rc;
+        if (!ws_reg_path_has_view(canonical)) {
+            WS_TRACE("RegCreateKeyExW: real key exists %ls -> passthrough (no staging)", canonical);
+            HKEY root = ws_reg_real_root(hive);
+            DWORD disp = REG_OPENED_EXISTING_KEY;
+            LONG rc = g_orig.RegCreateKeyExW(root, rel, Reserved, lpClass, dwOptions, samDesired, sa,
+                                             phkResult, lpdwDisposition ? lpdwDisposition : &disp);
+            return rc;
+        }
+        WS_TRACE("RegCreateKeyExW: real 32-view key exists %ls -> staging (pseudo handle keeps view)", canonical);
     }
     /* Neither the overlay nor the real hive has it: the caller is creating it.
      * A create must be visible to **path-based** lookups right away, in every
@@ -679,7 +997,7 @@ static LONG ws_create_key_inner(HKEY hKey, LPCWSTR lpSubKey, DWORD Reserved, LPW
         return ERROR_NOT_ENOUGH_MEMORY;
     }
     if (phkResult) *phkResult = h;
-    if (lpdwDisposition) *lpdwDisposition = REG_CREATED_NEW_KEY;
+    if (lpdwDisposition) *lpdwDisposition = realExists ? REG_OPENED_EXISTING_KEY : REG_CREATED_NEW_KEY;
     return ERROR_SUCCESS;
 }
 
@@ -753,10 +1071,20 @@ static LONG ws_open_key_inner(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGS
     wchar_t hive[64], canonical[WS_PATH_MAX];
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
-    /* R18 / KNOWN-01 审计补洞（见 WS_SAM_WRITE_INTENT 的说明）：写意图 open 在 32 位视图上
-     * 无法暂存 ⇒ 在 open 处就拒绝并记 HARD_DENY，而不是把失败留给真实 API（那样 WAL 无记录）。
-     * 纯读（无写意图位）仍走下面的透传，不影响 `reg query /reg:32` 等消费者。 */
-    if (ws_reg_wow64_unrepresentable(samDesired) && (samDesired & WS_SAM_WRITE_INTENT) != 0) {
+
+    /* Passthrough open that remembers a 32-bit view for later writes on this handle. */
+    #define WS_OPEN_REAL_API()                                                                        \
+        do {                                                                                          \
+            LONG wsRc = g_orig.RegOpenKeyExW(hKey, lpSubKey, ulOptions, samDesired, phkResult);       \
+            if (wsRc == ERROR_SUCCESS && phkResult && *phkResult && ws_reg_view_requested(samDesired)) { \
+                ws_reg_note_handle_view(*phkResult, 1);                                              \
+            }                                                                                         \
+            return wsRc;                                                                              \
+        } while (0)
+
+    /* R18 / KNOWN-01：WOW64 **进程**里的视图位仍 fail-closed（x64 shim 不注入那里，
+     * 这条是纵深防御）。64 位进程的 32 位视图 R26 起可暂存（见下面的分支）。 */
+    if (ws_reg_view_unrepresentable_here(samDesired) && (samDesired & WS_SAM_WRITE_INTENT) != 0) {
         UINT16 reason = (samDesired & KEY_WOW64_32KEY) ? WS_HARD_DENY_WOW64_32KEY_WRITE_NOT_STAGEABLE
                                                        : WS_HARD_DENY_WOW64_VIEW_WRITE_NOT_STAGEABLE;
         const wchar_t *label = NULL;
@@ -764,14 +1092,41 @@ static LONG ws_open_key_inner(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGS
             label = canonical;
         }
         ws_reg_hard_deny_reason(label && label[0] ? label : L"<RegOpenKeyExW:wow64-write>", reason);
-        WS_TRACE("RegOpenKeyExW: WOW64 write-intent open refused (fail-closed, HARD_DENY) %ls",
+        WS_TRACE("RegOpenKeyExW: WOW64-process write-intent open refused (fail-closed, HARD_DENY) %ls",
                  label ? label : L"<unresolvable>");
         return ERROR_ACCESS_DENIED;
+    }
+    /* R26: a representable 32-bit-view open. If the overlay holds a staged key in the
+     * synthetic namespace return a pseudo handle (so later writes inherit the view);
+     * otherwise pass through to the real API (read semantics stay passthrough) and
+     * remember the view on the returned real handle. */
+    if (ws_reg_view_requested(samDesired)) {
+        /* 读类 open 必须透传（读不投影 staging）：只有**写意图** open 才允许命中覆盖层，
+         * 这样 `reg delete /reg:32` 之类的"先 open 再删"能在暂存键上工作，而
+         * `reg query /reg:32` 永远读真实 32 视图。 */
+        wchar_t base[WS_PATH_MAX];
+        int pseudoBase = 0, bare = 0;
+        if ((samDesired & WS_SAM_WRITE_INTENT) != 0 &&
+            ws_rstore_canonical(hKey, lpSubKey, hive, 64, base, WS_PATH_MAX, &pseudoBase, &bare) && !bare) {
+            /* 写意图 open：即使真实 32 键存在也**不**返回真实句柄 —— 返回带合成段的
+             * pseudo handle，保证后续 Set/Delete 的视图归因不依赖调用方是否保留句柄
+             * 的视图位（R26-GATE-01：reg.exe 关闭并重开时视图会丢）。 */
+            wchar_t viewPath[WS_PATH_MAX];
+            if (ws_reg_path_add_view(base, viewPath, WS_PATH_MAX)) {
+                HKEY h = ws_pseudo_key_make(hive, viewPath);
+                if (!h) {
+                    return ERROR_NOT_ENOUGH_MEMORY;
+                }
+                if (phkResult) *phkResult = h;
+                return ERROR_SUCCESS;
+            }
+        }
+        WS_OPEN_REAL_API();
     }
     if (!ws_reg_read_ctx(hKey, lpSubKey, samDesired, hive, 64, canonical, WS_PATH_MAX,
                          &isPseudo, &isBareRoot) || isBareRoot) {
         WS_TRACE("RegOpenKeyExW: passthrough (unresolvable/bare-root/wow64)");
-        return g_orig.RegOpenKeyExW(hKey, lpSubKey, ulOptions, samDesired, phkResult);
+        WS_OPEN_REAL_API();
     }
     int inOverlay = 0;
     if (ws_t3_key_exists(canonical, &inOverlay) == ERROR_SUCCESS && inOverlay) {
@@ -794,7 +1149,8 @@ static LONG ws_open_key_inner(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGS
         return ERROR_SUCCESS;
     }
     WS_TRACE("RegOpenKeyExW: real hive %ls", canonical);
-    return g_orig.RegOpenKeyExW(hKey, lpSubKey, ulOptions, samDesired, phkResult);
+    WS_OPEN_REAL_API();
+    #undef WS_OPEN_REAL_API
 }
 
 LONG WINAPI ws_RegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult)
@@ -1537,7 +1893,11 @@ static LONG ws_delete_key_inner(HKEY hKey, LPCWSTR lpSubKey, REGSAM samDesired)
                 if (!root) {
                     return ERROR_FILE_NOT_FOUND;
                 }
-                return g_orig.RegDeleteKeyExW(root, ws_reg_rel_of(hive, canonical), samDesired, 0);
+                wchar_t realRel[WS_PATH_MAX];
+                int view = 0;
+                ws_reg_path_strip_view(canonical, NULL, 0, realRel, WS_PATH_MAX, &view);
+                REGSAM sam = samDesired | (view ? KEY_WOW64_32KEY : 0);
+                return g_orig.RegDeleteKeyExW(root, realRel, sam, 0);
             }
             return g_orig.RegDeleteKeyExW(hKey, lpSubKey, samDesired, 0);
         }
@@ -1823,8 +2183,16 @@ static HKEY ws_reg_open_real(const wchar_t *hive, const wchar_t *rel, REGSAM sam
     if (!root || !rel || !rel[0]) {
         return NULL;
     }
+    /* R26: overlay paths for the 32-bit view carry the synthetic segment; the real
+     * API wants the stripped relative path plus KEY_WOW64_32KEY on the open. */
+    wchar_t realRel[WS_PATH_MAX];
+    int view = 0;
+    ws_reg_path_strip_view(rel, NULL, 0, realRel, WS_PATH_MAX, &view);
+    if (view) {
+        sam |= KEY_WOW64_32KEY;
+    }
     HKEY h = NULL;
-    if (g_orig.RegOpenKeyExW(root, rel, 0, sam, &h) != ERROR_SUCCESS) {
+    if (g_orig.RegOpenKeyExW(root, realRel, 0, sam, &h) != ERROR_SUCCESS) {
         return NULL;
     }
     return h;
@@ -1988,6 +2356,7 @@ LONG WINAPI ws_RegCloseKey(HKEY hKey)
         return ERROR_SUCCESS;
     }
     LONG rc = g_orig.RegCloseKey(hKey);
+    ws_reg_forget_handle_view(hKey);
         ws_log("REGDBG api=RegCloseKey pid=%lu hKey=%p ret=%ld", (unsigned long)GetCurrentProcessId(), (void *)hKey, (long)rc);
 SetLastError(ws_saved_last_error);
     return rc;

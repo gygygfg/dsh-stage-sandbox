@@ -366,13 +366,18 @@ export function runRegistryStageChecks(harness) {
       const linkOption = classifyRegistryOperation({ api: 'RegCreateKeyExW', path: 'HKLM\\X', dwOptions: 0x00000002 })
       check('REG_OPTION_CREATE_LINK 硬拒（覆盖层没有"链接键"这个对象）', linkOption.stageable === false && linkOption.code === 'REG_STAGE_OPTION_HARD_DENY', stableJson(linkOption))
       const wow64 = classifyRegistryOperation({ api: 'RegDeleteKeyExW', path: 'HKLM\\X', samDesired: 0x0200 })
-      // 契约 v1.5 / R18 KNOWN-01 变更（v1.4 期望是 unstaged 透传）：
-      // 实测透传会**改真实 hive**（`reg delete /reg:32` 真删真实键；创建留空壳键），
-      // 因此写/删类改为 fail-closed 硬拒 + HARD_DENY 原因码；真实 hive 一个字节不动。
+      // ★ R26 / R13：x64 进程里的 KEY_WOW64_32KEY 写/删**改为可暂存**（合成前缀 + WAL view 字段），
+      // 真实 hive 仍然零写（apply 时才用 /reg:32 落 32 视图）。WOW64 进程内的视图位保持 fail-closed。
       check(
-        'KEY_WOW64_32KEY 写/删类 ⇒ fail-closed 硬拒（透传会改真实 hive）',
-        wow64.stageable === false && wow64.unstaged === undefined && wow64.code === 'REG_STAGE_SAM_HARD_DENY' && wow64.status === HARD_DENY_STATUS && wow64.hardDenyReason === 'WOW64_32KEY_WRITE_NOT_STAGEABLE',
+        'R26：KEY_WOW64_32KEY 写/删类 ⇒ 可暂存且 view=1（不再是硬拒）',
+        wow64.stageable === true && wow64.view === 1 && wow64.flags?.view32 === true && wow64.code === 'REG_STAGE_OK',
         stableJson(wow64),
+      )
+      const wow64InWow = classifyRegistryOperation({ api: 'RegDeleteKeyExW', path: 'HKLM\\X', samDesired: 0x0200, wow64Process: true })
+      check(
+        'R26：WOW64 进程内的 KEY_WOW64_32KEY 写类仍 fail-closed（纵深防御，原因码 1）',
+        wow64InWow.stageable === false && wow64InWow.code === 'REG_STAGE_SAM_HARD_DENY' && wow64InWow.hardDenyReason === 'WOW64_32KEY_WRITE_NOT_STAGEABLE',
+        stableJson(wow64InWow),
       )
       const wow64Read = classifyRegistryOperation({ api: 'RegQueryValueExW', path: 'HKLM\\X', samDesired: 0x0200 })
       check(
@@ -430,7 +435,8 @@ export function runRegistryStageChecks(harness) {
        * 旧实现只把 `unstaged === true` 当"策略分流"；WOW64 写类改硬拒后该值为空，
        * 于是继续走 `effectiveExists()`，把策略拒绝误报成 `REG_STAGE_KEY_NOT_FOUND(2)`。
        */
-      const facadeFake = createFakeRegistry([])
+      // R26 / R13：stageDeleteKey(32KEY) 现在应**进暂存**（不再硬拒），且 WAL 记录带 view 字段。
+      const facadeFake = createFakeRegistry([['HKCU\\Software\\Facade32', 'V', 'REG_SZ', 'x']])
       const facadeStage = createRegistryStage({
         sessionDir: join(workRoot, 's2-facade-policy'),
         sessionId: 's2-facade',
@@ -438,19 +444,30 @@ export function runRegistryStageChecks(harness) {
         writer: facadeFake.writer,
       })
       facadeStage.open()
-      let facade32 = null
-      try {
-        facadeStage.stageDeleteKey('HKCU\\Software\\Facade32', { samDesired: 0x0200 })
-      } catch (error) {
-        facade32 = error
-      }
+      const facade32 = facadeStage.stageDeleteKey('HKCU\\Software\\Facade32', { samDesired: 0x0200 })
       check(
-        'facade：stageDeleteKey(32KEY) 抛 REG_STAGE_HARD_DENY(status=5, 原因码) —— 不得误报成 KEY_NOT_FOUND',
-        facade32 !== null &&
-          facade32.code === 'REG_STAGE_HARD_DENY' &&
-          facade32.status === HARD_DENY_STATUS &&
-          facade32.hardDenyReason === 'WOW64_32KEY_WRITE_NOT_STAGEABLE',
-        facade32 ? `${facade32.code}: status=${facade32.status} reason=${facade32.hardDenyReason}` : 'no throw',
+        'R26 facade：stageDeleteKey(32KEY) 进暂存（真实路径 + 合成视图前缀）',
+        facade32?.net === true && facade32?.path === 'HKCU\\__DSH_WOW64_32__\\Software\\Facade32',
+        facade32 ? facade32.path : 'no result',
+      )
+      check(
+        'R26 facade：WAL 记录带 reserved=1（视图字段）且路径带合成段',
+        facade32?.record?.reserved === 1 && String(facade32?.record?.path).includes('HKCU\\__DSH_WOW64_32__\\Software\\Facade32'),
+        stableJson(facade32?.record),
+      )
+      // 仍不存在（真实 32 视图里没有该键）⇒ KEY_NOT_FOUND，不得静默当作已删除。
+      const facadeEmpty = createFakeRegistry([])
+      const facadeEmptyStage = createRegistryStage({
+        sessionDir: join(workRoot, 's2-facade-policy-empty'),
+        sessionId: 's2-facade-empty',
+        reader: facadeEmpty.reader,
+        writer: facadeEmpty.writer,
+      })
+      facadeEmptyStage.open()
+      checkThrows(
+        'R26 facade：不存在的键 + 32KEY 删除 ⇒ REG_STAGE_KEY_NOT_FOUND（不假装删掉）',
+        () => facadeEmptyStage.stageDeleteKey('HKCU\\Software\\Absent32', { samDesired: 0x0200 }),
+        'REG_STAGE_KEY_NOT_FOUND',
       )
 
       check(

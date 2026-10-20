@@ -24,6 +24,36 @@
 
 #define WS_RS_MAX_DENY 32
 
+/* R26 / R13: overlay paths of the staged 32-bit view carry this synthetic segment
+ * right after the short hive name (see ws_reg.c's block comment). The provider
+ * must strip it before probing the REAL hive, and select the real 32-bit view. */
+#define WS_RS_WOW64_32_PREFIX L"__DSH_WOW64_32__"
+#define WS_RS_WOW64_32_PREFIX_LEN (sizeof(WS_RS_WOW64_32_PREFIX) / sizeof(wchar_t) - 1)
+
+static int rs_strip_view(const wchar_t *rel, wchar_t *out, DWORD cch, REGSAM *sam)
+{
+    if (!rel) {
+        return 0;
+    }
+    const wchar_t *bs = wcschr(rel, L'\\');
+    const wchar_t *head = bs ? rel : NULL;
+    if (!rel[0]) {
+        if (out && cch) out[0] = 0;
+        return 0;
+    }
+    if (_wcsnicmp(rel, WS_RS_WOW64_32_PREFIX, WS_RS_WOW64_32_PREFIX_LEN) == 0 &&
+        (rel[WS_RS_WOW64_32_PREFIX_LEN] == 0 || rel[WS_RS_WOW64_32_PREFIX_LEN] == L'\\')) {
+        const wchar_t *rest = rel + WS_RS_WOW64_32_PREFIX_LEN;
+        if (*rest == L'\\') rest++;
+        if (out && cch) ws_strlcpy_w(out, rest, cch);
+        if (sam) *sam |= KEY_WOW64_32KEY;
+        return 1;
+    }
+    (void)head;
+    if (out && cch) ws_strlcpy_w(out, rel, cch);
+    return 0;
+}
+
 /* ---- fail-closed on an incomplete overlay view (D-R1/D-R2 fix, 2026-10-09) ----
  *
  * ws_t3reg.c replays the shared overlay.journal into whatever app hive it managed
@@ -473,7 +503,10 @@ int ws_rstore_key_delete(const wchar_t *hive, const wchar_t *subkey)
         else if (ws_wcscmp_ci(hive, L"HKCC") == 0) realRoot = HKEY_CURRENT_CONFIG;
         (void)shortName;
         HKEY probe = NULL;
-        if (!realRoot || g_orig.RegOpenKeyExW(realRoot, rel, 0, KEY_READ, &probe) != ERROR_SUCCESS) {
+        wchar_t realRel[WS_PATH_MAX];
+        REGSAM realSam = KEY_READ;
+        rs_strip_view(rel, realRel, WS_PATH_MAX, &realSam);
+        if (!realRoot || g_orig.RegOpenKeyExW(realRoot, realRel, 0, realSam, &probe) != ERROR_SUCCESS) {
             /* neither the overlay nor the real hive has it: no net change */
             return ERROR_FILE_NOT_FOUND;
         }
@@ -666,7 +699,10 @@ int ws_rstore_value_delete(const wchar_t *hive, const wchar_t *subkey, const wch
         else if (ws_wcscmp_ci(hiveName, L"HKU") == 0) realRoot = HKEY_USERS;
         else if (ws_wcscmp_ci(hiveName, L"HKCC") == 0) realRoot = HKEY_CURRENT_CONFIG;
         HKEY realKey = NULL;
-        if (realRoot && g_orig.RegOpenKeyExW(realRoot, rel, 0, KEY_READ, &realKey) == ERROR_SUCCESS) {
+        wchar_t realRel[WS_PATH_MAX];
+        REGSAM realSam = KEY_READ;
+        rs_strip_view(rel, realRel, WS_PATH_MAX, &realSam);
+        if (realRoot && g_orig.RegOpenKeyExW(realRoot, realRel, 0, realSam, &realKey) == ERROR_SUCCESS) {
             DWORD type = 0;
             if (g_orig.RegQueryValueExW(realKey, name ? name : L"", NULL, &type, NULL, NULL) == ERROR_SUCCESS) {
                 existsSomewhere = 1;
