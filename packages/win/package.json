@@ -91,6 +91,7 @@
     "tools/sandbox-audit.ts",
     "tools/dsh-patches.ts",
     "tools/uninstall-restore.ts",
+    "tools/plugin-remove-cleanup.ts",
     "README.md",
     "LICENSE",
     "PUBLISHING.md"

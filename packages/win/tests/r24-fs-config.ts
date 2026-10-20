@@ -31,7 +31,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -58,6 +58,52 @@ const section = (title) => process.stdout.write(`\n=== ${title} ===\n`)
 const savedEnv = { stageRoot: process.env.WINSTAGE_STAGE_ROOT, readPolicy: process.env.WINSTAGE_READ_POLICY }
 rmSync(SCRATCH, { recursive: true, force: true })
 mkdirSync(SCRATCH, { recursive: true })
+
+/**
+ * A1 子进程夹具（**套件自生成**，R25-B 修复）。
+ *
+ * 为什么内联：套件必须在**干净 checkout/CI** 上可跑 —— 早先版本引用
+ * `.t/fs-policy/r24-readpolicy-child.ts`（未跟踪、`.t` 被 ignore），
+ * 清 scratch 后变成 `Cannot find module`（gate-runner 在 final dist 树上实测 68/14）。
+ * 现在每次运行把源码写到本套件自己的 `SCRATCH` 下（路径随套件清理），
+ * 相对 import 用 `../../../dsh-plugin/fs-entry.ts`（SCRATCH = `.t/fs-policy/r24-fs-config`）。
+ * 内容只用单引号字符串，避免嵌入模板字符串时的插值/转义问题。
+ */
+const CHILD_SOURCE = [
+  "import { Context } from '@deepseek-ai/cordis'",
+  '',
+  'const workspaceRoot = process.argv[2]',
+  "if (typeof workspaceRoot !== 'string' || workspaceRoot.length === 0) {",
+  "  console.error('usage: node r24-readpolicy-child.ts <workspaceRoot>')",
+  '  process.exit(2)',
+  '}',
+  '',
+  'const captured = []',
+  'const ctx = new Context()',
+  'try {',
+  '  ctx.logger.exporter({',
+  '    levels: { default: 3 },',
+  '    export: ({ type, args }) => captured.push(type + ": " + args.map((arg) => String(arg)).join(" ")),',
+  '  })',
+  '} catch (error) {',
+  '  captured.push("exporter-failed: " + (error && error.message ? error.message : String(error)))',
+  '}',
+  "ctx.provide('sandboxPolicy', { defaultMode: 'workspace-write' })",
+  '',
+  "const module = await import('../../../dsh-plugin/fs-entry.ts')",
+  'const StagingFileSystem = module.default',
+  'const instance = new StagingFileSystem(ctx, { cwd: workspaceRoot, diffBasisMaxBytes: 1024 * 1024 })',
+  '',
+  'process.stdout.write(JSON.stringify({',
+  '  env: process.env.WINSTAGE_READ_POLICY ?? null,',
+  '  policy: instance.readPolicy,',
+  '  raw: instance.readPolicyRaw ?? null,',
+  '  source: instance.readPolicySource,',
+  '  invalidWarnings: captured.filter((line) => /读策略配置非法|fail-safe/.test(line)),',
+  '  capturedCount: captured.length,',
+  '}) + "\\n")',
+  '',
+].join('\n')
 
 const writeFile = (root, rel, content) => {
   const abs = join(root, ...rel.split('/'))
@@ -138,9 +184,16 @@ try {
   // ═════════════════════════════════════════════════════════════════════════
   section('2. A1 生产入口：WINSTAGE_READ_POLICY → 真实 fs-entry.ts（每个变体独立子进程）')
   {
-    const child = join(PKG, '.t', 'fs-policy', 'r24-readpolicy-child.ts')
+    // 夹具由套件自生成到 SCRATCH（干净树/CI 可跑；见 CHILD_SOURCE 注释）
+    const child = join(SCRATCH, 'r24-readpolicy-child.ts')
+    writeFileSync(child, CHILD_SOURCE)
     const wsRoot = join(SCRATCH, 'entry-ws')
     mkdirSync(wsRoot, { recursive: true })
+    check(
+      'A1 前置：子进程夹具由套件自生成（不依赖未跟踪的 .t 文件；干净 checkout 可跑）',
+      existsSync(child) && readFileSync(child, 'utf8') === CHILD_SOURCE,
+      child,
+    )
     const cases = [
       { id: 'unset', env: undefined, policy: 'record', source: 'default', warn: false },
       { id: 'record', env: 'record', policy: 'record', source: 'explicit', warn: false },

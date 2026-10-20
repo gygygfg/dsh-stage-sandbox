@@ -2000,6 +2000,16 @@ export class WindowsStageExecutor {
     this.transparent = undefined
     this.shimLauncher = undefined
     /**
+     * R25-A：T1S（受限令牌 + shim）的 opt-in 解析结果 / 档位判定 / 装配结果。
+     * 默认（`WINSTAGE_T1_SHIM` 未设）三者都是 undefined ⇒ T1 逐字不变。
+     */
+    this.t1ShimOptIn = undefined
+    this.t1ShimPlan = undefined
+    /** T1S 装配成功后的启动信息（artifacts/env/reportDir/grantDirs/checks）；未生效时 undefined */
+    this.t1sLaunch = undefined
+    /** 最近一次 T1S 注入器启动读数（诊断用；不参与判定） */
+    this.t1sLastLaunch = undefined
+    /**
      * ── 三轮接线：三个新维度（全部保持接线前的默认语义）──────────────────────────
      *   · `networkTier`        默认 `'OBSERVED_ONLINE'`：`resolveNetworkPolicy()` 对非 OFFLINE
      *     档位连绑定表都不碰 ⇒ 不安装、不阻断、不上报任何强制。
@@ -2055,7 +2065,8 @@ export class WindowsStageExecutor {
   static stagingWriteEnforceability(report, options = {}) {
     const lane = options.lane ?? 'sandbox'
     const checks = Array.isArray(report?.checks) ? report.checks : []
-    const measuredNames = lane === 'shim' ? SHIM_STAGING_WRITE_CHECKS : SANDBOX_STAGING_WRITE_CHECKS
+    const measuredNames =
+      lane === 'shim' ? SHIM_STAGING_WRITE_CHECKS : lane === 't1s' ? T1S_STAGING_WRITE_CHECKS : SANDBOX_STAGING_WRITE_CHECKS
     const relevant = checks.filter((c) => isStagingWriteCheckName(c?.name))
     const measuredChecks = relevant.map((c) => ({ name: c.name, status: c.status, detail: c.detail }))
     const failedChecks = measuredChecks.filter((c) => c.status !== 'pass' && c.status !== 'documented-residual')
@@ -2087,7 +2098,9 @@ export class WindowsStageExecutor {
    */
   stagingWriteEnforceability(options = {}) {
     return WindowsStageExecutor.stagingWriteEnforceability(this.initReport, {
-      lane: options.lane ?? (this.launchMode === 'shim' ? 'shim' : 'sandbox'),
+      lane:
+        options.lane ??
+        (this.launchMode === 'shim' ? 'shim' : this.launchMode === T1S_LAUNCH_MODE ? 't1s' : 'sandbox'),
     })
   }
 
@@ -2286,7 +2299,16 @@ export class WindowsStageExecutor {
       audit.events.push({ ...sample, kind: 'sample' })
     }
     // ── 档位漂移（BUG-3 的"会话漂移"）：请求档位 ≠ 生效档位 ⇒ 记录一次 ──────────
-    if (this.tierRequested !== undefined && this.tierEffective !== undefined && this.tierRequested !== this.tierEffective) {
+    // R25-A：T1S 是**显式 opt-in 的档位增强**（请求 T1 → 生效 T1S），不是回落/漂移；
+    // 把它记成 drift 会让"档位漂移"这个告警失去意义（它是用来抓 fail-closed 回退的）。
+    const tierUpgradeToT1s =
+      this.tierEffective === T1S_TIER && String(this.tierRequested ?? '').toUpperCase() === 'T1'
+    if (
+      this.tierRequested !== undefined &&
+      this.tierEffective !== undefined &&
+      this.tierRequested !== this.tierEffective &&
+      !tierUpgradeToT1s
+    ) {
       if (!audit.tierDrift) {
         audit.tierDrift = true
         audit.events.push({
@@ -2396,6 +2418,8 @@ export class WindowsStageExecutor {
       rootLostCount: audit.rootLostCount,
       rootLostEvents: critical.map((e) => ({ at: e.at, where: e.where, kind: e.kind, configured: e.configured, envStageRoot: e.envStageRoot, exists: e.exists })),
       tierDrift: audit.tierDrift,
+      /** R25-A：请求 T1 → 生效 T1S（显式 opt-in 的档位增强，不是回退/漂移） */
+      tierUpgrade: this.tierEffective === T1S_TIER && String(this.tierRequested ?? '').toUpperCase() === 'T1',
       tierRequested: this.tierRequested,
       tierEffective: this.tierEffective,
       configured: this.stagingRoot,
@@ -2668,6 +2692,329 @@ export class WindowsStageExecutor {
     return this.initReport
   }
 
+  /**
+   * ── R25-A：T1S 装配（在 T1 的 ACL 授权/受限令牌就绪之后调用）──────────────────
+   *
+   * 三条腿都要真装上，缺一条就 fail-closed（抛错，由 init() 归因成 T1S_UNAVAILABLE）：
+   *   ① **shim 运行目录可写**（受限身份实测写，不是只看 ACE）——spike 实测：不授权
+   *      registry session dir ⇒ `DshRegStageAttach failed: 3` ⇒ WAL 归因不成立；
+   *   ② shim 环境契约（stage root / log / config / read-mask / audit / REGSTAGE session dir），
+   *      与 `initTransparent()` 同一份组装（同一套 writeShimConfig / exportMaskJson）；
+   *   ③ T1S 语义探针：受限注入器 → cmd 写工作区外路径 ⇒ 子进程成功、**真实盘没有**、
+   *      **暂存树里有**；再加探测阶段的 shim 金丝雀两项（能力恢复、无 DSH_SANDBOX 痕迹）。
+   *
+   * 失败语义：**不降回 T1**（T1 没有 WAL 归因，静默降档会让调用方读错自己的档位）。
+   */
+  async initializeT1S({ tempDir, registryStageDir, extraGrantDirs, writable, baseEnv }) {
+    if (!this.transparent?.available || !this.transparent.artifacts?.dllPath || !this.transparent.artifacts?.injectorPath) {
+      throw fail(T1S_UNAVAILABLE, `the shim is not available (${this.transparent?.reason ?? 'not probed'})`)
+    }
+    if (!this.launcher || !this.token) {
+      throw fail(T1S_UNAVAILABLE, 'the restricted-token launcher/token is missing (T1 assembly did not complete)')
+    }
+    if (writable !== true) {
+      // read-only 档没有可暂存的写面；T1S 的卖点（WAL 归因）在只读档没有意义，
+      // 但也不该静默改变请求语义 —— 拒绝装配并让调用方显式选择。
+      throw fail(T1S_UNAVAILABLE, 'T1S staging/WAL attribution requires mode=workspace-write; read-only mode has no staged write surface')
+    }
+    // 受限子进程的环境从允许清单重建（手册 #8.3）；空环境会让 cmd/注入器自己先失败，
+    // 从而把"环境没配好"误判成"目录没授权"（实测：空 env 下 cmd 重定向 exit=1）。
+    const launchEnv = baseEnv ?? buildChildEnvironment({}, { tempDir, cwd: this.stagingRoot }).env ?? {}
+    const checks = []
+    // ① shim 运行目录的**受限身份实测写**
+    const aux = await this.verifyT1sAuxDirs(extraGrantDirs, launchEnv)
+    checks.push({ name: 't1s-aux-dirs-writable', status: aux.ok ? 'pass' : 'fail', detail: aux.detail, evidence: '[实测] 受限令牌子进程写标记文件' })
+    if (!aux.ok) {
+      throw fail(T1S_UNAVAILABLE, `the shim runtime directories are not writable by the restricted identity: ${aux.detail}`)
+    }
+    // ② shim 环境契约（与 initTransparent 同源组装）
+    const logPath = join(this.stagingRoot, 'shim.log')
+    const maskSessionDir = registryStageDir || tempDir
+    mkdirSync(maskSessionDir, { recursive: true })
+    const readDenyFile = join(maskSessionDir, 'read-deny.mask.json')
+    writeFileSync(readDenyFile, `${exportMaskJson({ pretty: false })}\n`, 'utf8')
+    this.readDenyMask = { path: readDenyFile, bytes: statSync(readDenyFile).size }
+    const { configPath, config, logRotation } = writeShimConfig({
+      stageRoot: this.stagingRoot,
+      logPath,
+      extraPassthrough: extraGrantDirs,
+      readDenyFile,
+    })
+    this.shimLogRotation = logRotation
+    const auditPath =
+      this.options.audit === false
+        ? undefined
+        : typeof this.options.auditLogPath === 'string' && this.options.auditLogPath.length > 0
+          ? resolve(this.options.auditLogPath)
+          : join(maskSessionDir, 'audit.jsonl')
+    this.auditPath = auditPath
+    const shimEnv = {
+      // shim 的环境契约（T4 `winstage_shim.h`）；**不设** WINSTAGE_SHIM_DISABLE（设了等于裸跑）
+      WINSTAGE_STAGE_ROOT: this.stagingRoot,
+      WINSTAGE_SHIM_LOG: logPath,
+      WINSTAGE_SHIM_CONFIG: configPath,
+      ...(auditPath ? { WINSTAGE_AUDIT_LOG: auditPath } : {}),
+      // 注册表覆盖层/WAL **不得**落在暂存树里（自指条目），与 TS 同口径放会话存储根
+      ...(registryStageDir
+        ? { WINSTAGE_REGSTAGE_SESSION_DIR: registryStageDir, DSH_REGSTAGE_ROOT: registryStageDir }
+        : {}),
+    }
+    this.t1sLaunch = {
+      artifacts: this.transparent.artifacts,
+      env: shimEnv,
+      envKeys: Object.keys(shimEnv).sort(),
+      captureDir: this.stagingRoot,
+      reportDir: this.stagingRoot,
+      logPath,
+      configPath,
+      config,
+      readDenyFile,
+      auditPath,
+      logRotation,
+      registryStageDir,
+      grantDirs: extraGrantDirs,
+      checks: [],
+    }
+    // ③ T1S 语义探针：区外写 ⇒ 子进程成功 + 真实盘无 + 暂存树有
+    const stamp = `${Date.now().toString(36)}${randomUUID().slice(0, 4)}`
+    const outside = `C:\\Windows\\Temp\\winstage-t1s-selfcheck-${stamp}.txt`
+    let probeOutcome
+    try {
+      const shell = resolvePowerShell(process.env, this.stagingRoot)
+      probeOutcome = await this.launchT1S({
+        command: shell.command,
+        args: [
+          '-NoLogo',
+          '-NonInteractive',
+          '-NoProfile',
+          '-Command',
+          `Set-Content -LiteralPath '${ps(outside)}' -Value 't1s' -ErrorAction Stop`,
+        ],
+        cwd: this.stagingRoot,
+        env: launchEnv,
+        timeoutMs: this.options.selfTestTimeoutMs ?? 90000,
+      })
+    } catch (error) {
+      throw fail(T1S_UNAVAILABLE, `T1S self-check injection failed: ${error.message}`)
+    }
+    const realExists = existsSync(outside)
+    const staged = findFileUnder(this.stagingRoot, `winstage-t1s-selfcheck-${stamp}.txt`)
+    checks.push({
+      name: 'outside-write-staged-not-real',
+      status: !realExists && Boolean(staged) ? 'pass' : 'fail',
+      detail: `child-response=ok real-disk-has-file=${realExists} staged=${staged ?? 'not-found'} injectorExit=${probeOutcome.exitCode}`,
+      evidence: '[实测] 受限注入器 → 沙箱内写、宿主侧核对真实磁盘与暂存树',
+    })
+    if (realExists) {
+      try {
+        unlinkSync(outside)
+      } catch {
+        /* 清理失败不影响判定 */
+      }
+    }
+    checks.push({
+      name: 'transparent-capability-canary',
+      status: this.transparent?.canaryJudge?.ok ? 'pass' : 'fail',
+      detail: `pre-flight canary: ${this.transparent?.canaryJudge?.reason ?? 'no canary result'}; items=${JSON.stringify(this.transparent?.canaryJudge?.items ?? {})}`,
+      evidence: '[实测] winstage-inject.exe → 金丝雀',
+    })
+    checks.push({
+      name: 'no-dsh-sandbox-trace',
+      status: this.transparent?.canary?.dshSandboxCount === 0 ? 'pass' : 'fail',
+      detail: `DSH_SANDBOX* vars in canary: ${JSON.stringify(this.transparent?.canary?.dshSandboxVars ?? null)}`,
+      evidence: '[实测] 金丝雀子进程环境扫描',
+    })
+    const failed = checks.filter((check) => check.status !== 'pass' && check.status !== 'documented-residual')
+    if (failed.length > 0) {
+      throw fail(T1S_UNAVAILABLE, `T1S self-check failed: ${failed.map((check) => `${check.name}=${check.status}`).join('; ')}`)
+    }
+    this.t1sLaunch = {
+      ...this.t1sLaunch,
+      checks,
+      probe: {
+        injectorExit: probeOutcome.exitCode,
+        injectionReport: probeOutcome.injectionReport,
+        judge: probeOutcome.judge,
+      },
+    }
+    return {
+      launch: this.t1sLaunch,
+      checks,
+      // 两条腿都在跑；不是"只有 shim"也不是"只有令牌"
+      enforcement: 'shim-user-mode+acl-restricted-token',
+    }
+  }
+
+  /**
+   * R25-A：受限身份**实测**给定目录可写（写标记文件 → 宿主删除）。
+   * 只看 ACE 不够：ACE 可能授给了错误的 SID/继承位不对/目录被占。spike 已证明
+   * "没授权 ⇒ DshRegStageAttach failed: 3"，这里把授权变成可执行判据。
+   */
+  async verifyT1sAuxDirs(dirs, baseEnv) {
+    if (!Array.isArray(dirs) || dirs.length === 0) {
+      return { ok: true, detail: 'no extra directories (shim session dir resolves to the granted temp dir / staging root)' }
+    }
+    const env = baseEnv ?? buildChildEnvironment({}, { tempDir: this.tempDir, cwd: this.stagingRoot }).env ?? {}
+    // 用 PowerShell 的 Set-Content 而不是 cmd 的 `>` 重定向：受限启动器的命令行引号规则
+    // 会把含空格的 `echo x> "path"` 搞坏（实测 Win32 123）；T1 selfTest 用的正是
+    // `-Command "Set-Content -LiteralPath '...'"` 这条已验证的形状（`ps()` 转义单引号）。
+    const shell = resolvePowerShell(process.env, this.stagingRoot)
+    const results = []
+    for (const dir of dirs) {
+      const marker = join(dir, `.winstage-t1s-grant-${process.pid}-${randomUUID().slice(0, 6)}.txt`)
+      let outcome
+      try {
+        outcome = await this.launchRestrictedCapture({
+          command: shell.command,
+          args: [
+            '-NoLogo',
+            '-NonInteractive',
+            '-NoProfile',
+            '-Command',
+            `Set-Content -LiteralPath '${ps(marker)}' -Value 't1s' -ErrorAction Stop`,
+          ],
+          cwd: dir,
+          env,
+          timeoutMs: 30000,
+        })
+      } catch (error) {
+        results.push({ dir, ok: false, detail: `launch failed: ${error.message}` })
+        continue
+      }
+      const written = existsSync(marker)
+      try {
+        unlinkSync(marker)
+      } catch {
+        /* 标记文件清理失败不影响判定 */
+      }
+      results.push({
+        dir,
+        ok: outcome.exitCode === 0 && written,
+        detail: `exit=${outcome.exitCode} wrote=${written}${written ? '' : ` stderr=${String(outcome.stderr).trim().slice(0, 160)}`}`,
+      })
+    }
+    const failed = results.filter((result) => !result.ok)
+    return {
+      ok: failed.length === 0,
+      dirs: results,
+      detail: results.map((result) => `${result.dir}: ${result.detail}`).join(' | '),
+    }
+  }
+
+  /** 受限令牌下启动一个进程并收集输出（T1S 的 shim 运行目录实测 / 探针用）。 */
+  async launchRestrictedCapture({ command, args = [], cwd, env, timeoutMs = 120000 }) {
+    if (!this.launcher) throw fail(T1S_UNAVAILABLE, 'the restricted-token launcher is missing')
+    const child = this.launcher.launch({ command, args, cwd, env: { ...(env ?? {}) }, job: this.job })
+    return this.collectWithTimeout(child, timeoutMs)
+  }
+
+  /** collectChild + 有界超时（超时 ⇒ terminate(124) 回收整棵 Job，fail-closed）。 */
+  async collectWithTimeout(child, timeoutMs) {
+    let timedOut = false
+    const timer = new Promise((resolvePromise) => {
+      const handle = setTimeout(() => {
+        timedOut = true
+        try {
+          this.terminate(124)
+        } catch {
+          /* 回收失败不掩盖超时结论 */
+        }
+        resolvePromise({
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.from(`dsh-stage: timeout after ${timeoutMs}ms`),
+          exitCode: 124,
+        })
+      }, timeoutMs)
+      if (typeof handle.unref === 'function') handle.unref()
+    })
+    const settled = await Promise.race([this.collectChild(child), timer])
+    return { ...settled, timedOut }
+  }
+
+  /**
+   * R25-A：T1S 的一次命令启动 —— **受限 injector 走 T1 的令牌**，目标进程继承该令牌，
+   * 再由注入器注入 shim（暂存 + WAL）。失败一律 fail-closed（T1S_INJECTION_FAILED），
+   * 绝不降级成"没有 shim 的 T1"。
+   */
+  async launchT1S({ command, args = [], cwd, env, timeoutMs = 120000 }) {
+    const launch = this.t1sLaunch
+    if (!launch?.artifacts?.injectorPath || !launch?.artifacts?.dllPath) {
+      throw fail(T1S_UNAVAILABLE, 'the T1S lane is not assembled — call init() first (no silent downgrade to T1)')
+    }
+    mkdirSync(launch.reportDir, { recursive: true })
+    const reportPath = join(launch.reportDir, `.winstage-inject-t1s-${randomUUID().slice(0, 6)}.json`)
+    try {
+      unlinkSync(reportPath)
+    } catch {
+      /* 不存在即目标状态 */
+    }
+    const injectorArgv = ['--dll', launch.artifacts.dllPath, '--report', reportPath, '--', command, ...args]
+    const mergedEnv = { ...(env ?? {}), ...launch.env }
+    const started = Date.now()
+    let child
+    try {
+      child = this.launcher.launch({
+        command: launch.artifacts.injectorPath,
+        args: injectorArgv,
+        cwd,
+        env: mergedEnv,
+        job: this.job,
+      })
+    } catch (error) {
+      throw fail(T1S_INJECTION_FAILED, `cannot start winstage-inject.exe under the restricted token: ${error.message}`)
+    }
+    const settled = await this.collectWithTimeout(child, timeoutMs)
+    let report
+    try {
+      report = existsSync(reportPath) ? JSON.parse(readFileSync(reportPath, 'utf8')) : undefined
+    } catch {
+      report = undefined
+    }
+    try {
+      unlinkSync(reportPath)
+    } catch {
+      /* 清理失败不影响判定 */
+    }
+    this.t1sLastLaunch = {
+      pid: child.pid,
+      injectorExit: settled.exitCode,
+      timedOut: settled.timedOut === true,
+      injectionReport: report,
+      durationMs: Date.now() - started,
+      dllPath: launch.artifacts.dllPath,
+      injectorPath: launch.artifacts.injectorPath,
+      transport: 'winstage-inject.exe (CreateProcessAsUserW under the T1 restricted token)',
+    }
+    if (settled.timedOut) {
+      throw fail(T1S_INJECTION_FAILED, `the restricted injector timed out after ${timeoutMs}ms (child tree terminated; fail-closed)`)
+    }
+    if (settled.exitCode === SHIM_INJECT_FAILURE_EXIT || report?.ok === false) {
+      throw fail(
+        T1S_INJECTION_FAILED,
+        `winstage-inject.exe refused to start the child under the restricted token (exit ${settled.exitCode}, report.ok=${report?.ok}): ` +
+          `${report?.error ?? String(settled.stderr).slice(0, 300)} — refusing to continue without the shim (fail-closed)`,
+      )
+    }
+    // R22-C 三件套握手：加载成功 ≠ 钩子已装（延迟初始化下 shimInitRc 才是判据）
+    const judge = judgeInjectorInit(report)
+    if (!judge.ok) {
+      throw fail(
+        T1S_INJECTION_FAILED,
+        `winstage-inject.exe loaded the DLL but the shim was not initialized (${judge.code}: ${judge.detail}) — ` +
+          'refusing to run the child without hooks while claiming T1S attribution (fail-closed)',
+      )
+    }
+    return {
+      pid: child.pid,
+      exitCode: settled.exitCode,
+      timedOut: false,
+      stdout: settled.stdout,
+      stderr: settled.stderr,
+      injectionReport: report,
+      judge,
+    }
+  }
+
   /** fail-closed 初始化：任何 Win32 失败都抛错，绝不降级为无沙箱（手册 1.2 / 5.2） */
   async init() {
     if (this.sandbox || this.launchMode === 'shim') return this.initReport
@@ -2704,8 +3051,17 @@ export class WindowsStageExecutor {
     // 受限令牌模式。绝不因为"配置开关打开"就换成普通令牌。
     const requested = this.options.tier ?? process.env.WINSTAGE_TIER ?? 'T1'
     this.tierRequested = requested
+    /**
+     * ── R25-A：T1S opt-in 的**唯一**入口 ──────────────────────────────────────────
+     * `WINSTAGE_T1_SHIM=1` + 请求 T1 才有意义；显式 opt-in 但探测/装配失败一律
+     * `T1S_UNAVAILABLE` fail-closed（绝不静默降回 T1 —— 那会丢掉调用方明确要的 WAL 归因）。
+     * 默认（未设）时 `t1ShimPlan.use === false` ⇒ 下面的 T1 路径逐字不变。
+     */
+    this.t1ShimOptIn = resolveT1ShimOptIn(process.env)
     const wantsTransparent = String(requested).toUpperCase() === TRANSPARENT_TIER || String(requested).toLowerCase() === 'auto'
-    if (wantsTransparent && typeof cap.probeTransparentShim === 'function') {
+    const wantsT1Shim =
+      !wantsTransparent && String(requested).toUpperCase() === 'T1' && this.t1ShimOptIn.requested
+    if ((wantsTransparent || wantsT1Shim) && typeof cap.probeTransparentShim === 'function') {
       this.transparent = cap.probeTransparentShim({
         stagingRoot: this.stagingRoot,
         tempDir: this.options.tempDir,
@@ -2722,8 +3078,24 @@ export class WindowsStageExecutor {
     this.tier = selected.tierEffective
     this.fallbackReason = selected.fallbackReason
     if (this.launchMode === 'shim') return this.initTransparent(cap)
+    this.t1ShimPlan = planT1ShimMode({ requested, optIn: this.t1ShimOptIn, shimProbe: this.transparent })
+    if (this.t1ShimPlan.failClosed) {
+      throw fail(
+        T1S_UNAVAILABLE,
+        `${T1_SHIM_OPT_IN_ENV} was explicitly requested but the T1S lane cannot be assembled: ${this.t1ShimPlan.reason}. ` +
+          'Refusing to silently fall back to plain T1 (that would report a tier the caller did not ask for and carry no WAL attribution).',
+      )
+    }
+    const t1s = this.t1ShimPlan.use === true
 
     if (!cap.aclAvailable) {
+      if (t1s) {
+        throw fail(
+          T1S_UNAVAILABLE,
+          `T1S opt-in requires the ACL backend (restricted token + stage-root write ACE) but it is not loadable (${cap.aclError}). ` +
+            'Refusing to fall back to plain T1.',
+        )
+      }
       throw fail(
         'SANDBOX_UNAVAILABLE',
         `@deepseek-ai/dsh-sandbox-windows-acl is not loadable (${cap.aclError}). Refusing to run unconfined — binding the workspace writable without an enforcing backend is forbidden (manual §1.2/§5.2).`,
@@ -2745,6 +3117,36 @@ export class WindowsStageExecutor {
     // 目标根 = `stageGrantTarget()`（显式 override 或 `resolveStageRoot` 的缓存根）。
     // 授权目标**逐字**就是下面 `writableDirs` / `writeSid` 用的那个根 —— 三者同源，
     // 不存在"授权落在一个目录、子进程 cwd 在另一个目录"的漂移。
+    // ── R25-A：T1S 还需要把 **shim 的运行目录**授给同一个写 SID ────────────────────
+    // shim 在**子进程（受限身份）**里写 registry overlay/WAL（`WINSTAGE_REGSTAGE_SESSION_DIR`）
+    // 与 audit.jsonl；这些目录不在 stagingRoot 下，T1 的 grant 不会覆盖它们。spike 实测：
+    // 不授权 ⇒ `DshRegStageAttach failed: 3 (ERROR_PATH_NOT_FOUND)` ⇒ 注册表写 fail-closed、
+    // WAL 为空 ⇒ "T1 真归因"不成立。因此 T1S 把这些目录一起放进同一次 AclSandbox.init 的
+    // writableDirs（同一个令牌、同一次授权），并在下面做**受限身份实测写**（不是只看 ACE）。
+    const t1sExtraGrantDirs = []
+    if (t1s) {
+      const registryStageDirForShim =
+        typeof this.options.registryStageDir === 'string' && this.options.registryStageDir.length > 0
+          ? resolve(this.options.registryStageDir)
+          : undefined
+      const auditPathForShim =
+        this.options.audit === false
+          ? undefined
+          : typeof this.options.auditLogPath === 'string' && this.options.auditLogPath.length > 0
+            ? resolve(this.options.auditLogPath)
+            : join(registryStageDirForShim || tempDir, 'audit.jsonl')
+      for (const dir of [registryStageDirForShim, auditPathForShim ? dirname(auditPathForShim) : undefined]) {
+        if (!dir) continue
+        if (sameDir(dir, this.stagingRoot)) continue
+        if (tempDir && sameDir(dir, tempDir)) continue
+        if (t1sExtraGrantDirs.some((existing) => sameDir(existing, dir))) continue
+        t1sExtraGrantDirs.push(dir)
+      }
+      // 宿主先建（受限身份建不出目录）；建不出就是 T1S 装配失败，下面 ensureStageGrant
+      // 之前的异常会被 init() 的 T1S catch 归因成 T1S_UNAVAILABLE。
+      for (const dir of t1sExtraGrantDirs) mkdirSync(dir, { recursive: true })
+    }
+
     const grant = await ensureStageGrant({
       target: { ...this.stageGrantPlan, root: this.stagingRoot },
       writable,
@@ -2753,7 +3155,7 @@ export class WindowsStageExecutor {
       // 后端抛错 / 回报失败一律被 `ensureStageGrant` 归因成 `STAGE_GRANT_FAILED`。
       runGrant: async (root, writeSid) => ({
         value: await initAclSandboxWithTokenCapture(cap.AclSandbox, {
-          writableDirs: writable ? [root] : [],
+          writableDirs: writable ? [root, ...t1sExtraGrantDirs] : [],
           tempDir: writable ? tempDir : null,
           writeSid,
           tempWriteSid: writable && tempDir ? cap.tempWriteSid(tempDir) : undefined,
@@ -2784,6 +3186,8 @@ export class WindowsStageExecutor {
       hostCreated: grant.hostCreated === true,
       created: grant.created === true,
       steps: grant.steps,
+      // R25-A：T1S 额外授给同一写 SID 的目录（shim 的 registry overlay/WAL、audit）
+      ...(t1s ? { extraWritableDirs: t1sExtraGrantDirs } : {}),
     }
     const { sandbox, api: capturedApi, token, fieldNames } = grant.value
 
@@ -2878,6 +3282,53 @@ export class WindowsStageExecutor {
     }
 
     this.initReport = await this.selfTest()
+    /**
+     * ── R25-A：T1S 装配（受限令牌已经建好，这一步把 shim 那条腿接上）──────────────
+     * 顺序很重要：**先**用 T1 语义跑 selfTest（上面这行，此时 launchMode 仍是
+     * `restricted-token` ⇒ "区外写被内核拒绝"的判据成立），**再**装配 shim 并跑
+     * T1S 语义探针（区外写被暂存、真实盘不变）。最后才把 launchMode 切到 T1S。
+     * 任何一步失败 ⇒ `T1S_UNAVAILABLE` fail-closed（绝不降回 T1）。
+     */
+    if (t1s) {
+      const t1sStarted = Date.now()
+      try {
+        const registryStageDirForShim =
+          typeof this.options.registryStageDir === 'string' && this.options.registryStageDir.length > 0
+            ? resolve(this.options.registryStageDir)
+            : undefined
+        const assembled = await this.initializeT1S({
+          tempDir,
+          registryStageDir: registryStageDirForShim,
+          extraGrantDirs: t1sExtraGrantDirs,
+          writable,
+          // 受限子进程环境从允许清单重建（#8.3）：装配探针与启动读数都用同一份
+          baseEnv: buildChildEnvironment({}, { tempDir, cwd: this.stagingRoot }).env,
+        })
+        this.t1sLaunch = assembled.launch
+        this.initReport.checks = [...(this.initReport.checks ?? []), ...assembled.checks]
+        this.initReport.enforcement = assembled.enforcement
+        this.launchMode = T1S_LAUNCH_MODE
+        this.tierEffective = T1S_TIER
+        this.tier = T1S_TIER
+        this.t1sLaunch = { ...this.t1sLaunch, invokeMs: Date.now() - t1sStarted }
+      } catch (error) {
+        try {
+          safeDispose(this.sandbox)
+        } catch {
+          /* 清理失败不掩盖原因 */
+        }
+        try {
+          safeClose(this.api, this.job)
+        } catch {
+          /* 同上 */
+        }
+        throw fail(
+          T1S_UNAVAILABLE,
+          `${T1_SHIM_OPT_IN_ENV} was explicitly requested but the T1S lane could not be assembled: ${error.message}. ` +
+            'Refusing to fall back to plain T1 (that would silently drop the WAL attribution the caller asked for).',
+        )
+      }
+    }
     // ── T0（AppContainer）执行路径的接线（本轮）──────────────────────────────
     // 只在**显式要求 T0** 时装配。任何一步失败都 fail-closed（抛 SANDBOX_UNAVAILABLE），
     // **绝不**降级成 T1 继续跑 —— 那会让调用方以为自己在 T0 里，而实际只是一个普通进程
@@ -2960,6 +3411,31 @@ export class WindowsStageExecutor {
       appContainer: this.appContainerInfo,
       // R20②：本档的注册表写归因能力（T1/T0 无 shim ⇒ 结构化声明"不可归因"，不冒充已归因）
       registryAttribution: registryAttributionFor(this.launchMode),
+      // ── R25-A：T1S 的装配读数（两条腿 + 授权目录 + shim 环境契约）；非 T1S 为 undefined ──
+      ...(t1s ? { backend: 'winstage-shim-iat+windows-acl-restricted-token' } : {}),
+      t1Shim: t1s
+        ? {
+            optInEnv: T1_SHIM_OPT_IN_ENV,
+            optInValue: this.t1ShimOptIn?.value,
+            tierRequested: this.tierRequested,
+            tierEffective: this.tierEffective,
+            launchMode: this.launchMode,
+            attribution: registryAttributionFor(this.launchMode),
+            artifacts: this.t1sLaunch?.artifacts,
+            envKeys: this.t1sLaunch?.envKeys,
+            grantDirs: this.t1sLaunch?.grantDirs,
+            readDenyFile: this.t1sLaunch?.readDenyFile,
+            auditPath: this.t1sLaunch?.auditPath,
+            logPath: this.t1sLaunch?.logPath,
+            checks: this.t1sLaunch?.checks,
+            probe: this.t1sLaunch?.probe,
+            enforcement: 'shim-user-mode+acl-restricted-token',
+            residual: registryAttributionFor(this.launchMode).residual,
+            summary:
+              'T1S（opt-in）：写面经 shim 进暂存 + WAL（可归因，与 TS 同口径）；受限令牌额外在真实盘上兜底。' +
+              'raw syscall / 未 hook 面仍不可归因，且本档不限制读取。',
+          }
+        : undefined,
     })
     return this.initReport
   }
@@ -3482,6 +3958,8 @@ export class WindowsStageExecutor {
     // 的管道句柄，而 T0 拿不到）。两条路都返回同一形状的结果，调用方无需知道区别。
     const t0 = this.launchMode === 'appcontainer' && this.appContainer !== undefined && this.appContainer !== null
     const transparent = this.launchMode === 'shim'
+    // R25-A：T1S = 受限令牌 + 注入 shim（两条腿）。launch 走注入器（**注入器自身受限**）。
+    const t1s = this.launchMode === T1S_LAUNCH_MODE
     try {
       if (t0) {
         child = this.appContainer.launch({
@@ -3496,6 +3974,16 @@ export class WindowsStageExecutor {
         // 去令牌化：普通令牌 + 正常完整性，强制/暂存交给已被注入的 shim。
         // 输出经文件描述符重定向读回（注入器只继承 stdio），因此这条路径**不依赖管道**。
         child = await this.shimLauncher.launch({
+          command: resolvedCommand,
+          args: options.args || [],
+          cwd,
+          env,
+          timeoutMs,
+        })
+      } else if (t1s) {
+        // T1S：受限令牌 + 注入 shim。注入器由 T1 的受限启动器创建（目标继承受限令牌），
+        // 输出经**匿名管道**读回（受限路径本就用管道；与 T1 同一套 collectChild）。
+        child = await this.launchT1S({
           command: resolvedCommand,
           args: options.args || [],
           cwd,
@@ -3541,6 +4029,14 @@ export class WindowsStageExecutor {
       }
     } else if (transparent) {
       // 去令牌化路径同理：注入器已经把子进程等到退出，输出已按文件描述符重定向读回。
+      timedOut = child.timedOut === true
+      settled = {
+        stdout: Buffer.isBuffer(child.stdout) ? child.stdout : Buffer.from(String(child.stdout ?? '')),
+        stderr: Buffer.isBuffer(child.stderr) ? child.stderr : Buffer.from(String(child.stderr ?? '')),
+        exitCode: child.exitCode,
+      }
+    } else if (t1s) {
+      // T1S：launchT1S 内部已经等到（目标进程的）退出并读回管道输出。
       timedOut = child.timedOut === true
       settled = {
         stdout: Buffer.isBuffer(child.stdout) ? child.stdout : Buffer.from(String(child.stdout ?? '')),
@@ -3608,8 +4104,17 @@ export class WindowsStageExecutor {
       envKeys: Object.keys(env).sort(),
       envRejected: rejected,
       classification: classifyOutcome({ exitCode: settled.exitCode, stdout, stderr, launchFailure, startupFailure: startupFailureReport }),
-      enforcement: transparent ? 'shim-user-mode' : 'partial',
-      backend: transparent ? 'winstage-shim-iat' : t0 ? 'windows-appcontainer' : 'windows-acl-restricted-token',
+      // R25-A：T1S 的两条腿都要如实写（shim 用户态暂存/WAL + 受限令牌内核兜底）
+      enforcement: transparent ? 'shim-user-mode' : t1s ? 'shim-user-mode+acl-restricted-token' : 'partial',
+      backend: transparent
+        ? 'winstage-shim-iat'
+        : t1s
+          ? 'winstage-shim-iat+windows-acl-restricted-token'
+          : t0
+            ? 'windows-appcontainer'
+            : 'windows-acl-restricted-token',
+      // R25-A：T1S 启动读数（注入器 report / 注入器退出码）供审计面核对；非 T1S 为 undefined
+      t1ShimLauncher: t1s ? this.t1sLastLaunch : undefined,
       launchMode: this.launchMode,
       tier: this.tier,
       hasOutput: stdout.length > 0 || stderr.length > 0,
@@ -5249,6 +5754,128 @@ export const SHIM_RELATIVE_PATHS = {
 /** 金丝雀/能力探针的输出哨兵（capability-probe 与 TS 可用性探测共用同一份脚本） */
 export const CAPABILITY_MARKER = 'WINSTAGE-CAPABILITY:'
 
+/* ═══════════════ R25-A：T1 真归因 —— 可选 T1S 档（受限令牌 + shim）═══════════════
+ *
+ * 背景（R19-FSREG-04 / R20②）：T1 = 受限令牌、**没有 shim** ⇒ 写面被内核拒绝但
+ * 审计里没有 WAL/归因；TS = shim 暂存但**没有令牌**。两者各缺一半。
+ *
+ * T1S = **additive opt-in**：只有显式 `WINSTAGE_T1_SHIM=1` **且**请求档位是 T1
+ * **且** shim 真实可用时才生效；否则默认 T1 逐字不变。显式 opt-in 但装配失败
+ * ⇒ `T1S_UNAVAILABLE` fail-closed（**绝不静默降回 T1**：那会让调用方以为有 WAL 归因，
+ * 实际没有）。
+ *
+ * 强制的两条腿（缺一不可，报告里必须分开写）：
+ *   · shim 用户态 IAT 钩子：写面进暂存 + WAL ⇒ **可归因**（与 TS 同口径）；
+ *   · 受限令牌（WRITE_RESTRICTED + Low IL + 暂存根/会话目录写 ACE）：真实盘直写
+ *     的内核兜底（纵深）。它不改变"未 hook 面/raw syscall 不可归因"这一结构事实。
+ */
+export const T1_SHIM_OPT_IN_ENV = 'WINSTAGE_T1_SHIM'
+/** 生效档位标签（请求仍是 T1；`tierEffective` 才是 T1S） */
+export const T1S_TIER = 'T1S'
+/** 生效启动模式标签（受限令牌 + shim 两条腿） */
+export const T1S_LAUNCH_MODE = 'shim+restricted-token'
+/** 显式 opt-in 但装配失败时的独立错误码（fail-closed，不降回 T1） */
+export const T1S_UNAVAILABLE = 'T1S_UNAVAILABLE'
+/** 受限 shim 启动时注入器拒绝启动的独立错误码（与 TS 的 TS_INJECTION_FAILED 区分） */
+export const T1S_INJECTION_FAILED = 'T1S_INJECTION_FAILED'
+/** T1S 的 staging-write 判据 = T1 的"暂存根可写" + TS 的"区外写进暂存/真盘不变"两条腿 */
+export const T1S_STAGING_WRITE_CHECKS = Object.freeze([
+  ...SANDBOX_STAGING_WRITE_CHECKS,
+  ...SHIM_STAGING_WRITE_CHECKS,
+])
+
+/**
+ * 解析 `WINSTAGE_T1_SHIM`（纯函数，离线可测）。
+ *
+ *   unset / '' / '0'  ⇒ 不 opt-in（默认 T1 逐字不变）
+ *   '1'               ⇒ opt-in
+ *   其它任何非空值     ⇒ `invalid:true`（显式意图但无法解释；调用方必须 fail-closed，
+ *                       不能把它读成"没开"——那会静默丢掉一次显式请求）
+ */
+export function resolveT1ShimOptIn(env = process.env) {
+  const raw = env && typeof env[T1_SHIM_OPT_IN_ENV] === 'string' ? env[T1_SHIM_OPT_IN_ENV].trim() : ''
+  if (raw === '' || raw === '0') {
+    return { value: raw === '0' ? '0' : undefined, requested: false, enabled: false, invalid: false }
+  }
+  if (raw === '1') return { value: '1', requested: true, enabled: true, invalid: false }
+  return { value: raw, requested: true, enabled: false, invalid: true }
+}
+
+/**
+ * 纯函数：T1S 档位判定（离线可测，不依赖 Win32）。
+ *
+ * 只回答"这次要不要走 T1S / 能不能走"；真正的装配（ACL 授权 + shim 环境）在
+ * `init()` 里做，装配失败同样抛 `T1S_UNAVAILABLE`。
+ *
+ * @param {{requested?:string, optIn?:object, shimProbe?:object}} input
+ * @returns {{use:boolean, applicable:boolean, mode?:string, tierEffective?:string,
+ *            failClosed:boolean, code?:string, ignored?:boolean, reason:string}}
+ */
+export function planT1ShimMode({ requested, optIn, shimProbe } = {}) {
+  const want = String(requested ?? 'T1').toUpperCase()
+  const opt = optIn ?? resolveT1ShimOptIn(process.env)
+  if (!opt.requested) {
+    return {
+      use: false,
+      applicable: false,
+      mode: 'restricted-token',
+      tierEffective: want || 'T1',
+      failClosed: false,
+      reason: `${T1_SHIM_OPT_IN_ENV} is unset/0 — default T1 is unchanged (no shim, no WAL attribution)`,
+    }
+  }
+  // 显式 opt-in 只在"请求的就是 T1"时才有意义；显式请求 TS/T0 时本开关不参与决定。
+  if (want !== 'T1') {
+    return {
+      use: false,
+      applicable: false,
+      ignored: true,
+      failClosed: false,
+      mode: undefined,
+      tierEffective: want,
+      reason: `${T1_SHIM_OPT_IN_ENV}=${JSON.stringify(opt.value)} ignored: requested tier is ${want}, not T1`,
+    }
+  }
+  if (opt.invalid) {
+    return {
+      use: false,
+      applicable: true,
+      failClosed: true,
+      code: T1S_UNAVAILABLE,
+      reason:
+        `invalid ${T1_SHIM_OPT_IN_ENV} value ${JSON.stringify(opt.value)} — only "1" opts in and "0"/unset keeps T1; ` +
+        'refusing to guess (a silent T1 run would drop the WAL attribution the caller explicitly asked for)',
+    }
+  }
+  if (opt.enabled !== true) {
+    return {
+      use: false,
+      applicable: false,
+      failClosed: false,
+      mode: 'restricted-token',
+      tierEffective: 'T1',
+      reason: `${T1_SHIM_OPT_IN_ENV} does not opt in — default T1 is unchanged`,
+    }
+  }
+  if (shimProbe?.available !== true) {
+    return {
+      use: true,
+      applicable: true,
+      failClosed: true,
+      code: T1S_UNAVAILABLE,
+      reason: `explicit T1S opt-in but the shim is not available (${shimProbe?.reason ?? 'not probed'})`,
+    }
+  }
+  return {
+    use: true,
+    applicable: true,
+    mode: T1S_LAUNCH_MODE,
+    tierEffective: T1S_TIER,
+    failClosed: false,
+    reason: 'T1S: restricted token (WRITE_RESTRICTED + Low IL) + injected shim staging/WAL',
+  }
+}
+
 /** 本仓库根目录（`src/executor.ts` 的上两级） */
 export function repoRootPath() {
   return dirname(dirname(fileURLToPath(import.meta.url)))
@@ -5290,7 +5917,10 @@ export const REGISTRY_ATTRIBUTION_CODE = Object.freeze({
 
 /** 一个纯函数：launchMode → 归因能力声明（可离线断言，不依赖 Win32）。 */
 export function registryAttributionFor(launchMode) {
-  const shim = launchMode === 'shim'
+  // R25-A：T1S = shim 用户态 IAT 钩子 + 受限令牌。归因能力来自 **shim 那条腿**
+  // （写尝试进暂存/HARD_DENY 都有 WAL）；受限令牌只是真实盘的内核纵深，不产生归因记录。
+  const t1s = launchMode === T1S_LAUNCH_MODE
+  const shim = launchMode === 'shim' || t1s
   const appcontainer = launchMode === 'appcontainer'
   return {
     version: 1,
@@ -5298,23 +5928,40 @@ export function registryAttributionFor(launchMode) {
     attributable: shim,
     code: shim ? REGISTRY_ATTRIBUTION_CODE.ATTRIBUTABLE : REGISTRY_ATTRIBUTION_CODE.NOT_ATTRIBUTABLE,
     launchMode: launchMode ?? null,
-    mechanism: shim ? 'winstage-shim-iat' : appcontainer ? 'windows-appcontainer' : 'windows-acl-restricted-token',
+    mechanism: t1s
+      ? 'winstage-shim-iat+windows-acl-restricted-token'
+      : shim
+        ? 'winstage-shim-iat'
+        : appcontainer
+          ? 'windows-appcontainer'
+          : 'windows-acl-restricted-token',
     /** 注册表写面的审计通道：shim 档有 WAL；无 shim 档**结构性地**没有。 */
     wal: shim ? 'expected' : 'none-by-construction',
     /** 残余面：即使 shim 档也拦不住的部分；无 shim 档额外多出"整面不可归因"。 */
     residual: shim
-      ? ['raw syscall (no IAT slot; not attributable even in shim mode)']
+      ? [
+          'raw syscall (no IAT slot; not attributable even in shim mode)',
+          ...(t1s
+            ? [
+                'no read restriction: the restricted token/Low IL only stop writes, reads stay allowed',
+                'unhooked surfaces (direct syscalls / kernel-only paths) stay kernel-denied but carry no WAL record',
+              ]
+            : []),
+        ]
       : [
           'no shim in this lane: refused registry writes are kernel-token/AppContainer denials',
           'no WAL / HARD_DENY record by construction (registry staging audit requires the shim)',
           'unhooked registry surface (no IAT interception at all in this lane)',
           'raw syscall (no IAT slot)',
         ],
-    summary: shim
-      ? '注册表写尝试经 shim 拦截：暂存与 HARD_DENY 都有 WAL 记录，可归因；raw syscall 除外。'
-      : '本档没有注入 WinStage shim：被拒的注册表写由内核令牌/AppContainer 拒绝，审计里不会有 WAL/HARD_DENY 记录。' +
-        '不要把 "Access denied" 读成"沙箱策略拒绝"，也不要把"没有 WAL"读成"没有尝试过写"——' +
-        '本字段只是声明"不可归因"，不是归因结果。',
+    summary: t1s
+      ? 'T1S（opt-in）：shim 用户态钩子把写尝试记进 WAL ⇒ 可归因（与 TS 同口径）；受限令牌额外在真实盘上兜底。' +
+        'raw syscall / 未 hook 面仍不可归因，且本档不限制读取。'
+      : shim
+        ? '注册表写尝试经 shim 拦截：暂存与 HARD_DENY 都有 WAL 记录，可归因；raw syscall 除外。'
+        : '本档没有注入 WinStage shim：被拒的注册表写由内核令牌/AppContainer 拒绝，审计里不会有 WAL/HARD_DENY 记录。' +
+          '不要把 "Access denied" 读成"沙箱策略拒绝"，也不要把"没有 WAL"读成"没有尝试过写"——' +
+          '本字段只是声明"不可归因"，不是归因结果。',
   }
 }
 

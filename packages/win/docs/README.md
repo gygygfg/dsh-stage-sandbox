@@ -72,6 +72,7 @@
   三件套版本握手（`shimInitRc` 三态 fail-closed）、根 README/§13 文档同步；附残余与下一批建议。
 - [round23/R23-剩余项修复报告.md](round23/R23-剩余项修复报告.md)：第二批 —— 面板路由本机鉴权（R21-LC-01：命名前缀路由接入宿主 connection.authorizeIndex，裸请求 401 / 带 cookie 正常 / 关态 503 不泄快照）、>MAX_PATH 写面（R21-FS-06）；附残余与下一批。
 - [`round24/R24-剩余项修复报告.md`](round24/R24-剩余项修复报告.md)：第三批 —— 生产接线（`WINSTAGE_READ_POLICY` 通道 + host config `masks`，默认行为 deep-equal 不变）、R14 批量 apply 收窄为"全有或全无 + 回滚快照"、R16 hive-file ntdll 独立探针 104/0 + autotest 全量；附残余与下一批。
+- [`round25/R25-剩余项修复报告.md`](round25/R25-剩余项修复报告.md)：第四批 —— T1 真归因（opt-in **T1S** 档：受限令牌 + shim，WAL/audit 归因与 TS 同口径；默认 T1 不变）、`dsh plugin remove` 残留清理工具（R21-LC-04：dry-run/apply/幂等/护栏，隔离 e2e）；附残余与下一批。
 
 ## 5. archive —— 历史归档（不代表现行口径）
 

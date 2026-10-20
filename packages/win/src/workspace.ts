@@ -25,7 +25,7 @@
  *   - 遮蔽前先规范化，符号链接不能绕过（#16.6）；硬拒绝先于软遮蔽（#16.7）
  */
 
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, normalize, relative, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import {
@@ -1642,7 +1642,105 @@ export class Workspace {
    *   - 逐文件条件检查：真实文件自暂存以来被外部改动 → 该文件 STALE，不静默覆盖
    *   - 未选部分保留为可追踪修订，不丢弃整份候选（#12.2）
    */
+  /**
+   * ── R25：跨进程 apply 串行化（lost-update 修复）───────────────────────────────
+   *
+   * R24-B 引入回滚后，两个进程并发 apply **同一候选**时会出现 lost-update：
+   * w1 已成功写入，w2 在 baseline conflict 失败后按自己的旧快照回滚 ⇒ 把 w1 的
+   * 成功结果覆盖回 base（r21 B4.1 verify 实测）。根因是"回滚只按本进程快照"，
+   * 无法知道别的进程已经成功。
+   *
+   * 修复取**方案①（跨进程串行化）**：applyCandidate 在 `store.dir` 上建 `apply.lock`
+   * （O_CREAT|O_EXCL），持锁期间完成预检/写入/回滚；第二个进程等锁，拿到锁后
+   * `resolveCandidate()` 会看到候选已 `applied` ⇒ 返回 ALREADY_APPLIED（幂等），
+   * 不再重复写入/回滚。锁超时（默认 30s）返回结构化 `APPLY_LOCK_TIMEOUT`；
+   * 进程崩溃遗留的锁按 mtime >120s 视为陈旧并清除（残余见 findings）。
+   * 锁只覆盖**同一 store**的 apply；不同 store/工作区的并发仍由逐文件 hash 闸门兜底。
+   */
+  _applyLockPath() {
+    return join(this.store.dir, 'apply.lock')
+  }
+
+  _sleepMs(ms) {
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+    } catch {
+      /* best effort */
+    }
+  }
+
+  _acquireApplyLock(timeoutMs = 30000) {
+    const path = this._applyLockPath()
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0)
+    for (;;) {
+      try {
+        const fd = openSync(path, 'wx')
+        try {
+          writeFileSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }))
+        } finally {
+          closeSync(fd)
+        }
+        this._applyLockHeld = true
+        return { ok: true, path }
+      } catch (error) {
+        if (error.code !== 'EEXIST') {
+          return { ok: false, path, code: error.code || 'APPLY_LOCK_UNAVAILABLE', message: error.message }
+        }
+        // 陈旧锁（持锁进程被强杀等）：mtime 超时后清除并重试
+        try {
+          const st = statSync(path)
+          if (Date.now() - st.mtimeMs > 120000) {
+            rmSync(path, { force: true })
+            continue
+          }
+        } catch {
+          continue
+        }
+        if (Date.now() >= deadline) {
+          return { ok: false, path, code: 'APPLY_LOCK_TIMEOUT', message: `another process is applying (lock ${path})` }
+        }
+        this._sleepMs(25)
+      }
+    }
+  }
+
+  _releaseApplyLock() {
+    if (!this._applyLockHeld) return
+    this._applyLockHeld = false
+    try {
+      rmSync(this._applyLockPath(), { force: true })
+    } catch {
+      /* lock cleanup is best-effort; stale-lock timeout covers leftovers */
+    }
+  }
+
   applyCandidate(id, opts = {}) {
+    const lock = this._acquireApplyLock(opts.applyLockTimeoutMs)
+    if (!lock.ok) {
+      return {
+        id,
+        status: undefined,
+        applied: [],
+        failed: [{ path: undefined, op: 'apply-lock', code: lock.code, message: lock.message }],
+        blockedByMask: [],
+        maskWarnings: [],
+        conflicts: [],
+        remaining: [],
+        totalChanged: 0,
+        requeued: true,
+        rolledBack: false,
+        rollback: [],
+        note: 'apply-lock-busy: another process is applying this candidate; retry after it finishes',
+      }
+    }
+    try {
+      return this._applyCandidateLocked(id, opts)
+    } finally {
+      this._releaseApplyLock()
+    }
+  }
+
+  _applyCandidateLocked(id, opts = {}) {
     const { candidate, idempotent } = this.resolveCandidate(id)
     if (idempotent === 'ALREADY_APPLIED') {
       // WP5′：候选可能已被修剪（磁盘上只剩墓碑）⇒ 这里必须仍然返回**旧口径的完整形状**
@@ -1887,7 +1985,10 @@ export class Workspace {
           note: 'another process already applied this candidate; skipped local rollback (no cross-process lock)',
         }
       }
-      const attempted = [...applied.map((item) => this.absolute(item.path)), this.absolute(firstFailure.change.path)]
+      // R25：回滚**只针对本进程确实写过的条目**。失败的条目由 applyOneChange 自身保证
+      // 原子（要么未写、要么已自行回滚）；把它纳入回滚会在"别的进程已写入同一 after 内容"
+      // 时把他人成功结果覆盖成旧快照（r21 B4.1 lost-update 的直接根因）。
+      const attempted = applied.map((item) => this.absolute(item.path))
       const results = []
       for (const abs of [...new Set(attempted)].reverse()) {
         const snap = snapshots.get(abs)
