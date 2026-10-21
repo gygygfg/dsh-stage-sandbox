@@ -1737,7 +1737,7 @@ export function apply(ctx, config = {}) {
     if (logger && typeof logger.error === 'function') logger.error(message)
     else log.warn(message)
   }
-  const workspaceRoot = config.workspaceRoot || new URL('..', import.meta.url).pathname.replace(/^\//, '')
+  const configuredWorkspaceRoot = typeof config.workspaceRoot === 'string' ? config.workspaceRoot.trim() : ''
 
   /**
    * ★ R24-A2：把 host 行 config 的 `masks` **编译并 fail-closed 校验**（规则对象 → Workspace）。
@@ -1749,6 +1749,34 @@ export function apply(ctx, config = {}) {
    * 编译后的规则经 `serviceFor()` 传给 `getReviewService({ …, masks })`。
    */
   const configuredMasks = compileConfiguredMasks(config.masks, { logError })
+
+  /**
+   * R34b-G-04：`workspaceRoot` 未配置 / 指向不存在的目录时 **fail-closed**。
+   *
+   * 旧实现回退到 `new URL('..', import.meta.url)` = 包目录本身：用户没配根时，
+   * 暂存/快照会落到插件安装目录（甚至 asar 内路径），既不是用户工作区，也没有任何提示。
+   * 现在要求 profile 显式配置（bundle 默认值见 `cordis.patch.yml`；跨机器安装见 README
+   * "三个根必须一起重述"），否则在装配期抛结构化错误，宿主日志里能直接看到原因。
+   */
+  if (configuredWorkspaceRoot.length === 0) {
+    const error = new Error(
+      'WinStage workspaceRoot 未配置：拒绝装配。请在 profile 覆盖层设置 winstage-sandbox.config.workspaceRoot，' +
+        '并同时重述 winstage-fs.config.cwd/workspaceRoot 与 winstage-shell.config.workspaceRoot（config 是整体替换）。',
+    )
+    error.code = 'WINSTAGE_WORKSPACE_ROOT_MISSING'
+    logError(error.message)
+    throw error
+  }
+  const workspaceRoot = canonical(configuredWorkspaceRoot)
+  if (!existsSync(workspaceRoot)) {
+    const error = new Error(
+      `WinStage workspaceRoot 指向的目录不存在：${workspaceRoot}。请修正 profile 覆盖层里的根（host/fs/shell 三处必须一致）；` +
+        '本插件不会自动创建用户工作区，也不会回退到插件安装目录。',
+    )
+    error.code = 'WINSTAGE_WORKSPACE_ROOT_NOT_FOUND'
+    logError(error.message)
+    throw error
+  }
 
   /**
    * 开关的**唯一读法**：每次现读，绝不在这里冻结成常量。

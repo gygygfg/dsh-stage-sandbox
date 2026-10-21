@@ -241,7 +241,7 @@ export const OFFLINE_SUITES = [
   { id: 'r31-apply-journal', script: 'tests/r31-apply-journal.ts', title: 'R31 apply 崩溃恢复 WAL（journal 生命周期/崩溃缝恢复/损坏 fail-closed/并发守卫/幂等；10 断言）' },
   // R34：守卫不可用（root-not-creatable / 受限宿主）时，**只读**操作回退真实磁盘；
   // 有既有暂存状态仍 fail-closed；写入永不回退；存储状态机路径守卫堵住尾随空格/点/8.3 绕过。
-  { id: 'r34-guard-unavailable-read', script: 'tests/r34-guard-unavailable-read.ts', title: 'R34 守卫不可用只读回退（STAGE_GUARD_UNAVAILABLE 归一/读回退/有状态不回退/写 fail-closed/状态机路径守卫/快照自校验/STAGE_OUTSIDE 三态/配置漂移；31 断言）' },
+  { id: 'r34-guard-unavailable-read', script: 'tests/r34-guard-unavailable-read.ts', title: 'R34 守卫不可用只读回退（STAGE_GUARD_UNAVAILABLE 归一/读回退/有状态不回退/写 fail-closed/状态机路径守卫/快照自校验/STAGE_OUTSIDE 三态/配置漂移/根缺失；32 断言）' },
 ]
 
 /** 需要未受限会话的套件 */

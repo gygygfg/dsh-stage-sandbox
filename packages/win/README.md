@@ -44,6 +44,10 @@ bundle patch（`dsh-plugin/cordis.patch.yml`）里的 `workspaceRoot` 是**本�
 静默丢掉；R34 起 `staging-fs` 对"给了 `workspaceRoot` 却没有 `cwd`"直接
 `FS_STAGE_ROOT_DRIFT` fail-closed，避免回退宿主 cwd 造成"暂存写到 A、快照发布在 B"。
 
+根**缺失或不存在**同样 fail-closed：host 行抛 `WINSTAGE_WORKSPACE_ROOT_MISSING` /
+`WINSTAGE_WORKSPACE_ROOT_NOT_FOUND`，fs 行抛 `FS_STAGE_ROOT_NOT_FOUND`；
+不会回退插件安装目录或宿主 cwd。
+
 ---
 
 ## 1. 三条命令

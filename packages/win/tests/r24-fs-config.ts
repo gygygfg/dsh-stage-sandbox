@@ -514,6 +514,39 @@ try {
       disposeReviewServices()
     }
 
+    // 5.3b R34b-G-04：workspaceRoot 缺失/不存在 ⇒ 装配期 fail-closed，不回退插件目录
+    {
+      const empty = makeFakeCtx()
+      let emptyError
+      try {
+        apply(empty.ctx, { enabled: true, workspaceRoot: '', probeOnStart: false, verboseLog: false })
+      } catch (error) {
+        emptyError = error
+      }
+      check(
+        '空 workspaceRoot ⇒ WINSTAGE_WORKSPACE_ROOT_MISSING（不装配）',
+        emptyError?.code === 'WINSTAGE_WORKSPACE_ROOT_MISSING',
+        JSON.stringify({ code: emptyError?.code }),
+      )
+      const missing = makeFakeCtx()
+      let missingError
+      try {
+        apply(missing.ctx, {
+          enabled: true,
+          workspaceRoot: join(SCRATCH, 'ws-does-not-exist'),
+          probeOnStart: false,
+          verboseLog: false,
+        })
+      } catch (error) {
+        missingError = error
+      }
+      check(
+        '不存在的 workspaceRoot ⇒ WINSTAGE_WORKSPACE_ROOT_NOT_FOUND（不装配、不回退）',
+        missingError?.code === 'WINSTAGE_WORKSPACE_ROOT_NOT_FOUND',
+        JSON.stringify({ code: missingError?.code }),
+      )
+    }
+
     // 5.4 schema 层：masks 字段被真 schemastery 接受，缺省水合为 []
     {
       const { Config } = await import('../plugin/index.ts')

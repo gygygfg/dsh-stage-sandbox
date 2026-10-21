@@ -355,6 +355,17 @@ try {
       mismatched?.code === 'FS_STAGE_ROOT_DRIFT',
       JSON.stringify({ code: mismatched?.code }),
     )
+    let notFound
+    try {
+      new Cls(new Context(), { cwd: join(SCRATCH, 'does-not-exist'), diffBasisMaxBytes: 1024 * 1024 })
+    } catch (error) {
+      notFound = error
+    }
+    check(
+      '配置的根目录不存在 ⇒ FS_STAGE_ROOT_NOT_FOUND（不回退宿主 cwd）',
+      notFound?.code === 'FS_STAGE_ROOT_NOT_FOUND',
+      JSON.stringify({ code: notFound?.code, root: notFound?.root }),
+    )
   }
 } finally {
   disposeReviewServices()

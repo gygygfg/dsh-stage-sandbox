@@ -765,6 +765,20 @@ export function createStagingFileSystem(options = {}) {
        * 存储根则按会话走（见 `stagingFor()`）。
        */
       this.workspaceRoot = canonical(hasCwd ? config.cwd : process.cwd())
+      /**
+       * R34b-G-04：配置了根却指向不存在的目录 ⇒ 装配期 fail-closed。
+       * 旧行为会让 `keyOf()` 把每个路径都判成"工作区外"（或让暂存根指向一个不存在的树），
+       * 写入/快照的去向不可预测。这里明确拒绝，并提示"三处根必须一致"；不回退宿主 cwd。
+       */
+      if ((hasCwd || hasWorkspaceRoot) && !existsSync(this.workspaceRoot)) {
+        const error = new Error(
+          `WinStage 暂存文件系统：配置的工作区根不存在 —— ${this.workspaceRoot}。` +
+            '请修正 profile 覆盖层里的 winstage-fs.config.cwd/workspaceRoot（与 host/shell 行一致）；本插件不会自动创建用户工作区。',
+        )
+        error.code = 'FS_STAGE_ROOT_NOT_FOUND'
+        error.root = this.workspaceRoot
+        throw error
+      }
       /** 装配/自测可固定一个会话身份；生产里不传，按每次调用现解析 */
       this.fixedSessionId =
         typeof options.sessionId === 'string' && options.sessionId.length > 0 ? options.sessionId : undefined
