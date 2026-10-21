@@ -19,6 +19,10 @@
  *   2. 抛出的错误必须是**同一个模块实例**的 `FsError`：`dsh-tool-fs` 用
  *      `error instanceof FsError` 判别，第二份 dsh-fs 副本会让判别失败。
  *      所以这里用 `resolveDshModuleRoot()` 定位**运行时那一份**并按其绝对路径 import。
+ *      ⚠ R32-A：同一进程里**测试代码/其它入口**可能解析到另一份 dsh-fs（DSH-as-node
+ *      下实测有两份模块实例）——因此凡是要对"本 provider 抛出的错误"做 instanceof 判别，
+ *      一律用本文件导出的 `isStagingFsError()`（用**本文件自己那份** FsError），
+ *      不要拿调用方静态 import 的副本去比（那会把真 FsError 误判成非 FsError）。
  *   3. 边界映射必须先 `canonical()`：`Workspace.relative()` 用**词法**判定，
  *      而 8.3 短名（`ADMINI~1`）与长名是同一对象的两种拼写；不归一就会被判成
  *      "在工作区外"（实测踩到过）。
@@ -145,6 +149,37 @@ if (!fsImport.mod || !fsLocalImport.mod) {
 
 const { FsError, FsVersion, FsTargetKey } = fsImport.mod
 const { LocalFileSystem } = fsLocalImport.mod
+
+/**
+ * ★ R32-A：**provider 同实例**的 FsError 判别（供测试/诊断使用；生产 `dsh-tool-fs` 不需要它）。
+ *
+ * ── 为什么必须由本文件导出，而不是让调用方自己 `import '@deepseek-ai/dsh-fs'` ──────────
+ * `instanceof` 判的是**模块实例级**的 class 身份。同一进程里完全可能加载出**两份**
+ * `@deepseek-ai/dsh-fs`：
+ *   · 生产（DSH-as-node / Electron-as-node）：宿主 loader 按**裸名/asar** 解析出一份，
+ *     本文件的 `importPlatformModule()` 也可能解析到另一份（asar 内 vs 磁盘 node_modules）；
+ *   · 自测（`node tests/...`）：测试进程按文件路径解析出一份，与本模块解析到的那份未必同一实例。
+ * 于是测试代码若拿**自己那份** `FsError` 做 `error instanceof FsError`，在 DSH-as-node 下会得到
+ * `false`（R32 实测：`r21-fs-policy` 8× `isFsError:false`），而错误对象本身一直是 provider
+ * 抛出的**真 FsError**、`code/readPolicy/maskId` 全部正确 —— 产品行为没有缺陷。
+ *
+ * ── 为什么不能放宽成"按 code 字符串匹配" ──────────────────────────────────────────
+ * `dsh-tool-fs` 的错误映射依赖 `error instanceof FsError` 来区分"文件系统错误"与宿主/策略错误；
+ * 若把判别降级成 `error.code === 'FS_READ_DENIED'` 之类的字符串比较，任何普通 Error（或外部
+ * 构造的对象）都能伪装成 FsError，类型契约退化成"可伪造字段"。因此本 helper **保留
+ * `instanceof` 语义**，只是改用**本模块自己那份** FsError 做判别 —— 与 provider 抛错时用的是
+ * 同一个 class 实例，这才是"provider 同实例判别"的准确含义。
+ *
+ * @param {unknown} error 任何被 provider 拒绝路径抛出的错误
+ * @returns {boolean} 是否为本 provider 所抛的那份 `FsError` 实例
+ */
+export function isStagingFsError(error) {
+  try {
+    return error instanceof FsError
+  } catch {
+    return false
+  }
+}
 
 /**
  * 平台自带的**沙箱** fs 后端（`ctx.fs` 的正常提供方）。

@@ -29,7 +29,7 @@
  *
  * 用法：node tests\r28-apply-attributes.ts
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -37,7 +37,7 @@ import { Workspace } from '../src/workspace.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const REPO = join(HERE, '..')
-const SCRATCH = join(REPO, '.t', 'r28-apply-attributes')
+const SCRATCH = mkdtempSync(join(REPO, '.t', 'r28-apply-attributes-'))
 const W = (t) => process.stdout.write(`${t}\n`)
 let assertions = 0
 let failures = 0
@@ -57,7 +57,6 @@ function section(t) {
   W('')
   W(`=== ${t} ===`)
 }
-rmSync(SCRATCH, { recursive: true, force: true })
 mkdirSync(SCRATCH, { recursive: true })
 
 const onWindows = process.platform === 'win32'

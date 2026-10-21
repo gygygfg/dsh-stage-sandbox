@@ -38,8 +38,7 @@ import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
-import { FsError } from '@deepseek-ai/dsh-fs'
-import { createStagingFileSystem } from '../dsh-plugin/staging-fs.ts'
+import { createStagingFileSystem, isStagingFsError } from '../dsh-plugin/staging-fs.ts'
 import { getReviewService, readVisibilitySnapshot } from '../dsh-plugin/review-service.ts'
 
 const PLANT = process.argv.includes('--plant')
@@ -150,11 +149,21 @@ const capture = async (fn) => {
   }
 }
 
+/**
+ * ★ R32-A：`isFsError` 改用 **provider 自己那份 FsError** 的判别
+ * （`staging-fs.ts::isStagingFsError()`）。
+ *
+ * 旧写法是测试里静态 `import { FsError } from '@deepseek-ai/dsh-fs'` 再做 `instanceof`：
+ * 在 DSH-as-node 下测试进程与 provider 解析到**两份模块实例** ⇒ `instanceof` 恒 false
+ * （实测 8× `isFsError:false`），但 `code/readPolicy/maskId/message` 全部正确 —— 产品行为
+ * 没问题，是测试用了错误的实例身份。**不得**放宽成按 `code` 字符串匹配：`dsh-tool-fs`
+ * 的错误映射依赖 `instanceof`，字符串比较会让普通 Error 伪装成 FsError。
+ */
 const errorShape = (error) => ({
   code: error?.code,
   readPolicy: error?.readPolicy,
   maskId: error?.maskId,
-  isFsError: error instanceof FsError,
+  isFsError: isStagingFsError(error),
   message: String(error?.message ?? error),
 })
 

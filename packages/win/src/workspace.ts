@@ -2611,48 +2611,68 @@ export class Workspace {
   }
   _readWin32Attributes(abs, ioOverride) {
     if (ioOverride && typeof ioOverride.read === 'function') return ioOverride.read(abs)
-    try {
-      const arg = this._win32AttrsArg(abs)
-      if (arg.startsWith('\\\\?\\')) {
-        const q = arg.replace(/'/g, "''")
-        const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `[int][IO.File]::GetAttributes('${q}')`], { encoding: 'utf8', timeout: 10000 })
-        const m = /^(\d+)/.exec(String(r.stdout || '').trim())
-        if (r.status === 0 && m) {
-          const v = Number(m[1])
-          return { ok: true, hidden: (v & 0x2) !== 0, system: (v & 0x4) !== 0, readonly: (v & 0x1) !== 0, raw: v }
-        }
-        return { ok: false, code: 'ATTRIB_READ_FAILED', message: `powershell GetAttributes status=${r.status}` }
-      }
+    const arg = this._win32AttrsArg(abs)
+    const fromAttrib = () => {
       const r = spawnSync('attrib.exe', [abs], { encoding: 'utf8', timeout: 10000 })
       if (r.status !== 0) return { ok: false, code: 'ATTRIB_READ_FAILED', message: `attrib status=${r.status}` }
       const line = String(r.stdout || '').split(/\r?\n/)[0]
       const flagPart = line.slice(0, 20)
       return { ok: true, hidden: /H/.test(flagPart), system: /S/.test(flagPart), readonly: /R/.test(flagPart) }
-    } catch (error) {
-      return { ok: false, code: 'ATTRIB_READ_FAILED', message: error.message }
     }
+    const fromPowerShell = () => {
+      const q = arg.replace(/'/g, "''")
+      const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `[int][IO.File]::GetAttributes('${q}')`], { encoding: 'utf8', timeout: 10000 })
+      const m = /^(\d+)/.exec(String(r.stdout || '').trim())
+      if (r.status !== 0 || !m) return { ok: false, code: 'ATTRIB_READ_FAILED', message: `powershell GetAttributes status=${r.status}` }
+      const v = Number(m[1])
+      return { ok: true, hidden: (v & 0x2) !== 0, system: (v & 0x4) !== 0, readonly: (v & 0x1) !== 0, raw: v }
+    }
+    // R32 fallback chain: long paths prefer PowerShell (attrib rejects \\?\); short
+    // paths prefer attrib (cheap); if the preferred mechanism fails, try the other.
+    const order = arg.startsWith('\\\\?\\') ? [fromPowerShell, fromAttrib] : [fromAttrib, fromPowerShell]
+    const errors = []
+    for (const attempt of order) {
+      try {
+        const result = attempt()
+        if (result.ok) return result
+        errors.push(result.message)
+      } catch (error) {
+        errors.push(error.message)
+      }
+    }
+    return { ok: false, code: 'ATTRIB_READ_FAILED', message: errors.join(' | ') || 'attribute read failed' }
   }
   _setWin32Attributes(abs, desired, ioOverride) {
     if (ioOverride && typeof ioOverride.set === 'function') return ioOverride.set(abs, desired)
-    try {
-      const arg = this._win32AttrsArg(abs)
-      if (arg.startsWith('\\\\?\\')) {
-        const cur = this._readWin32Attributes(abs)
-        if (!cur.ok) return cur
-        let v = cur.raw || 0
-        v = desired && desired.hidden ? v | 0x2 : v & ~0x2
-        v = desired && desired.system ? v | 0x4 : v & ~0x4
-        const q = arg.replace(/'/g, "''")
-        const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `[IO.File]::SetAttributes('${q}', ${v})`], { encoding: 'utf8', timeout: 10000 })
-        return r.status === 0 ? { ok: true } : { ok: false, code: 'ATTRIB_SET_FAILED', message: `powershell SetAttributes status=${r.status}` }
-      }
-      const args = [desired && desired.hidden ? '+H' : '-H', desired && desired.system ? '+S' : '-S', abs]
-      const r = spawnSync('attrib.exe', args, { encoding: 'utf8', timeout: 10000 })
+    const arg = this._win32AttrsArg(abs)
+    const viaAttrib = () => {
+      const r = spawnSync('attrib.exe', [desired && desired.hidden ? '+H' : '-H', desired && desired.system ? '+S' : '-S', abs], { encoding: 'utf8', timeout: 10000 })
       return r.status === 0 ? { ok: true } : { ok: false, code: 'ATTRIB_SET_FAILED', message: `attrib status=${r.status}` }
-    } catch (error) {
-      return { ok: false, code: 'ATTRIB_SET_FAILED', message: error.message }
     }
+    const viaPowerShell = () => {
+      const cur = this._readWin32Attributes(abs)
+      if (!cur.ok) return cur
+      let v = cur.raw || 0
+      v = desired && desired.hidden ? v | 0x2 : v & ~0x2
+      v = desired && desired.system ? v | 0x4 : v & ~0x4
+      const q = arg.replace(/'/g, "''")
+      const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `[IO.File]::SetAttributes('${q}', ${v})`], { encoding: 'utf8', timeout: 10000 })
+      return r.status === 0 ? { ok: true } : { ok: false, code: 'ATTRIB_SET_FAILED', message: `powershell SetAttributes status=${r.status}` }
+    }
+    const order = arg.startsWith('\\\\?\\') ? [viaPowerShell, viaAttrib] : [viaAttrib, viaPowerShell]
+    const errors = []
+    for (const attempt of order) {
+      try {
+        const result = attempt()
+        if (result.ok) return result
+        errors.push(result.message)
+      } catch (error) {
+        errors.push(error.message)
+      }
+    }
+    return { ok: false, code: 'ATTRIB_SET_FAILED', message: errors.join(' | ') || 'attribute set failed' }
   }
+
   _stagedWin32Attributes(change) {
     try {
       const staged = this.store.stagedPath(change.path)
@@ -2854,6 +2874,43 @@ export class Workspace {
     throw new SandboxError('ROLLBACK_SNAPSHOT_UNAVAILABLE', `cannot snapshot ${abs} (unsupported type) for rollback`, { path: abs })
   }
 
+  /**
+   * R32：把一棵真实树里的**只读文件**也改成可写（chmod 0o666；目录 0o700），
+   * 再交给 rmSync。store 的 makeRemovable 只处理目录，DSH-as-node 的令牌下
+   * rmSync(readonly file) 会 EPERM，导致目录删除半途而废 / 回滚失败。
+   * 只用于"即将删除/重建"的路径；跟随真实子目录、不跟随符号链接。
+   * 失败不吞：由调用方的 EDELETE_FAILED / ROLLBACK_EPERM 如实上报（返回修复数）。
+   */
+  _makeTreeRemovable(abs) {
+    if (!abs || !existsSync(abs)) return 0
+    let repaired = 0
+    const stack = [abs]
+    while (stack.length) {
+      const current = stack.pop()
+      let info
+      try {
+        info = lstatSync(current)
+      } catch {
+        continue
+      }
+      if (info.isSymbolicLink()) continue
+      try {
+        chmodSync(current, info.isDirectory() ? 0o700 : 0o666)
+        repaired += 1
+      } catch {
+        /* best effort: rmSync below reports the real failure */
+      }
+      if (info.isDirectory()) {
+        try {
+          for (const entry of readdirSync(current, { withFileTypes: true })) stack.push(join(current, entry.name))
+        } catch {
+          /* unreadable child: rmSync will fail honestly */
+        }
+      }
+    }
+    return repaired
+  }
+
   _restoreRollbackSnapshot(snap, opts = {}) {
     const rel = this._rollbackRel(snap.abs)
     const override = typeof opts.rollbackRestoreOverride === 'function' ? opts.rollbackRestoreOverride(snap) : null
@@ -2862,6 +2919,7 @@ export class Workspace {
     }
     try {
       if (existsSync(snap.abs)) {
+        this._makeTreeRemovable(snap.abs)
         rmSync(snap.abs, { recursive: true, force: true })
       }
       if (snap.kind === 'absent') {
@@ -3087,7 +3145,9 @@ export class Workspace {
         return false /* R21: already gone => no-op */
       }
       {
+        const deepRepaired = this._makeTreeRemovable(abs)
         const repair = makeRemovable(abs)
+        repair.repaired += deepRepaired
         try {
           /**
            * ── WP8.3（白障语义）：删除必须**真的落到宿主机**，且失败不留半成品 ──────────
