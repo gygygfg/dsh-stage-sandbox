@@ -355,6 +355,29 @@ section('K. R34d：显式 paths 为空/未知 ⇒ NO_MATCHING_PATHS，候选与�
     svcResult.ok === false && (svcResult.failed || []).some((failure) => failure.code === 'NO_MATCHING_PATHS'),
     JSON.stringify({ ok: svcResult.ok, approved: svcResult.approved, failed: svcResult.failed }),
   )
+  const rejectUnknown = svc.reject(['nope.txt'])
+  const rejectEmpty = svc.reject([])
+  const rebaseUnknown = svc.rebase(['nope.txt'])
+  const rebaseEmpty = svc.rebase([])
+  check(
+    'K4 reject/rebase 的未知路径与显式空数组 ⇒ ok:false（空数组不得被当成"全部拒绝/全部 rebase"）',
+    rejectUnknown.ok === false &&
+      rejectEmpty.ok === false &&
+      rebaseUnknown.ok === false &&
+      rebaseEmpty.ok === false &&
+      (rejectUnknown.failures || []).some((failure) => failure.code === 'NO_MATCHING_PATHS'),
+    JSON.stringify({
+      rejectUnknown: rejectUnknown.ok,
+      rejectEmpty: rejectEmpty.ok,
+      rebaseUnknown: rebaseUnknown.ok,
+      rebaseEmpty: rebaseEmpty.ok,
+    }),
+  )
+  check(
+    'K5 上述失败没有清掉待审内容（reject([]) 未拒绝全部）',
+    svc.snapshot().counts.net > 0,
+    JSON.stringify({ net: svc.snapshot().counts.net }),
+  )
 }
 
 W('')

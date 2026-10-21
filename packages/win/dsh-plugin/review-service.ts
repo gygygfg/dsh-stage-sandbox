@@ -2183,6 +2183,34 @@ export class ReviewService {
    *   - 真实内容恰好等于暂存内容时，该条目变成"无净变化"，自动退出视图。
    */
   rebase(paths) {
+    /**
+     * R34e：显式空数组 / 未知路径不得静默成功（更不能被当成"全部"）。
+     * `undefined` 才是"全部"；`[]` 是"什么都没选"。
+     */
+    if (Array.isArray(paths) && paths.length === 0) {
+      return {
+        ok: false,
+        rebased: [],
+        discarded: [],
+        failures: [{ path: '', code: 'NO_MATCHING_PATHS', message: '没有选择任何路径；未 rebase。' }],
+        remaining: this.workspace.diffEntries().length,
+        message: '没有选择任何路径（未 rebase）',
+      }
+    }
+    if (Array.isArray(paths) && paths.length > 0) {
+      const known = new Set(this.workspace.diffEntries().map((change) => compareKey(change.path)))
+      const unmatched = paths.filter((path) => !known.has(compareKey(path)))
+      if (unmatched.length > 0) {
+        return {
+          ok: false,
+          rebased: [],
+          discarded: [],
+          failures: [{ path: unmatched.join(', '), code: 'NO_MATCHING_PATHS', message: '所选路径不在当前待审净变化里；未 rebase。' }],
+          remaining: this.workspace.diffEntries().length,
+          message: `没有匹配的待审路径：${unmatched.join(', ')}（未 rebase）`,
+        }
+      }
+    }
     const result = this._rebase(paths)
     const snapshot = this.publish()
     this.markFresh()
@@ -2231,6 +2259,38 @@ export class ReviewService {
     const registryKeys = new Set(
       registryPending.flatMap((candidate) => (candidate.changes || []).map((change) => compareKey(change.path))),
     )
+    /**
+     * R34e：显式空数组/未知路径**不能**被解释成"拒绝全部"或静默成功。
+     * 旧实现里 `paths=[]` 与 `undefined` 同义 ⇒ `reject([])` 会清空**所有**暂存改动；
+     * `reject(['nope'])` 则返回 `ok:true, rejected:0`。两者都必须改为结构化失败。
+     */
+    if (Array.isArray(paths) && paths.length === 0) {
+      return {
+        ok: false,
+        rejected: 0,
+        paths: [],
+        discarded: [],
+        registryDiscarded: undefined,
+        failures: [{ path: '', code: 'NO_MATCHING_PATHS', message: '没有选择任何路径；未拒绝任何内容。' }],
+        message: '没有选择任何路径（未拒绝任何内容）',
+      }
+    }
+    if (Array.isArray(paths) && paths.length > 0) {
+      const known = new Set(this.workspace.diffEntries().map((change) => compareKey(change.path)))
+      for (const key of registryKeys) known.add(key)
+      const unmatched = paths.filter((path) => !known.has(compareKey(path)))
+      if (unmatched.length > 0) {
+        return {
+          ok: false,
+          rejected: 0,
+          paths: [],
+          discarded: [],
+          registryDiscarded: undefined,
+          failures: [{ path: unmatched.join(', '), code: 'NO_MATCHING_PATHS', message: '所选路径不在当前待审净变化里；未拒绝任何内容。' }],
+          message: `没有匹配的待审路径：${unmatched.join(', ')}（未拒绝任何内容）`,
+        }
+      }
+    }
     const selectedRegistryDiscard = paths && paths.length > 0 ? paths.filter((p) => registryKeys.has(compareKey(p))) : []
     const wantsRegistryDiscard =
       registryPending.length > 0 && ((paths ?? []).length === 0 || selectedRegistryDiscard.length > 0)
