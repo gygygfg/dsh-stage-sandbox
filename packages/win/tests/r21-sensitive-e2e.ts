@@ -511,6 +511,21 @@ try {
         maskSensitiveLine(`  ${MARK.blockBodyA}`).masked === false, // 短正文单行判据本身遮不住 ⇒ 正是跨行状态机存在的原因
       '真凭据被遮 / 短块标量正文单行不可判（根因自证）',
     )
+    // R34-SEC-EXT：无键名、靠固定前缀识别的凭据（R34 新增 KNOWN_SECRET_RE 形态）。
+    const PREFIX_SECRETS = [
+      ['aws-akid', 'AKIAIOSFODNN7EXAMPLE'],
+      ['github-pat', 'ghp_0123456789abcdefghijklmnopqrstuvwxyz'],
+      ['slack-token', 'xoxb-1234567890-abcdefghij'],
+    ]
+    const prefixMisses = PREFIX_SECRETS.filter(([, secret]) => {
+      const result = maskSensitiveLine(secret)
+      return result.masked !== true || result.text.includes(secret)
+    }).map(([id]) => id)
+    check(
+      '裸前缀凭据（AWS AKID / GitHub PAT / Slack token）必须被遮且原文不残留',
+      prefixMisses.length === 0,
+      prefixMisses.length ? `未遮: ${prefixMisses.join(', ')}` : PREFIX_SECRETS.map(([, s]) => maskSensitiveLine(s).text).join(' | '),
+    )
 
     // ── R21-SENS-02：gate-runner 独立探针的四条 URI 复现 + 两条已绿对照 ────────────
     // 形态来自 `.lead/logs/gate-runner-r21/g4-independent-findings.md`（C5）：

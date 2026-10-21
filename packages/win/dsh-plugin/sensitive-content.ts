@@ -118,8 +118,17 @@ const BARE_TOKEN_RE = /[A-Za-z0-9+/_][A-Za-z0-9+/=_.-]{15,}/g
 /** `scheme://…` / `file:` / `wss:` 之类的 URI 形态（用于 `isLocationLike`） */
 const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:(?:\/\/|\\\\)?[^\s]*$/
 
-/** 已知秘密形态：`sk-…`（OpenAI/DeepSeek 风格密钥前缀）与 `Bearer <token>`。 */
-const KNOWN_SECRET_RE = /\b(?:sk-[A-Za-z0-9_-]{6,}|Bearer\s+[A-Za-z0-9+/=_.-]{16,})/g
+/**
+ * 已知秘密形态：
+ *   · `sk-…`（OpenAI/DeepSeek 风格）；
+ *   · AWS access key id（`AKIA` + 16 个大写/数字，裸出现时没有键名可依）；
+ *   · GitHub token（`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`）；
+ *   · Slack token（`xoxb-`/`xoxp-`/…）；
+ *   · `Bearer <token>`。
+ * R34：后四类是"有固定前缀、无键名"的高置信形态；旧规则只认 `sk-`/`Bearer`，
+ * 裸 `AKIA…` 会因字符类不足而漏明（见 sec-r34.md 残余段）。
+ */
+const KNOWN_SECRET_RE = /\b(?:sk-[A-Za-z0-9_-]{6,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|Bearer\s+[A-Za-z0-9+/=_.-]{16,})/g
 
 /**
  * **凭据键名**（分隔符之前那段，小写比较）。

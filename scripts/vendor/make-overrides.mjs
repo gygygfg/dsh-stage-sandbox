@@ -3,7 +3,7 @@
 //
 // 幂等：只重写 `pnpm-workspace.yaml` 里 `# --- BEGIN/END LOCAL VENDOR OVERRIDES ---`
 // 之间的内容；文件内容无变化时 `pnpm-workspace.yaml` 一字不动。
-import { readdirSync, existsSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
+import { readdirSync, existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -31,11 +31,42 @@ function hasRealBody(dir) {
   if (!existsSync(pj)) return false
   try {
     const j = JSON.parse(readFileSync(pj, 'utf8'))
-    if (j.version === '0.0.0-local-stub') return true // 已经是占位：别再动它
+    if (j.version === '0.0.0-local-stub') {
+      /**
+       * R34-G-02：不能把"旧占位 package.json"直接当成"占位仍然有效"。
+       * 实测形态：package.json 仍是 0.0.0-local-stub，但 `lib/index.js` 已被后来的
+       * asar 提取写成真实实体；旧逻辑 `return true` ⇒ 永远不再修，且陈旧的
+       * `lib/index.d.ts`（写着"本地占位"）会一直骗过 tsc（linux 侧 6 条 TS2305 假信号）。
+       * 判据：入口 JS 还是不是占位内容。
+       */
+      const entry = join(dir, 'lib/index.js')
+      if (!existsSync(entry)) return false
+      return !readFileSync(entry, 'utf8').includes('本地占位包')
+    }
     if (typeof j.main === 'string') return existsSync(join(dir, j.main))
     return true // exports 形态：有 package.json 就先信它
   } catch {
     return false
+  }
+}
+
+/**
+ * R34-G-02：清理"真实实体 + 陈旧占位类型声明"的混合态。
+ * 只删带 `本地占位` 标记的 `lib/index.d.ts`，且仅当同目录 `lib/index.js` 已是真实内容；
+ * 真正的占位包（index.js 仍是占位）不动。缺失 d.ts 会让 tsc 报"没有声明"的**真话**
+ * （TS7016），比"声明导出了空对象"的假信号（TS2305）诚实。
+ */
+function cleanStaleStub(dir) {
+  const dts = join(dir, 'lib/index.d.ts')
+  const entry = join(dir, 'lib/index.js')
+  if (!existsSync(dts) || !existsSync(entry)) return
+  try {
+    if (!readFileSync(dts, 'utf8').includes('本地占位')) return
+    if (readFileSync(entry, 'utf8').includes('本地占位包')) return
+    rmSync(dts, { force: true })
+    console.log(`# 清理陈旧占位类型声明（真实 JS 实体已在场）：${dts}`)
+  } catch {
+    /* 清理失败不阻断引导；下次运行还会再试 */
   }
 }
 
@@ -75,6 +106,7 @@ function requiredNames() {
 }
 
 const required = requiredNames()
+for (const name of required) cleanStaleStub(join(VENDOR, name))
 const stubbed = required.filter((n) => !hasRealBody(join(VENDOR, n)))
 for (const name of stubbed) writeStub(name)
 console.log(`# 需求 ${required.length} 个包；其中**无实体需占位** ${stubbed.length} 个：${stubbed.join(', ') || '（无）'}`)

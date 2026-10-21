@@ -3040,9 +3040,23 @@ window.__ModuleLoader__.load({
        *   3. 把这三个事实挂成 `data-winstage-staging-*` 属性 —— GUI 验收可以逐字核对
        *      （R11 的 `aria-checked` 判据仍然保留，没有换掉既有锚点）。
        */
-      const liveStaging =
+      const snapshotStaging =
         (liveFacts && typeof liveFacts === 'object' ? liveFacts : undefined) ??
         (store.state.staging && typeof store.state.staging === 'object' ? store.state.staging : undefined)
+      /**
+       * R34-E2E-03：快照里的 `configValue` 是**发布那一刻**的开关值。用户刚把开关
+       * off→on（或 on→off）时，宿主可能还来不及发布新快照（例如本宿主建不出暂存根，
+       * 根本发布不了），旧快照会继续写着 opposite 的 `effective`，设置页就出现
+       * "已启用 · 文件面已关闭" 的自相矛盾。判据：快照的 configValue 与当前表单值
+       * **不一致 ⇒ 这份 face 信息已过期**，宁可不显示，也不显示过期结论；
+       * 等新快照到了再显示。没有 configValue 的旧快照保持既有行为。
+       */
+      const liveStaging =
+        snapshotStaging &&
+        typeof snapshotStaging.configValue === 'boolean' &&
+        snapshotStaging.configValue !== enabled
+          ? undefined
+          : snapshotStaging
       const liveEffective = liveStaging && liveStaging.effective === true ? 'on' : liveStaging && liveStaging.effective === false ? 'off' : 'unknown'
       const liveOverride = liveStaging && liveStaging.shellOverride && liveStaging.shellOverride.forced === true
       const liveOverrideText = liveStaging && liveStaging.shellOverride && typeof liveStaging.shellOverride.text === 'string'

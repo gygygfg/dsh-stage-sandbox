@@ -7,7 +7,7 @@
 //
 // 用法：node scripts/vendor/asar-extract.mjs [--dry]
 //   asar 路径可由环境变量 `DSH_APP_ASAR` 指定；否则按下列候选顺序自动探测。
-import { openSync, readSync, closeSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { openSync, readSync, closeSync, existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -137,6 +137,12 @@ function extractDir(node, destDir, parts) {
 
 for (const name of [...closure].sort()) {
   const dest = join(DEST, '@deepseek-ai', name)
+  /**
+   * R34-G-02：先清空目标目录再抽取。旧实现只覆盖 asar 里存在的文件，
+   * 旧占位（`lib/index.d.ts` 等）会留在新实体旁边，形成"真实 JS + 占位类型"的混合态，
+   * tsc 因此读到假声明（linux 侧 TS2305 假信号）。`--dry` 不删除任何东西。
+   */
+  if (!DRY) rmSync(dest, { recursive: true, force: true })
   extractDir(scope[name], dest, [name])
 }
 closeSync(fd)
