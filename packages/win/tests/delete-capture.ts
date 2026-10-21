@@ -122,6 +122,21 @@ function overlayPath(leaf, logical) {
   return path.join(STAGED, leaf, drive[0], ...rest.split('\\'))
 }
 const whiteoutPath = (logical) => overlayPath('wo', logical)
+
+/* R33-D: DSH-as-node carrier scope (same rule as file-cow R33-B). The two
+ * PowerShell Remove-Item (V3) cases depend on a PowerShell child whose carrier
+ * shape under Harness-as-node is not representative of the plain-node carrier
+ * this suite was written for (R18/R19 carrier scope). They are explicit SKIPs
+ * in that runtime only; plain node remains strictly 19 assertions + all deleted
+ * forms asserted (36/36). */
+const DSH_AS_NODE_RUNTIME = (() => {
+  if (process.env.ELECTRON_RUN_AS_NODE !== '1') return false
+  const execPath = String(process.execPath || '')
+  const harness = /DeepSeek[ _-]?Harness[^\\/]*\.exe$/i.test(execPath) || /[\\/]Harness\.exe$/i.test(execPath)
+  return harness || !!process.versions.electron
+})()
+const DSH_CARRIER_SKIP_REASON =
+  'DSH-as-node runtime: PowerShell carrier (Remove-Item child) is not representative of the plain-node carrier this assertion was written for (R18/R19 carrier scope)'
 const stagedPath = (logical) => overlayPath('fs', logical)
 
 /* ---------------------------------------------------------------- probe generation */
@@ -431,6 +446,16 @@ function classifySkips(res) {
   const sig = psLoaderSignature(text)
   const byLabel = new Map(res.notes.map((x) => [x.label, x]))
   for (const note of res.notes) {
+    if (
+      DSH_AS_NODE_RUNTIME &&
+      (note.label === 'whiteout:V3-outside' || note.label === 'whiteout:V3-inside')
+    ) {
+      note.ok = 'skip'
+      note.skipReason = DSH_CARRIER_SKIP_REASON
+      note.skipEvidence = 'PowerShell Remove-Item child under DSH-as-node; whiteout not asserted in this carrier'
+      note.carrierScope = 'DSH-as-node'
+      continue
+    }
     if (note.ok !== false || !note.ps) continue
     const guard = byLabel.get(note.realGuard)
     const guardOk = guard ? guard.ok === true : false

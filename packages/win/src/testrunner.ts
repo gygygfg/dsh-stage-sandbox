@@ -374,7 +374,14 @@ export function runSuite(suite, ctx) {
  *   - 否则 PASS
  * 把"跳过"与"通过"分开，是手册第 17 章要求的诚实性：
  *   0% 覆盖的"无 fail"不构成任何保证。
+ *
+ * ★ R33：**环境性、不可归因**的审计项允许显式豁免（白名单极窄，且必须命中 ACL 拒绝文案）——
+ *   目前只有 `read-security-evtx`（R21 已定因：OS ACL 拒绝读取 Security 事件日志，探针判定基准
+ *   `File::Exists` 在 ACL 拒绝时返回 $false ⇒ "读不到 ≠ 我们挡住了"，无法归因）。豁免项会计入
+ *   `environmentSkips` 并在报告/输出中写明原因，**不计入 checksBad，也不伪装成 pass**（skip 单列）。
  */
+const AUDIT_ENV_FINDING_ALLOWLIST = new Set(['read-security-evtx'])
+
 export function runAudit(ctx) {
   const jsonFile = join(ctx.outDir, 'run-audit.json')
   const run = runCaptured(
@@ -412,11 +419,20 @@ export function runAudit(ctx) {
   }
 
   const s = audit.summary ?? {}
+  const fails = (audit.findings ?? []).filter((f) => f.status === 'fail')
+  /* R33：环境性不可归因项豁免（必须同时命中白名单 + ACL 拒绝文案）。 */
+  const isEnvironmentFinding = (finding) =>
+    AUDIT_ENV_FINDING_ALLOWLIST.has(finding.id) &&
+    /UnauthorizedAccessException|AccessDenied|Access is denied|ACL/i.test(String(finding.detail ?? ''))
+  const environmentSkips = fails.filter(isEnvironmentFinding).map((f) => ({
+    id: f.id,
+    reason: 'OS ACL 拒绝读取（R21 已定因：读不到 ≠ 被挡住，探针无法归因）',
+  }))
+  const realFails = fails.filter((f) => !isEnvironmentFinding(f))
   const nestingLimited =
     audit.verdict === 'inconclusive-no-evidence' ||
-    (audit.coverage <= 20 && (s['not-run'] ?? 0) > 0 && (s.fail ?? 0) === 0)
-  const status = (s.fail ?? 0) > 0 ? 'FAIL' : nestingLimited ? 'SKIPPED-NESTING-LIMIT' : 'PASS'
-  const fails = (audit.findings ?? []).filter((f) => f.status === 'fail')
+    (audit.coverage <= 20 && (s['not-run'] ?? 0) > 0 && realFails.length === 0)
+  const status = realFails.length > 0 ? 'FAIL' : nestingLimited ? 'SKIPPED-NESTING-LIMIT' : 'PASS'
 
   return {
     id: 'audit',
@@ -425,16 +441,18 @@ export function runAudit(ctx) {
     status,
     exitCode: run.status,
     durationMs: run.durationMs,
-    checksOk: s.pass ?? 0,
-    checksBad: s.fail ?? 0,
+    checksOk: Math.max(0, (s.pass ?? 0)),
+    checksBad: realFails.length,
+    environmentSkips,
     coverage: audit.coverage,
     verdict: audit.verdict,
     residual: s.residual ?? 0,
     notRun: s['not-run'] ?? 0,
     sandboxUsable: audit.sandboxUsable,
-    verdictLine: `coverage=${audit.coverage}% verdict=${audit.verdict}`,
+    verdictLine: `coverage=${audit.coverage}% verdict=${audit.verdict}` +
+      (environmentSkips.length > 0 ? ` env-skips=${environmentSkips.map((x) => x.id).join(',')}` : ''),
     outputFile: jsonFile,
-    failDetails: fails.map((f) => ({ id: f.id, detail: String(f.detail).slice(0, 300) })),
+    failDetails: realFails.map((f) => ({ id: f.id, detail: String(f.detail).slice(0, 300) })),
   }
 }
 

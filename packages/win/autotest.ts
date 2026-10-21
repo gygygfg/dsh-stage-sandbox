@@ -20,7 +20,9 @@
 
 import { join, resolve } from 'node:path'
 import { mkdirSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { REPO, runAll, OFFLINE_SUITES, SANDBOX_SUITES } from './src/testrunner.ts'
+import { resolveDshModuleRoot } from './src/executor.ts'
 
 function parseArgs(argv) {
   const out = { skipAudit: false, verbose: false, json: false, only: undefined, workspace: undefined, report: undefined }
@@ -81,11 +83,27 @@ mkdirSync(join(REPO, '.t'), { recursive: true })
  * 退出码 **2（环境错误）**；DSH-as-node 下行为不变。`--skip-audit` 语义不变。
  */
 async function probeSandboxRuntime() {
+  /* R33：不能用**裸 import** —— `@deepseek-ai/dsh-sandbox-windows-acl` 在桌面版只在
+   * `…\resources\app.asar\dsh\node_modules` 内，仓库上下文的 ESM 解析找不到它（于是 DSH-as-node 下
+   * sandbox 段被误跳过）。这里复用 `resolveDshModuleRoot()` 的**绝对路径**候选（含 app.asar），
+   * 用 createRequire 从该根加载，与 capability/executor 的真实加载口径一致。 */
+  const spec = '@deepseek-ai/dsh-sandbox-windows-acl'
+  const roots = resolveDshModuleRoot()
+  const errors = []
+  for (const root of roots) {
+    try {
+      createRequire(join(root, 'noop.js'))(spec)
+      return { ok: true, from: root }
+    } catch (error) {
+      errors.push(`${root}: ${String(error?.code ?? error?.message ?? error)}`)
+    }
+  }
   try {
-    await import('@deepseek-ai/dsh-sandbox-windows-acl')
-    return { ok: true }
+    createRequire(import.meta.url)(spec)
+    return { ok: true, from: 'self' }
   } catch (error) {
-    return { ok: false, reason: String(error?.message ?? error) }
+    errors.push(`self: ${String(error?.code ?? error?.message ?? error)}`)
+    return { ok: false, reason: `cannot resolve ${spec} via resolveDshModuleRoot():\n  ${errors.join('\n  ')}` }
   }
 }
 

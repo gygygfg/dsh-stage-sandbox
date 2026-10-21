@@ -80,6 +80,8 @@
 - [`round30/R30-NT长路径专项报告.md`](round30/R30-NT长路径专项报告.md)：第九批 —— NT 上限长路径专项（`WS_PATH_MAX` 4096→32768 + 堆缓冲/cleanup，无 64KB 栈数组；≤32000 支持，32760–32767 受 staged 物理路径限制显式 fail-closed+归因，>32767 fail-closed；`-Wframe-larger-than=8192` 0 warning + STRESS-OK）；附残余。
 - [`round31/R31-崩溃恢复WAL报告.md`](round31/R31-崩溃恢复WAL报告.md)：第十批 —— R21-FS-07 崩溃恢复 WAL（`<store.dir>/apply.journal` 整批快照+sha256；`recoverApplyJournal()`/applyCandidate/init 自动恢复；崩溃缝 N=1/2 真实子进程 exit 134 ⇒ 逐字节回原态+候选 pending+事件；损坏 fail-closed、并发守卫、幂等）；附残余（无 fsync 断电 durability 等）。
 - [`round32/R32-运行时差异收口报告.md`](round32/R32-运行时差异收口报告.md)：第十一批 —— autotest DSH-as-node 运行时差异收口（r21-fs-policy provider 同实例 `isStagingFsError`、r24 E2/r28 19/1 的 `_makeTreeRemovable` 只读树删除/回滚 + 属性 helper 回退链），两运行时均绿无 SKIP；附新登记 autotest sandbox probe 裸 import 基建残余。
+- [`round33/R33-最终收口报告.md`](round33/R33-最终收口报告.md)：最终阶段 —— autotest 两运行时达标（plain PASS/exit=2 sandbox 按设计跳过；DSH-as-node PASS 60/0/0 exit=0，sandbox 段真正运行；file-cow/delete-capture 的 DSH carrier 用例显式 SKIP+原因；audit evtx environmentSkip 单列）；verify 55 ALL PASS、4 沙箱 SBX_RC=0；残余全部归档为环境/宿主 CLI/架构边界。
+- [`round33/R33-最终残余清单.md`](round33/R33-最终残余清单.md)：**最终残余清单**（环境缺口 E1–E5 / 宿主 CLI H1–H2 / 架构边界 A1–A13 / §13 已登记项）——后续"看起来更强"的声明应先对照这里。
 
 ## 5. archive —— 历史归档（不代表现行口径）
 

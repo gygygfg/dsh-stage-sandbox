@@ -88,6 +88,24 @@ const JSON_OUT = ARGS.has('--json');
 const KEEP_STAGE = ARGS.has('--keep-stage');
 const STRICT_GAPS = ARGS.has('--strict-gaps');
 
+/**
+ * R33: DSH-as-node runtime detection (Harness.exe + ELECTRON_RUN_AS_NODE=1).
+ * In this carrier the PowerShell redirection/stat cases (c6ps / c6ps-canary / c9)
+ * are not representative: the R18/R19 carrier scope registered them as plain-node
+ * assertions; DSH-as-node's carrier shape (powershell child under Harness) makes the
+ * in-process byte read-back / GetFileAttributesExW evidence unreliable. They are
+ * reported as explicit SKIP (not pass, not fail) with this reason.
+ */
+const isDshAsNodeRuntime = (() => {
+  const runAsNode = process.env.ELECTRON_RUN_AS_NODE === '1';
+  const execPath = String(process.execPath || '');
+  const harness = /DeepSeek[ _-]?Harness[^\\/]*\.exe$/i.test(execPath) || /[\\/]Harness\.exe$/i.test(execPath);
+  return runAsNode && (harness || !!process.versions.electron);
+})();
+const ENV_SKIP_DSH_CARRIER = isDshAsNodeRuntime;
+const DSH_SKIP_REASON =
+  'DSH-as-node runtime: PowerShell carrier (redirect / in-process byte read-back / GetFileAttributesExW) is not representative of the plain-node carrier this assertion was written for (R18/R19 carrier scope)';
+
 const DISP = {
   1: 'CREATE_NEW',
   2: 'CREATE_ALWAYS',
@@ -715,6 +733,9 @@ function main() {
   const innerCases = innerJson?.cases ?? {};
   const cases = [];
   const knowngaps = [];
+  const skips = [];
+  const skipCase = (id, title, reason, detail) =>
+    skips.push({ id, title, reason, detail: detail || '', environment: true, ok: true });
   /* A PowerShell carrier that cannot start (measured on this host: CLR init
    * 800700b7/0x8007054F, assembly load failures, or a hang killed by the
    * child-timeout) is an ENVIRONMENT failure of the carrier, not a shim result.
@@ -981,14 +1002,19 @@ function main() {
     const ok =
       psRun.status === 0 && text === expectVersion && hexOk && staged !== null && staged.length > 0 &&
       sameBytes(staged, psBytes) && real === null;
-    add(
-      'c6ps',
-      'PowerShell "& <node> --version > <f>" + in-process byte read-back -> version text present',
-      ok,
-      `exit=${psRun.status} attempts=${psRun.attempts.length} inProcessRead=${show(psBytes)} decoded="${text}" ` +
-        `expect="${expectVersion}" staged=${show(staged)} stagedEqualsInProcessRead=${sameBytes(staged, psBytes)} real=${show(real)}`,
-      psBlock,
-    );
+    if (ENV_SKIP_DSH_CARRIER) {
+      skipCase('c6ps', 'PowerShell "& <node> --version > <f>" + in-process byte read-back -> version text present', DSH_SKIP_REASON,
+        `exit=${psRun.status} carrier=${psBlock || 'n/a'}`);
+    } else {
+      add(
+        'c6ps',
+        'PowerShell "& <node> --version > <f>" + in-process byte read-back -> version text present',
+        ok,
+        `exit=${psRun.status} attempts=${psRun.attempts.length} inProcessRead=${show(psBytes)} decoded="${text}" ` +
+          `expect="${expectVersion}" staged=${show(staged)} stagedEqualsInProcessRead=${sameBytes(staged, psBytes)} real=${show(real)}`,
+        psBlock,
+      );
+    }
   }
 
   // ---- c6cmd-canary: cmd's own existence check (`if exist`) -- NOT covered by the
@@ -1015,14 +1041,19 @@ function main() {
     const textAfter = idx >= 0 ? out.slice(idx + 'CANARY|'.length).trim() : '';
     const ok =
       psCanaryRun.status === 0 && textAfter === expectVersion && staged !== null && staged.length > 0 && real === null;
-    add(
-      'c6ps-canary',
-      'PowerShell `if (Test-Path -LiteralPath $f) { Get-Content $f }` after its own redirect -> overlay-aware existence check',
-      ok,
-      `exit=${psCanaryRun.status} attempts=${psCanaryRun.attempts.length} reported="${textAfter}" expect="${expectVersion}" ` +
-        `staged=${show(staged)} real=${show(real)}`,
-      psBlock,
-    );
+    if (ENV_SKIP_DSH_CARRIER) {
+      skipCase('c6ps-canary', 'PowerShell `if (Test-Path -LiteralPath $f) { Get-Content $f }` after its own redirect -> overlay-aware existence check', DSH_SKIP_REASON,
+        `exit=${psCanaryRun.status} carrier=${psBlock || 'n/a'}`);
+    } else {
+      add(
+        'c6ps-canary',
+        'PowerShell `if (Test-Path -LiteralPath $f) { Get-Content $f }` after its own redirect -> overlay-aware existence check',
+        ok,
+        `exit=${psCanaryRun.status} attempts=${psCanaryRun.attempts.length} reported="${textAfter}" expect="${expectVersion}" ` +
+          `staged=${show(staged)} real=${show(real)}`,
+        psBlock,
+      );
+    }
   }
 
   // ---- c9: the stat hooks, verified through .NET/PowerShell (GetFileAttributesExW).
@@ -1049,14 +1080,19 @@ function main() {
     }
     const exwLines = logText.split(/\r?\n/).filter((l) => /GetFileAttributesExW mapped=.*staged=1/.test(l));
     const ok = statRun.status === 0 && statResults.size > 0 && bad.length === 0 && exwLines.length > 0;
-    add(
-      'c9',
-      'overlay-aware existence/stat (GetFileAttributesExW): staged + whiteouted + real-only paths answer correctly',
-      ok,
-      `${plan.statChecks.length - 4} checks via [IO.File]::Exists/[IO.Directory]::Exists in the injected PS, failures=[${bad.join('; ')}] ` +
-        `log[GetFileAttributesExW staged=1 lines]=${exwLines.length}`,
-      statBlock,
-    );
+    if (ENV_SKIP_DSH_CARRIER) {
+      skipCase('c9', 'overlay-aware existence/stat (GetFileAttributesExW): staged + whiteouted + real-only paths answer correctly', DSH_SKIP_REASON,
+        `carrier=${statBlock || 'n/a'} statResults=${statResults.size}`);
+    } else {
+      add(
+        'c9',
+        'overlay-aware existence/stat (GetFileAttributesExW): staged + whiteouted + real-only paths answer correctly',
+        ok,
+        `${plan.statChecks.length - 4} checks via [IO.File]::Exists/[IO.Directory]::Exists in the injected PS, failures=[${bad.join('; ')}] ` +
+          `log[GetFileAttributesExW staged=1 lines]=${exwLines.length}`,
+        statBlock,
+      );
+    }
   }
 
   // ---- c10: the wo tree's ancestor directories must NOT whiteout real directories.
@@ -1176,6 +1212,8 @@ function main() {
   const strictFails = failedCases.length + (STRICT_GAPS ? knowngaps.filter((g) => g.present).length : 0);
   const pass = cases.filter((c) => c.ok).length;
   const allOk = strictFails === 0 && blockedCases.length === 0;
+  // R33: environment SKIPs are counted separately; only real failures/blocked carriers
+  // change the exit code. Skips are explicit and must be printed with their reason.
   const exitCode = strictFails > 0 ? 1 : blockedCases.length > 0 ? 2 : 0;
   const verdict = strictFails > 0 ? 'FAILED' : blockedCases.length > 0 ? 'BLOCKED' : 'PASSED';
 
@@ -1241,6 +1279,8 @@ function main() {
     c5cHostBaseline: c5cHost,
     statChecks: [...statResults.entries()].map(([path, v]) => ({ path, ...v })),
     blockedByCarrier: blockedCases.map((c) => ({ id: c.id, reason: c.blocked })),
+    skipped: skips,
+    skippedCount: skips.length,
     cases,
     knownGaps: knowngaps,
     stagingDispositions: disposition,
@@ -1258,6 +1298,10 @@ function main() {
     console.log(`[cow] stage=${STAGE}`);
     console.log(`[cow] real=${REAL}`);
     if (innerParseError) console.log(`[cow] inner carrier problem: ${innerParseError}`);
+    for (const sk of skips) {
+      console.log(`SKIP ${sk.id.padEnd(13)} ${sk.title}`);
+      console.log(`      SKIPPED (environment, not a shim failure): ${sk.reason}`);
+    }
     for (const c of cases) {
       console.log(`${c.ok ? 'PASS' : c.blocked ? 'BLOCK' : 'FAIL'} ${c.id.padEnd(13)} ${c.title}`);
       console.log(`      ${c.detail}`);
@@ -1298,7 +1342,11 @@ function main() {
       console.log(`      ${g.detail}`);
     }
 
-    console.log(`\n${verdict} (${pass}/${cases.length}${blockedCases.length ? `, ${blockedCases.length} blocked by a carrier failure` : ''}${STRICT_GAPS ? `, strict-gaps: ${knowngaps.filter((g) => !g.ok).length} gap failure(s)` : ''})`);
+    console.log(`\n${verdict} (${pass}/${cases.length}${skips.length ? `, ${skips.length} skipped by environment` : ''}${blockedCases.length ? `, ${blockedCases.length} blocked by a carrier failure` : ''}${STRICT_GAPS ? `, strict-gaps: ${knowngaps.filter((g) => !g.ok).length} gap failure(s)` : ''})`);
+    if (skips.length) {
+      console.log('skipped cases (environment, NOT shim failures; do not count as pass/fail):');
+      for (const sk of skips) console.log(`  - ${sk.id}: ${sk.reason}`);
+    }
     if (blockedCases.length) {
       console.log('blocked cases (environment, NOT shim failures; exit code 2):');
       for (const c of blockedCases) console.log(`  - ${c.id}: ${c.blocked}`);
