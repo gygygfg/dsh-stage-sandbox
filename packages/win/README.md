@@ -113,9 +113,9 @@ node tools\ebk-sandbox-test.ts # Windows E2E 测试台（需 docker + KVM，见 
 | `shim/` | C 注入层源码（`src`/`include`/`injector`/`probe`/`audit`）；构建产物在 `shim/out/`（不入库） |
 | `patches/` | DSH 宿主的可重放补丁包（P1/P2/P3，**默认不应用**）+ 原样副本 `pristine/` |
 | `tools/` | 构建/基线封印/补丁工具/shim 闭环节（受源码封印，见 §5） |
-| `tests/` | 离线关口 33 套件 + 沙箱 4 套件 + 元测试与治理套件 |
+| `tests/` | 离线关口 55 套件 + 沙箱 4 套件 + 元测试与治理套件 |
 | `e2e/` | Windows 实测台（docker + KVM + Windows guest）；`e2e/domains/` 是一次性归档 |
-| `docs/` | 设计与规范；历史轮次记录已归入 `docs/archive/`（见 `docs/README.md`） |
+| `docs/` | 设计与规范（历史轮次报告已在 R33 后清理，git 历史可追溯；见 `docs/README.md`） |
 
 ---
 
@@ -198,4 +198,4 @@ node tests\dsh-patch-guard.ts             # 守门：现场哈希必须恰好是
 - 测试入口与套件清单：[`docs/测试套件总览.md`](docs/测试套件总览.md)
 - 修改流程规范：[`docs/项目规范-测试与修改流程.md`](docs/项目规范-测试与修改流程.md)
 - Windows E2E 测试台：[`e2e/README.md`](e2e/README.md)
-- 历史轮次与一次性记录（**不代表现行口径**）：`docs/archive/`
+- 历史轮次与一次性记录（**不代表现行口径**）：git 历史（round10–round32/archive 已在 R33 后清理）

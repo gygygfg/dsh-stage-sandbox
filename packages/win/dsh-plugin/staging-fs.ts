@@ -620,7 +620,7 @@ export function normalizeReadPolicy(raw) {
  *       也**不产生候选**。模型面看到的是本插件自己的诚实文案（实测：`dsh-tool-fs` 的
  *       `mapError()` 在暂存面（`sandboxMode === undefined` ⇒ `policy === undefined`）
  *       **不会**把它换成 `[sandbox: …]` 标记 —— 见
- *       `docs/archive/round10/fileio/修复-工具面.md` §1.3 的实测与读码）。
+ *       `git 历史（历史归档已清理）` §1.3 的实测与读码）。
  *     · `'direct'`：显式逃生口，直通真实磁盘。
  *   任何**其它**取值一律 fail-safe 归一为 `'stage'`（不静默变成拒绝，也不静默直写）。
  *   `readPolicy` 三态**显式通道**（R24-A1，生产来自 `WINSTAGE_READ_POLICY`）：

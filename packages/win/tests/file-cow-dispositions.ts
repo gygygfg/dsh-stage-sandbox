@@ -874,12 +874,12 @@ function main() {
   }
 
   // ---- c4d: a failed CoW fails closed.
-  /* 2026-10-08 夹具修正（见 docs/archive/round10/shim/报告.md §c4d）：
+  /* 2026-10-08 夹具修正（见 git 历史（历史归档已清理） §c4d）：
    * 旧期望写死了 `openOk===false && openCode==='EPERM'`，前提是"CopyFileW 复制不了目录
    * ⇒ 打开必须失败"。实测该前提不成立：**未注入的主机**上
    * `fs.openSync(<real dir>, O_RDWR|O_CREAT)` 同样 `openOk=true`
    * （libuv 对目录带 FILE_FLAG_BACKUP_SEMANTICS 打开；差分证据见
-   * docs/archive/round10/shim/evidence/D10-c4d-uninjected-control.txt），
+   * git 历史（历史归档已清理）），
    * 因此这里根本不会走到 CoW 失败分支 —— 旧断言把"主机的目录语义"误判成"未 fail-closed"。
    * 新判据**保判定力**：真走到 CoW 失败分支时，仍然要求 EPERM + 无暂存产物 + fail-closed 日志；
    * 主机允许打开时，只接受"真实目录完好、且暂存面里没有出现**文件内容**（目录镜像可以）"。 */

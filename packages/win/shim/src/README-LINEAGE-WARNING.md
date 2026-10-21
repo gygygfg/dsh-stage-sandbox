@@ -1,7 +1,7 @@
 # ⚠ shim/src 血统警告 —— 本目录当前**不是**在用 DLL 的源码
 
-> 写入者：Lead · 时间：2026-10-09 18:2x（+08:00）· 依据：`docs/archive/round10/LEAD-修复记录.md` §V5、
-> `docs/archive/round10/shim/evidence/D39/D44/D45/D46-*`、`docs/archive/round10/汇总报告.md` §8.5/§8.5.1
+> 写入者：Lead · 时间：2026-10-09 18:2x（+08:00）· 依据：`git 历史（历史归档已清理）` §V5、
+> `git 历史（历史归档已清理）`、`git 历史（历史归档已清理）` §8.5/§8.5.1
 
 ## 事实
 

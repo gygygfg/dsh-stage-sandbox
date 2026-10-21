@@ -574,7 +574,7 @@ async function liveSection() {
       const verdict = executor.stagingWriteEnforceability()
       degraded = verdict.verdict === 'fail'
       degradeEvidence = `enforcement=${report.enforcement} inside=${report.observed?.inside} verdict=${verdict.verdict}`
-      /* 2026-10-08 夹具定因（见 docs/archive/round10/shim/报告.md §B4）：旧夹具用的是
+      /* 2026-10-08 夹具定因（见 git 历史（历史归档已清理） §B4）：旧夹具用的是
        * `cmd /c echo MUST-NOT-RUN`（**纯只读**），而闸门**刻意**放行"正向判定为只读"的
        * 命令（BUG-4：拒绝面只覆盖有风险的那一条命令，`assertStagingWriteEnforceable` 的
        * ② 分支 `allowed-read-only-bypass`）。实测

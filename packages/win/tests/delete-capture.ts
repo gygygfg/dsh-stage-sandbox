@@ -319,7 +319,7 @@ const PS_LOADER_SIGNATURES = [
   { re: /HRESULT:\s*0x8007[0-9a-f]{4}/i, why: 'CLR 加载器 HRESULT 失败' },
   { re: /The type initializer for/i, why: 'CLR 类型初始化失败（进程未真正启动）' },
   /* ── 2026-10-08 实测新增：注入后的 PowerShell 载体在 AMSI 初始化处崩溃 ──────────
-   * 根因（原始输出见 docs/archive/round10/shim/evidence/D4-ps-amsi-crash-excerpt.txt、
+   * 根因（原始输出见 git 历史（历史归档已清理）
    * .t/delete-capture/run-muzny0wd-1u8/raw/cli.json）：
    *   System.TypeInitializationException:
    *     "System.Management.Automation.AmsiUtils" 的类型初始值设定项引发异常
@@ -329,7 +329,7 @@ const PS_LOADER_SIGNATURES = [
    * 0xe0434352（CLR 异常）或 0xc0000005（访问冲突）。
    * `tools/carrier-flake.ts 30` 实测 6/30（20%）失败，且失败运行里 shim 日志统一出现
    * `STUCK waiting on lock hook` ⇒ 这是**产品缺陷**（shim 与 amsi.dll 初始化竞争），
-   * 已记 docs/archive/round10/shim/defects.md D-SHIM-1。这里只把它按既有纪律归成
+   * 已记 git 历史（历史归档已清理） D-SHIM-1。这里只把它按既有纪律归成
    * "载体未启动 ⇒ SKIP（未判定）"，**守卫不变**：真实盘被改、或成功标记出现 ⇒ 仍然 FAIL。
    * 只列 ASCII 片段：控制台代码页会把中文报错变成乱码，ASCII 片段逐字存活。 */
   { re: /TypeInitializationException/i, why: 'CLR 类型初始化异常（PowerShell 载体启动即失败）' },

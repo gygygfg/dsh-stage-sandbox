@@ -6,7 +6,7 @@
  * `src/registry-guard.ts` 的定位是**检测**：执行前快照、执行后差异、可选回滚**计划**。
  * 它**不阻止**写入（见该文件头注释）。`[实测]` 沙箱内
  * `New-Item HKCU:\Software\X` → `UnauthorizedAccessException`，归因见
- * `docs/archive/dsh2/越界与注册表-实测诊断.md` §3：`HKCU:\Software` 的 SD 里
+ * `git 历史（历史归档已清理）` §3：`HKCU:\Software` 的 SD 里
  * `NT AUTHORITY\RESTRICTED` 只有 `ReadKey`，而受限令牌确含该 SID ——
  * **拒绝由受限令牌本身引入**，且发生在**内核**，不是"没捕获"。
  *

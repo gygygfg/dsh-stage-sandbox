@@ -691,7 +691,7 @@ function stringOption(raw, key) {
 /**
  * ── R14 修复 · D5-N5：网络档位的**唯一入口**（此前 `dsh-plugin/**` 从不传它）───────
  *
- * R11 实测（`docs/archive/round11/network-报告.md`）：出站/入站全开、真实 WFP 过滤器 0 个、
+ * R11 实测（`git 历史（历史归档已清理）`）：出站/入站全开、真实 WFP 过滤器 0 个、
  * `sandbox-lane.json` 里**零网络字段**。代码侧的根因不是 `src/netpolicy.ts`（那套
  * 安装/回读/fail-closed 判定是齐的），而是**装配侧从没把 `networkTier` 交给执行器**：
  * `src/executor.ts:1985` 的默认值 `OBSERVED_ONLINE` 于是永远是唯一取值，
@@ -2303,7 +2303,7 @@ export function createWinStageShellExecutor(options = {}) {
        * workspace: …)`、`[winstage] captured N change(s) …`、`CAPTURE FAILED` 与所有内部
        * 注记**追加进 stderr**。而 `dsh-tool-pwsh` 的 `renderPwshResult()` 会把 stdout 与
        * stderr 全文一起渲染进模型可见的结果 ⇒ 沙箱存在、暂存树路径、候选 id 全部暴露。
-       * 实测原始形态见 `docs/archive/dsh2/shell-交还与降级-修复报告.md:86-88`。
+       * 实测原始形态见 `git 历史（历史归档已清理）`。
        *
        * 现在：**一个字节都不注入**（连尾部换行都不补 —— 否则"零痕迹"就不成立）。
        * 同一份诊断仍在，但只在**人工侧**：

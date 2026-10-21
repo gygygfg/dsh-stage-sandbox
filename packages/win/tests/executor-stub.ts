@@ -642,7 +642,7 @@ async function main() {
     } catch (error) {
       err = error
     }
-    /* 2026-10-08 夹具定因（见 docs/archive/round10/shim/报告.md §ACL-init）：
+    /* 2026-10-08 夹具定因（见 git 历史（历史归档已清理） §ACL-init）：
      * 旧断言 `check('ACL init 失败向上抛出（不吞）', /OpenProcessToken/.test(err?.message))` 把
      * "诊断文本在哪儿"与"失败有没有被吞"混成一件事。产品契约（`src/executor.ts:979-1000`
      * `stageGrantError` 的注释 + 透明性硬约束）明确要求：**模型可见的 message 只写

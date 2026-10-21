@@ -3,7 +3,7 @@
  * R21 · G4a —— 读侧策略 `readPolicy:'record' | 'block'` 双档端到端
  *
  * ── 为什么必须新增这个套件（红证据，先红后绿）──────────────────────────────
- * R19 报告（`docs/round19/R19-独立测试与边界修复报告.md:155-157`）自认：
+ * R19 报告（`git 历史（旧轮次报告已清理）`）自认：
  *   「`block` 档对 readText/readBytes/readByteRange/listDir/stat/lstat 的守卫已
  *    **代码核对**，但**未做双档 e2e**。」
  * 全仓 `tests/**` 在此之前只有 `crosscheck-boundaries.ts:131-145` 的**静态源码 grep**

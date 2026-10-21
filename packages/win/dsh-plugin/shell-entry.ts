@@ -23,7 +23,7 @@
  * 于是**同一个 sessionId** 下出现两份 `.dshstage\sessions\<sid>\manifest.json`，
  * 各自自报不同的 `workspaceRoot`；而 `getReviewService()` 按根做单例 ⇒ 两个单例
  * ⇒ 暂存写到 A、面板发布在 B（**面板看不到命令产出**）。
- * 证据：`docs/archive/dsh2/越界与注册表-实测诊断.md` §1（第 38-51 行）。
+ * 证据：`git 历史（历史归档已清理）` §1（第 38-51 行）。
  *
  * 现在的取值顺序（逐条，**没有 `process.cwd()` 这一档**）：
  *   1. **loader 行表**（`entry.parent.data`）里 `winstage-fs` 行的 `cwd` —— 那才是

@@ -48,7 +48,7 @@
 # `staging-fs.mjs` 的 fail-closed 自校验使用（两键都给了且不一致 → 直接 throw）。
 #
 # ★ **shell 半边的根不再猜 `process.cwd()`**（那正是"两个根"的成因，实测见
-#   `docs/archive/dsh2/越界与注册表-实测诊断.md` §1）：`shell-executor.mjs` 的
+#   `git 历史（历史归档已清理）` §1）：`shell-executor.mjs` 的
 #   `effectiveWorkspaceRoot()` 现读 loader 行表，取 **fs 行的 `cwd`** 作为权威根
 #   （它才是 fs 半边建 Store 用的那个值），并与 shell 行的 `workspaceRoot` 交叉校验；
 #   两处不一致 ⇒ error 级日志 + 以 fs 根为准（绝不按两个根分叉出两个单例）。

@@ -949,7 +949,7 @@ static int ws_patch_all(void)
 /**
  * ── 只补丁**刚加载的那一个模块**（task-11b / D-SHIM-1）────────────────────────────
  *
- * 为什么需要它（实测，见 docs/archive/round10/shim/报告.md §2.4）：
+ * 为什么需要它（实测，见 git 历史（历史归档已清理） §2.4）：
  *   `ws_LoadLibraryW/A/ExW/ExA` 四个钩子在**每一次**真实加载返回后都调用 `ws_hook_refresh()`
  *   → 旧实现是 `ws_patch_all()`：**全量**遍历 loader 表、对**所有**模块做
  *   `VirtualProtect` + 原子改写 IAT 槽位，全程持 `g_hookLock`。

@@ -60,9 +60,9 @@ docs/evidence/
 
 # ── 归档轮次的原始证据（体量大、含宿主路径）────────────────────────────────────
 # 用 `**` 而非 `*`：后者不跨目录分隔符，挡不住 `fileio/13d/<stage>/evidence/` 这类深层目录。
-docs/archive/round10/**/evidence/
-docs/archive/round10/**/evidence-archive/
-docs/archive/round10/LEAD-本线程污染-证据/
+git 历史（历史归档已清理）
+git 历史（历史归档已清理）
+git 历史（历史归档已清理）
 
 # ── 可再生缓存（体积最大，删除后由测试自动重建）────────────────────────────────
 **/edge-profile/
