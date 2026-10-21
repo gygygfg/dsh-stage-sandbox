@@ -38,7 +38,7 @@ import { acquireStageGuard } from '../src/stage-guard.ts'
 import { Store } from '../src/store.ts'
 import { hashAbsent } from '../src/store.ts'
 import { renderCandidateDiff } from '../src/tools.ts'
-import { canonical } from '../src/paths.ts'
+import { canonical, maskSessionId } from '../src/paths.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SCRATCH = join(HERE, '..', '.t', 'r34-guard-unavailable')
@@ -722,6 +722,30 @@ try {
       else process.env.WINSTAGE_STAGE_ROOT = previous
       disposeReviewServices()
     }
+  }
+
+  section('12. R41-MASK：review.json / 面板日志只发布会话伪名')
+  {
+    const session = 'session-11111111-2222-3333-4444-555555555555'
+    const ref = maskSessionId(session)
+    check(
+      '12a maskSessionId 稳定、带 sref_ 前缀、不含真实 id',
+      ref.startsWith('sref_') && ref === maskSessionId(session) && !ref.includes('11111111') && ref.length === 17,
+      JSON.stringify({ ref }),
+    )
+    check('12b 不同会话伪名不同', maskSessionId('session-other') !== ref, maskSessionId('session-other'))
+    const reviewSource = readFileSync(join(HERE, '..', 'dsh-plugin', 'review-service.ts'), 'utf8')
+    check(
+      '12c review.json 写 sessionRef=maskSessionId(...)，不再写真实 sessionId',
+      reviewSource.includes('sessionRef: maskSessionId(ws.manifest?.sessionId)') && !reviewSource.includes('sessionId: ws.manifest?.sessionId'),
+      'source-check',
+    )
+    const hostSource = readFileSync(join(HERE, '..', 'dsh-plugin', 'host-plugin.ts'), 'utf8')
+    check(
+      '12d 面板拒绝日志用 maskSessionId(requestedSessionId)',
+      /session=\$\{maskSessionId\(requestedSessionId\)/.test(hostSource),
+      'source-check',
+    )
   }
 } finally {
   disposeReviewServices()

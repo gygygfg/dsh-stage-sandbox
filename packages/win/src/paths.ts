@@ -19,6 +19,7 @@
  */
 
 import { realpathSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -708,4 +709,20 @@ if (runAsMain) {
     process.stderr.write(`mask export → ${target}（${MASK_CLASSES.length} 条规则）\n`)
   }
   process.exit(0)
+}
+
+/**
+ * R41-MASK：真实会话 id → **稳定伪名**（`sref_` + SHA-256 前 12 hex）。
+ *
+ * 用途：`review.json` / 面板拒绝日志等**会离开进程边界**的输出只写伪名，不写真实
+ * session id。UUID 会话 id 熵足够，截断哈希不可逆；同一 id 稳定映射，便于关联。
+ *
+ * ⚠ 这是**脱敏/防泄漏**，不是访问控制：协议里 `?session=` 仍需要真实 id（宿主没有
+ * per-page 会话绑定，客户端只能从 DSH 页面拿真实 id）。它挡住的是"本插件把别的会话
+ * 的真实 id 告诉同源脚本"这条发现路径；不能替代宿主侧绑定。
+ */
+export function maskSessionId(sessionId) {
+  const raw = typeof sessionId === 'string' ? sessionId.trim() : ''
+  if (raw.length === 0) return ''
+  return `sref_${createHash('sha256').update(raw, 'utf8').digest('hex').slice(0, 12)}`
 }

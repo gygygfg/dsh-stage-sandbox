@@ -27,7 +27,7 @@
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, sep } from 'node:path'
-import { MASK_CLASSES, SELF_MASK_ID, canonical, compareKey, isInside, maskReason } from '../src/paths.ts'
+import { MASK_CLASSES, SELF_MASK_ID, canonical, compareKey, isInside, maskReason, maskSessionId } from '../src/paths.ts'
 import { STATE, STORE_DIR, hashAbsent, hashFile, makeRemovable, writeFileAtomic } from '../src/store.ts'
 import { resolveStageRoot } from '../src/stage-guard.ts'
 import { Workspace, driftReasonOf } from '../src/workspace.ts'
@@ -1423,7 +1423,12 @@ export class ReviewService {
       version: 1,
       generatedAt: new Date().toISOString(),
       workspaceRoot: this.workspaceRoot,
-      sessionId: ws.manifest?.sessionId,
+      /**
+       * R41-MASK：**不写真实 session id**。review.json 会经面板路由交给浏览器，
+       * 真实 id 会变成"从本插件发现其他会话"的入口；只暴露稳定伪名 `sessionRef`。
+       * 内部仍用 `ws.manifest.sessionId`/存储根目录名，不受影响。
+       */
+      sessionRef: maskSessionId(ws.manifest?.sessionId) || null,
       candidateId: latest?.id,
       revision: ws.manifest?.revision,
       // 待审 = 面板上有**任何**一行（全量口径：被截断掉的行也是待审）

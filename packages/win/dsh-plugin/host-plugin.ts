@@ -40,7 +40,7 @@ import { Config } from './schema.ts'
 import { evaluateEnvironment, environmentFailureMessage } from './environment-gate.ts'
 import { probeWin32Abi } from '../src/capability.ts'
 import { WindowsStageExecutor, resolveDshModuleRoot } from '../src/executor.ts'
-import { canonical, compareKey } from '../src/paths.ts'
+import { canonical, compareKey, maskSessionId } from '../src/paths.ts'
 import { renderCandidateDiff } from '../src/tools.ts'
 import { verifyStageRootAlive } from '../src/stage-guard.ts'
 import { REVIEW_BASENAME, getReviewService, resolveReviewStoreDir, disposeReviewServices } from './review-service.ts'
@@ -1244,7 +1244,7 @@ export function createPanelHandler(options = {}) {
         }
         if (enabled) {
           const status = verdict.code === 'session-check-unavailable' ? 503 : 403
-          log(`面板会话校验拒绝（${verdict.reason ?? verdict.code}）：session=${requestedSessionId} route=${url.pathname}`)
+          log(`面板会话校验拒绝（${verdict.reason ?? verdict.code}）：session=${maskSessionId(requestedSessionId) || '(none)'} route=${url.pathname}`)
           try {
             res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
             res.end(JSON.stringify({ ok: false, code: verdict.code ?? 'session-not-authorized', reason: verdict.reason, route: url.pathname }))
