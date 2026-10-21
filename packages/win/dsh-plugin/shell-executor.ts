@@ -124,6 +124,12 @@ import { getReviewService } from './review-service.ts'
 import { buildAuditReport, summarizeAudit } from '../src/audit-report.ts'
 import { captureRegistryChanges } from './registry-capture.ts'
 import { rootSessionIdFor, rootSessionIdOf } from './session-identity.ts'
+/**
+ * R41：外壳启动噪声的**唯一判据来源**在 `run-capture.ts`（那里同时服务于工具级捕获面）。
+ * 这里只 import 判据，不重写一套 —— 两个捕获面若各持一份名单，"面板干净了但捕获没干净"
+ * 或反之会立刻发生（本仓库反复踩过的判据漂移）。
+ */
+import { isShellInternalArtifactPath, shellNoiseFilterEnabled, SHELL_INTERNAL_ARTIFACT_REASON } from './run-capture.ts'
 
 // ==================== 常量 ====================
 
@@ -507,18 +513,20 @@ function sameRootText(a, b) {
 }
 
 /**
- * 从 loader patch **组合后**的行表（`entry.parent.data`）里取出"同一个暂存根"的两处声明值。
+ * 从 loader patch **组合后**的行表（`entry.parent.data`）里取出与本插件根有关的已书写值。
  *
  * 为什么这是根统一的落点：fs 半边（`winstage-fs` 行）真正决定存储根的是 `config.cwd`
- * （`staging-fs.ts` 用 `canonical(config?.cwd || …)` 建 Store），因此它就是**权威**；
- * shell 半边自己那行（`winstage-shell`）用 `config.workspaceRoot` 表达同一个根。
- * 两处不一致 = 配置漂移 = `getReviewService()` 按根分叉 ⇒「暂存写到 A、面板发布在 B」。
+ * （`staging-fs.ts` 用 `canonical(config?.cwd || …)` 建 Store）；shell 半边自己那行
+ * （`winstage-shell`）用 `config.workspaceRoot` 表达同一个根；而 **host 行**
+ * （`winstage-sandbox`）的 `config.workspaceRoot` 是 R41-G04 之后的**唯一配置入口**。
+ * 三处不一致 = 配置漂移 = `getReviewService()` 按根分叉 ⇒「暂存写到 A、面板发布在 B」。
  *
  * 兼容两种形态：行表既可能是**已展平**的条目列表，也可能仍是带 `insert: [...]` 的补丁行
  * （`cordis-plugin-include` 的输入形态），两种都扫。
  *
  * @param {unknown} data `entry.parent.data`
- * @returns {{fsRoot?: string, shellRoot?: string}} 缺该行/该键时对应字段为 `undefined`
+ * @returns {{fsRoot?: string, shellRoot?: string, hostRoot?: string}}
+ *   缺该行/该键时对应字段为 `undefined`（**已书写值**，不是 schema 默认值）
  */
 export function workspaceRootsOfLoaderRows(data) {
   const out = {}
@@ -537,8 +545,48 @@ export function workspaceRootsOfLoaderRows(data) {
     if (!config || typeof config !== 'object') continue
     if (row.id === 'winstage-fs') out.fsRoot = text(config.cwd) ?? text(config.workspaceRoot)
     else if (row.id === 'winstage-shell') out.shellRoot = text(config.workspaceRoot)
+    // ★ R41-G04：host 行 = 单源配置入口（bundle 里留空，profile 只需覆盖这一行）
+    else if (row.id === 'winstage-sandbox') out.hostRoot = text(config.workspaceRoot)
   }
   return out
+}
+
+/**
+ * R41-G04：把行表里三个候选根解析成**一个**生效根，并把"冲突"作为可断言的事实返回。
+ *
+ * 取值顺序（显式覆盖 > 单源配置 > 装配期显式值）：
+ *   1. `winstage-fs` 行的显式根（`cwd`，权威 —— fs 半边真正建 Store 的那个值）；
+ *   2. `winstage-shell` 行的显式 `workspaceRoot`（fs 行没写时才轮到它）；
+ *   3. **host 行** `winstage-sandbox.config.workspaceRoot`（bundle 的唯一配置入口）；
+ *   4. 装配期显式值（`onConfig`/`WINSTAGE_SHELL_WORKSPACE`，由 `declaredWorkspaceRoot` 兜底）。
+ *
+ * 冲突（fail-closed，绝不静默挑一个）：
+ *   · `explicitConflict`：fs 行与 shell 行**都显式**写了根，却不是同一个目录；
+ *   · `hostConflict`：显式根与 host 行都写了根，却不是同一个目录。
+ *
+ * 纯函数、无副作用：`effectiveWorkspaceRoot()` 与回归自测共用同一份判据。
+ *
+ * @param {{fsRoot?: string, shellRoot?: string, hostRoot?: string}} rows
+ * @param {string} [declaredRoot] 装配期显式值
+ * @returns {{root?: string, fsRoot?: string, shellRoot?: string, hostRoot?: string,
+ *   declaredRoot?: string, explicitConflict: boolean, hostConflict: boolean}}
+ */
+export function resolveWorkspaceRoot(rows, declaredRoot) {
+  const text = (value) => (typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined)
+  const fsRoot = text(rows?.fsRoot)
+  const shellRoot = text(rows?.shellRoot)
+  const hostRoot = text(rows?.hostRoot)
+  const declared = text(declaredRoot)
+  const explicit = fsRoot ?? shellRoot
+  return {
+    root: explicit ?? hostRoot ?? declared,
+    fsRoot,
+    shellRoot,
+    hostRoot,
+    declaredRoot: declared,
+    explicitConflict: fsRoot !== undefined && shellRoot !== undefined && !sameRootText(fsRoot, shellRoot),
+    hostConflict: explicit !== undefined && hostRoot !== undefined && !sameRootText(explicit, hostRoot),
+  }
 }
 
 /**
@@ -1089,6 +1137,112 @@ export function currentWorkspaceOf(source) {
   return source
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// R41 · 外壳启动噪声过滤（候选面 + 审计面；纯函数，可离线断言）
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 背景（真机 E2E，R41）：PowerShell 启动会写 `StartupProfileData-*`（PS 性能缓存）与
+// `%TEMP%\dsh-stage-temp\<id>\__PSScriptPolicyTest_*`（AppLocker 探针）。它们经 shim 进
+// 暂存树、被 `captureAfterExecution()` 反解成**工作区外**条目 ⇒ 面板多出 6 条用户没干过的
+// 待审项；`sandbox-audit.json` 的"工作区外写入"计数也一起虚高。
+//
+// 纪律（为什么过滤不会掩盖用户意图）：
+//   1. 判据只有一份（`run-capture.ts::isShellInternalArtifactPath()`：文件名 + 固定目录的
+//      合取），本文件不另写名单；
+//   2. 只丢**已知外壳产物**，`%TEMP%` 里用户自己的文件、`dsh-stage-temp` 下用户内容照样保留；
+//   3. **不静默**：条数进日志/报告（`noiseFiltered`），审计报告把被丢的行数写进产物；
+//   4. `WINSTAGE_CAPTURE_NOISE=0` 可关闭（端到端排查）。
+const SHELL_NOISE_REASON = SHELL_INTERNAL_ARTIFACT_REASON
+
+/**
+ * 把"捕获到的变化"拆成 `{kept, dropped}`（R41）。
+ *
+ * @param {Array<{path?: string}>} changes `CaptureAfterExecution()` 的返回（可能含工作区外绝对键）
+ * @param {(path: string) => string} [toAbsolute] 把逻辑键映射成绝对路径（真实为 `workspace.absolute`）
+ * @returns {{kept: Array, dropped: Array}}
+ */
+export function partitionShellInternalArtifactChanges(changes, toAbsolute) {
+  if (!Array.isArray(changes)) return { kept: changes, dropped: [] }
+  const kept = []
+  const dropped = []
+  for (const change of changes) {
+    const raw = change && typeof change.path === 'string' ? change.path : ''
+    let noise = isShellInternalArtifactPath(raw)
+    if (!noise && typeof toAbsolute === 'function') {
+      try {
+        noise = isShellInternalArtifactPath(toAbsolute(raw))
+      } catch {
+        noise = false
+      }
+    }
+    if (noise) dropped.push(change)
+    else kept.push(change)
+  }
+  return { kept, dropped }
+}
+
+/**
+ * 审计报告里的外壳启动噪声过滤（R41；纯函数）。
+ *
+ * `buildAuditReport()`（`src/audit-report.ts`）统计的是"shim 记录到的每一次文件/注册表操作"，
+ * 因此 PowerShell 的启动缓存/策略探针会被算成"工作区外写入"。这里按同一份窄判据把
+ * **文件**读/写/删/移动行去掉，并**重算** `summary` 的全部派生计数（不重算就会出现
+ * "行没了、计数还在"的自相矛盾）。注册表行不受影响（判据只针对文件路径）。
+ *
+ * 返回 `{report, dropped}`：`report.noiseFiltered = dropped` 如实标明丢了几行，
+ * 因此"清理过"这件事本身可机读，不是静默少报。
+ *
+ * @param {object} report `buildAuditReport()` 的返回（不会被原地修改）
+ * @returns {{report: object, dropped: number}}
+ */
+export function dropShellInternalArtifactRows(report) {
+  if (!report || typeof report !== 'object') return { report, dropped: 0 }
+  const files = report.files && typeof report.files === 'object' ? report.files : {}
+  let dropped = 0
+  const take = (rows) => {
+    if (!Array.isArray(rows)) return []
+    const kept = []
+    for (const row of rows) {
+      if (isShellInternalArtifactPath(row && row.path)) {
+        dropped += 1
+        continue
+      }
+      kept.push(row)
+    }
+    return kept
+  }
+  const read = take(files.read)
+  const written = take(files.written)
+  const deleted = take(files.deleted)
+  const moved = (Array.isArray(files.moved) ? files.moved : []).filter((entry) => {
+    if (isShellInternalArtifactPath(entry && entry.to) || isShellInternalArtifactPath(entry && entry.from)) {
+      dropped += 1
+      return false
+    }
+    return true
+  })
+  const summary = report.summary && typeof report.summary === 'object' ? { ...report.summary } : {}
+  const countScope = (rows, scope) => rows.filter((row) => row && row.scope === scope).length
+  summary.filesRead = read.length
+  summary.filesWritten = written.length
+  summary.filesDeleted = deleted.length
+  summary.filesMoved = moved.length
+  summary.filesWrittenInWorkspace = countScope(written, 'workspace')
+  summary.filesWrittenOutside = countScope(written, 'outside')
+  summary.filesDeletedInWorkspace = countScope(deleted, 'workspace')
+  return {
+    report: {
+      ...report,
+      files: { ...files, read, written, deleted, moved },
+      summary,
+      /** R41：被忽略的外壳启动噪声行数（0 = 本次没有；行数与原始审计行数分开给） */
+      noiseFiltered: dropped,
+      noiseFilterReason: SHELL_NOISE_REASON,
+    },
+    dropped,
+  }
+}
+
 // ==================== 工厂 ====================
 
 /**
@@ -1308,33 +1462,54 @@ export function createWinStageShellExecutor(options = {}) {
     /**
      * **生效的工作区根** —— shell 半边与 fs 半边取同一个根的唯一入口。
      *
-     * 取值顺序与理由见 `shell-entry.ts` 文件头"工作区根从哪来"。要点：
-     *   1. `winstage-fs` 行的 `cwd`（fs 半边真正的存储根）**权威**；
-     *   2. `winstage-shell` 行的 `workspaceRoot`（同一根的另一处声明）；
-     *   3. 行 config 经 `onConfig` 落下的显式值（`this.declaredRoot`）。
-     * 1 与 2 都在且不同 ⇒ **error 级报警**（人工侧）并**以 fs 根为准**：宁可响，
-     * 也绝不让 `getReviewService` 按两个根分叉出第二个单例（面板看不到命令产出）。
+     * 取值顺序与理由见 `shell-entry.ts` 文件头"工作区根从哪来" + `resolveWorkspaceRoot()`：
+     *   1. `winstage-fs` 行的显式 `cwd`（fs 半边真正的存储根）**权威**；
+     *   2. `winstage-shell` 行的显式 `workspaceRoot`（fs 行没写时才轮到它）；
+     *   3. **host 行** `winstage-sandbox.config.workspaceRoot`（R41-G04 之后的**唯一配置入口**，
+     *      bundle 里留空；profile 只需覆盖这一行，fs/shell 两行由此派生）；
+     *   4. 行 config 经 `onConfig` 落下的显式值（`this.declaredRoot`）。
+     *
+     * 冲突一律 **fail-closed**（绝不分叉出第二个单例、也绝不静默挑一个）：
+     *   · fs 行与 shell 行的显式根不一致；
+     *   · 显式根与 host 行（唯一配置入口）不一致。
+     * 抛出的错误经 `currentWorkspace()` 包成可读的 `WINSTAGE_SHELL_WORKSPACE_FAILED`
+     * （命令**不执行**），精确原因同时进 error 级日志。
      *
      * 返回 `undefined` 时由入口的 `declaredWorkspaceRoot()` **抛错**（不再猜 cwd）。
      */
     effectiveWorkspaceRoot() {
-      let fsRoot
-      let shellRoot
+      let roots = {}
       try {
-        ;({ fsRoot, shellRoot } = workspaceRootsOfLoaderRows(this.loaderRows()))
+        roots = workspaceRootsOfLoaderRows(this.loaderRows())
       } catch {
-        fsRoot = undefined
-        shellRoot = undefined
+        roots = {}
       }
-      if (fsRoot && shellRoot && !sameRootText(fsRoot, shellRoot)) {
-        this.logError(
-          `配置漂移：fs 行 cwd(${fsRoot}) 与 shell 行 workspaceRoot(${shellRoot}) 不是同一个根；` +
-            `已按 fs 行的根继续（否则按根做单例的审阅服务会分叉，面板看不到命令产出）。` +
-            '请让 profile 覆盖层把两个键重述成同一个值（bundle 层用 YAML 锚点绑死）。',
+      const resolved = resolveWorkspaceRoot(roots, this.declaredRoot)
+      const conflict = (kind, message) => {
+        this.logError(message)
+        const error = new Error(message)
+        error.code = 'WINSTAGE_SHELL_ROOT_CONFLICT'
+        error.winstage = { code: error.code, executed: false, conflict: kind }
+        return error
+      }
+      if (resolved.explicitConflict) {
+        throw conflict(
+          'fs-vs-shell',
+          `配置漂移：fs 行根(${resolved.fsRoot}) 与 shell 行 workspaceRoot(${resolved.shellRoot}) 不是同一个根。` +
+            '本次命令没有执行 —— 拒绝在两个根里挑一个（按根做单例的审阅服务会分叉，面板看不到命令产出）。' +
+            '请让两行写同一个值，或删掉 fs/shell 行的显式根（host 行是唯一配置入口）。',
         )
-        return fsRoot
       }
-      return fsRoot ?? shellRoot ?? this.declaredRoot
+      if (resolved.hostConflict) {
+        throw conflict(
+          'explicit-vs-host',
+          `配置漂移：显式根(${resolved.fsRoot ?? resolved.shellRoot}) 与 host 行 ` +
+            `winstage-sandbox.config.workspaceRoot(${resolved.hostRoot}) 不是同一个根。` +
+            '本次命令没有执行 —— host 行是唯一配置入口；fs/shell 行要么不写根（自动派生），' +
+            '要么写成与 host 行相同的值。',
+        )
+      }
+      return resolved.root
     }
 
     /**
@@ -2264,7 +2439,7 @@ export function createWinStageShellExecutor(options = {}) {
      * **任何一步失败都走 error 级日志**，并把失败信息如实带回（绝不静默）。
      */
     captureStagedChanges(workspace, before, warn) {
-      const report = { captured: 0, ingested: 0, deletions: 0, skipped: [], candidate: undefined, failures: [] }
+      const report = { captured: 0, ingested: 0, deletions: 0, skipped: [], candidate: undefined, failures: [], noiseFiltered: 0 }
       if (typeof workspace.captureAfterExecution !== 'function') {
         report.failures.push('captureAfterExecution is not available on this workspace')
         warn('工作区没有 captureAfterExecution()：命令产出**不会**进入清单（本次执行结果仍然如实返回）。')
@@ -2278,6 +2453,36 @@ export function createWinStageShellExecutor(options = {}) {
         report.failures.push(`captureAfterExecution: ${error?.message ?? error}`)
         warn(`捕获命令产生的变更失败：${error?.message ?? error}（命令已执行，但产出没有被并入清单）`)
         return report
+      }
+      /**
+       * ── R41：先摘掉**已知的外壳启动噪声**，再并入清单 ─────────────────────────
+       *
+       * 为什么必须在 `ingestCapturedChanges()` **之前**：那一步会 `writeFile()` 建清单条目、
+       * 随后 `freezeIfNeeded()` 把它冻结成候选 ⇒ 一旦进去，`review.json`/面板就已经多出
+       * "用户没干过的"待审项了（R41 红读数：一次命令 3 条 captured 全部 ingest）。
+       * 判据只有一份（`run-capture.ts::isShellInternalArtifactPath`，见那里的长注释：
+       * 文件名 + 固定目录的合取，`%TEMP%` 里的用户文件不受影响）。
+       * 过滤**不是静默**：条数与样本路径走人工侧日志、条数进 `report.noiseFiltered`
+       * 并随 `handle.winstage.capture` 带出；`WINSTAGE_CAPTURE_NOISE=0` 可关闭。
+       */
+      if (shellNoiseFilterEnabled()) {
+        const { kept, dropped } = partitionShellInternalArtifactChanges(
+          captured,
+          typeof workspace.absolute === 'function' ? (path) => workspace.absolute(path) : undefined,
+        )
+        if (dropped.length > 0) {
+          captured = kept
+          report.noiseFiltered = dropped.length
+          const samples = dropped
+            .map((change) => String(change?.path ?? ''))
+            .filter((path) => path.length > 0)
+            .slice(0, 3)
+          this.log(
+            `忽略 ${dropped.length} 条外壳启动噪声（PowerShell 启动缓存/策略探针；不入清单、不进候选）：` +
+              `${samples.join(', ')}${dropped.length > samples.length ? ' …' : ''}` +
+              '（判据见 run-capture.ts::isShellInternalArtifactPath；WINSTAGE_CAPTURE_NOISE=0 可关闭）',
+          )
+        }
       }
       try {
         const ingested = workspace.ingestCapturedChanges(captured)
@@ -2318,10 +2523,32 @@ export function createWinStageShellExecutor(options = {}) {
       try {
         if (!existsSync(auditPath)) return { handled: false, reason: 'no-audit-file' }
         const lines = readFileSync(auditPath, 'utf8').split(/\r?\n/)
-        const report = buildAuditReport(lines, { root: workspace.root, audits: [auditPath] })
+        const built = buildAuditReport(lines, { root: workspace.root, audits: [auditPath] })
+        /**
+         * ── R41：审计面同样摘掉外壳启动噪声 ─────────────────────────────────────
+         * 红读数（`.t/r41/ux/probe-shell-noise.ts` D 段）：两条 PowerShell 启动写入让
+         * `summary.filesWritten` 2→4、`filesWrittenOutside` 1→3，面板"工作区外写入"虚高。
+         * 过滤后**重算**全部派生计数（否则会出现"行没了、计数还在"的自相矛盾），
+         * 并把丢了几行写进产物（`noiseFiltered`）—— 清理本身可机读，不是静默少报。
+         */
+        const { report, dropped } = shellNoiseFilterEnabled()
+          ? dropShellInternalArtifactRows(built)
+          : { report: built, dropped: 0 }
         const out = join(storeDir, 'sandbox-audit.json')
         writeFileSync(out, `${JSON.stringify(report, null, 2)}\n`)
-        return { handled: true, path: out, summary: report.summary, text: summarizeAudit(report.summary) }
+        if (dropped > 0) {
+          this.log(
+            `审计忽略 ${dropped} 行外壳启动噪声（PowerShell 启动缓存/策略探针；不影响用户文件计数；` +
+              'WINSTAGE_CAPTURE_NOISE=0 可关闭）。',
+          )
+        }
+        return {
+          handled: true,
+          path: out,
+          summary: report.summary,
+          noiseFiltered: dropped,
+          text: summarizeAudit(report.summary) + (dropped > 0 ? `（已忽略 ${dropped} 条外壳启动噪声）` : ''),
+        }
       } catch (error) {
         warn(`聚合审计失败（命令结果不受影响）：${error?.message ?? error}`)
         return { handled: false, reason: `error:${error?.message ?? error}` }
@@ -2382,6 +2609,8 @@ export function createWinStageShellExecutor(options = {}) {
               ingested: capture.ingested,
               deletions: capture.deletions,
               skipped: capture.skipped,
+              /** R41：被忽略的外壳启动噪声条数（0 = 本次没有；不进清单/候选） */
+              noiseFiltered: capture.noiseFiltered ?? 0,
               frozen: capture.candidate?.frozen === true,
               candidateId: capture.candidate?.candidate?.id,
               reason: capture.candidate?.reason,
@@ -2444,6 +2673,8 @@ export function createWinStageShellExecutor(options = {}) {
                 ingested: capture.ingested,
                 deletions: capture.deletions,
                 skipped: capture.skipped,
+                /** R41：被忽略的外壳启动噪声条数（人工侧可见；不进清单/候选） */
+                noiseFiltered: capture.noiseFiltered ?? 0,
                 frozen: capture.candidate?.frozen === true,
                 candidateId: capture.candidate?.candidate?.id,
                 reason: capture.candidate?.reason,

@@ -180,10 +180,13 @@ section('3. 注册表暂存与应用（应用后不得仍停在待审 / 不得�
 const registryStageSrc = readSrc('src/registry-stage.ts')
 const applyBody = /function apply\(opts = \{\}\) \{[\s\S]*?\n  \}\n/.exec(registryStageSrc)
 const applyText = applyBody ? applyBody[0] : ''
+/** R41-REG06 把批处理拆成 `apply()`（取锁）→ `applyUnlocked()`（原逻辑）；终态同步必须仍在锁内那条链上。 */
+const applyUnlockedBody = /function applyUnlocked\(opts = \{\}\) \{[\s\S]*?\n  \}\n/.exec(registryStageSrc)
+const applyUnlockedText = applyUnlockedBody ? applyUnlockedBody[0] : ''
 assert(
-  /syncQueueStatus\(/.test(applyText),
+  /syncQueueStatus\(/.test(applyText) || (/applyUnlocked\(/.test(applyText) && /syncQueueStatus\(/.test(applyUnlockedText)),
   '`apply()` 必须把终态同步进 queue.json（否则批准后面板仍列同一批、pending 恒 true）',
-  applyBody ? '命中' : '未取到 apply() 函数体',
+  applyBody ? (applyUnlockedBody ? '命中 applyUnlocked 链' : 'apply() 内无同步且未找到 applyUnlocked()') : '未取到 apply() 函数体',
 )
 assert(
   /function syncQueueStatus\(/.test(registryStageSrc),

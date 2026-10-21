@@ -147,7 +147,7 @@ pnpm win:verify                # Windows：套件接线治理 + 源码基线封�
 
 ```powershell
 cd packages/win
-.\verify.cmd                   # 56 个离线套件关口
+.\verify.cmd                   # 58 个离线套件关口
 .\autotest.cmd                 # 全量：离线 56 + 沙箱 4 + audit，写出 .t/test-report.json
 node tools\ebk-sandbox-test.ts # Windows E2E（需 docker + KVM），见 e2e/README.md
 ```

@@ -624,6 +624,46 @@ function isStoreStatePath(abs, stateRoots) {
 }
 
 /**
+ * R41-G04：从 loader 行表里取**已书写**的根配置（`undefined` = 该键没写）。
+ *
+ * 为什么必须读行表而不是只读构造参数 `config`：基类 `LocalFileSystem.Config` 的
+ * `cwd` 有 `default(process.cwd())`，schemastery 在构造前就把默认值填好了 ⇒ 生产里
+ * `config.cwd` **永远非空**，无法据此区分"fs 行写了根"与"fs 行没写、被默认值填了"。
+ * 行表（`entry.parent.data`）保存的是**补丁组合后的已书写值**（与
+ * `shell-executor.ts::workspaceRootsOfLoaderRows()` 同一读法、同一形态），因此它是
+ * "这个键到底有没有被配置"的唯一可靠来源。
+ *
+ * @param {unknown} data `entry.parent.data`（可能是展平条目表，也可能是带 insert 的补丁行）
+ * @returns {{fsRowFound: boolean, fsCwd?: string, fsWorkspaceRoot?: string, hostWorkspaceRoot?: string}}
+ */
+function rootConfigOfLoaderRows(data) {
+  const out = { fsRowFound: false }
+  if (!Array.isArray(data)) return out
+  const rows = []
+  for (const item of data) {
+    if (!item || typeof item !== 'object') continue
+    rows.push(item)
+    if (Array.isArray(item.insert)) {
+      for (const inner of item.insert) if (inner && typeof inner === 'object') rows.push(inner)
+    }
+  }
+  const text = (value) => (typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined)
+  for (const row of rows) {
+    const config = row.config && typeof row.config === 'object' ? row.config : undefined
+    if (row.id === 'winstage-fs') {
+      out.fsRowFound = true
+      out.fsCwd = text(config?.cwd)
+      out.fsWorkspaceRoot = text(config?.workspaceRoot)
+    } else if (row.id === 'winstage-sandbox') {
+      // ★ 单源：host 行的 `workspaceRoot` 是**唯一配置入口**（bundle 里留空，
+      //   profile 只需覆盖这一行；fs/shell 两行没显式写根时就派生这个值）。
+      out.hostWorkspaceRoot = text(config?.workspaceRoot)
+    }
+  }
+  return out
+}
+
+/**
  * 字面替换，错误码与 fs-local 对齐。
  *
  * ★ R40-FS-01（P1）：`oldString` / `newString` **必须先做 LF 归一**再匹配/替换 ——
@@ -774,61 +814,96 @@ export function createStagingFileSystem(options = {}) {
           /* best effort */
         }
       }
-      // ── C-8 配置漂移 fail-closed（与文件头 58-64 行同风格）──────────────────────
-      // 两个 loader 行用**不同的配置键**表达同一个暂存根：host 行 `workspaceRoot`、
-      // 本行 `cwd`。`getReviewService()` 按 canonical 根做进程内单例
-      // （review-service.ts:330-343），两键一旦不一致就会产生两个单例 ——
-      // 于是"暂存写到 A、快照发布在 B"，面板永远看不到改动。
-      // 因此：两键**都给了且不一致**时直接 throw，宁可不激活，也不静默分叉。
-      //
-      // ⚠ 已知限制（**不要**读成"守卫生效"）：`cordis-plugin-include/lib/index.js:99-102`
-      //   对 `config` 是**整体替换**（`target[key] = value`），不是深合并。所以任何
-      //   **只重述 `cwd`** 的 profile 覆盖层（例如现存形态的 3081
-      //   `.t\dsh2\home\profiles\dsh2\cordis.patch.yml`）会把本行 config 换成
-      //   `{ cwd }` 而已 —— `workspaceRoot === undefined` ⇒ 上面第一个合取项恒假
-      //   ⇒ **本守卫在该实例上不触发**，且 bundle 补丁里锚点提供的
-      //   `fs.config.workspaceRoot` 也被整段绕过。此时 drift 检测退化为
-      //   "外部约定两处写同一个字面值"。
-      //   要让守卫真正生效，profile 覆盖层必须**同时**重述 `workspaceRoot` 与 `cwd`
-      //   （T1 正在补）。在此之前，3081 上这条守卫是**空转**的。
-      const hasWorkspaceRoot =
-        config?.workspaceRoot !== undefined && config?.workspaceRoot !== null && String(config.workspaceRoot).length > 0
-      const hasCwd = typeof config?.cwd === 'string' && config.cwd.length > 0
+      // ── C-8 / R41-G04：单源工作区根 + 配置漂移 fail-closed ────────────────────
+      // 历史形态：host 行 `workspaceRoot`、本行 `cwd`、shell 行 `workspaceRoot` 三处
+      // 用 YAML 锚点写成同一个字面值；`getReviewService()` 按 canonical 根做进程内单例
+      // （review-service.ts:330-343），三处一旦不一致就会产生多个单例 —— 于是"暂存写到 A、
+      // 快照发布在 B"，面板永远看不到改动。
+      // R41-G04 起：bundle 不再硬编码开发机路径，host 行是**唯一配置入口**，本行没显式
+      // 写根时派生它；显式写根仍权威；两处都显式且不一致 ⇒ 直接 throw（宁可不激活，
+      // 也不静默分叉）。
       /**
-       * R34-G-03：profile 覆盖层对 `config` 是**整体替换**，不是深合并。只重述
-       * `workspaceRoot`、丢掉 `cwd` 时，旧实现会静默回退 `process.cwd()`：
-       *   ·  `workspaceRoot`（host 行/fs 行）与真实 `cwd`（暂存键映射）分叉；
-       *   ·  `shell-executor` 又把 fs 行的 `workspaceRoot` 当权威根 ⇒ 两半各建一个根；
-       * 这正是"暂存写到 A、快照发布在 B"的原始形态。
-       * 因此：只要显式给了 `workspaceRoot`，`cwd` 就必须同时存在且指向同一目录；
-       * 缺 `cwd` 也算 drift（不再回退到宿主 cwd）。两键都不给（离线自测/无配置）才回退。
+       * ★ R41-G04：**单源工作区根**（唯一配置入口 = host 行
+       * `winstage-sandbox.config.workspaceRoot`）。
+       *
+       * 历史形态：bundle 用 YAML 锚点把同一个字面值同时写进 host / fs / shell 三行。
+       * 但 profile 覆盖层对 `config` 是**整体替换** ⇒ "只覆盖 host 行"的 profile
+       * （`~/.dsh/profiles/desktop` 就是这种形态）会让 fs/shell 继续用 bundle 里
+       * 硬编码的**开发机路径**，换机器即漂移（G-04）。
+       *
+       * 现在的判定（`cordis.patch.yml` 已改成单源）：
+       *   · fs 行**显式**写了 `cwd`/`workspaceRoot` ⇒ 仍然权威（profile 显式覆盖优先）；
+       *   · fs 行没写 ⇒ 派生 host 行的 `workspaceRoot`（profile 只需覆盖那一行）；
+       *   · 两处**都显式**且不是同一个目录 ⇒ fail-closed `FS_STAGE_ROOT_DRIFT`，
+       *     绝不静默挑一个（否则 `getReviewService()` 按根分叉出两个单例）。
+       *
+       * ⚠ 为什么"写没写"只能看行表：基类 Config 的 `cwd` 有 `default(process.cwd())`，
+       *   生产里构造参数 `config.cwd` **永远非空**；行表里保存的才是已书写值。
+       *   拿不到行表（离线自测/没有 loader）时才回退到 `config`（保持 R34 的既有断言）。
        */
-      const drift = hasWorkspaceRoot && (!hasCwd || !sameRoot(config.cwd, config.workspaceRoot))
-      if (drift) {
-        const error = new Error(
-          hasCwd
-            ? `WinStage 暂存文件系统：配置漂移 —— workspaceRoot(${config.workspaceRoot}) 与 cwd(${config.cwd}) ` +
-                '必须指向同一个暂存根，否则"暂存写到 A、快照发布在 B"'
-            : `WinStage 暂存文件系统：配置不完整 —— 给了 workspaceRoot(${config.workspaceRoot}) 却没有 cwd。` +
-                'profile 覆盖层对 config 是整体替换，必须同时重述 cwd 与 workspaceRoot（不得回退宿主 cwd）。',
-        )
+      const loaderRoots = rootConfigOfLoaderRows((this.rootEntry ?? ctx?.fiber?.entry)?.parent?.data)
+      const configCwd = typeof config?.cwd === 'string' && config.cwd.length > 0 ? config.cwd : undefined
+      const configWorkspaceRoot =
+        config?.workspaceRoot !== undefined && config?.workspaceRoot !== null && String(config.workspaceRoot).length > 0
+          ? String(config.workspaceRoot)
+          : undefined
+      // 行表里找到了**本行** ⇒ 只认已书写值（忽略 schemastery 填进来的 process.cwd() 默认值）
+      const ownCwd = loaderRoots.fsRowFound ? loaderRoots.fsCwd : configCwd
+      const ownWorkspaceRoot = loaderRoots.fsRowFound ? loaderRoots.fsWorkspaceRoot : configWorkspaceRoot
+      const hostRoot = loaderRoots.hostWorkspaceRoot
+      const hasCwd = ownCwd !== undefined
+      const hasWorkspaceRoot = ownWorkspaceRoot !== undefined
+      const explicitRoot = ownCwd ?? ownWorkspaceRoot
+      const driftError = (message) => {
+        const error = new Error(message)
         error.code = 'FS_STAGE_ROOT_DRIFT'
-        throw error
+        return error
+      }
+      // ① 本行两个键都写了却指向不同目录（既有语义，R34 钉住）
+      if (hasCwd && hasWorkspaceRoot && !sameRoot(ownCwd, ownWorkspaceRoot)) {
+        throw driftError(
+          `WinStage 暂存文件系统：配置漂移 —— workspaceRoot(${ownWorkspaceRoot}) 与 cwd(${ownCwd}) ` +
+            '必须指向同一个暂存根，否则"暂存写到 A、快照发布在 B"',
+        )
+      }
+      // ② 显式根与唯一配置入口（host 行）不一致 ⇒ fail-closed（G-04 的"冲突仍 fail-closed"）
+      if (explicitRoot !== undefined && hostRoot !== undefined && !sameRoot(explicitRoot, hostRoot)) {
+        throw driftError(
+          `WinStage 暂存文件系统：配置冲突 —— winstage-fs 行显式根(${explicitRoot}) 与 ` +
+            `host 行 winstage-sandbox.config.workspaceRoot(${hostRoot}) 不是同一个目录。` +
+            '要么删掉 fs 行的 cwd/workspaceRoot（让它派生 host 行），要么把两处改成同一个值。',
+        )
+      }
+      /**
+       * ③ R34-G-03：只写了 `workspaceRoot`、没有 `cwd`，且**没有** host 行可派生
+       * （profile 覆盖层把 config 整体替换掉的经典形态）⇒ 仍然 drift：
+       * 旧实现会静默回退 `process.cwd()`，于是 fs 的键映射与 host/shell 的根分叉。
+       * 只要有 host 行可派生（且与它一致，②已校验），这一形态现在是**合法**的。
+       */
+      if (!hasCwd && hasWorkspaceRoot && hostRoot === undefined) {
+        throw driftError(
+          `WinStage 暂存文件系统：配置不完整 —— 给了 workspaceRoot(${ownWorkspaceRoot}) 却没有 cwd，` +
+            '也没有 host 行 winstage-sandbox.config.workspaceRoot 可派生。' +
+            'profile 覆盖层对 config 是整体替换，必须同时重述 cwd 与 workspaceRoot（不得回退宿主 cwd）。',
+        )
       }
       /**
        * 工作区根（canonical）—— **键映射与存储根解耦**：`keyOf()` 只用它判断内外，
        * 存储根则按会话走（见 `stagingFor()`）。
+       * 显式根 > host 行派生 > 无配置时的既有回退（`config.cwd`）。
        */
-      this.workspaceRoot = canonical(hasCwd ? config.cwd : process.cwd())
+      const configuredRoot = explicitRoot ?? hostRoot
+      this.workspaceRoot = canonical(configuredRoot ?? configCwd ?? process.cwd())
       /**
-       * R34b-G-04：配置了根却指向不存在的目录 ⇒ 装配期 fail-closed。
+       * R34b-G-04：配置了根（显式或 host 行）却指向不存在的目录 ⇒ 装配期 fail-closed。
        * 旧行为会让 `keyOf()` 把每个路径都判成"工作区外"（或让暂存根指向一个不存在的树），
-       * 写入/快照的去向不可预测。这里明确拒绝，并提示"三处根必须一致"；不回退宿主 cwd。
+       * 写入/快照的去向不可预测。这里明确拒绝，不回退宿主 cwd。
        */
-      if ((hasCwd || hasWorkspaceRoot) && !existsSync(this.workspaceRoot)) {
+      if (configuredRoot !== undefined && !existsSync(this.workspaceRoot)) {
         const error = new Error(
           `WinStage 暂存文件系统：配置的工作区根不存在 —— ${this.workspaceRoot}。` +
-            '请修正 profile 覆盖层里的 winstage-fs.config.cwd/workspaceRoot（与 host/shell 行一致）；本插件不会自动创建用户工作区。',
+            '请修正 profile 覆盖层里的 winstage-sandbox.config.workspaceRoot（单源；fs/shell 行未显式写根时由它派生）；' +
+            '本插件不会自动创建用户工作区。',
         )
         error.code = 'FS_STAGE_ROOT_NOT_FOUND'
         error.root = this.workspaceRoot
@@ -2271,6 +2346,132 @@ export function createStagingFileSystem(options = {}) {
       return { exists: true, kind: 'file', version: String(info.version), text, size: info.size }
     }
 
+    /**
+     * ★ R41-FOREIGN-READ（P1）：会话工作区 ≠ 配置根时的**只读暂存投影**。
+     *
+     * 背景（真 E2E，不是理论）：host-only profile 的 DSH 会话工作区
+     * （`…\deepseek-harness\default-workspace`）与插件 `workspaceRoot`
+     * （`.t\r41\e2e\ws`）不同 ⇒ `inConfiguredWorkspace()` 为假。写入侧自 R11-D 起
+     * **仍然进暂存**（`stageOverForeignWorkspace()` 记一条 `foreign-session-workspace` 账），
+     * 但读取侧旧实现在这里直接 `super.*` ⇒ 工具刚说"已创建"、紧接着 `read` 却回
+     * `FS_NOT_FOUND`（机器自相矛盾：写成功/读不存在）。
+     *
+     * 口径（**安全属性优先**）：
+     *   · **只**在本会话暂存清单里有**构成净变化**的条目（或 shim 落点/删除标记）时才走暂存投影；
+     *   · 没有暂存条目 ⇒ 交回 `super`（真实磁盘），"异工作区 + 无暂存"的既有行为一位不变；
+     *   · 暂存内容**只来自暂存对象**，绝不把同名真实外部文件当"暂存内容"读回来，
+     *     也不因为路径在配置根外就额外暴露真实内容。
+     *
+     * @param {object} [options] `{ descendants: true }` ⇒ 该目录**下**有暂存条目也算"有内容"
+     *   （`listDir` 用；文件读入口不需要）
+     * @returns {{active: false} | {active: true, place: object, ws: object, current: object}}
+     */
+    async foreignStagedView(target, signal, options = {}) {
+      const place = this.keyOf(target)
+      if (place === undefined) return { active: false }
+      // R34 同口径：守卫建不起来且无既有暂存状态 ⇒ 只读回退真实磁盘（写入仍 fail-closed）
+      const service = this.stagingForRead(this.sessionIdOf())
+      if (service === undefined) return { active: false }
+      const ws = service.fresh()
+      const hasContent =
+        options.descendants === true
+          ? // 目录：本会话在该目录**下**有净变化条目，或 shim 内容树里已有这个目录/子项
+            this.hasEntryUnder(ws, place.key) ||
+            this.hasStagedContent(ws, place.key, place.abs) ||
+            this.shimChildrenOf(ws, this.shimMirrorOf(ws, place.abs)) !== undefined
+          : this.hasStagedContent(ws, place.key, place.abs)
+      if (!hasContent) return { active: false }
+      const current = await this.currentOf(ws, target, place.key, signal, place.abs)
+      return { active: true, place, ws, current }
+    }
+
+    /** 暂存投影 → `stat`/`lstat` 形状（与 `statInner` 的配置根内分支同一口径） */
+    staticMetaOfCurrent(current) {
+      if (!current || !current.exists) return undefined
+      if (current.kind === 'dir') return { version: FsVersion(current.version), type: 'directory', size: 0 }
+      if (current.kind !== 'file') return { version: FsVersion(current.version), type: 'other' }
+      return {
+        version: FsVersion(current.version),
+        type: 'file',
+        size: current.size ?? Buffer.byteLength(current.text ?? '', 'utf8'),
+      }
+    }
+
+    /** 暂存投影 → 文本读（错误码/文案与 `readTextInner` 的配置根内分支逐字一致） */
+    textOfCurrent(current, displayPath) {
+      if (!current || !current.exists) throw new FsError(`"${displayPath}" does not exist`, 'FS_NOT_FOUND')
+      if (current.kind === 'dir') {
+        throw new FsError(`cannot read "${displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+      }
+      return current.text ?? ''
+    }
+
+    /**
+     * ★ R41-FOREIGN-READ：异工作区目录的合并视图 = 真实目录（若存在） + 本会话在该目录下的暂存条目。
+     *
+     * 键空间与 `listDirInner` 的常规分支同一口径（内部条目 `external:false`、外部条目 `external:true`），
+     * 因此"异工作区会话里写进配置根内/外的文件"都能在 `listDir` 里看见；删除条目按"不存在"处理。
+     * 调用方已确认本会话**有**暂存内容（否则走 `super.listDir`，不改变既有行为）。
+     */
+    async foreignListing(target, place, ws, signal) {
+      /** @type {Map<string, object>} */
+      const merged = new Map()
+      try {
+        for (const entry of await super.listDir(target, signal)) merged.set(entry.name.toLowerCase(), entry)
+      } catch {
+        /* 目录可能只存在于暂存树里（真实磁盘上没有） */
+      }
+      const rel = place.key
+      const selfEntry = ws.entryOf(rel)
+      if (this.projectsEntry(selfEntry) && selfEntry.state === STATE.DELETED) return []
+      // shim/shell 通道的同一逻辑目录也参与合并（与 `listDirInner` 常规分支同一口径）：
+      // 异工作区会话里的命令产出走 shim 内容树，不能出现"readText 看得到、listDir 看不到"。
+      const shim = this.shimChildrenOf(ws, this.shimMirrorOf(ws, place.abs))
+      const wo = this.shimDeletionsOf(ws, place.abs)
+      if (wo?.selfDeleted) return []
+      if (shim !== undefined) {
+        for (const name of shim.deleted) merged.delete(name)
+        for (const entry of shim.entries) merged.set(entry.name.toLowerCase(), entry)
+      }
+      if (wo?.deleted !== undefined) {
+        for (const name of wo.deleted) merged.delete(name)
+      }
+      const external = place.external === true
+      const prefix = rel === '' ? '' : `${rel}${sep}`.toLowerCase()
+      for (const [key, entry] of Object.entries(ws.manifest.entries)) {
+        if ((entry.external === true) !== external) continue
+        if (!this.projectsEntry(entry)) continue
+        const lower = key.toLowerCase()
+        if (rel !== '' && !lower.startsWith(prefix)) continue
+        const rest = rel === '' ? key : key.slice(rel.length + 1)
+        if (rest.length === 0) continue
+        const head = rest.split(/[\\/]/)[0]
+        const isDirect = !/[\\/]/.test(rest.slice(head.length))
+        const childRel = join(rel, head)
+        const childAbs = ws.absolute(childRel)
+        const targetOfChild = { targetKey: FsTargetKey(canonical(childAbs)), displayPath: childAbs }
+        const keyOfChild = head.toLowerCase()
+        if (entry.state === STATE.DELETED) {
+          if (isDirect) merged.delete(keyOfChild)
+          continue
+        }
+        const direct = isDirect ? entry : undefined
+        const kind = direct ? direct.kind : 'dir'
+        if (kind === 'dir') {
+          merged.set(keyOfChild, { name: head, type: 'directory', target: targetOfChild })
+          continue
+        }
+        merged.set(keyOfChild, {
+          name: head,
+          type: 'file',
+          target: targetOfChild,
+          version: FsVersion(`winstage:${direct.stagedHash}`),
+          size: direct.size,
+        })
+      }
+      return [...merged.values()]
+    }
+
     async stat(target, signal) {
       return this.withStageFailureMap(target?.displayPath ?? target?.targetKey, () => this.statInner(target, signal))
     }
@@ -2285,7 +2486,10 @@ export function createStagingFileSystem(options = {}) {
       if (!this.stagingEnabled()) return super.stat(target, signal)
       if (!this.inConfiguredWorkspace()) {
         this.warnForeignWorkspace()
-        return super.stat(target, signal)
+        // R41-FOREIGN-READ：异工作区里**本会话写过**的路径必须读得到（写成功/读不存在是缺陷）
+        const foreign = await this.foreignStagedView(target, signal)
+        if (!foreign.active) return super.stat(target, signal)
+        return this.staticMetaOfCurrent(foreign.current)
       }
       const place = this.keyOf(target)
       if (place === undefined) return super.stat(target, signal)
@@ -2333,7 +2537,11 @@ export function createStagingFileSystem(options = {}) {
       if (!this.stagingEnabled()) return super.lstat(path, opts, signal)
       if (!this.inConfiguredWorkspace()) {
         this.warnForeignWorkspace()
-        return super.lstat(path, opts, signal)
+        // R41-FOREIGN-READ：与 stat 同一口径（异工作区里本会话写过的路径读得到）
+        if (!validPath) return super.lstat(path, opts, signal)
+        const foreign = await this.foreignStagedView({ targetKey: FsTargetKey(abs), displayPath: path }, signal)
+        if (!foreign.active) return super.lstat(path, opts, signal)
+        return this.staticMetaOfCurrent(foreign.current)
       }
       if (!validPath) throw new FsError('file_path must be a non-empty string', 'FS_NOT_FOUND')
       const place = this.keyOf({ targetKey: FsTargetKey(abs), displayPath: path })
@@ -2467,7 +2675,10 @@ export function createStagingFileSystem(options = {}) {
       if (!this.stagingEnabled()) return super.readText(target, signal)
       if (!this.inConfiguredWorkspace()) {
         this.warnForeignWorkspace()
-        return super.readText(target, signal)
+        // R41-FOREIGN-READ：本会话在异工作区里暂存的写入必须读得到（否则写成功/读不存在）
+        const foreign = await this.foreignStagedView(target, signal)
+        if (!foreign.active) return super.readText(target, signal)
+        return this.textOfCurrent(foreign.current, target.displayPath)
       }
       const place = this.keyOf(target)
       if (place === undefined) return super.readText(target, signal)
@@ -2486,7 +2697,13 @@ export function createStagingFileSystem(options = {}) {
       if (!this.stagingEnabled()) return super.streamText(target, signal)
       if (!this.inConfiguredWorkspace()) {
         this.warnForeignWorkspace()
-        return super.streamText(target, signal)
+        // R41-FOREIGN-READ：异工作区无暂存 ⇒ 仍走基类的流式真实磁盘读；有暂存 ⇒ 暂存文本
+        const foreign = await this.foreignStagedView(target, signal)
+        if (!foreign.active) return super.streamText(target, signal)
+        const text = this.textOfCurrent(foreign.current, target.displayPath)
+        return (async function* stream() {
+          yield text
+        })()
       }
       const text = await this.readText(target, signal)
       return (async function* stream() {
@@ -2505,7 +2722,15 @@ export function createStagingFileSystem(options = {}) {
       if (!this.stagingEnabled()) return super.readBytes(target, signal, maxBytes)
       if (!this.inConfiguredWorkspace()) {
         this.warnForeignWorkspace()
-        return super.readBytes(target, signal, maxBytes)
+        // R41-FOREIGN-READ：异工作区暂存写入的字节读（口径与 readText 同一判据）
+        const foreign = await this.foreignStagedView(target, signal)
+        if (!foreign.active) return super.readBytes(target, signal, maxBytes)
+        const text = this.textOfCurrent(foreign.current, target.displayPath)
+        const buffer = Buffer.from(text, 'utf8')
+        if (Number.isSafeInteger(maxBytes) && buffer.length > maxBytes) {
+          throw new FsError(`cannot read "${target.displayPath}": file is larger than ${maxBytes} bytes`, 'FS_TOO_LARGE')
+        }
+        return new Uint8Array(buffer)
       }
       const place = this.keyOf(target)
       if (place === undefined) return super.readBytes(target, signal, maxBytes)
@@ -2535,7 +2760,16 @@ export function createStagingFileSystem(options = {}) {
       if (!this.stagingEnabled()) return super.readByteRange(target, range, signal)
       if (!this.inConfiguredWorkspace()) {
         this.warnForeignWorkspace()
-        return super.readByteRange(target, range, signal)
+        // R41-FOREIGN-READ：异工作区暂存写入的区间读（与配置根内分支同一裁剪/拒绝口径）
+        const foreign = await this.foreignStagedView(target, signal)
+        if (!foreign.active) return super.readByteRange(target, range, signal)
+        const buffer = Buffer.from(this.textOfCurrent(foreign.current, target.displayPath), 'utf8')
+        const offset = Number(range?.offset ?? 0)
+        const length = Number(range?.length ?? buffer.length)
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
+          return super.readByteRange(target, range, signal)
+        }
+        return new Uint8Array(buffer.subarray(Math.min(offset, buffer.length), Math.min(buffer.length, offset + length)))
       }
       const place = this.keyOf(target)
       if (place === undefined) return super.readByteRange(target, range, signal)
@@ -2576,7 +2810,10 @@ export function createStagingFileSystem(options = {}) {
       if (!this.stagingEnabled()) return finish(await super.listDir(target, signal))
       if (!this.inConfiguredWorkspace()) {
         this.warnForeignWorkspace()
-        return finish(await super.listDir(target, signal))
+        // R41-FOREIGN-READ：异工作区里本会话的暂存条目要出现在目录列表里（否则"写成功/列表里没有"）
+        const foreign = await this.foreignStagedView(target, signal, { descendants: true })
+        if (!foreign.active) return finish(await super.listDir(target, signal))
+        return finish(await this.foreignListing(target, foreign.place, foreign.ws, signal))
       }
       const place = this.keyOf(target)
       if (place === undefined) return finish(await super.listDir(target, signal))

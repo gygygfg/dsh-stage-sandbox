@@ -198,7 +198,7 @@ node .t\command-selftest.mjs
 | S5 | ~~面板视觉未确认~~ → **已闭环** | 见 §3.3。headless + 有头**双证据**，且批准真的落盘 |
 | S6 | 在线切换 bundle 会崩 | 仍然存在（**仅指**增删/启停 bundle 或换 `fs` 提供方行）；设置里的开关只切"面"，不碰行 —— 见 §10 |
 | S7 | ~~`watch()` 不覆盖暂存~~ → **已实现覆写** | 覆写 `watch()`：超类观察者照旧 + 暂存变更本地失效。**残留**：跨进程改动仍不可见（需文档标注）。`[引用]` 契约是"失效通知"（无事件类型/路径），唯一消费者是 `ctx.remote.workspaceFiles.changes` |
-| **S8** | **新增：两个"根"的配置漂移** | host 行用 `config.workspaceRoot`、fs 行用 `config.cwd` 表达同一个暂存根；不一致会产生两个 `getReviewService()` 单例 ⇒"暂存写到 A、快照发布在 B"。已用 YAML 锚点做结构性同源 + `staging-fs.mjs` fail-closed 守卫；**但守卫只在两键都给时生效**，而 profile 覆盖层对 `config` 是**整体替换** ⇒ 覆盖层必须重述所有键（见 §1.1） |
+| **S8** | **两个"根"的配置漂移（R41-G04 已收口为单源）** | host 行 `config.workspaceRoot` 是唯一配置入口；fs/shell 没有显式根时从 host 行派生，显式覆盖仍权威、显式冲突 fail-closed（`FS_STAGE_ROOT_DRIFT` / `WINSTAGE_SHELL_ROOT_CONFLICT`）。bundle 不再带开发机绝对路径；profile 只需覆盖 host 行。历史 YAML 锚点形态已删除 |
 | **S9** | **新增：跨工作区串台** | `workspaceFiles.read` **不做包含校验**（见 §7），所以 client 侧一旦"根选错"，结果不是"读不到"而是"**读到别的工作区的快照并渲染出来**"。已修：client 兜底必须落在 config 根之内，并用 `review.json` 自带的 `workspaceRoot` 做零额外 IO 的自校验 |
 
 

@@ -67,7 +67,7 @@
  *   Registry Hives  https://learn.microsoft.com/en-us/windows/win32/sysinfo/registry-hives
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, truncateSync, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, truncateSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 import {
@@ -107,6 +107,43 @@ export const OVERLAY_DISCARDED_NAME = 'overlay.discarded.journal'
  * 被截掉的原始字节**移到这里**留证（不静默丢），日志本体才继续可追加。
  */
 export const OVERLAY_TORN_JOURNAL_NAME = 'overlay.journal.torn'
+
+/**
+ * ── R41 / REG-06：注册表暂存的**跨进程 apply 锁** ───────────────────────────────
+ *
+ * 为什么需要它（与 `workspace.ts` 的 `apply.lock` 同一类缺陷）：两个宿主进程可以同时
+ * `freezeCandidate()` / `apply()` 同一个 `<sessionDir>/registry/`。值写入是幂等的，但
+ * **没有任何串行化**：两个进程都在"自己冻结的 before"上逐条重放，删除/回滚的结果取决于
+ * 交错顺序（R24/R25 在文件侧实测过同族的 lost-update；注册表侧缺同一把锁）。
+ * 实测（`.t/r41/reg06/lock.ts` S2）：第一个 `apply()` 正在写真实 hive 时，第二个实例的
+ * `apply()` 会**交错进入**（一次 setValue 窗口内就写出了 1 条记录）。
+ *
+ * 锁的形状**照抄已验证的 Workspace 实现**（`src/workspace.ts::_acquireApplyLock`）：
+ *   · 文件 `<stageDir>/apply.lock`，`open(..., 'wx')` 原子独占创建；
+ *   · 内容 `{ pid, at, sessionId, scope }`，供诊断/陈旧判定；
+ *   · 陈旧恢复：mtime 超过 {@link REG_APPLY_LOCK_STALE_MS}（持锁进程被强杀），或锁里的
+ *     pid 已不存在（`process.kill(pid,0)`）⇒ 删除后重试；
+ *   · 超时（默认 {@link REG_APPLY_LOCK_TIMEOUT_MS}）⇒ fail-closed `REG_APPLY_BUSY`，
+ *     消息带锁路径与持有者 pid/时间（**不**假装成功、**不**重复写入）。
+ *
+ * 锁只串行化**改变真实世界/审批状态的操作**：`apply()`、`discard()` 与 WAL 追加
+ * （`stage*` 写入）。**读路径不取锁**：`readValue/readKey/enumKeys/enumValues/diff/snapshot`
+ * 不受影响（覆盖层视图是内存 + reader，读不该被写者阻塞）。
+ *
+ * 残余（如实声明）：同进程内两个实例共享 pid，无法靠 pid 判活 ⇒ 第二个实例只能等超时后
+ * 被 `REG_APPLY_BUSY` 拒绝（不给 `applyLockTimeoutMs` 时默认等 30s）；锁的 mtime 阈值
+ * 与 Workspace 同口径（单次 apply 超过 120s 会被误判陈旧，Workspace 同样如此）。
+ */
+export const REG_APPLY_LOCK_NAME = 'apply.lock'
+/** 陈旧锁判定阈值（毫秒）；与 `workspace.ts` 的 120s 同口径。 */
+export const REG_APPLY_LOCK_STALE_MS = 120000
+/** 等锁超时（毫秒）；超时 fail-closed `REG_APPLY_BUSY`。 */
+export const REG_APPLY_LOCK_TIMEOUT_MS = 30000
+
+/** `<sessionDir>/registry/apply.lock`（跨进程 apply 锁的绝对路径） */
+export function resolveRegistryApplyLockPath(sessionDir) {
+  return join(assertNonEmptyString(sessionDir, 'sessionDir'), REGISTRY_STAGE_SUBDIR, REG_APPLY_LOCK_NAME)
+}
 
 /** 候选来源标记：审批面板据此区分"文件候选"与"注册表候选"（顶层形状同构，只有 changes 不同） */
 export const REGISTRY_CANDIDATE_SOURCE = 'registry-stage'
@@ -2384,6 +2421,10 @@ export function createRegistryStage(options = {}) {
   const discardedPath = resolveRegistryStageDiscardedPath(sessionDir)
   const candidateDir = join(sessionDir, 'candidates')
   const queuePath = join(sessionDir, queueFileName())
+  /* R41 / REG-06：跨进程 apply 锁（同一 stage dir 一把），详见 REG_APPLY_LOCK_NAME 的注释。 */
+  const applyLockPath = resolveRegistryApplyLockPath(sessionDir)
+  const defaultApplyLockTimeoutMs =
+    Number.isInteger(options.applyLockTimeoutMs) && options.applyLockTimeoutMs >= 0 ? options.applyLockTimeoutMs : REG_APPLY_LOCK_TIMEOUT_MS
   const now = typeof options.now === 'function' ? options.now : () => new Date().toISOString()
   const sessionId = typeof options.sessionId === 'string' && options.sessionId.length > 0 ? options.sessionId : null
 
@@ -2489,6 +2530,136 @@ export function createRegistryStage(options = {}) {
     if (!opened) open()
   }
 
+  // ── R41 / REG-06：跨进程 apply 锁（模型：workspace.ts::_acquireApplyLock）──────
+  /** 本实例当前是否持锁（同实例重入不再取锁；跨实例/跨进程靠文件独占）。 */
+  let applyLockHeld = false
+
+  function sleepMs(ms) {
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+    } catch {
+      /* best effort（Worker/受限环境） */
+    }
+  }
+
+  /** 读锁内容（诊断用；坏 JSON 不算失败）。 */
+  function readLockHolder() {
+    try {
+      const text = readFileSync(applyLockPath, 'utf8')
+      const parsed = JSON.parse(text)
+      return { holder: parsed && typeof parsed === 'object' ? parsed : null, text }
+    } catch {
+      return { holder: null, text: '' }
+    }
+  }
+
+  /**
+   * 取锁。`timeoutMs=0` ⇒ 忙时立刻失败（不等待）。
+   * @returns {{ok:true,path:string}|{ok:false,path:string,code:string,message:string,holder:object|null}}
+   */
+  function acquireApplyLock(timeoutMs = defaultApplyLockTimeoutMs) {
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0)
+    for (;;) {
+      mkdirSync(stageRoot, { recursive: true })
+      try {
+        const fd = openSync(applyLockPath, 'wx')
+        try {
+          writeFileSync(fd, JSON.stringify({ pid: process.pid, at: now(), sessionId, scope: 'registry-apply' }))
+        } finally {
+          closeSync(fd)
+        }
+        applyLockHeld = true
+        return { ok: true, path: applyLockPath }
+      } catch (error) {
+        if (error.code !== 'EEXIST') {
+          return { ok: false, path: applyLockPath, code: 'REG_APPLY_LOCK_UNAVAILABLE', message: String(error.message), holder: null }
+        }
+        // 陈旧锁恢复（与 workspace 同口径）：先看 mtime 超时（持锁进程被强杀），再看 pid 是否还活着。
+        const { holder, text } = readLockHolder()
+        let reclaimed = false
+        try {
+          const st = statSync(applyLockPath)
+          if (Date.now() - st.mtimeMs > REG_APPLY_LOCK_STALE_MS) {
+            rmSync(applyLockPath, { force: true })
+            reclaimed = true
+          }
+        } catch {
+          reclaimed = true // 锁文件在判定期间消失 ⇒ 直接重试
+        }
+        if (!reclaimed) {
+          const pid = Number(holder?.pid)
+          if (Number.isInteger(pid) && pid > 0) {
+            let alive = true
+            try {
+              process.kill(pid, 0)
+            } catch (pidError) {
+              // EPERM = 进程在但没权限发信号 ⇒ 视为存活（与 workspace 同口径）
+              alive = pidError.code === 'EPERM'
+            }
+            if (!alive) {
+              try {
+                rmSync(applyLockPath, { force: true })
+                reclaimed = true
+              } catch {
+                /* 另一个进程同时清掉了：下一轮 EEXIST/成功都会给出答案 */
+              }
+            }
+          }
+        }
+        if (reclaimed) continue
+        if (Date.now() >= deadline) {
+          const holderDesc = holder
+            ? ` holder pid=${String(holder.pid)} at=${String(holder.at)} scope=${String(holder.scope ?? 'unknown')}`
+            : ` holder=<unreadable ${JSON.stringify(text.slice(0, 120))}>`
+          return {
+            ok: false,
+            path: applyLockPath,
+            code: 'REG_APPLY_BUSY',
+            message:
+              `another process/instance is applying registry changes on this stage dir ` +
+              `(lock ${applyLockPath};${holderDesc}). ` +
+              'Fail-closed: no write was attempted; retry after the holder finishes ' +
+              `(timeoutMs=${timeoutMs}, stale=${REG_APPLY_LOCK_STALE_MS}ms)`,
+            holder,
+          }
+        }
+        sleepMs(25)
+      }
+    }
+  }
+
+  /** 释放锁（best-effort；陈旧锁阈值兜底遗留）。 */
+  function releaseApplyLock() {
+    if (!applyLockHeld) return
+    applyLockHeld = false
+    try {
+      rmSync(applyLockPath, { force: true })
+    } catch {
+      /* 清理失败由陈旧锁阈值兜底 */
+    }
+  }
+
+  /**
+   * 在 apply 锁内执行一次**会改变真实世界/审批状态**的操作。
+   * 忙超时 ⇒ 抛 `REG_APPLY_BUSY`（fail-closed；status=5），**不**返回"成功"的空结果。
+   */
+  function withApplyLock(action, timeoutMs, run) {
+    if (applyLockHeld) return run() // 同实例重入：外层已持锁
+    const lock = acquireApplyLock(timeoutMs)
+    if (!lock.ok) {
+      throw stageError(lock.code, `registry-stage: ${action}: ${lock.message}`, {
+        status: REG_STATUS.ERROR_ACCESS_DENIED,
+        lockPath: lock.path,
+        holder: lock.holder,
+      })
+    }
+    try {
+      return run()
+    } finally {
+      releaseApplyLock()
+    }
+  }
+
   /** 打开/恢复：解析既有 WAL、恢复已解决状态。返回可审计的摘要。 */
   function open() {
     mkdirSync(stageRoot, { recursive: true })
@@ -2575,7 +2746,16 @@ export function createRegistryStage(options = {}) {
     }
   }
 
-  function persistOperation(operation) {
+  /**
+   * WAL 追加（`stage*` 的唯一写口）也在 apply 锁内执行（R41 / REG-06）：
+   * 一个进程正在 apply 真实 hive 时，另一个实例的暂存不能插进它的批次中间。
+   * `opts.applyLockTimeoutMs` 可覆盖等待（0 = 忙时立刻 `REG_APPLY_BUSY`）。
+   */
+  function persistOperation(operation, applyLockTimeoutMs) {
+    return withApplyLock('stage-write', applyLockTimeoutMs ?? defaultApplyLockTimeoutMs, () => persistOperationUnlocked(operation))
+  }
+
+  function persistOperationUnlocked(operation) {
     const canonicalReal = parseRegistryPath(operation.path).canonical
     const policy = classifyRegistryOperation({
       api: API_BY_OP[operation.op],
@@ -2718,7 +2898,7 @@ export function createRegistryStage(options = {}) {
       dwOptions: opts.dwOptions ?? 0,
       samDesired: opts.samDesired ?? 0,
       wow64Process: opts.wow64Process,
-    })
+    }, opts.applyLockTimeoutMs)
   }
 
   /** 暂存"删除键"（对齐 `RegDeleteKeyExW`：**有子键就失败**，除非 `recursive`） */
@@ -2731,7 +2911,7 @@ export function createRegistryStage(options = {}) {
       samDesired: opts.samDesired ?? 0,
       wow64Process: opts.wow64Process,
     }
-    if (isUnstageable(REG_STAGE_OP.DELETE_KEY, canonical, opts)) return persistOperation(operation)
+    if (isUnstageable(REG_STAGE_OP.DELETE_KEY, canonical, opts)) return persistOperation(operation, opts.applyLockTimeoutMs)
     const exists = effectiveExists(canonical)
     if (!exists) {
       throw stageError('REG_STAGE_KEY_NOT_FOUND', `RegDeleteKeyExW(${canonical}): 键不存在（ERROR_FILE_NOT_FOUND）`, {
@@ -2750,7 +2930,7 @@ export function createRegistryStage(options = {}) {
         )
       }
     }
-    return persistOperation(operation)
+    return persistOperation(operation, opts.applyLockTimeoutMs)
   }
 
   /** 暂存"写值"（对齐 `RegSetValueExW`：键不存在时失败） */
@@ -2767,14 +2947,14 @@ export function createRegistryStage(options = {}) {
       samDesired: opts.samDesired ?? 0,
       wow64Process: opts.wow64Process,
     }
-    if (isUnstageable(REG_STAGE_OP.SET_VALUE, canonical, opts, type)) return persistOperation(operation)
+    if (isUnstageable(REG_STAGE_OP.SET_VALUE, canonical, opts, type)) return persistOperation(operation, opts.applyLockTimeoutMs)
     if (!effectiveExists(canonical)) {
       throw stageError('REG_STAGE_KEY_NOT_FOUND', `RegSetValueExW(${canonical}): 键不存在（ERROR_FILE_NOT_FOUND）`, {
         status: REG_STATUS.ERROR_FILE_NOT_FOUND,
         path: canonical,
       })
     }
-    return persistOperation(operation)
+    return persistOperation(operation, opts.applyLockTimeoutMs)
   }
 
   /** 暂存"删值"（对齐 `RegDeleteValueW`：值不存在时失败） */
@@ -2788,7 +2968,7 @@ export function createRegistryStage(options = {}) {
       samDesired: opts.samDesired ?? 0,
       wow64Process: opts.wow64Process,
     }
-    if (isUnstageable(REG_STAGE_OP.DELETE_VALUE, canonical, opts)) return persistOperation(operation)
+    if (isUnstageable(REG_STAGE_OP.DELETE_VALUE, canonical, opts)) return persistOperation(operation, opts.applyLockTimeoutMs)
     if (!effectiveExists(canonical)) {
       throw stageError('REG_STAGE_KEY_NOT_FOUND', `RegDeleteValueW(${canonical}): 键不存在`, {
         status: REG_STATUS.ERROR_FILE_NOT_FOUND,
@@ -2804,7 +2984,7 @@ export function createRegistryStage(options = {}) {
         valueName,
       })
     }
-    return persistOperation(operation)
+    return persistOperation(operation, opts.applyLockTimeoutMs)
   }
 
   function effectiveExists(canonical) {
@@ -3055,6 +3235,19 @@ export function createRegistryStage(options = {}) {
    *   3. writer 返回非 0 LSTATUS ⇒ 该单元标 `failed` 并带上原始状态码。
    */
   function apply(opts = {}) {
+    return withApplyLock('apply', opts.applyLockTimeoutMs ?? defaultApplyLockTimeoutMs, () => {
+      /* 串行化后必须**重读**已解决状态：另一个进程可能刚刚 apply/discard 完。否则本实例
+       * 会拿"它 apply 之前"的 appliedPaths 再重放一遍（值幂等，但删除会二次失败、
+       * 候选状态也会被覆盖回去）。读不到就当没写过（本次仍按本地状态走）。 */
+      const persistedResolution = readJsonIfExists(statePath)
+      if (persistedResolution && typeof persistedResolution === 'object') {
+        resolution = { ...resolution, ...persistedResolution }
+      }
+      return applyUnlocked(opts)
+    })
+  }
+
+  function applyUnlocked(opts = {}) {
     requireOpen()
     if (resolution.status === CANDIDATE_STATUS.DISCARDED) {
       throw stageError('REG_CANDIDATE_DISCARDED', `registry candidate ${resolution.candidateId} was discarded`, {
@@ -3289,6 +3482,12 @@ export function createRegistryStage(options = {}) {
 
   /** 丢弃：真实 hive 从未被本候选触碰；覆盖层被清空，WAL 改名保留为审计副本 */
   function discard(opts = {}) {
+    /* R41 / REG-06：discard 会重命名 WAL、删 overlay.hive、改已解决状态 ⇒ 必须在 apply
+     * 锁内（否则它可能与另一个进程正在进行的 apply 交错：apply 读到被改名/删除的 WAL）。 */
+    return withApplyLock('discard', opts.applyLockTimeoutMs ?? defaultApplyLockTimeoutMs, () => discardUnlocked(opts))
+  }
+
+  function discardUnlocked(opts = {}) {
     requireOpen()
     resolution.status = CANDIDATE_STATUS.DISCARDED
     resolution.discardedAt = now()
@@ -3339,6 +3538,8 @@ export function createRegistryStage(options = {}) {
     journalPath,
     statePath,
     discardedPath,
+    /** R41 / REG-06：跨进程 apply 锁的路径（诊断/测试可见）。 */
+    applyLockPath,
     sessionId,
     // 生命周期
     open,

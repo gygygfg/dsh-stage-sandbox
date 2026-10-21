@@ -33,6 +33,11 @@ import { ToolSurface, renderCandidateDiff } from './tools.ts'
 import { COMMAND_RISK, WindowsStageExecutor, classifyCommandRisk } from './executor.ts'
 import { formatReport, probe } from './capability.ts'
 import { canonical, compareKey } from './paths.ts'
+// R41-CLI-NOISE：外壳启动噪声判据的**唯一来源**（run-capture.ts）。
+// CLI 的 exec 捕获面必须与 shell-executor 的候选/审计面用同一份判据，否则
+// PowerShell 的 StartupProfileData-*/__PSScriptPolicyTest_* 只是从面板消失，
+// 却仍会从 `src/cli.ts exec` 进入 manifest/候选（本轮实测：ingested=7 全进）。
+import { SHELL_INTERNAL_ARTIFACT_REASON, isShellInternalArtifactPath, shellNoiseFilterEnabled } from '../dsh-plugin/run-capture.ts'
 
 const EXIT = { OK: 0, FAIL: 1, USAGE: 2, FAIL_CLOSED: 3, STALE: 4 }
 
@@ -78,6 +83,8 @@ const COMMAND_USAGE = Object.freeze({
   --read-only         **真正只读**：先判命令风险，写/判不出来直接拒绝（executed=false）；
                       只执行正向证明无副作用的命令，且执行后用一次性暂存根 ⇒ 不并入清单、不冻结候选
   --timeout <ms>      执行超时毫秒数
+  WINSTAGE_CAPTURE_NOISE=0  关闭外壳启动噪声过滤（PowerShell StartupProfileData-* /
+                      dsh-stage-temp\\*\\__PSScriptPolicyTest_* 默认被忽略且计入 noiseFiltered）
   命令与参数必须放在 -- 之后，例如: exec -- pwsh -c "ni a.txt"`,
   review: `用法: run.cmd src\\cli.ts review [--workspace <dir>] [--session <id>] [--json]`,
   diff: `用法: run.cmd src\\cli.ts diff [--workspace <dir>] [--candidate <id>] [--max-lines <n>] [--json]
@@ -264,6 +271,127 @@ export function materializeOverlayInto(workspace, destRoot) {
     }
   }
   return report
+}
+
+/**
+ * ── R41-CLI-NOISE：exec 捕获面的外壳启动噪声过滤 ────────────────────────────────
+ *
+ * 真机实测（R41）：PowerShell 每次启动都会写 `StartupProfileData-*`（PS 性能缓存）与
+ * `%TEMP%\dsh-stage-temp\<id>\__PSScriptPolicyTest_*`（AppLocker 探针）。它们经 shim 落进
+ * 暂存树的 `fs\<盘>\…` 布局，被 `captureAfterExecution()` 反解成**工作区外**条目。
+ * shell-executor 的候选/审计面已经按 `run-capture.ts::isShellInternalArtifactPath()` 过滤，
+ * 但 CLI 的 exec 分支此前直接把 raw captured 塞进 `ingestCapturedChanges()` ⇒ 这些
+ * "用户没干过"的条目照样进 manifest/候选（本机复现：captured=7 → ingested=7）。
+ *
+ * 纪律与 shell 面逐条一致：
+ *   · 判据只有一份（import 自 run-capture.ts），本文件**不另写名单**；
+ *   · 只丢**已知外壳产物**：`%TEMP%` 用户文件、`dsh-stage-temp` 下用户内容、工作区文件照样保留；
+ *   · **不静默**：`noiseFiltered` 计数 + 每条 `reason=shell-internal-artifact` 样本可机读，
+ *     文本面也明说"已忽略 N 项"；
+ *   · 逃生口 `WINSTAGE_CAPTURE_NOISE=0`（`shellNoiseFilterEnabled()`）恢复旧行为，并明说
+ *     "过滤已关闭 + 本次仍含 N 条已知产物"，绝不悄悄少报。
+ */
+export const SHELL_NOISE_SKIP_REASON = SHELL_INTERNAL_ARTIFACT_REASON
+
+/** 文本面列出的被忽略样本路径上限（计数不受此限） */
+const SHELL_NOISE_SAMPLE_LIMIT = 5
+
+/**
+ * 把 `captureAfterExecution()` 的结果拆成 `{kept, dropped}`。
+ * 与 `shell-executor.ts::partitionShellInternalArtifactChanges()` **同一判据、同一行为**：
+ * 先按逻辑键判定；未命中且给了 `toAbsolute` 时再按绝对路径判定（映射抛错保持可见，不误杀）。
+ *
+ * @param {Array<{path?: string}>} changes
+ * @param {(path: string) => string} [toAbsolute]
+ * @returns {{kept: Array, dropped: Array}}
+ */
+export function partitionCapturedShellNoise(changes, toAbsolute) {
+  if (!Array.isArray(changes)) return { kept: changes, dropped: [] }
+  const kept = []
+  const dropped = []
+  for (const change of changes) {
+    const raw = change && typeof change.path === 'string' ? change.path : ''
+    let noise = isShellInternalArtifactPath(raw)
+    if (!noise && typeof toAbsolute === 'function') {
+      try {
+        noise = isShellInternalArtifactPath(toAbsolute(raw))
+      } catch {
+        noise = false
+      }
+    }
+    if (noise) dropped.push(change)
+    else kept.push(change)
+  }
+  return { kept, dropped }
+}
+
+/**
+ * exec 捕获过滤的**唯一入口**（纯逻辑，可在无沙箱会话里离线断言）。
+ *
+ * @param {object} workspace 真实 Workspace（只读 `absolute`，不写盘）
+ * @param {Array} changes `captureAfterExecution()` 的原始返回
+ * @param {{enabled?: boolean, toAbsolute?: (path: string) => string, maxSamples?: number}} [options]
+ * @returns {{captured: Array, noiseFiltered: number, noiseSkipped: Array<{path: string, reason: string}>, shellNoiseFilter: 'enabled'|'disabled'|'read-only', noiseVisible: number}}
+ *   `captured` = 过滤后要 ingest 的条目；`noiseFiltered` = 被忽略条数（原始读数 `capturedChanges`
+ *   仍由调用方按过滤前长度报出，不篡改）；`noiseVisible` 只在过滤关闭时 >0（同一判据数的可见噪声）。
+ */
+export function filterCapturedShellNoise(workspace, changes, options = {}) {
+  const list = Array.isArray(changes) ? changes : []
+  const enabled = options.enabled !== undefined ? options.enabled === true : shellNoiseFilterEnabled()
+  const toAbsolute =
+    typeof options.toAbsolute === 'function'
+      ? options.toAbsolute
+      : typeof workspace?.absolute === 'function'
+        ? (path) => workspace.absolute(path)
+        : undefined
+  const maxSamples = Number.isInteger(options.maxSamples) && options.maxSamples > 0 ? options.maxSamples : 50
+  if (!enabled) {
+    // 逃生口：不丢任何条目，但把"本次仍含多少条已知产物"如实报出来（不沉默）。
+    const { dropped } = partitionCapturedShellNoise(list, toAbsolute)
+    return {
+      captured: list,
+      noiseFiltered: 0,
+      noiseSkipped: [],
+      shellNoiseFilter: 'disabled',
+      noiseVisible: dropped.length,
+    }
+  }
+  const { kept, dropped } = partitionCapturedShellNoise(list, toAbsolute)
+  return {
+    captured: kept,
+    noiseFiltered: dropped.length,
+    noiseSkipped: dropped.slice(0, maxSamples).map((change) => ({
+      path: change && typeof change.path === 'string' ? change.path : String(change?.path ?? ''),
+      reason: SHELL_INTERNAL_ARTIFACT_REASON,
+    })),
+    shellNoiseFilter: 'enabled',
+    noiseVisible: 0,
+  }
+}
+
+/**
+ * 文本面渲染（0 命中/只读时返回空串，避免每轮 exec 都刷一行废话）。
+ * 过滤关闭时必须**明说**，不能表现为"没有噪声"。
+ */
+export function formatShellNoiseSummary(noise) {
+  if (!noise || noise.shellNoiseFilter === 'read-only') return ''
+  if (noise.shellNoiseFilter === 'disabled') {
+    const visible = Number(noise.noiseVisible) || 0
+    if (visible === 0) return ''
+    return (
+      `外壳噪声过滤已关闭（WINSTAGE_CAPTURE_NOISE=0）：本次捕获仍含 ${visible} 条已知外壳启动产物，` +
+      `会照旧进入清单/候选（端到端排查模式）\n`
+    )
+  }
+  const count = Number(noise.noiseFiltered) || 0
+  if (count === 0) return ''
+  const samples = (noise.noiseSkipped ?? []).slice(0, SHELL_NOISE_SAMPLE_LIMIT).map((s) => s.path)
+  return (
+    `外壳内部/瞬态产物已忽略 ${count} 项（reason=${SHELL_INTERNAL_ARTIFACT_REASON}，不计入清单/候选；` +
+    `WINSTAGE_CAPTURE_NOISE=0 可关闭过滤）` +
+    (samples.length > 0 ? `\n  样本: ${samples.join('；')}` : '') +
+    '\n'
+  )
 }
 
 function fail(code, message, extra = {}) {
@@ -530,7 +658,17 @@ async function main() {
           timeoutMs,
         })
         // ── 只读模式：不捕获、不并入、不冻结（暂存副作用都在 scratch，随后删除）──
-        const captured = readOnlyScratch ? [] : workspace.captureAfterExecution(before)
+        const rawCaptured = readOnlyScratch ? [] : workspace.captureAfterExecution(before)
+        /**
+         * ── R41-CLI-NOISE：先过外壳噪声过滤，再 ingest ────────────────────────────
+         * 被忽略的 PowerShell 启动产物（StartupProfileData-… 与 __PSScriptPolicyTest_…）
+         * **绝不进 manifest/候选**；过滤关闭（WINSTAGE_CAPTURE_NOISE=0）时照旧全量进，
+         * 但 `noiseFiltered/noiseVisible` 与文本面会明说，绝不悄悄少报。
+         */
+        const shellNoise = readOnlyScratch
+          ? { captured: [], noiseFiltered: 0, noiseSkipped: [], shellNoiseFilter: 'read-only', noiseVisible: 0 }
+          : filterCapturedShellNoise(workspace, rawCaptured)
+        const captured = shellNoise.captured
         // ── D9 修复：捕获结果必须**并入清单并冻结候选**，否则 exec → review → apply 断链 ──
         // 原先这里只有 `captured.length` 一个统计数字：暂存树里有命令产出的文件，
         // 但 `diffEntries()` 看不到任何变化 → `review` 恒为空 → `apply` 无候选可应用。
@@ -567,7 +705,14 @@ async function main() {
               }
             : {}),
           materialized: materialize,
-          capturedChanges: captured.length,
+          /** 原始捕获读数（不因过滤而篡改；过滤后的条数见 capturedAfterNoiseFilter） */
+          capturedChanges: rawCaptured.length,
+          /** R41：外壳噪声过滤状态与可机读计数/样本（过滤关闭时 noiseVisible>0） */
+          shellNoiseFilter: shellNoise.shellNoiseFilter,
+          noiseFiltered: shellNoise.noiseFiltered,
+          noiseSkipped: shellNoise.noiseSkipped,
+          noiseVisible: shellNoise.noiseVisible,
+          capturedAfterNoiseFilter: captured.length,
           /** 新增：并入清单的条数 / 删除条数 / 跳过原因（可观测，不静默） */
           ingested,
           /** 新增：候选冻结结果（frozen=false 且 reason=already-represented 表示幂等复用） */
@@ -592,7 +737,8 @@ async function main() {
               '只读模式：命令已按"正向证明只读"执行；暂存副作用落一次性根并已丢弃，未并入清单、未冻结候选\n',
             )
           } else {
-            process.stdout.write(`沙箱内提取到 ${captured.length} 项变化，并入清单 ${ingested.ingested} 项，删除 ${ingested.deletions} 项\n`)
+            process.stdout.write(`沙箱内提取到 ${rawCaptured.length} 项变化，并入清单 ${ingested.ingested} 项，删除 ${ingested.deletions} 项\n`)
+            process.stdout.write(formatShellNoiseSummary(shellNoise))
             if (frozen.frozen) process.stdout.write(`已冻结候选 ${frozen.candidate.id}（${frozen.candidate.changes.length} 个变更单元）→ 可用 review/apply 处理\n`)
             else process.stdout.write(`未新建候选：${frozen.reason}\n`)
             for (const skip of ingested.skipped) process.stdout.write(`  ⚠ 跳过 ${skip.path}: ${skip.reason}\n`)

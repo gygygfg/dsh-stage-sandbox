@@ -25,20 +25,19 @@
  * ⇒ 暂存写到 A、面板发布在 B（**面板看不到命令产出**）。
  * 证据：`git 历史（历史归档已清理）` §1（第 38-51 行）。
  *
- * 现在的取值顺序（逐条，**没有 `process.cwd()` 这一档**）：
- *   1. **loader 行表**（`entry.parent.data`）里 `winstage-fs` 行的 `cwd` —— 那才是
- *      fs 半边真正的存储根（`staging-fs.ts` 用 `canonical(config.cwd)` 建 Store），
- *      所以它**就是权威**；同一个字面值由 bundle 的 YAML 锚点 `&winstageRoot` 绑在
- *      host 行 `workspaceRoot`、fs 行 `cwd`/`workspaceRoot`、shell 行 `workspaceRoot`
- *      四处（C-8：结构性同源）；由 `shell-executor.ts` 的 `effectiveWorkspaceRoot()`
- *      取出并**交叉校验**：两处不一致 ⇒ error 级日志 + **以 fs 根的值为准**（宁可响，
- *      也不能分叉出第二个单例）；
- *   2. 行表里 `winstage-shell` 行的 `workspaceRoot`；
+ * 现在的取值顺序（R41-G04 单源；逐条，**没有 `process.cwd()` 这一档**）：
+ *   1. 显式 fs 根（行表 `winstage-fs` 的 `cwd`/`workspaceRoot`）/ 显式 shell 根
+ *      （`winstage-shell` 的 `workspaceRoot`）—— profile 显式覆盖仍**权威**；
+ *   2. **host 行** `winstage-sandbox` 的 `workspaceRoot` —— bundle 里留空，profile 只需
+ *      覆盖这一行；fs/shell 没显式写根时由 `shell-executor.ts::resolveWorkspaceRoot()`
+ *      派生它；
  *   3. 显式装配值：`configureShellWorkspaceRoot(root)`（行 config 经
  *      `WinStageShellExecutor` 的 `onConfig` 通路自动调入，见下）；
  *   4. `WINSTAGE_SHELL_WORKSPACE`（显式诊断逃生口，**不是猜**）。
- * 都没有 ⇒ **抛错**（`WINSTAGE_SHELL_NO_WORKSPACE_ROOT`）。宁可这一行报一条可读的
- * fail-closed 错误，也绝不再回退到 `process.cwd()`：那正是"两个根"的成因。
+ * 显式值之间冲突（fs≠shell、显式≠host）⇒ **拒绝执行**（`WINSTAGE_SHELL_ROOT_CONFLICT`，
+ * `executed:false`），绝不静默挑一个分叉出第二个单例。都没有 ⇒ **抛错**
+ * （`WINSTAGE_SHELL_NO_WORKSPACE_ROOT`）。宁可这一行报一条可读的 fail-closed 错误，
+ * 也绝不再回退到 `process.cwd()`：那正是"两个根"的成因。
  *
  * ── fail-closed（与 fs-entry.ts:25-33 同一风格）──────────────────────────────
  * 定位不到 `@deepseek-ai/dsh-shell` ⇒ **直接抛**。拿不到服务定义就不该注册任何

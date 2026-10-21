@@ -496,11 +496,15 @@ export function summarizeReadVisibility(readVisibility) {
  *
  * @param {{service?: object, session?: object, snapshot?: object, env?: object, now?: string}} options
  *   `service` = 审阅服务（取存储根/清单）；`session` = 会话句柄（面④读事件）；
- *   `snapshot` = 已发布的快照（面⑥读 `readVisibility`；不传就如实标 `available:false`）
+ *   `snapshot` = 已发布的快照（面⑥读 `readVisibility`；不传就如实标 `available:false`）；
+ *   `recordLoss` = 是否把本次观测写进 lane journal（面板 `/trust` 传 false：**刷新面板
+ *   不应增加"失根次数"**；`/winstage status` 命令仍是显式观测，默认 true）
  */
 export function buildTrustCard(options = {}) {
   const service = options.service
   const store = service?.workspace?.store
+  /** R41-UX-02：纯查看面不记账（见 doc 注释）；默认 true 保持命令面语义不变。 */
+  const recordLoss = options.recordLoss !== false
   const dir =
     typeof store?.dir === 'string' && store.dir.length > 0
       ? store.dir
@@ -570,17 +574,36 @@ export function buildTrustCard(options = {}) {
   const lossRelevant = checked && aliveNow !== true && everCreated
   let rootLoss = history.rootLoss
   if (lossRelevant) {
-    // 观测点②：用户查看状态也是一次观测（与命令执行前同一个记账函数）
-    const entry = noteStageRootLoss(dir, { reason: live.reason ?? 'not-alive', phase: 'status' })
-    if (entry) {
+    if (recordLoss) {
+      // 观测点②：用户查看状态也是一次观测（与命令执行前同一个记账函数）
+      const entry = noteStageRootLoss(dir, { reason: live.reason ?? 'not-alive', phase: 'status' })
+      if (entry) {
+        rootLoss = {
+          everLost: true,
+          count: entry.count,
+          lastReason: entry.lastReason,
+          lastAt: entry.lastAt,
+          lastPhase: entry.lastPhase,
+          lastSeq: entry.lastSeq,
+          observedAt: entry.observedAt,
+        }
+      }
+    } else {
+      /**
+       * R41-UX-02：面板 `/trust` 是**纯查看**，不写 lane journal。旧行为每次刷新都会
+       * `count+1`，把"我点了几次刷新"伪装成"失根次数"，用户无法据此判断真实故障。
+       * 当前这次丢失仍由面③ `stageRoot.alive=false/reason` 如实显示；这里只保留
+       * **历史**计数，不新增观测。
+       */
+      const prior = history.rootLoss ?? {}
       rootLoss = {
         everLost: true,
-        count: entry.count,
-        lastReason: entry.lastReason,
-        lastAt: entry.lastAt,
-        lastPhase: entry.lastPhase,
-        lastSeq: entry.lastSeq,
-        observedAt: entry.observedAt,
+        count: prior.count ?? 0,
+        lastReason: live.reason ?? 'not-alive',
+        lastAt: prior.lastAt ?? null,
+        lastPhase: prior.lastPhase ?? null,
+        lastSeq: prior.lastSeq ?? null,
+        observedAt: Array.isArray(prior.observedAt) ? [...prior.observedAt] : [],
       }
     }
   }
@@ -600,7 +623,7 @@ export function buildTrustCard(options = {}) {
     lastLossPhase: rootLoss?.lastPhase ?? null,
     lastLossSeq: rootLoss?.lastSeq ?? null,
     observedAt: Array.isArray(rootLoss?.observedAt) ? [...rootLoss.observedAt] : [],
-    note: '失根次数是**被观测到**的次数（观测点：命令执行前 / 用户查看状态时），不是完整审计；"根还没建"不算失根。',
+    note: '失根次数是**被观测到**的次数（观测点：命令执行前 / 显式 /winstage status；面板刷新不计数），不是完整审计；"根还没建"不算失根。',
   }
 
   // ── 面 ④⑤⑥ ────────────────────────────────────────────────────────────────
@@ -1034,21 +1057,123 @@ export function buildPanelPayload({ pathname, query, workspaceRoot, sessionId, e
     session,
     // 面⑥要靠已发布快照（这里**不**写盘）
     snapshot: published.ok ? published.snapshot : undefined,
+    // R41-UX-02：刷新面板不是"一次失根观测"；只读历史计数，不写 lane journal。
+    recordLoss: false,
     now,
   })
   return { status: 200, body: { ok: true, store, card, source: 'host-route' } }
 }
 
 /**
+ * ★ R41-SEC04：把面板查询里的 `?session=` **绑定到宿主侧真实会话**（只读校验，零文件 IO）。
+ *
+ * 缺陷（R34-SEC/§14 残余）：`authorizeIndex()` 只证明"这是一个持有本机浏览器签名 cookie 的
+ * 页面"，**cookie 载荷里没有会话身份**（`{version,authority,issuedAt,expiresAt}`，见
+ * `dsh-client-connection` 的 `BrowserAuth.authenticate()`），而快照存储根却由 query 的
+ * `session` 解析。于是同源脚本/页面只要换一个 id，就能读到**另一个会话**的暂存快照。
+ *
+ * 最强可行绑定（不引入客户端可伪造的新凭据）：
+ *   · 宿主有 `sessionQuery`（`@deepseek-ai/dsh-session-query`，`dsh-base` 提供）时，
+ *     `observeSession(id)` 覆盖**实时 + 已持久化**会话（不是只有 live `sessions.get()`），
+ *     返回的 `header.cwd` 是创建时校验过的绝对路径；
+ *   · 要求 `canonical(header.cwd) === canonical(workspaceRoot)`：拒绝不存在的 id、
+ *     拒绝别的会话/别的工作区的 id（这正是"跨工作区串台"那条）；
+ *   · 服务缺失 / 没传 session id 时才退回**显式未校验**（`checked:false`）并交调用方记日志：
+ *     这是宿主能力边界，不能假装已校验。
+ *
+ * 为什么是 async：`observeSession()` 可能读持久化后端；本函数在 `buildPanelPayload()` 之前
+ * 调用（未通过校验**零快照读盘**），与 authorize 的顺序纪律一致。
+ *
+ * @param {{sessionQuery?: object, sessions?: object, sessionId?: string, workspaceRoot?: string}} options
+ *   `sessionQuery` = 宿主会话查询服务（duck-typed：`observeSession(id)`）；
+ *   `sessions` = 退回的实时会话注册表（`sessions.get(id)`），仅当没有 `sessionQuery` 时用；
+ *   `sessionId` = 请求 query 里的会话 id；`workspaceRoot` = 插件配置/解析出的工作区根。
+ * @returns {Promise<{ok: boolean, checked: boolean, code?: string, reason?: string, cwd?: string, source?: string}>}
+ *   `ok:false` 且 `code:'session-check-unavailable'` ⇒ 调用方答 503；
+ *   `ok:false` 其余 ⇒ 调用方答 403（`session-not-authorized`），且**不得**构建 payload。
+ */
+export async function authorizePanelSession(options = {}) {
+  const sessionId = typeof options.sessionId === 'string' ? options.sessionId.trim() : ''
+  if (sessionId.length === 0) return { ok: true, checked: false, reason: 'no-session-id', source: 'none' }
+  const workspaceRoot = options.workspaceRoot
+  const query = options.sessionQuery
+  const sessions = options.sessions
+  let cwd
+  let source
+  if (query && typeof query.observeSession === 'function') {
+    source = 'sessionQuery'
+    let observation
+    try {
+      observation = await query.observeSession(sessionId, { projectionMode: 'none' })
+    } catch (error) {
+      if (error?.code === 'SESSION_QUERY_SESSION_NOT_FOUND') {
+        return { ok: false, checked: true, code: 'session-not-authorized', reason: 'session-not-found', source }
+      }
+      return {
+        ok: false,
+        checked: true,
+        code: 'session-check-unavailable',
+        reason: `observe-failed: ${error?.code ?? error?.name ?? error}`,
+        source,
+      }
+    }
+    cwd = observation?.header?.cwd
+  } else if (sessions && typeof sessions.get === 'function') {
+    source = 'sessions'
+    let live
+    try {
+      live = sessions.get(sessionId)
+    } catch (error) {
+      return {
+        ok: false,
+        checked: true,
+        code: 'session-check-unavailable',
+        reason: `live-get-failed: ${error?.code ?? error?.name ?? error}`,
+        source,
+      }
+    }
+    if (!live) return { ok: false, checked: true, code: 'session-not-authorized', reason: 'session-not-found', source }
+    cwd = live?.header?.cwd ?? live?.session?.header?.cwd
+  } else {
+    // 宿主没有会话查询能力：如实标记"未校验"，由调用方决定兼容策略（不得静默伪称已校验）
+    return { ok: true, checked: false, reason: 'no-session-service', source: 'none' }
+  }
+  if (typeof cwd !== 'string' || cwd.trim().length === 0) {
+    return { ok: false, checked: true, code: 'session-not-authorized', reason: 'session-workspace-unknown', source }
+  }
+  if (typeof workspaceRoot !== 'string' || workspaceRoot.trim().length === 0) {
+    return { ok: false, checked: true, code: 'session-not-authorized', reason: 'panel-workspace-unknown', source }
+  }
+  let same
+  try {
+    same = compareKey(canonical(cwd)) === compareKey(canonical(workspaceRoot))
+  } catch (error) {
+    return {
+      ok: false,
+      checked: true,
+      code: 'session-check-unavailable',
+      reason: `canonical-failed: ${error?.code ?? error?.name ?? error}`,
+      source,
+    }
+  }
+  if (!same) {
+    return { ok: false, checked: true, code: 'session-not-authorized', reason: 'session-workspace-mismatch', cwd, source }
+  }
+  return { ok: true, checked: true, cwd, source }
+}
+
+/**
  * 造面板路由处理器（`ctx.webServer.register({kind:'prefix', path: PANEL_ROUTE_PREFIX, handler})`）。
  *
- * @param {{workspaceRoot: string, isEnabled?: Function, env?: object, sessionOf?: Function, log?: Function, authorize?: Function}} options
+ * @param {{workspaceRoot: string, isEnabled?: Function, env?: object, sessionOf?: Function, log?: Function, authorize?: Function, sessionQueryOf?: Function, sessionsOf?: Function}} options
  *   `sessionOf(invocation)`：本路由没有 command invocation，面④需要调用方给一个"当前会话"
  *   的取法；拿不到就如实标"未知"，**不猜**。
  *   `authorize(req, res)`：**R23-A 鉴权钩子**（生产必须传）。命名前缀路由先于宿主前端静态兜底，
  *   宿主的 `Connection.authorizeIndex()` 只在兜底里执行 ⇒ 不在这里显式鉴权，本机任意进程可无
  *   token/cookie 读审阅快照。调用发生在 `buildPanelPayload()` **之前**（未鉴权零读盘）；
  *   返回 false 表示授权方已自行写完响应（401/403），本函数直接返回。
+ *   `sessionQueryOf()` / `sessionsOf()`：**R41-SEC04** 每请求现读宿主会话服务（apply 期服务
+ *   可能尚未 provide，故必须惰性取）。见 `authorizePanelSession()`。
  */
 export function createPanelHandler(options = {}) {
   const isEnabled = typeof options.isEnabled === 'function' ? options.isEnabled : () => true
@@ -1080,6 +1205,55 @@ export function createPanelHandler(options = {}) {
       res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify({ ok: false, code: 'bad-url' }))
       return
+    }
+    /**
+     * ★ R41-SEC04：`?session=` 必须能对上宿主里的真实会话，且该会话的 cwd == 本面板工作区。
+     *
+     * 为什么放在 authorize 之后、payload 之前：
+     *   · authorize 证明"这是本机已认证页面"；本步证明"这个 id 不是别的会话/别的工作区"；
+     *   · 未通过 ⇒ **零快照读盘、零 payload 构建**（与 R23-A 同一条纪律）。
+     * 关态优先：`enabled:false` 时仍回既有 `503 disabled`，不因为会话校验把语义改成 403。
+     * 服务缺失（老宿主/离线单测）⇒ `checked:false` 放行 + 日志，属于宿主能力边界（文档记录）。
+     */
+    const requestedSessionId = url.searchParams.get('session') ?? undefined
+    if (
+      typeof requestedSessionId === 'string' &&
+      requestedSessionId.length > 0 &&
+      typeof options.workspaceRoot === 'string' &&
+      options.workspaceRoot.length > 0
+    ) {
+      let verdict
+      try {
+        const sessionQuery = typeof options.sessionQueryOf === 'function' ? options.sessionQueryOf() : undefined
+        const liveSessions = typeof options.sessionsOf === 'function' ? options.sessionsOf() : undefined
+        verdict = await authorizePanelSession({
+          sessionQuery,
+          sessions: liveSessions,
+          sessionId: requestedSessionId,
+          workspaceRoot: options.workspaceRoot,
+        })
+      } catch (error) {
+        verdict = { ok: false, checked: true, code: 'session-check-unavailable', reason: `session-check-threw: ${error?.message ?? error}` }
+      }
+      if (verdict.ok === false) {
+        let enabled = true
+        try {
+          enabled = isEnabled() !== false
+        } catch {
+          enabled = true
+        }
+        if (enabled) {
+          const status = verdict.code === 'session-check-unavailable' ? 503 : 403
+          log(`面板会话校验拒绝（${verdict.reason ?? verdict.code}）：session=${requestedSessionId} route=${url.pathname}`)
+          try {
+            res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+            res.end(JSON.stringify({ ok: false, code: verdict.code ?? 'session-not-authorized', reason: verdict.reason, route: url.pathname }))
+          } catch {
+            /* 响应已被写者占用时不再二次写 */
+          }
+          return
+        }
+      }
     }
     let session
     try {
@@ -1793,14 +1967,15 @@ export function apply(ctx, config = {}) {
    *
    * 旧实现回退到 `new URL('..', import.meta.url)` = 包目录本身：用户没配根时，
    * 暂存/快照会落到插件安装目录（甚至 asar 内路径），既不是用户工作区，也没有任何提示。
-   * 现在要求 profile 显式配置（bundle 默认值见 `cordis.patch.yml`；跨机器安装见 README
-   * "三个根必须一起重述"），否则在装配期抛结构化错误，宿主日志里能直接看到原因。
+   * 现在要求 profile 配置 host 行（bundle 里留空；R41-G04 单源，fs/shell 未显式写根时
+   * 从这里派生，跨机器安装见 README "只配置 host 行的根"），否则在装配期抛结构化错误，
+   * 宿主日志里能直接看到原因。
    */
   if (enabledNow) {
     if (configuredWorkspaceRoot.length === 0) {
       const error = new Error(
-        'WinStage workspaceRoot 未配置：拒绝装配。请在 profile 覆盖层设置 winstage-sandbox.config.workspaceRoot，' +
-          '并同时重述 winstage-fs.config.cwd/workspaceRoot 与 winstage-shell.config.workspaceRoot（config 是整体替换）。',
+        'WinStage workspaceRoot 未配置：拒绝装配。请在 profile 覆盖层设置 winstage-sandbox.config.workspaceRoot（R41-G04 单源）；' +
+          'fs/shell 未显式写根时会自动派生它，不需要再重述三处。',
       )
       error.code = 'WINSTAGE_WORKSPACE_ROOT_MISSING'
       logError(error.message)
@@ -1809,8 +1984,8 @@ export function apply(ctx, config = {}) {
     if (!existsSync(canonical(configuredWorkspaceRoot))) {
       const resolved = canonical(configuredWorkspaceRoot)
       const error = new Error(
-        `WinStage workspaceRoot 指向的目录不存在：${resolved}。请修正 profile 覆盖层里的根（host/fs/shell 三处必须一致）；` +
-          '本插件不会自动创建用户工作区，也不会回退到插件安装目录。',
+        `WinStage workspaceRoot 指向的目录不存在：${resolved}。请修正 profile 覆盖层里的 host 行根（R41-G04 单源；` +
+          'fs/shell 未显式写根时自动派生，显式值冲突仍会 fail-closed）；本插件不会自动创建用户工作区，也不会回退到插件安装目录。',
       )
       error.code = 'WINSTAGE_WORKSPACE_ROOT_NOT_FOUND'
       logError(error.message)
@@ -2011,6 +2186,26 @@ export function apply(ctx, config = {}) {
         log: (message) => log.warn(message),
         // R23-A：把宿主 BrowserAuth 的会话校验搬进命名路由（401 响应由授权方拥有）。
         authorize: (req, res) => connection.authorizeIndex(req, res, secureListener),
+        /**
+         * ★ R41-SEC04：`?session=` 的服务端绑定源。
+         * 必须**每请求现读**：本注入回调可能在 `sessionQuery`/`sessions` 被 provide 之前执行，
+         * 捕获一次会永久拿到 undefined。`get()` 在服务缺失时返回 undefined（不抛），
+         * 因此这里不改变"没有会话服务 ⇒ 兼容旧行为"的降级路径。
+         */
+        sessionQueryOf: () => {
+          try {
+            return webScope.get?.('sessionQuery') ?? ctx.get?.('sessionQuery')
+          } catch {
+            return undefined
+          }
+        },
+        sessionsOf: () => {
+          try {
+            return webScope.get?.('sessions') ?? ctx.get?.('sessions')
+          } catch {
+            return undefined
+          }
+        },
         // 面④（未结算审批）需要"当前会话"的事件流。本路由没有 command invocation，
         // 拿不到就如实标"未知" —— 绝不用"最近一次命令的会话"冒充当前会话。
       })

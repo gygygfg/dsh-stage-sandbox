@@ -38,6 +38,7 @@ import { acquireStageGuard } from '../src/stage-guard.ts'
 import { Store } from '../src/store.ts'
 import { hashAbsent } from '../src/store.ts'
 import { renderCandidateDiff } from '../src/tools.ts'
+import { canonical } from '../src/paths.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SCRATCH = join(HERE, '..', '.t', 'r34-guard-unavailable')
@@ -492,6 +493,235 @@ try {
       !joined.includes('\x1b') && !joined.includes('\0') && joined.includes('\\x1b') && joined.includes('\\x00'),
       JSON.stringify({ joined }),
     )
+  }
+  section('10. R41-G04：单源工作区根（host 行唯一配置入口；显式覆盖权威；冲突 fail-closed）')
+  {
+    const otherRoot = join(SCRATCH, 'ws-other')
+    mkdirSync(otherRoot, { recursive: true })
+    // ── 10.1 patch 本身：不再硬编码开发机路径 / 不再用锚点复制根 ───────────────
+    const patchText = readFileSync(join(HERE, '..', 'dsh-plugin', 'cordis.patch.yml'), 'utf8')
+    const codeOnly = patchText
+      .split(/\r?\n/)
+      .filter((line) => !/^\s*#/.test(line))
+      .join('\n')
+    // 只认"真正的绝对路径"：`!!js` 表达式里有 `id:\s*`/`enabled:\s*` 这类**字母+冒号+反斜杠**，
+    // 不能把 `[A-Za-z]:\\` 直接当判据（那会假红）。要求盘符前是行首/引号/空白。
+    const absolutePaths = codeOnly
+      .split(/\r?\n/)
+      .filter((line) => /(?:^|['"\s])[A-Za-z]:[\\/]/.test(line) || /Users[\\/]|Desktop/i.test(line))
+    check(
+      'G-04a bundle patch 的**有效行**里没有任何绝对路径（开发机/本仓路径已移除）',
+      absolutePaths.length === 0,
+      JSON.stringify(absolutePaths.slice(0, 3)),
+    )
+    check(
+      'G-04b 不再用 YAML 锚点 (&winstageRoot / *winstageRoot) 把同一个根复制到多行',
+      !/&\w*[Rr]oot\b|\*\w*[Rr]oot\b/.test(codeOnly),
+      JSON.stringify(codeOnly.split(/\r?\n/).filter((line) => /[&*]\w*[Rr]oot/.test(line))),
+    )
+    const rowsOfPatch = (text) => {
+      const rows = []
+      let current
+      for (const line of text.split(/\r?\n/)) {
+        if (/^\s*#/.test(line)) continue
+        const head = /^\s*-\s+id:\s*(\S+)\s*$/.exec(line)
+        if (head) {
+          current = { id: head[1], body: '' }
+          rows.push(current)
+          continue
+        }
+        if (current) current.body += `${line}\n`
+      }
+      return rows
+    }
+    const patchRows = rowsOfPatch(patchText)
+    const rowById = (id) => patchRows.filter((row) => row.id === id)
+    const hostPatchRow = rowById('winstage-sandbox')[0]?.body ?? ''
+    const fsPatchRow = rowById('winstage-fs')[0]?.body ?? ''
+    const shellPatchRow = rowById('winstage-shell')[0]?.body ?? ''
+    check(
+      "G-04c host 行 workspaceRoot 是**中性空值**（bundle 不替用户选工作区）",
+      /^\s*workspaceRoot:\s*''\s*$/m.test(hostPatchRow),
+      JSON.stringify(hostPatchRow.split(/\r?\n/).filter((line) => /workspaceRoot/.test(line))),
+    )
+    check(
+      'G-04d fs 行不再写 cwd/workspaceRoot（改为从 host 行派生）',
+      !/^\s*(cwd|workspaceRoot):/m.test(fsPatchRow),
+      JSON.stringify(fsPatchRow.split(/\r?\n/).filter((line) => /^(cwd|workspaceRoot):/.test(line.trim()))),
+    )
+    check(
+      'G-04e shell 行不再写 workspaceRoot（网络档位仍在）',
+      !/^\s*workspaceRoot:/m.test(shellPatchRow) && /^\s*networkTier:/m.test(shellPatchRow),
+      JSON.stringify(shellPatchRow.split(/\r?\n/).filter((line) => /workspaceRoot|networkTier/.test(line))),
+    )
+
+    // ── 10.2 fs 半边：fake loader rows（host 只有根）⇒ fs 派生它 ────────────────
+    const hostRows = (root, enabled = false) => [{ id: 'winstage-sandbox', config: { enabled, workspaceRoot: root } }]
+    const fsRowWith = (config) => ({ id: 'winstage-fs', config })
+    const makeFs = (rows) => {
+      const Cls = createStagingFileSystem({ base: LocalFileSystem, enabled: () => false })
+      // 必须是**真** cordis Context（Service 基类要用 ctx.reflect.provide）；
+      // loader 行表通过 `ctx.fiber.entry.parent.data` 注入（与生产同一读法）。
+      const ctx = new Context()
+      ctx.fiber.entry = { parent: { data: rows } }
+      const fs = new Cls(ctx, { diffBasisMaxBytes: 1024 * 1024 })
+      fs.log = () => {}
+      fs.logError = () => {}
+      return fs
+    }
+    const derived = makeFs([...hostRows(wsRoot), fsRowWith({})])
+    check(
+      'G-04f host 行给根、fs 行不给 ⇒ fs 使用 host 行的根（desktop 只覆盖 host 行的形态）',
+      derived.workspaceRoot === canonical(wsRoot),
+      JSON.stringify({ got: derived.workspaceRoot, want: canonical(wsRoot) }),
+    )
+    const explicitOnly = makeFs([...hostRows(''), fsRowWith({ cwd: wsRoot })])
+    check(
+      'G-04g fs 行显式根仍然权威（host 行留空时用它）',
+      explicitOnly.workspaceRoot === canonical(wsRoot),
+      JSON.stringify({ got: explicitOnly.workspaceRoot }),
+    )
+    let conflictError
+    try {
+      makeFs([...hostRows(wsRoot), fsRowWith({ cwd: otherRoot })])
+    } catch (error) {
+      conflictError = error
+    }
+    check(
+      'G-04h fs 行显式根 ≠ host 行 ⇒ FS_STAGE_ROOT_DRIFT（冲突 fail-closed，不静默挑一个）',
+      conflictError?.code === 'FS_STAGE_ROOT_DRIFT',
+      JSON.stringify({ code: conflictError?.code, message: String(conflictError?.message ?? '').slice(0, 120) }),
+    )
+    const wsOnlyDerivable = makeFs([...hostRows(wsRoot), fsRowWith({ workspaceRoot: wsRoot })])
+    check(
+      'G-04i fs 行只写 workspaceRoot、host 行有同一个根 ⇒ 合法（cwd 由 host 行派生）',
+      wsOnlyDerivable.workspaceRoot === canonical(wsRoot),
+      JSON.stringify({ got: wsOnlyDerivable.workspaceRoot }),
+    )
+
+    // ── 10.3 shell 半边：同一个单源判据（纯函数 + 真实执行器方法）──────────────
+    const { createWinStageShellExecutor, workspaceRootsOfLoaderRows, resolveWorkspaceRoot } = await import(
+      '../dsh-plugin/shell-executor.ts'
+    )
+    const byRows = workspaceRootsOfLoaderRows([...hostRows(wsRoot), fsRowWith({}), { id: 'winstage-shell', config: {} }])
+    check(
+      'G-04j shell 半边能从行表里读到 host 行的根（hostRoot）',
+      byRows.hostRoot === wsRoot && byRows.fsRoot === undefined && byRows.shellRoot === undefined,
+      JSON.stringify(byRows),
+    )
+    const resolvedHostOnly = resolveWorkspaceRoot(byRows, undefined)
+    check(
+      'G-04k host-only ⇒ 生效根 = host 行（shell/fs 都不用猜 cwd）',
+      resolvedHostOnly.root === wsRoot && !resolvedHostOnly.explicitConflict && !resolvedHostOnly.hostConflict,
+      JSON.stringify(resolvedHostOnly),
+    )
+    const fsVsShell = resolveWorkspaceRoot({ fsRoot: wsRoot, shellRoot: otherRoot, hostRoot: undefined })
+    check(
+      'G-04l fs 行与 shell 行都显式且不同 ⇒ explicitConflict（fail-closed 事实）',
+      fsVsShell.explicitConflict === true && fsVsShell.root === wsRoot,
+      JSON.stringify(fsVsShell),
+    )
+    const fsVsHost = resolveWorkspaceRoot({ fsRoot: otherRoot, hostRoot: wsRoot })
+    check(
+      'G-04m 显式根 ≠ host 行 ⇒ hostConflict（fail-closed 事实）',
+      fsVsHost.hostConflict === true,
+      JSON.stringify(fsVsHost),
+    )
+    const ShellCls = createWinStageShellExecutor({ workspaceFor: () => ({}) })
+    const makeShell = (rows) => {
+      const exec = new ShellCls({ fiber: { entry: { parent: { data: rows } } } }, {})
+      exec.log = () => {}
+      exec.logError = () => {}
+      return exec
+    }
+    const shellDerived = makeShell([...hostRows(wsRoot), fsRowWith({}), { id: 'winstage-shell', config: {} }])
+    check(
+      'G-04n 真实执行器 effectiveWorkspaceRoot() = host 行的根（desktop 只覆盖 host 行即可）',
+      shellDerived.effectiveWorkspaceRoot() === wsRoot,
+      JSON.stringify({ got: shellDerived.effectiveWorkspaceRoot() }),
+    )
+    let shellConflict
+    try {
+      makeShell([...hostRows(wsRoot), fsRowWith({ cwd: otherRoot }), { id: 'winstage-shell', config: {} }]).effectiveWorkspaceRoot()
+    } catch (error) {
+      shellConflict = error
+    }
+    check(
+      'G-04o shell 半边在显式根与 host 行冲突时 **拒绝执行**（WINSTAGE_SHELL_ROOT_CONFLICT）',
+      shellConflict?.code === 'WINSTAGE_SHELL_ROOT_CONFLICT' && shellConflict?.winstage?.executed === false,
+      JSON.stringify({ code: shellConflict?.code, executed: shellConflict?.winstage?.executed }),
+    )
+  }
+  section('11. R41-FOREIGN-READ：异工作区里暂存的写入必须读得到（写成功 / 读不存在的自相矛盾）')
+  {
+    const store = join(SCRATCH, 'foreign-store')
+    const configuredWs = join(SCRATCH, 'foreign-configured-ws')
+    const foreignWs = join(SCRATCH, 'foreign-session-ws')
+    for (const dir of [store, configuredWs, foreignWs]) mkdirSync(dir, { recursive: true })
+    writeFileSync(join(foreignWs, 'real-only.txt'), 'REAL-EXTERNAL')
+    writeFileSync(join(configuredWs, 'inside.txt'), 'REAL-INSIDE')
+    const previous = process.env.WINSTAGE_STAGE_ROOT
+    process.env.WINSTAGE_STAGE_ROOT = store
+    disposeReviewServices()
+    try {
+      const Cls = createStagingFileSystem({ base: LocalFileSystem, enabled: () => true, sessionId: 'r34-foreign' })
+      // 真 Context + ambient initiator：会话 cwd = foreignWs（与配置根 configuredWs 不同）
+      const ctx = new Context()
+      ctx.provide('agents', {
+        currentInitiator: () => ({ session: { id: 'r34-foreign', header: { cwd: foreignWs } } }),
+      })
+      const fs = new Cls(ctx, { cwd: configuredWs, diffBasisMaxBytes: 1024 * 1024 })
+      const logs = { error: [] }
+      fs.log = () => {}
+      fs.logError = (message) => logs.error.push(String(message))
+      const at = (abs) => ({ targetKey: abs, displayPath: abs })
+      const stagedAbs = join(foreignWs, 'g41.txt')
+      const body = 'STAGED-FOREIGN-CONTENT'
+      const wrote = await fs.writeText(at(stagedAbs), body, undefined, undefined, undefined)
+      check(
+        '11a 异工作区写入报告成功（operation=create）且真实磁盘零写',
+        wrote?.operation === 'create' && !existsSync(stagedAbs),
+        JSON.stringify({ op: wrote?.operation, exists: existsSync(stagedAbs) }),
+      )
+      const read = await fs.readText(at(stagedAbs)).catch((error) => ({ error }))
+      check(
+        '11b 立即 readText 读到暂存内容（修复前：FS_NOT_FOUND —— 本套件的红证据）',
+        read === body,
+        JSON.stringify(read),
+      )
+      const stat = await fs.stat(at(stagedAbs))
+      check('11c stat 看到暂存文件与真实字节数', stat?.type === 'file' && stat?.size === Buffer.byteLength(body), JSON.stringify(stat))
+      const bytes = await fs.readBytes(at(stagedAbs))
+      check('11d readBytes 读到暂存字节', Buffer.from(bytes).toString('utf8') === body, JSON.stringify(bytes?.length))
+      const window = await fs.readByteRange(at(stagedAbs), { offset: 0, length: 6 })
+      check('11e readByteRange 读到暂存窗口', Buffer.from(window).toString('utf8') === 'STAGED', JSON.stringify(Buffer.from(window).toString('utf8')))
+      const listing = (await fs.listDir(at(foreignWs))).map((entry) => entry.name).sort()
+      check(
+        '11f listDir 同时列出暂存子项与真实子项',
+        listing.includes('g41.txt') && listing.includes('real-only.txt'),
+        JSON.stringify(listing),
+      )
+      const streamed = []
+      for await (const chunk of await fs.streamText(at(stagedAbs))) streamed.push(chunk)
+      check('11g streamText 读到暂存内容', streamed.join('') === body, JSON.stringify(streamed.join('')))
+      const realRead = await fs.readText(at(join(foreignWs, 'real-only.txt')))
+      check('11h 没有暂存条目的外部文件仍读真实磁盘（不泄漏、不改变既有行为）', realRead === 'REAL-EXTERNAL', JSON.stringify(realRead))
+      const missing = await fs.readText(at(join(foreignWs, 'missing.txt'))).catch((error) => ({ code: error?.code }))
+      check('11i 既无暂存也不存在的路径仍是 FS_NOT_FOUND', missing?.code === 'FS_NOT_FOUND', JSON.stringify(missing))
+      const insideAbs = join(configuredWs, 'inside-new.txt')
+      await fs.writeText(at(insideAbs), 'STAGED-INSIDE', undefined, undefined, undefined)
+      const insideRead = await fs.readText(at(insideAbs)).catch((error) => ({ error }))
+      check('11j 异工作区会话写进配置根内的文件同样读得到（相对键空间）', insideRead === 'STAGED-INSIDE', JSON.stringify(insideRead))
+      check(
+        '11k 异工作区读路径仍记一条"配置根不一致"的 error 日志（不静默）',
+        logs.error.some((line) => line.includes('会话工作区') && line.includes('不同')),
+        JSON.stringify(logs.error.slice(0, 1)),
+      )
+    } finally {
+      if (previous === undefined) delete process.env.WINSTAGE_STAGE_ROOT
+      else process.env.WINSTAGE_STAGE_ROOT = previous
+      disposeReviewServices()
+    }
   }
 } finally {
   disposeReviewServices()

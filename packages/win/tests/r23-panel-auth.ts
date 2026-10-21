@@ -251,6 +251,109 @@ section('D. 静态守卫：生产接线必须注入 connection 并把 authorizeI
   )
 }
 
+section('E. R41-SEC04：?session= 必须绑定到宿主真实会话（存在 + cwd==workspaceRoot）')
+
+{
+  /** 假 sessionQuery（真实形状：observeSession(id) → {header:{id,cwd}}；NOT_FOUND 用稳定 code） */
+  const fakeQuery = (mode) => {
+    const calls = []
+    return {
+      calls,
+      async observeSession(id) {
+        calls.push(id)
+        if (mode === 'not-found') {
+          const error = new Error(`session "${id}" not found`)
+          error.code = 'SESSION_QUERY_SESSION_NOT_FOUND'
+          throw error
+        }
+        if (mode === 'throw') throw new Error('session backend down')
+        if (mode === 'foreign') return { header: { id, cwd: join(REPO, 'some-other-workspace') } }
+        if (mode === 'no-cwd') return { header: { id } }
+        return { header: { id, cwd: WS_ROOT } }
+      },
+    }
+  }
+  const WS_ROOT = join(REPO, '.t', 'r23-panel-auth', 'panel-ws')
+  const makeHandler = ({ mode, isEnabled = () => true, authorize = () => true, withService = true } = {}) => {
+    const query = fakeQuery(mode)
+    let enabledCalls = 0
+    const handler = createPanelHandler({
+      workspaceRoot: WS_ROOT,
+      env: { LOCALAPPDATA: join(REPO, '.t', 'r23-panel-auth', 'localappdata') },
+      isEnabled: () => { enabledCalls += 1; return isEnabled() },
+      authorize,
+      ...(withService ? { sessionQueryOf: () => query } : {}),
+    })
+    return { handler, query, enabledCalls: () => enabledCalls }
+  }
+  const snap = async (handler, sid) => {
+    const res = makeRes()
+    await handler(req(`/winstage-panel/snapshot?session=${encodeURIComponent(sid)}`), res)
+    let body
+    try { body = JSON.parse(res.body) } catch { body = undefined }
+    return { res, body }
+  }
+
+  {
+    const { handler, query } = makeHandler({ mode: 'not-found' })
+    const { res, body } = await snap(handler, 'ghost-session')
+    check('E1 不存在的会话 id ⇒ 403 session-not-authorized（不泄任何快照）', res.status === 403 && body?.code === 'session-not-authorized' && body?.snapshot === undefined && body?.files === undefined, `status=${res.status} body=${String(res.body).slice(0, 120)}`)
+    check('E1.2 会话校验确实调用了宿主 sessionQuery（不是走本地猜测）', query.calls.length === 1 && query.calls[0] === 'ghost-session', `calls=${JSON.stringify(query.calls)}`)
+  }
+  {
+    const { handler } = makeHandler({ mode: 'foreign' })
+    const { res, body } = await snap(handler, 'victim-in-other-workspace')
+    check('E2 会话 cwd 属于别的工作区 ⇒ 403 session-workspace-mismatch', res.status === 403 && body?.reason === 'session-workspace-mismatch' && body?.snapshot === undefined, `status=${res.status} reason=${body?.reason}`)
+  }
+  {
+    const { handler } = makeHandler({ mode: 'match' })
+    const { res, body } = await snap(handler, 'own-session')
+    check('E3 会话存在且 cwd==workspaceRoot ⇒ 放行到既有业务路径（200/404 均可，且不是 session-*）', (res.status === 200 || res.status === 404) && String(body?.code ?? '').startsWith('session-') === false, `status=${res.status} code=${body?.code}`)
+  }
+  {
+    const { handler } = makeHandler({ mode: 'throw' })
+    const { res, body } = await snap(handler, 'own-session')
+    check('E4 sessionQuery 后端异常 ⇒ 503 session-check-unavailable（fail-closed）', res.status === 503 && body?.code === 'session-check-unavailable' && body?.snapshot === undefined, `status=${res.status} code=${body?.code}`)
+  }
+  {
+    const { handler } = makeHandler({ mode: 'no-cwd' })
+    const { res, body } = await snap(handler, 'own-session')
+    check('E5 会话 header 无 cwd（无法证明工作区）⇒ 403 fail-closed', res.status === 403 && body?.reason === 'session-workspace-unknown', `status=${res.status} reason=${body?.reason}`)
+  }
+  {
+    const { handler } = makeHandler({ withService: false })
+    const { res } = await snap(handler, 'any-session')
+    check('E6 宿主没有 sessionQuery（老宿主/离线装配）⇒ 兼容旧行为并显式降级（不伪称已校验）', res.status === 404 || res.status === 200, `status=${res.status}`)
+  }
+  {
+    const { handler, query } = makeHandler({ mode: 'foreign', authorize: (_q, r) => { r.writeHead(401, {}); r.end('auth required'); return false } })
+    const { res } = await snap(handler, 'own-session')
+    check('E7 未授权 ⇒ 401 且零会话查询（authorize 仍先于 session 校验）', res.status === 401 && query.calls.length === 0, `status=${res.status} calls=${query.calls.length}`)
+  }
+  {
+    const { handler, query } = makeHandler({ mode: 'foreign', isEnabled: () => false })
+    const { res, body } = await snap(handler, 'own-session')
+    check('E8 关态 + 别的会话 ⇒ 仍回 503 disabled（关态语义不被会话校验改写），且不读快照', body?.code === 'disabled' && body?.snapshot === undefined, `status=${res.status} code=${body?.code}`)
+    check('E8.2 关态也要先完成会话校验再决定响应（拒绝路径仍被走到）', query.calls.length === 1, `calls=${query.calls.length}`)
+  }
+  {
+    const { handler, query } = makeHandler({ mode: 'match' })
+    const res = makeRes()
+    await handler(req('/winstage-panel/snapshot?session='), res)
+    check('E9 空 session id（无会话身份的共享存储）不触发会话校验（兼容路径不变）', query.calls.length === 0, `calls=${query.calls.length}`)
+  }
+  {
+    const src = readFileSync(join(REPO, 'dsh-plugin', 'host-plugin.ts'), 'utf8')
+    const handlerAt = src.indexOf('export function createPanelHandler')
+    const block = src.slice(handlerAt, handlerAt + 12000)
+    const sessionAt = block.indexOf('authorizePanelSession(')
+    const payloadAt = block.indexOf('buildPanelPayload(')
+    check('E10 静态守卫：createPanelHandler 里会话校验出现在 buildPanelPayload 之前（未校验零构建）', sessionAt >= 0 && payloadAt > 0 && sessionAt < payloadAt, `sessionAt=${sessionAt} payloadAt=${payloadAt}`)
+    check('E11 静态守卫：apply() 把 sessionQueryOf/sessionsOf 交给面板 handler（生产接线，非仅单测）', /sessionQueryOf:\s*\(\)\s*=>/.test(src) && /sessionsOf:\s*\(\)\s*=>/.test(src), 'sessionQueryOf/sessionsOf in apply()')
+    check('E12 静态守卫：会话校验用宿主 sessionQuery.observeSession 与 canonical(header.cwd) 对比，而不是信任 query', /observeSession\(/.test(src) && /compareKey\(canonical\(cwd\)\)\s*===\s*compareKey\(canonical\(workspaceRoot\)\)/.test(src), 'observeSession + canonical compare')
+  }
+}
+
 W('')
 W('='.repeat(64))
 const verdict = failures === 0 ? 'PASS' : 'FAIL'

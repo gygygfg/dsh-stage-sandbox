@@ -22,13 +22,14 @@
  * 用法：node tests\r21-registry-apply.ts
  */
 
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
   DEFAULT_VALUE_SUFFIX,
   KEY_WOW64,
+  REG_APPLY_LOCK_NAME,
   REG_OPTIONS,
   REG_STAGE_FLAGS,
   createRegistryStage,
@@ -36,6 +37,7 @@ import {
   encodeJournalRecord,
   journalRecordForOperation,
   readRegistryJournal,
+  resolveRegistryApplyLockPath,
 } from '../src/registry-stage.ts'
 import { REG_STATUS, decodeRegistryValue, encodeRegistryValue, parseRegistryPath } from '../src/registry-guard.ts'
 
@@ -376,6 +378,67 @@ try {
     // 7d：跨 apply 调用仍然幂等（第二次 apply 不再写）
     const second = stage3.apply()
     check('S7.8 二次 apply 幂等（applied=0，无重复写入）', second.applied.length === 0, JSON.stringify({ applied: second.applied, skipped: second.skipped.map((s) => s.reason) }))
+  }
+
+  // ═══════════════════════ S8 跨进程 apply 锁（R41 / REG-06） ═══════════════════════
+  section('S8 跨进程 apply 锁：忙时 fail-closed、串行化后不重放、陈旧锁回收')
+  {
+    // 8a：第一个 apply 持锁期间，第二个实例 apply ⇒ REG_APPLY_BUSY（零写入、锁路径/持有者可读）
+    const real = seedRegistry()
+    const sessionDir = join(workRoot, 's8-lock')
+    const lockPath = resolveRegistryApplyLockPath(sessionDir)
+    const a = createRegistryStage({ sessionDir, sessionId: 's8a', reader: real.reader, writer: real.writer })
+    const b = createRegistryStage({ sessionDir, sessionId: 's8b', reader: real.reader, writer: real.writer })
+    a.open()
+    b.open()
+    check('S8.1 锁路径 = <sessionDir>/registry/apply.lock', lockPath === join(sessionDir, 'registry', REG_APPLY_LOCK_NAME), lockPath)
+    a.stageSetValue(`${KEY}\\Dup`, 'V', 'REG_SZ', 'locked')
+    b.stageSetValue(`${KEY}\\Dup`, 'V', 'REG_SZ', 'locked')
+    a.freezeCandidate()
+    b.freezeCandidate()
+    let busyError = null
+    let lockHeldDuring = null
+    let writesDuringBusy = 0
+    let firstCall = true
+    const hookedWriter = {
+      ...real.writer,
+      setValue(registryPath, name, type, dataHex, options = {}) {
+        if (firstCall) {
+          firstCall = false
+          lockHeldDuring = existsSync(lockPath)
+          const before = real.log.writes.length
+          try {
+            b.apply({ applyLockTimeoutMs: 0 })
+          } catch (error) {
+            busyError = error
+          }
+          writesDuringBusy = real.log.writes.length - before
+        }
+        return real.writer.setValue(registryPath, name, type, dataHex, options)
+      },
+    }
+    const applyA = a.apply({ writer: hookedWriter })
+    check('S8.2 第一个 apply 持锁（写入窗口内锁文件存在）', lockHeldDuring === true && applyA.failed.length === 0, JSON.stringify({ lockHeldDuring, failed: applyA.failed }))
+    check('S8.3 持锁期间第二个 apply ⇒ fail-closed REG_APPLY_BUSY（status=5）', busyError?.code === 'REG_APPLY_BUSY' && busyError?.status === REG_STATUS.ERROR_ACCESS_DENIED, busyError ? `${busyError.code}/${busyError.status}` : 'no throw')
+    check('S8.4 REG_APPLY_BUSY 消息带锁路径与持有者 pid（可诊断，不静默）', typeof busyError?.message === 'string' && busyError.message.includes('apply.lock') && /pid/i.test(busyError.message), busyError ? busyError.message.slice(0, 160) : 'no throw')
+    check('S8.5 忙时第二个 apply 零写入；锁在第一个 apply 结束后释放', writesDuringBusy === 0 && existsSync(lockPath) === false, JSON.stringify({ writesDuringBusy, lockAfter: existsSync(lockPath) }))
+
+    // 8b：串行化后第二个实例重读已解决状态 ⇒ already-applied，不重复 replay
+    const applyB = b.apply()
+    check('S8.6 串行化后的第二个 apply 无失败、applied=0（already-applied 而非重复写入）', applyB.failed.length === 0 && applyB.applied.length === 0, JSON.stringify({ applied: applyB.applied, failed: applyB.failed, skipped: applyB.skipped.map((s) => s.reason) }))
+    check('S8.7 真实 hive 只收到一次该写入（无重复 replay）', real.log.writes.filter((entry) => entry[0] === 'set-value' && entry[2] === 'V').length === 1, JSON.stringify(real.log.writes))
+
+    // 8c：陈旧锁（持锁进程已被强杀 ⇒ pid 不存在）必须被回收，而不是把整批挡死
+    const real2 = seedRegistry()
+    const staleDir = join(workRoot, 's8-stale')
+    const staleStage = createRegistryStage({ sessionDir: staleDir, sessionId: 's8-stale', reader: real2.reader, writer: real2.writer })
+    staleStage.open()
+    staleStage.stageSetValue(`${KEY}\\Dup`, 'V', 'REG_SZ', 'after-stale')
+    staleStage.freezeCandidate()
+    mkdirSync(join(staleDir, 'registry'), { recursive: true })
+    writeFileSync(resolveRegistryApplyLockPath(staleDir), JSON.stringify({ pid: 999999, at: new Date().toISOString(), scope: 'registry-apply' }))
+    const staleApply = staleStage.apply()
+    check('S8.8 死 pid 的陈旧锁被回收，apply 正常完成且锁已清理', staleApply.failed.length === 0 && !existsSync(resolveRegistryApplyLockPath(staleDir)), JSON.stringify({ failed: staleApply.failed, lock: existsSync(resolveRegistryApplyLockPath(staleDir)) }))
   }
 } finally {
   try { rmSync(workRoot, { recursive: true, force: true }) } catch { /* best effort */ }

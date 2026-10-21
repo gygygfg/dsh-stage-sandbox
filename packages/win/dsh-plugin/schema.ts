@@ -212,7 +212,7 @@ const DICT = {
   }),
   workspaceRoot: field('string', {
     default: '',
-    description: '沙箱工作区根目录；留空则使用插件所在项目的根目录。',
+    description: '沙箱工作区根目录（R41-G04 唯一配置入口；fs/shell 未显式配置时由此派生）。留空 = 未配置：开态装配期 fail-closed（WINSTAGE_WORKSPACE_ROOT_MISSING），关态不校验；profile 只需覆盖 host 行。',
   }),
   probeOnStart: field('boolean', {
     default: true,

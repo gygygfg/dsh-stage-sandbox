@@ -133,6 +133,67 @@ const DEFAULT_MAX_FILES = 5000
 const MAX_SKIP_RECORDS = 200
 
 /**
+ * ── R41 · 外壳启动噪声（默认忽略，**唯一判据来源**）──────────────────────────
+ *
+ * 真机 E2E 实测（R41）：PowerShell 每次启动都会写几处**与用户意图无关**的固定/瞬态产物：
+ *
+ *   1. `%LOCALAPPDATA%\Microsoft\Windows\PowerShell\StartupProfileData-Interactive`
+ *      / `StartupProfileData-NonInteractive` —— PS 自己的启动/退出性能缓存；
+ *   2. `%LOCALAPPDATA%\Temp\dsh-stage-temp\<每次新 uuid>\__PSScriptPolicyTest_*.ps1`
+ *      —— AppLocker 策略探针；`dsh-stage-temp` 是**本工具自己**的临时根
+ *      （`src/executor.ts:5671` 用 `join(tmpdir(), 'dsh-stage-temp')`）。
+ *
+ * 这些写入经 shim 落进暂存树的 `fs\<盘>\…` 布局，随后被
+ * `Workspace.captureAfterExecution()` 反解成**工作区外的候选条目**，还会进
+ * `sandbox-audit.json` 的写计数 ⇒ 一次普通命令就给面板塞进 6 条"用户没干过"的待审项，
+ * 并让审计的"工作区外写入"数字虚高（R41 复现：`.t/r41/ux/probe-shell-noise.ts`）。
+ *
+ * ── 判定为什么这么窄（以及为什么它不能掩盖用户意图）──────────────────────────
+ *   · 只认**文件名 + 固定目录**的合取：
+ *       - basename 以 `__psscriptpolicytest_` 开头，**且**路径里有一段就是
+ *         `dsh-stage-temp`（本工具自己的临时根；用户在别处放的同名文件不命中）；
+ *       - basename 形如 `StartupProfileData-<...>`，**且**父目录恰好是
+ *         `Microsoft\Windows\PowerShell`（同名的用户文件在别处不命中）。
+ *   · 不按"工作区外""Temp 目录""看起来随机"这类宽类别过滤 ⇒ `%TEMP%\my-own.txt`、
+ *     `...\Temp\dsh-stage-temp\<id>\notes-for-user.txt` 这类**用户内容照样是候选**。
+ *   · 被忽略的条目**不是静默消失**：`walk()` 记一条 `skipped`（reason
+ *     `shell-internal-artifact`），shell 侧把条数写进人工侧日志与 capture 报告
+ *     （`noiseFiltered`），审计报告同样带 `noiseFiltered` 计数 ⇒ 可追溯。
+ *   · 逃生口：`WINSTAGE_CAPTURE_NOISE=0`（或 `createRunCapture({noiseFilter:false})`）
+ *     关闭过滤，端到端排查时这些条目照旧出现。
+ */
+export const SHELL_INTERNAL_ARTIFACT_REASON = 'shell-internal-artifact'
+
+/** 过滤是否生效（环境变量逃生口 `WINSTAGE_CAPTURE_NOISE=0`） */
+export function shellNoiseFilterEnabled(env = process.env) {
+  const raw = env && env.WINSTAGE_CAPTURE_NOISE !== undefined && env.WINSTAGE_CAPTURE_NOISE !== null
+    ? String(env.WINSTAGE_CAPTURE_NOISE).trim()
+    : ''
+  return raw !== '0'
+}
+
+/**
+ * 该路径是否属于**已知的外壳内部/瞬态产物**（见上方长注释的窄判据）。
+ * @param {unknown} input 绝对或相对路径（只做词法判定，不解析链接）
+ * @returns {boolean}
+ */
+export function isShellInternalArtifactPath(input) {
+  const raw = String(input ?? '')
+  if (raw.length === 0) return false
+  const parts = raw.replace(/[\\/]+/g, '/').toLowerCase().split('/').filter((part) => part.length > 0)
+  if (parts.length === 0) return false
+  const base = parts[parts.length - 1]
+  const parents = parts.slice(0, -1)
+  // ① PowerShell 启动性能缓存：文件名 + 固定父目录，两者同时命中才算
+  if (/^startupprofiledata-[a-z0-9._-]+$/.test(base) && parents.slice(-3).join('/') === 'microsoft/windows/powershell') {
+    return true
+  }
+  // ② PowerShell AppLocker 探针：文件名前缀 + 落在本工具自己的 dsh-stage-temp 下
+  if (base.startsWith('__psscriptpolicytest_') && parents.includes('dsh-stage-temp')) return true
+  return false
+}
+
+/**
  * Phase 1 / WP2：**模型可见的失败文案**（本模块唯一的模板来源）。
  *
  * ⚠ 本模块**没有**模型可见通道（见文件头"痕迹边界"）：`failures[]` 只交给调用方，
@@ -420,6 +481,11 @@ export function createRunCapture(options = {}) {
   const exclude = (Array.isArray(options.exclude) ? options.exclude : DEFAULT_EXCLUDE).map(globToRegExp)
   const maxFileBytes = Number.isFinite(options.maxFileBytes) ? options.maxFileBytes : DEFAULT_MAX_FILE_BYTES
   const maxFiles = Number.isFinite(options.maxFiles) ? options.maxFiles : DEFAULT_MAX_FILES
+  /**
+   * R41：外壳启动噪声默认**不纳入**监视集（判据见 `isShellInternalArtifactPath()`）。
+   * `options.noiseFilter === false` / `WINSTAGE_CAPTURE_NOISE=0` 可整体关闭，用于端到端排查。
+   */
+  const noiseFilter = options.noiseFilter !== false && shellNoiseFilterEnabled()
 
   /** 镜像索引绝对路径（**自己的文件**；绝不触碰 manifest.json / review.json / queue.json） */
   const mirrorPath = join(String(store.dir), MIRROR_BASENAME)
@@ -427,9 +493,28 @@ export function createRunCapture(options = {}) {
   /** 本进程内最近一次 `prime()` 的 before 镜像；`capture()` 在镜像文件被删掉时用它兜底 */
   let lastPrimed = new Map()
 
-  /** 当前监视集（仅元数据，不读内容） */
+  /**
+   * 当前监视集（仅元数据，不读内容）。
+   *
+   * R41：默认滤掉已知的外壳启动噪声（`isShellInternalArtifactPath()`），并**逐条记 skip**
+   * ——"没进捕获面"这件事必须可追溯，不能变成静默少报（本仓库对安静截断的一贯口径）。
+   * `prime()` / `snapshot()` / `diff()` 共用这一份遍历，因此三处的"捕获面"逐字一致。
+   */
   function walk() {
-    return walkMonitored(roots, exclude, maxFileBytes, maxFiles)
+    const result = walkMonitored(roots, exclude, maxFileBytes, maxFiles)
+    if (!noiseFilter) return { ...result, noiseFiltered: 0 }
+    const kept = new Map()
+    let noiseFiltered = 0
+    for (const [abs, info] of result.files) {
+      if (isShellInternalArtifactPath(abs)) {
+        noiseFiltered += 1
+        result.skipped.push({ path: abs, reason: SHELL_INTERNAL_ARTIFACT_REASON })
+        continue
+      }
+      kept.set(abs, info)
+    }
+    if (result.skipped.length > MAX_SKIP_RECORDS) result.skipped.length = MAX_SKIP_RECORDS
+    return { ...result, files: kept, noiseFiltered }
   }
 
   /** 清单键：工作区内 = 相对路径，工作区外 = 规范化绝对路径（与 `Workspace.keyOf()` / `store.ts` 的键模型同一套） */
@@ -978,5 +1063,5 @@ export function createRunCapture(options = {}) {
     return { changes: changeRecords, staged: stagedChanges.length, restored, failures, splits }
   }
 
-  return { prime, snapshot, diff, capture, mirrorPath, roots: [...roots], exclude: [...exclude] }
+  return { prime, snapshot, diff, capture, mirrorPath, roots: [...roots], exclude: [...exclude], noiseFilter }
 }

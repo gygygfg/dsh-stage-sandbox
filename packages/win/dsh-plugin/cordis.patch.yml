@@ -40,21 +40,29 @@
 # 会被静默丢弃（含它携带的 config）。3081 的
 # `.t\dsh2\home\profiles\dsh2\cordis.patch.yml` 就是这个形态，必须与本文件同步改名。
 #
-# ── C-8：两个"根"结构性同源（本轮加了一道**运行期**守卫）────────────────────────
-# host 行用 `config.workspaceRoot`、fs 行用 `config.cwd` 表达同一个暂存根。两者一旦漂移，
-# `getReviewService()`（review-service.mjs，按 canonical 根做**进程内单例**）会产生两个
-# 单例 ⇒「暂存写到 A、快照发布在 B」，面板永远看不到改动。因此这里用 YAML 锚点把两者
-# 绑成**同一个字面值**：改一处即两处同改。fs 行额外带一个 `workspaceRoot`，供
-# `staging-fs.mjs` 的 fail-closed 自校验使用（两键都给了且不一致 → 直接 throw）。
+# ── R41-G04：**单源**工作区根（host 行是唯一配置入口）──────────────────────────
+# 历史形态（R41 之前）：用 YAML 锚点 `&winstageRoot` 把同一个字面值同时写进
+#   host 行 `workspaceRoot`、fs 行 `cwd`+`workspaceRoot`、shell 行 `workspaceRoot`。
+#   问题：bundle 里那个字面值是**本仓开发机路径**；profile 覆盖层对 `config` 是
+#   **整体替换**，于是"只覆盖 host 行"的 profile（`~/.dsh/profiles/desktop` 就是这种）
+#   会让 fs/shell 继续用开发机路径 ⇒ 换机器即漂移（G-04）。
 #
-# ★ **shell 半边的根不再猜 `process.cwd()`**（那正是"两个根"的成因，实测见
-#   `git 历史（历史归档已清理）` §1）：`shell-executor.mjs` 的
-#   `effectiveWorkspaceRoot()` 现读 loader 行表，取 **fs 行的 `cwd`** 作为权威根
-#   （它才是 fs 半边建 Store 用的那个值），并与 shell 行的 `workspaceRoot` 交叉校验；
-#   两处不一致 ⇒ error 级日志 + 以 fs 根为准（绝不按两个根分叉出两个单例）。
-#   缺失显式配置 ⇒ 抛 `WINSTAGE_SHELL_NO_WORKSPACE_ROOT`（绝不回退 cwd）。
-#   ⚠ 推论：**profile 覆盖层若覆盖 `winstage-shell` 行，必须重述 `workspaceRoot`**；
-#     覆盖 `winstage-fs` 行则必须重述 `cwd` 与 `workspaceRoot`（config 是整体替换）。
+# 现在（单源，本文件所有 **config 值** 都不再出现绝对路径）：
+#   · host 行 `winstage-sandbox.config.workspaceRoot` = **唯一配置入口**；bundle 里留空，
+#     profile（或安装方）只需覆盖这一行；
+#   · fs 行**不写** `cwd`/`workspaceRoot` ⇒ `staging-fs.ts` 从 loader 行表派生 host 行的根；
+#   · shell 行**不写** `workspaceRoot` ⇒ `shell-executor.ts::effectiveWorkspaceRoot()`
+#     同样派生 host 行的根（它仍读 fs 行的显式值，只是本文件不再写）。
+#
+# ★ 显式覆盖仍然权威，冲突仍然 fail-closed：
+#   · profile 若**显式**给 fs 行写 `cwd`/`workspaceRoot`，以它为准（fs 行是真正建 Store 的那半边）；
+#   · 但"显式值 ≠ host 行"或"fs 行 ≠ shell 行（两处都显式）"⇒ **拒绝装载/拒绝执行**
+#     （`FS_STAGE_ROOT_DRIFT` / `WINSTAGE_SHELL_ROOT_CONFLICT`），绝不静默挑一个 ——
+#     `getReviewService()` 按 canonical 根做进程内单例，挑错就会「暂存写到 A、快照发布在 B」。
+#   · fs 行只写 `workspaceRoot` 不写 `cwd`、且没有 host 行可派生 ⇒ 仍是 `FS_STAGE_ROOT_DRIFT`
+#     （R34-G-03：profile 覆盖层必须能自证"哪个根"，不得回退宿主 cwd）。
+#   · 完全没配（host 行留空且 fs/shell 也没写）⇒ fs 半边沿用无配置回退，shell 半边
+#     抛 `WINSTAGE_SHELL_NO_WORKSPACE_ROOT`（不猜 cwd），host 行在开态抛 `WINSTAGE_WORKSPACE_ROOT_MISSING`。
 
 - id: fs-sandbox
   name: '@deepseek-ai/dsh-fs-sandbox'
@@ -144,7 +152,15 @@
       name: 'dsh-winstage-sandbox'
       config:
         enabled: true
-        workspaceRoot: &winstageRoot C:\Users\12075\Desktop\dsh-stage-sandbox
+        # ── R41-G04：**唯一配置入口**（单源）────────────────────────────────────
+        # bundle 里**刻意留空**：绝不硬编码任何开发机/本仓绝对路径（否则换机器即漂移，
+        # 且 fs/shell 两行会跟着用错根）。安装方/ profile 覆盖层只覆盖本键即可：
+        #     - id: winstage-sandbox
+        #       config: { workspaceRoot: <你的工作区> }
+        # fs/shell 两行没显式写根时会从**本行**派生；留空 = 未配置 ⇒ 开态装配期
+        # fail-closed（`WINSTAGE_WORKSPACE_ROOT_MISSING`，见 host-plugin.ts），
+        # 关态不校验（关 = 对原 harness 零影响）。
+        workspaceRoot: ''
         probeOnStart: true
         # ── R16 修复 · D5-R16-1：网络档位的入口**不在本行**，在下面的 `winstage-shell` 行 ──
         # R15（D5-N5）曾把 `networkTier` 写在本行，R16 实测证明那是**死键**：
@@ -162,14 +178,16 @@
       # **必须**保持子路径 specifier（不要改成裸包名）：
       #   a) 裸名解析到 `exports["."]` = host-plugin.mjs，会把 host-plugin **apply 两次**
       #      （命令 definitionId 冲突）；
-      #   b) 改名会让 profile 覆盖层（断言 `.../fs`）整条被跳过，丢掉 `cwd` 隔离配置。
+      #   b) 改名会让 profile 覆盖层（断言 `.../fs`）整条被跳过，丢掉它携带的 config。
       name: 'dsh-winstage-sandbox/fs'
-      config:
-        # `cwd` 同时是暂存工作区根：`ctx.fs` 的解析基准与暂存树的根必须是同一个目录。
-        # 与 host 行的 `workspaceRoot` 共用同一个锚点（C-8：结构性同源）。
-        cwd: *winstageRoot
-        # fail-closed 自校验用：与 `cwd` 不一致时 staging-fs.mjs 直接 throw。
-        workspaceRoot: *winstageRoot
+      # ── R41-G04：**不再写** `cwd`/`workspaceRoot` ────────────────────────────────
+      # `staging-fs.ts` 从 loader 行表派生 host 行的 `workspaceRoot`（单源）。
+      # 显式写仍然权威（profile 想让 fs 半边用另一个根时写在这里），但：
+      #   · 与 host 行不一致 ⇒ `FS_STAGE_ROOT_DRIFT`（fail-closed，静默挑一个会分叉出
+      #     两个 review 单例）；
+      #   · 只写 `workspaceRoot` 不写 `cwd` 且没有 host 行可派生 ⇒ 同样 drift（R34-G-03）。
+      # 注意：这里**不能**写 `config: {}` 之外的占位根 —— 空串等价于"没配置"，
+      # 而任何真实字面值又会让 bundle 变回不可移植。
 
     - id: winstage-shell
       # 子路径 specifier（与 fs 行同理：裸名会把 host-plugin 装第二遍）。
@@ -182,10 +200,12 @@
       #   `pwsh-sandbox` 行的实测说明）。因此这里用 `!== '0' && (…)` 而不是三目。
       disabled: !!js (() => { const on = (process.env.WINSTAGE_SHELL !== '0') && ((process.env.WINSTAGE_SHELL === '1') || (() => { try { const fs = process.getBuiltinModule('node:fs'); let p = null; if (process.env.DSH_HOME && process.env.DSH_PROFILE) p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; try { if (ctx && typeof ctx.baseUrl === 'string' && ctx.baseUrl.length > 0) p = new URL('cordis.patch.yml', ctx.baseUrl) } catch {} if (!p) return true; if (!fs.existsSync(p)) return true; const m = /id:\s*winstage-sandbox\b([\s\S]*?)(?=\s*-\s*id:|\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return true; const e = /enabled:\s*(true|false)\b/.exec(m[1]); return !e || e[1] !== 'false' } catch { return true } })()); return !on })()
       config:
-        # 与 fs/host 两行共用同一个暂存根锚点（C-8：结构性同源）。
-        # `shell-executor.mjs` 的 `effectiveWorkspaceRoot()` 以 **fs 行的 `cwd`** 为权威、
-        # 与这里的值交叉校验；漂移 ⇒ error 级日志 + 以 fs 根为准（绝不两个根各建一个单例）。
-        workspaceRoot: *winstageRoot
+        # ── R41-G04：**不再写** `workspaceRoot` ────────────────────────────────────
+        # `shell-executor.ts::effectiveWorkspaceRoot()` 从 loader 行表派生：
+        #   fs 行显式根 > 本行显式根 > **host 行 `winstage-sandbox.config.workspaceRoot`**。
+        # 本行显式写仍然权威（诊断/特殊部署可以用），但"本行 ≠ host 行"或"本行 ≠ fs 行"
+        # ⇒ `WINSTAGE_SHELL_ROOT_CONFLICT` 拒绝执行（绝不静默挑一个根）。
+        # 什么都不配也拿不到根 ⇒ `WINSTAGE_SHELL_NO_WORKSPACE_ROOT`（绝不回退 process.cwd()）。
         # ── R16 修复 · D5-R16-1：网络档位的**唯一有效入口**（默认值 = 既有行为，逐字不变）──
         # `OBSERVED_ONLINE`（默认）：不安装任何 WFP 过滤器，出站/入站全开；执行器仍把档位与
         #   `enforced:false` 如实写进 `sandbox-lane.json` 的 `network` 段。

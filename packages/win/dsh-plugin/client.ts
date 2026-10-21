@@ -1084,6 +1084,18 @@ window.__ModuleLoader__.load({
     async function readReview(ctx, sessionId, root) {
       const viaRoute = await readReviewViaRoute(ctx, sessionId)
       if (viaRoute.ok) return { snapshot: viaRoute.snapshot, source: viaRoute.source, store: viaRoute.store }
+      /**
+       * ★ R41-SEC04：宿主**明确拒绝**会话绑定（403 `session-not-authorized` /
+       * 503 `session-check-unavailable`）时，**不得**再走旧布局兜底。
+       *
+       * 旧兜底按同一个 `?session=` 自己拼 `<root>/.dshstage/sessions/<key>/review.json`：
+       * 在还有旧布局的机器上，那等于把"服务端刚拒绝的跨会话读取"重新变成"客户端读别的会话"，
+       * 绑定就白做了。这里返回宿主口径的空结果（面板保持 idle），并带上 `routeDenied`
+       * 供排障（不伪造旧快照）。
+       */
+      if (viaRoute.code === 'session-not-authorized' || viaRoute.code === 'session-check-unavailable') {
+        return { snapshot: null, source: 'host-route', store: undefined, routeDenied: viaRoute.code, staging: viaRoute.staging }
+      }
       const snapshot = await readReviewViaLegacyPath(ctx, sessionId, root)
       /**
        * R13 修复 · D7-b/d：路由被关（`503 disabled`）时宿主仍然告诉我们**两张脸**的状态，

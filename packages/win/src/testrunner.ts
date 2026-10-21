@@ -210,7 +210,7 @@ export const OFFLINE_SUITES = [
   { id: 'build-shim-help', script: 'tests/build-shim-help.ts', title: '工具链回归（build-shim --help/-h 必须纯 usage、退出 0、不改 canonical shim/out）' },
   // R21 证据缺口收口（G1/G2）：注册表 apply 正面对抗样本（大值/默认值/非空键删除/链接键/
   // volatile/32 位视图/重名冲突），并钉住 R21-REG-01（批内同值多条按 WAL 顺序重放）回归。
-  { id: 'r21-registry-apply', script: 'tests/r21-registry-apply.ts', title: 'R21 注册表 apply 对抗样本（大值/默认值/非空键删除/链接键/volatile/32 位视图/重名冲突；44 断言）' },
+  { id: 'r21-registry-apply', script: 'tests/r21-registry-apply.ts', title: 'R21 注册表 apply 对抗样本（大值/默认值/非空键删除/链接键/volatile/32 位视图/重名冲突/跨进程 apply 锁；56 断言）' },
   // R21 证据缺口收口（G4）：readPolicy=record/block 双档 e2e + sensitive-content 端到端脱敏。
   { id: 'r21-fs-policy', script: 'tests/r21-fs-policy.ts', title: 'R21 fs 读策略双档 e2e（readPolicy record/block × readText/readBytes/readByteRange/listDir/stat/lstat；60 断言）' },
   { id: 'r21-sensitive-e2e', script: 'tests/r21-sensitive-e2e.ts', title: 'R21 sensitive-content 端到端脱敏（块标量/URI 内嵌凭据/凭据键真实链路不落明文；49 断言）' },
@@ -221,7 +221,7 @@ export const OFFLINE_SUITES = [
   { id: 'r22-registry-hooked', script: 'tests/r22-registry-hooked.ts', title: 'R22 注册表残余面（ConnectRegistryEx/OverridePredefKey/OpenUserClassesRoot/OpenCurrentUser/SetKeySecurity；24 断言）' },
   { id: 'r22-file-advex', script: 'tests/r22-file-advex.ts', title: 'R22 文件侧残余面（NtQueryDirectoryFileEx 原地分批过滤 / single / 未知类透传；12 断言）' },
   // R23 逐项修复（第二批）：面板路由鉴权（R21-LC-01）；>MAX_PATH 写面（R21-FS-06）。
-  { id: 'r23-panel-auth', script: 'tests/r23-panel-auth.ts', title: 'R23 面板路由鉴权（authorize 先于 buildPanelPayload / 失败 fail-closed / connection 注入静态守卫；18 断言）' },
+  { id: 'r23-panel-auth', script: 'tests/r23-panel-auth.ts', title: 'R23 面板路由鉴权（authorize 先于 buildPanelPayload / 失败 fail-closed / connection 注入静态守卫/会话绑定；32 断言）' },
   { id: 'r23-long-path', script: 'tests/r23-long-path.ts', title: 'R23 >MAX_PATH 写面（\\\\?\\ 长路径写/建目录/rename/delete 进暂存、whiteout 跨进程、遮蔽读拒绝；13 断言）' },
   // R24 逐项修复（第三批）：readPolicy 生产通道 + 自定义 mask 来源；批量 apply 原子性（回滚）。
   { id: 'r24-fs-config', script: 'tests/r24-fs-config.ts', title: 'R24 fs 生产接线（WINSTAGE_READ_POLICY 三态 + config.masks 值级脱敏 + 非法正则 fail-closed；69 断言）' },
@@ -241,7 +241,10 @@ export const OFFLINE_SUITES = [
   { id: 'r31-apply-journal', script: 'tests/r31-apply-journal.ts', title: 'R31 apply 崩溃恢复 WAL（journal 生命周期/崩溃缝恢复/损坏 fail-closed/并发守卫/幂等；10 断言）' },
   // R34：守卫不可用（root-not-creatable / 受限宿主）时，**只读**操作回退真实磁盘；
   // 有既有暂存状态仍 fail-closed；写入永不回退；存储状态机路径守卫堵住尾随空格/点/8.3 绕过。
-  { id: 'r34-guard-unavailable-read', script: 'tests/r34-guard-unavailable-read.ts', title: 'R34 守卫不可用只读回退（STAGE_GUARD_UNAVAILABLE 归一/读回退/有状态不回退/写 fail-closed/状态机路径守卫/快照自校验/STAGE_OUTSIDE 三态/配置漂移/根缺失；47 断言）' },
+  { id: 'r34-guard-unavailable-read', script: 'tests/r34-guard-unavailable-read.ts', title: 'R34 守卫不可用只读回退（STAGE_GUARD_UNAVAILABLE 归一/读回退/有状态不回退/写 fail-closed/状态机路径守卫/快照自校验/STAGE_OUTSIDE 三态/配置漂移/根缺失/G-04 单源根/异工作区暂存读；73 断言）' },
+  // R41：外壳启动噪声过滤（run-capture/shell-executor/CLI 同一判据）+ trust 面板不增加失根计数。
+  { id: 'ux-r41-shell-noise', script: 'tests/ux-r41-shell-noise.ts', title: 'R41 外壳启动噪声过滤（PowerShell StartupProfileData/__PSScriptPolicyTest_* 不进候选/审计；36 断言）' },
+  { id: 'ux-r41-trust-loss', script: 'tests/ux-r41-trust-loss.ts', title: 'R41 trust 面板只读不记账（recordLoss:false 不增加失根次数；3 断言）' },
 ]
 
 /** 需要未受限会话的套件 */

@@ -6,7 +6,7 @@
 真实工作区始终不被写入；沙箱内产生的变化冻结为**候选**，用户批准后才**逐文件**提交。
 
 > **口径以代码为准**：测试套件的唯一权威是 `src/testrunner.ts`
-> （现为 **56 个离线套件 + 4 个沙箱套件 + 1 段 `audit`**），全部以 `.ts` 为准，
+> （现为 **58 个离线套件 + 4 个沙箱套件 + 1 段 `audit`**），全部以 `.ts` 为准，
 > 遗留的 `.mjs` 已全部删除。完整入口见 [`docs/测试套件总览.md`](docs/测试套件总览.md)。
 
 ---
@@ -25,24 +25,19 @@ dsh plugin --profile web add github:gygygfg/dsh-winstage-sandbox   # 或直接�
 - **shim**：发行包只带 C 源码；需要透明模式先 `node tools/fetch-toolchain.ts` 再 `node tools/build-shim.ts`。
 - 发布说明见 [`PUBLISHING.md`](PUBLISHING.md)。
 
-### 安装到非本仓工作区时：三个根必须一起重述
+### 安装到非本仓工作区时：只配置 host 行的根（R41-G04 单源）
 
-bundle patch（`dsh-plugin/cordis.patch.yml`）里的 `workspaceRoot` 是**本仓开发默认值**
-（`C:\Users\12075\Desktop\dsh-stage-sandbox`）。安装到别的机器/工作区时，profile 覆盖层
-必须同时设置三个 loader 行的根：
+bundle patch（`dsh-plugin/cordis.patch.yml`）里的 `workspaceRoot` 现在是**空值**，不再带
+任何开发机绝对路径。安装到别的机器/工作区时，profile 覆盖层**只需设置 host 行**：
 
 ```yaml
 - id: winstage-sandbox
-  config: { workspaceRoot: <你的工作区> }       # host 行
-- id: winstage-fs
-  config: { cwd: <你的工作区>, workspaceRoot: <你的工作区> }  # fs 行两个键都要
-- id: winstage-shell
-  config: { workspaceRoot: <你的工作区> }       # shell 行
+  config: { workspaceRoot: <你的工作区> }       # 唯一配置入口
 ```
 
-原因：`cordis-plugin-include` 对 `config` 是**整体替换、不是深合并**。只写一个键会把其余键
-静默丢掉；R34 起 `staging-fs` 对"给了 `workspaceRoot` 却没有 `cwd`"直接
-`FS_STAGE_ROOT_DRIFT` fail-closed，避免回退宿主 cwd 造成"暂存写到 A、快照发布在 B"。
+`winstage-fs` / `winstage-shell` 没有显式写根时会从 host 行派生；显式覆盖仍然权威，但
+显式值之间冲突会 fail-closed（`FS_STAGE_ROOT_DRIFT` / `WINSTAGE_SHELL_ROOT_CONFLICT`），
+不会静默挑一个造成"暂存写到 A、快照发布在 B"。
 
 根**缺失或不存在**同样 fail-closed：host 行抛 `WINSTAGE_WORKSPACE_ROOT_MISSING` /
 `WINSTAGE_WORKSPACE_ROOT_NOT_FOUND`，fs 行抛 `FS_STAGE_ROOT_NOT_FOUND`；
@@ -53,8 +48,8 @@ bundle patch（`dsh-plugin/cordis.patch.yml`）里的 `workspaceRoot` 是**本�
 ## 1. 三条命令
 
 ```powershell
-.\verify.cmd                   # 56 个离线套件关口（轻量、无报告；清单 = OFFLINE_SUITES）
-.\autotest.cmd                 # 全量：离线 56 + 沙箱 4 + audit，写出 .t/test-report.json
+.\verify.cmd                   # 58 个离线套件关口（轻量、无报告；清单 = OFFLINE_SUITES）
+.\autotest.cmd                 # 全量：离线 58 + 沙箱 4 + audit，写出 .t/test-report.json
 .\autotest.cmd --skip-audit    # 只跑离线确定性测试（不需要未受限会话）
 .\diag.cmd                     # 绑定表契约 + 完整 init（需未受限会话）
 node tools\ebk-sandbox-test.ts # Windows E2E 测试台（需 docker + KVM，见 e2e/README.md）
@@ -136,7 +131,7 @@ node tools\ebk-sandbox-test.ts # Windows E2E 测试台（需 docker + KVM，见 
 | `shim/` | C 注入层源码（`src`/`include`/`injector`/`probe`/`audit`）；构建产物在 `shim/out/`（不入库） |
 | `patches/` | DSH 宿主的可重放补丁包（P1/P2/P3，**默认不应用**）+ 原样副本 `pristine/` |
 | `tools/` | 构建/基线封印/补丁工具/shim 闭环节（受源码封印，见 §5） |
-| `tests/` | 离线关口 56 套件 + 沙箱 4 套件 + 元测试与治理套件 |
+| `tests/` | 离线关口 58 套件 + 沙箱 4 套件 + 元测试与治理套件 |
 | `e2e/` | Windows 实测台（docker + KVM + Windows guest）；`e2e/domains/` 是一次性归档 |
 | `docs/` | 设计与规范（历史轮次报告已在 R33 后清理，git 历史可追溯；见 `docs/README.md`） |
 
