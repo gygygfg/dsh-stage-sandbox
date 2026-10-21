@@ -67,7 +67,7 @@
  *   Registry Hives  https://learn.microsoft.com/en-us/windows/win32/sysinfo/registry-hives
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, truncateSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 import {
@@ -97,6 +97,16 @@ export const OVERLAY_HIVE_NAME = 'overlay.hive'
 export const OVERLAY_JOURNAL_NAME = 'overlay.journal'
 export const OVERLAY_STATE_NAME = 'overlay.state.json'
 export const OVERLAY_DISCARDED_NAME = 'overlay.discarded.journal'
+/**
+ * 撕裂 WAL 尾巴的审计副本（R40）。
+ *
+ * `open()` 发现 `overlay.journal` 尾部是"写了一半"的记录时，**不能**把它留在日志里：
+ * DLL/宿主的下一次追加会接在这半个记录之后，解码器会把追加的记录当成撕裂记录的负载
+ * （待补长度一旦被填满，还会在非记录边界重新同步 ⇒ `REG_STAGE_JOURNAL_CORRUPT`，
+ * 整段 WAL 不可读、之前暂存的操作全部丢失）。标准 WAL 恢复是截断到最后一条完整记录；
+ * 被截掉的原始字节**移到这里**留证（不静默丢），日志本体才继续可追加。
+ */
+export const OVERLAY_TORN_JOURNAL_NAME = 'overlay.journal.torn'
 
 /** 候选来源标记：审批面板据此区分"文件候选"与"注册表候选"（顶层形状同构，只有 changes 不同） */
 export const REGISTRY_CANDIDATE_SOURCE = 'registry-stage'
@@ -778,7 +788,18 @@ function ancestorFolds(canonical) {
 
 /** 变更单元路径：值单元带名字，未命名（默认）值用 `\@` 约定 */
 export function registryValueUnitPath(keyPath, valueName) {
-  return typeof valueName === 'string' && valueName.length > 0 ? `${keyPath}\\${valueName}` : `${keyPath}${DEFAULT_VALUE_SUFFIX}`
+  if (typeof valueName !== 'string' || valueName.length === 0) return `${keyPath}${DEFAULT_VALUE_SUFFIX}`
+  /* R40：注册表**允许**存在一个字面名为 `@` 的值（`RegSetValueExW` 的名字是任意 UTF-16
+   * 串；`@` 只是在 .reg 文件/res.exe 里**表示**默认值的语法，不是名字空间的保留字）。
+   * 若按"`${key}\${name}`"直接拼，`@` 值的单元路径与默认值的单元路径（`${key}\@`）
+   * **逐字相同** ⇒ `overlayChangesToCandidateChanges()` 的 `op|path` 去重会把两个不同
+   * 变更合并成**一个**审批单元，而 `apply()` 按 WAL 重放**两条** ⇒ 审阅者只批准了 1 个
+   * 单元、真实 hive 却被写 2 个值（审批范围被绕过）。
+   * 编码必须**单射**：以 `@` 开头的名字在单元路径里多写一个 `@`（`@`→`@@`，`@@`→`@@@`…），
+   * 默认值仍是单独的 `\@`，两者不再相撞。名字本身仍原样保存在 WAL/候选的 `valueName`
+   * 字段里（单元路径只是身份，不参与反向解码）。 */
+  const encoded = valueName.startsWith('@') ? `@${valueName}` : valueName
+  return `${keyPath}\\${encoded}`
 }
 
 /**
@@ -896,6 +917,20 @@ export function classifyRegistryOperation(operation = {}) {
   const samDesired = operation.samDesired ?? 0
   if (!Number.isInteger(samDesired) || samDesired < 0) {
     throw stageError('REG_STAGE_POLICY_INVALID', `samDesired must be a non-negative integer, got ${String(operation.samDesired)}`)
+  }
+  /**
+   * R40-REG-05：`KEY_WOW64_32KEY | KEY_WOW64_64KEY` 同时出现时，Windows 自身返回
+   * `ERROR_INVALID_PARAMETER (87)`，没有"某个视图"可落。旧实现按 `& 32KEY` 取 view=32
+   * 并**成功暂存**，等于把一次注定失败的调用伪装成可批准操作。这里在策略层直接硬拒
+   * （读/写一视同仁：真实 API 也不会接受这种 samDesired）。C shim 的
+   * `ws_reg_wow64_unrepresentable()` 已同步加同一判据。
+   */
+  if ((samDesired & KEY_WOW64.KEY_WOW64_32KEY) !== 0 && (samDesired & KEY_WOW64.KEY_WOW64_64KEY) !== 0) {
+    return deny(
+      'REG_STAGE_SAM_HARD_DENY',
+      `${api}: samDesired 同时包含 KEY_WOW64_32KEY 与 KEY_WOW64_64KEY（Windows 返回 ERROR_INVALID_PARAMETER 87）⇒ fail-closed`,
+      { flags: ['KEY_WOW64_32KEY', 'KEY_WOW64_64KEY'], samDesired },
+    )
   }
   const wow64Process = operation.wow64Process === true
   const readOnlyApi = READ_ONLY_REGISTRY_APIS.includes(api)
@@ -2429,8 +2464,22 @@ export function createRegistryStage(options = {}) {
     writeJson(queuePath, queue)
   }
 
+  /**
+   * R40：WAL 撕裂尾巴是否已被安全封口（截断到最后一条完整记录）。
+   * 封口失败时**绝不允许追加**：追加到半个记录之后会静默丢记录或把整段 WAL 变不可读。
+   */
+  let journalSealed = true
+
   function appendRecord(record) {
     mkdirSync(stageRoot, { recursive: true })
+    if (journalSealed !== true) {
+      throw stageError(
+        'REG_STAGE_JOURNAL_TORN',
+        `overlay.journal has a torn tail that could not be sealed (truncate failed); ` +
+          'refusing to append after a half-written record (that would silently drop records or corrupt the WAL)',
+        { journalPath, status: REG_STATUS.ERROR_ACCESS_DENIED },
+      )
+    }
     const buffer = encodeJournalRecord(record)
     appendFileSync(journalPath, buffer)
     return buffer.length
@@ -2443,13 +2492,51 @@ export function createRegistryStage(options = {}) {
   /** 打开/恢复：解析既有 WAL、恢复已解决状态。返回可审计的摘要。 */
   function open() {
     mkdirSync(stageRoot, { recursive: true })
+    journalSealed = true // 重新解析时会重新判定；上一次封口失败允许这次重试
     let resumedRecords = 0
     let torn = false
+    let tornTrimmedBytes = 0
+    let tornAuditPath = null
+    let tornRepaired = false
+    let journalBytesConsumed = 0
+    let journalBytes = 0
     let hardDenied = []
     let rejected = []
     let unstaged = []
     if (existsSync(journalPath)) {
-      const decoded = decodeJournalRecords(readFileSync(journalPath))
+      const rawJournal = readFileSync(journalPath)
+      const decoded = decodeJournalRecords(rawJournal)
+      journalBytesConsumed = decoded.bytesConsumed
+      journalBytes = rawJournal.length
+      /* ── R40：撕裂尾巴必须先**封口**再允许追加 ────────────────────────────────
+       * 旧行为：只把 `torn` 报给调用方，文件字节原样保留。随后任何一次暂存都会
+       * `appendFileSync` 到那半个记录**之后**：
+       *   ① 尚未补齐撕裂记录的负载长度时，解码器把这半个记录 + 新记录一起当成
+       *      "仍未写完的尾巴" ⇒ **新记录被静默丢弃**（重新打开后暂存的值消失）；
+       *   ② 追加的总字节补齐负载长度后，解码器在**非记录边界**继续解析 ⇒
+       *      `REG_STAGE_JOURNAL_CORRUPT`，整段 WAL 不可读，之前暂存的操作全部丢失。
+       * 正确恢复：把撕裂尾巴移到审计副本（`overlay.journal.torn`，不静默丢字节），
+       * 再把日志截断到最后一条**完整**记录（WAL 只追加，截断后新记录落在合法边界上）。
+       * 该操作幂等：修好之后再次 open() 不会再有 `torn`。 */
+      if (decoded.torn === true && decoded.bytesConsumed < rawJournal.length) {
+        const trimmed = rawJournal.subarray(decoded.bytesConsumed)
+        tornTrimmedBytes = trimmed.length
+        try {
+          writeFileSync(join(stageRoot, OVERLAY_TORN_JOURNAL_NAME), trimmed)
+          tornAuditPath = join(stageRoot, OVERLAY_TORN_JOURNAL_NAME)
+        } catch {
+          // 审计副本写不下不应阻止恢复（字节仍在原日志里，直到下一行截断）。
+          tornAuditPath = null
+        }
+        try {
+          truncateSync(journalPath, decoded.bytesConsumed)
+          tornRepaired = true
+        } catch {
+          // 截断失败 ⇒ 日志仍然是"半条记录结尾"，**禁止后续追加**（appendRecord 抛错）。
+          journalSealed = false
+          tornRepaired = false
+        }
+      }
       const replay = replayJournal(decoded.records)
       state = replay.state
       hardDenied = replay.hardDenied
@@ -2471,6 +2558,12 @@ export function createRegistryStage(options = {}) {
       sessionId,
       resumed: resumedRecords,
       torn,
+      tornTrimmedBytes,
+      tornAuditPath,
+      tornRepaired,
+      /** R40：恢复后**完整记录**消耗到的字节数（撕裂尾巴不计）。宿主捕获标记应据此推进。 */
+      journalBytesConsumed,
+      journalBytes,
       hardDenied,
       rejected,
       unstaged,
@@ -3120,7 +3213,28 @@ export function createRegistryStage(options = {}) {
         failed.push({ path: unit.path, op: unit.op, status: error.status ?? REG_STATUS.ERROR_ACCESS_DENIED, reason: String(error.message) })
         continue
       }
-      const status = (result?.status ?? result ?? 0) >>> 0
+      /* ── R40：writer 的返回值是"这次写入到底成没成"的**唯一**证词 ──────────────
+       * 旧式 `(result?.status ?? result ?? 0) >>> 0` 把"什么都没返回"（undefined / null /
+       * `{}`）折成 0 = ERROR_SUCCESS ⇒ 一个**没有报告状态**的 writer 会被记成 applied，
+       * 候选状态被判 APPLIED。这与"绝不假装应用成功"直接冲突（同 REG_WRITER_MISSING 的纪律）。
+       * 只接受两种合同内形状：数字 LSTATUS，或带**整数** `status` 字段的对象；
+       * 其余一律记 failed（status=87 ERROR_INVALID_PARAMETER），不推进 appliedPaths。 */
+      let status
+      const reported = result !== null && typeof result === 'object' && Number.isInteger(result.status)
+      if (typeof result === 'number') status = result >>> 0
+      else if (reported) status = result.status >>> 0
+      else {
+        failed.push({
+          path: unit.path,
+          op: unit.op,
+          status: REG_STATUS.ERROR_INVALID_PARAMETER,
+          reason:
+            `writer contract violation: ${unit.op} returned ` +
+            `${result === null ? 'null' : typeof result === 'object' ? 'an object without an integer status' : typeof result} ` +
+            'instead of an LSTATUS; refusing to count an unreported write as applied',
+        })
+        continue
+      }
       if (status === REG_STATUS.ERROR_SUCCESS) {
         applied.push({ path: unit.path, op: unit.op })
         satisfied.add(fold(unit.path))

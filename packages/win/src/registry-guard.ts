@@ -479,7 +479,14 @@ export function parseRegistryPath(fullPath) {
     throw error
   }
   const canonicalName = HIVE_CANONICAL[head]
-  const subKey = rest.replace(/\\+$/, '')
+  /* R40：折叠重复分隔符。Win32 把连续 `\` 当作一个分隔符（本机只读实测：
+   * `[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\\Microsoft')` → True，
+   * `'Software\\\Microsoft'` → True，`'Software\Microsoft\'` → True）。
+   * 旧实现只去掉**尾部**分隔符，于是 `HKCU\Software\\R40` 的 canonical 与
+   * `HKCU\Software\R40` **不相等** ⇒ 同一个真实键在覆盖层/WAL/候选里有两个身份：
+   * 同一次写入用两种拼法会暂存两次（幻影重复单元），删除与创建可能落在"不同键"上。
+   * 归一化必须与真实 API 的路径语义一致，否则覆盖层/真实 hive 的比较失去意义。 */
+  const subKey = rest.replace(/\\{2,}/g, '\\').replace(/\\+$/, '').replace(/^\\+/, '')
   return { hive: canonicalName, handle, subKey, canonical: subKey.length > 0 ? `${canonicalName}\\${subKey}` : canonicalName }
 }
 

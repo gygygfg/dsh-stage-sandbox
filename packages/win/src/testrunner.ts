@@ -225,12 +225,12 @@ export const OFFLINE_SUITES = [
   { id: 'r23-long-path', script: 'tests/r23-long-path.ts', title: 'R23 >MAX_PATH 写面（\\\\?\\ 长路径写/建目录/rename/delete 进暂存、whiteout 跨进程、遮蔽读拒绝；13 断言）' },
   // R24 逐项修复（第三批）：readPolicy 生产通道 + 自定义 mask 来源；批量 apply 原子性（回滚）。
   { id: 'r24-fs-config', script: 'tests/r24-fs-config.ts', title: 'R24 fs 生产接线（WINSTAGE_READ_POLICY 三态 + config.masks 值级脱敏 + 非法正则 fail-closed；69 断言）' },
-  { id: 'r24-atomic-apply', script: 'tests/r24-atomic-apply.ts', title: 'R24 批量 apply 原子性（回滚快照 / 全有或全无 / 回滚失败如实 partial；23 断言）' },
+  { id: 'r24-atomic-apply', script: 'tests/r24-atomic-apply.ts', title: 'R24 批量 apply 原子性（回滚快照 / 全有或全无 / 回滚失败如实 partial；24 断言）' },
   // R25 逐项修复（第四批）：T1 真归因（T1S 可选档）；plugin remove 残留清理工具。
   { id: 'r25-t1s', script: 'tests/r25-t1s.ts', title: 'R25 T1S 可选档（受限令牌 + shim：opt-in 解析/装配失败 fail-closed/默认 T1 不变/静态守卫；48 断言）' },
   { id: 'r25-remove-cleanup', script: 'tests/r25-remove-cleanup.ts', title: 'R25 plugin remove 残留清理工具（dry-run/apply/幂等/护栏/越界拒绝；65 断言）' },
   // R26 逐项修复（第五批）：R13 32 位注册表视图暂存化（/reg:32 写/删进 overlay、apply 落 32 视图）。
-  { id: 'r26-wow64-registry', script: 'tests/r26-wow64-registry.ts', title: 'R26 32 位注册表视图暂存（合成路径 + WAL view + apply /reg:32；41 断言）' },
+  { id: 'r26-wow64-registry', script: 'tests/r26-wow64-registry.ts', title: 'R26 32 位注册表视图暂存（合成路径 + WAL view + apply /reg:32；42 断言）' },
   // R27 收尾：边缘路径（>4095 显式 fail-closed 归因、≤3000 支持、跨卷 rename 无半态、远端 SMB 环境缺口）。
   { id: 'r27-edge-paths', script: 'tests/r27-edge-paths.ts', title: 'R27 边缘路径（≤32000 长路径支持/32760+ 显式 fail-closed/跨卷 rename copy-up/远端 SMB 缺口；16 断言）' },
   // R28 收尾：apply 属性面（hidden/system 还原 + ACL 继承口径）。
@@ -241,7 +241,7 @@ export const OFFLINE_SUITES = [
   { id: 'r31-apply-journal', script: 'tests/r31-apply-journal.ts', title: 'R31 apply 崩溃恢复 WAL（journal 生命周期/崩溃缝恢复/损坏 fail-closed/并发守卫/幂等；10 断言）' },
   // R34：守卫不可用（root-not-creatable / 受限宿主）时，**只读**操作回退真实磁盘；
   // 有既有暂存状态仍 fail-closed；写入永不回退；存储状态机路径守卫堵住尾随空格/点/8.3 绕过。
-  { id: 'r34-guard-unavailable-read', script: 'tests/r34-guard-unavailable-read.ts', title: 'R34 守卫不可用只读回退（STAGE_GUARD_UNAVAILABLE 归一/读回退/有状态不回退/写 fail-closed/状态机路径守卫/快照自校验/STAGE_OUTSIDE 三态/配置漂移/根缺失；32 断言）' },
+  { id: 'r34-guard-unavailable-read', script: 'tests/r34-guard-unavailable-read.ts', title: 'R34 守卫不可用只读回退（STAGE_GUARD_UNAVAILABLE 归一/读回退/有状态不回退/写 fail-closed/状态机路径守卫/快照自校验/STAGE_OUTSIDE 三态/配置漂移/根缺失；47 断言）' },
 ]
 
 /** 需要未受限会话的套件 */

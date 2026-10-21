@@ -304,6 +304,24 @@ process.stdout.write('\n[7] wire 快照→依赖\n')
   const res = deps.apply(deps.units().slice(0, 1))
   ok(res.applied.length === 1 && calls.some((c) => c.startsWith('approve:src/a.txt')), 'apply 委派到 service.approve')
 
+  const beforeEmpty = calls.length
+  const emptyRes = deps.apply([])
+  ok(
+    emptyRes.applied.length === 0 && emptyRes.failed.length === 0 && calls.length === beforeEmpty,
+    '空 units ⇒ 零应用、零失败、不调用 service.approve（不是"批准全部"）',
+  )
+
+  const failureDeps = buildAlignedDeps({
+    snapshot: () => ({ files: [{ path: 'src/a.txt', op: 'modify', kind: 'file', risk: 'normal' }] }),
+    approve: () => ({ approved: 0, failed: [{ path: 'src/a.txt', code: 'NO_MATCHING_PATHS', message: 'nope' }] }),
+    reject: () => {},
+  })
+  const failureRes = failureDeps.apply(failureDeps.units())
+  ok(
+    failureRes.failed.length === 1 && failureRes.failed[0].includes('NO_MATCHING_PATHS') && failureRes.failed[0].includes('src/a.txt') && !failureRes.failed[0].includes('[object Object]'),
+    '结构化 failed ⇒ 可读字符串（含 code/path，不是 [object Object]）',
+  )
+
   deps.discard()
   ok(calls.some((c) => c.startsWith('reject:')), 'discard 委派到 service.reject')
 }

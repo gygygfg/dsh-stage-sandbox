@@ -259,6 +259,11 @@ static int g_wow64Process = -1; /* -1 unknown, 0 = 64-bit process, 1 = WOW64 */
  * brand-new key could not be created). One predicate, one meaning. */
 static int ws_reg_wow64_unrepresentable(REGSAM samDesired)
 {
+    /* R40-REG-05: both view bits together is ERROR_INVALID_PARAMETER (87) even
+     * for the real API; never stage it as "the 32-bit view". */
+    if ((samDesired & KEY_WOW64_64KEY) != 0 && (samDesired & KEY_WOW64_32KEY) != 0) {
+        return 1;
+    }
     if (g_wow64Process < 0) {
         BOOL isWow = FALSE;
         if (!IsWow64Process(GetCurrentProcess(), &isWow)) {

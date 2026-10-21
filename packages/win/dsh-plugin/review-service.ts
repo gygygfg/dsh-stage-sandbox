@@ -31,7 +31,7 @@ import { MASK_CLASSES, SELF_MASK_ID, canonical, compareKey, isInside, maskReason
 import { STATE, STORE_DIR, hashAbsent, hashFile, makeRemovable, writeFileAtomic } from '../src/store.ts'
 import { resolveStageRoot } from '../src/stage-guard.ts'
 import { Workspace, driftReasonOf } from '../src/workspace.ts'
-import { renderCandidateDiff } from '../src/tools.ts'
+import { countCandidateDiff, renderCandidateDiff } from '../src/tools.ts'
 import { MASK_REASON, maskSensitiveLines, redactedToken } from './sensitive-content.ts'
 import { unstagedSnapshot } from './unstaged-ledger.ts'
 import { REGISTRY_CANDIDATE_SOURCE, createRegistryStage, registryWireBytes } from '../src/registry-stage.ts'
@@ -396,6 +396,12 @@ export function recordReadVisibility(input = {}) {
     return { dedupKey, maskId, reads: existing.reads, firstForMaskId: false, dropped: false }
   }
   if (entry.byKey.size >= MAX_READ_VISIBILITY_KEYS) {
+    // ★ R40：如实记"真的丢过条目" —— 旧实现的 `truncated` 判据是
+    //   `byKey.size >= MAX`，于是"恰好记满 200 条、一条都没丢"也会被标成
+    //   "计数不完整"（R40 实测 `.t/r40/snapshot/probe1.ts` A7 段：
+    //   exact200 = {objects:200, truncated:true}，而 dropResult.dropped 从未发生）。
+    //   现在只有真的 drop 过才置位，并给出被丢掉的次数。
+    entry.dropped = (entry.dropped ?? 0) + 1
     return { dedupKey, maskId, reads: 1, firstForMaskId: false, dropped: true }
   }
   const now = new Date().toISOString()
@@ -438,7 +444,9 @@ export function readVisibilitySnapshot(sessionId) {
     /** 未去重的读取次数（同一个对象读 N 次就 +N，但**不**新增条目） */
     reads: entry.reads,
     /** 是否因为条目上限而不再新增条目（只累计 `reads`）—— 如实标注，不假装计数完整 */
-    truncated: entry.byKey.size >= MAX_READ_VISIBILITY_KEYS,
+    truncated: (entry.dropped ?? 0) > 0,
+    /** 因上限被丢弃的条目次数（`truncated` 的唯一判据；0 = 一条都没丢） */
+    dropped: entry.dropped ?? 0,
     byMaskId,
     items,
     note: '读侧可见性：只记录、不改写读结果（默认 readPolicy=record）。这是黑名单式的记录，不是读边界。',
@@ -1636,12 +1644,17 @@ export class ReviewService {
 
     if (item.kind === 'dir') return item
 
-    const candidateLike = { changes: [change] }
-    const all = renderCandidateDiff(ws.store, candidateLike, { maxLines: limits.countLines })
-    for (const line of all) {
-      if (line.type === 'add') item.totals.added += 1
-      else if (line.type === 'remove') item.totals.removed += 1
-    }
+    /**
+     * R40-SNAP-07：totals 必须用**全量**计数（`countCandidateDiff`），不能复用
+     * `renderCandidateDiff({ maxLines: countLines })` —— 后者在 >4000 行变化时会把
+     * totals 也封顶到 4000。展示仍由下面的 `maxLinesPerFile` 截断并置 `truncated`。
+     */
+    const counted = countCandidateDiff(ws.store, change)
+    item.totals.added += counted.added
+    item.totals.removed += counted.removed
+    // 掩码/展示仍用渲染器（按 countLines 生成后由 maxLinesPerFile 截断）；
+    // totals 已单独用全量计数，不受这个展示上限影响。
+    const all = renderCandidateDiff(ws.store, { changes: [change] }, { maxLines: limits.countLines })
 
     // 凭据/密钥类：**计数照给，内容不给**（`truncated` 保持 false —— 内容不是被截断，
     // 而是策略上有意不给，两个语义不能混）

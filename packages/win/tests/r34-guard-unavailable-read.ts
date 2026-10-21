@@ -36,6 +36,8 @@ import { createStagingFileSystem } from '../dsh-plugin/staging-fs.ts'
 import { disposeReviewServices, getReviewService } from '../dsh-plugin/review-service.ts'
 import { acquireStageGuard } from '../src/stage-guard.ts'
 import { Store } from '../src/store.ts'
+import { hashAbsent } from '../src/store.ts'
+import { renderCandidateDiff } from '../src/tools.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SCRATCH = join(HERE, '..', '.t', 'r34-guard-unavailable')
@@ -246,6 +248,40 @@ try {
       JSON.stringify({ code: plainError?.code }),
     )
   }
+
+  section('4b. 真实 Phase-1 存储根（无 .dshstage 段）同样受写保护（R40-FS-04）')
+  {
+    const realStore = join(SCRATCH, 'real-phase1-store')
+    mkdirSync(realStore, { recursive: true })
+    const previous = process.env.WINSTAGE_STAGE_ROOT
+    process.env.WINSTAGE_STAGE_ROOT = realStore
+    disposeReviewServices()
+    try {
+      const Cls = createStagingFileSystem({ base: LocalFileSystem, enabled: () => true, sessionId: 'r34-real-store' })
+      const fs = new Cls(new Context(), { cwd: wsRoot, diffBasisMaxBytes: 1024 * 1024 })
+      fs.log = () => {}
+      fs.logError = () => {}
+      const attempts = ['manifest.json', 'review.json', 'queue.json', 'blobs/x.bin', 'candidates/c.json', 'staged/a.txt']
+      for (const rel of attempts) {
+        const abs = join(realStore, rel)
+        let denied
+        try {
+          await fs.writeText({ targetKey: abs, displayPath: abs }, 'TAMPER', undefined, undefined, undefined)
+        } catch (error) {
+          denied = error
+        }
+        check(
+          `真实存储根写 ${rel} ⇒ FS_SANDBOX_DENIED（不再只认 .dshstage）`,
+          denied?.code === 'FS_SANDBOX_DENIED',
+          JSON.stringify({ rel, code: denied?.code }),
+        )
+      }
+    } finally {
+      if (previous === undefined) delete process.env.WINSTAGE_STAGE_ROOT
+      else process.env.WINSTAGE_STAGE_ROOT = previous
+      disposeReviewServices()
+    }
+  }
   section('5. 已发布快照的 workspaceRoot 自校验（不渲染别的工作区）')
   {
     const { readPublishedSnapshot } = await import('../dsh-plugin/host-plugin.ts')
@@ -272,6 +308,22 @@ try {
       genuine.ok === true && genuine.snapshot?.workspaceRoot === wsRoot,
       JSON.stringify({ ok: genuine.ok, code: genuine.code }),
     )
+    const malformed = [
+      ['files-not-array', { version: 1, workspaceRoot: wsRoot, files: 'nope' }],
+      ['root-array', []],
+      ['version-not-number', { version: '1', workspaceRoot: wsRoot, files: [] }],
+      ['file-entry-missing-path', { version: 1, workspaceRoot: wsRoot, files: [{ op: 'modify' }] }],
+      ['staging-not-object', { version: 1, workspaceRoot: wsRoot, files: [], staging: 'on' }],
+    ]
+    for (const [id, payload] of malformed) {
+      writeFileSync(join(storeDir, 'review.json'), JSON.stringify(payload))
+      const result = readPublishedSnapshot({ workspaceRoot: wsRoot, sessionId: 'r34-panel', env })
+      check(
+        `畸形快照 ${id} ⇒ snapshot-invalid（不把不可解析形状交给客户端）`,
+        result.ok === false && result.code === 'snapshot-invalid',
+        JSON.stringify({ id, ok: result.ok, code: result.code, detail: result.detail }),
+      )
+    }
   }
   section('6. WINSTAGE_STAGE_OUTSIDE 三态（direct 是直写真实盘的逃生口，必须有边界断言）')
   {
@@ -365,6 +417,80 @@ try {
       '配置的根目录不存在 ⇒ FS_STAGE_ROOT_NOT_FOUND（不回退宿主 cwd）',
       notFound?.code === 'FS_STAGE_ROOT_NOT_FOUND',
       JSON.stringify({ code: notFound?.code, root: notFound?.root }),
+    )
+  }
+
+  section('8. R40 回归：editText CRLF 归一 / 二进制 stat 真实大小')
+  {
+    const store = join(SCRATCH, 'edit-store')
+    mkdirSync(store, { recursive: true })
+    const previous = process.env.WINSTAGE_STAGE_ROOT
+    process.env.WINSTAGE_STAGE_ROOT = store
+    disposeReviewServices()
+    try {
+      const Cls = createStagingFileSystem({ base: LocalFileSystem, enabled: () => true, sessionId: 'r34-edit' })
+      const fs = new Cls(new Context(), { cwd: wsRoot, diffBasisMaxBytes: 1024 * 1024 })
+      fs.log = () => {}
+      fs.logError = () => {}
+      writeFileSync(join(wsRoot, 'crlf.txt'), 'alpha\r\nbeta\r\n')
+      let editError
+      try {
+        await fs.editText(
+          { targetKey: join(wsRoot, 'crlf.txt'), displayPath: join(wsRoot, 'crlf.txt') },
+          { oldString: 'alpha\r\nbeta', newString: 'alpha\r\nBETA' },
+          undefined,
+          undefined,
+          undefined,
+        )
+      } catch (error) {
+        editError = error
+      }
+      const after = await fs.readText({ targetKey: join(wsRoot, 'crlf.txt'), displayPath: join(wsRoot, 'crlf.txt') })
+      check(
+        'editText：带 CRLF 的 oldString/newString 正确归一，不产生 \\r\\r\\n',
+        editError === undefined && after === 'alpha\r\nBETA\r\n' && !after.includes('\r\r\n'),
+        JSON.stringify({ code: editError?.code, after }),
+      )
+
+      const binTarget = { targetKey: join(wsRoot, 'bin.dat'), displayPath: join(wsRoot, 'bin.dat') }
+      const writeOutcome = await fs.writeText(binTarget, 'a\0b', undefined, undefined, undefined)
+      check(
+        'writeText 成功回执的可见键只有 operation/version/before/after（不得含 logicalPath）',
+        Object.keys(writeOutcome).every((key) => ['operation', 'version', 'before', 'after'].includes(key)) && !('logicalPath' in writeOutcome),
+        JSON.stringify({ keys: Object.keys(writeOutcome) }),
+      )
+      const stat = await fs.stat(binTarget)
+      check('二进制/NUL 内容的 stat.size = 真实字节数（不是 0）', stat?.size === 3, JSON.stringify({ size: stat?.size }))
+    } finally {
+      if (previous === undefined) delete process.env.WINSTAGE_STAGE_ROOT
+      else process.env.WINSTAGE_STAGE_ROOT = previous
+      disposeReviewServices()
+    }
+  }
+
+  section('9. R40-SNAP-06：diff 文本不得把 ESC/NUL 原样交给终端')
+  {
+    const fakeStore = {
+      hasBlob: () => true,
+      readBlob: () => Buffer.from('safe\n\x1b[31mred\x1b[0m\n\0nul', 'utf8'),
+    }
+    const candidate = {
+      changes: [
+        {
+          path: 'bad\x1bname.txt',
+          op: 'create',
+          kind: 'file',
+          before: { hash: hashAbsent() },
+          after: { hash: 'h' },
+        },
+      ],
+    }
+    const lines = renderCandidateDiff(fakeStore, candidate, { maxLines: 10 })
+    const joined = lines.map((line) => `${line.path ?? ''}${line.text ?? ''}`).join('|')
+    check(
+      '渲染后的 diff 不含原始 ESC/NUL，控制字符显示为 \\xNN',
+      !joined.includes('\x1b') && !joined.includes('\0') && joined.includes('\\x1b') && joined.includes('\\x00'),
+      JSON.stringify({ joined }),
     )
   }
 } finally {

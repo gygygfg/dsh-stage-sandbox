@@ -380,6 +380,24 @@ section('K. R34d：显式 paths 为空/未知 ⇒ NO_MATCHING_PATHS，候选与�
   )
 }
 
+section('L. R40-SNAP-07：totals 全量计数不受 4000 行展示上限封顶')
+{
+  const { countCandidateDiff } = await import('../src/tools.ts')
+  const { ws, root } = makeWs('count-all')
+  const lineCount = 4500
+  const baseText = `${Array.from({ length: lineCount }, (_, i) => `old-${i}`).join('\n')}\n`
+  const nextText = `${Array.from({ length: lineCount }, (_, i) => `new-${i}`).join('\n')}\n`
+  writeFileSync(join(root, 'big.txt'), baseText)
+  ws.writeFile(join(root, 'big.txt'), nextText, { origin: 'test' })
+  const frozen = ws.freezeCandidate({})
+  const counts = countCandidateDiff(ws.store, frozen.candidate.changes[0])
+  check(
+    'L1 4500 行全改 ⇒ added=4500 / removed=4500（不被 countLines=4000 截断）',
+    counts.added === lineCount && counts.removed === lineCount,
+    JSON.stringify(counts),
+  )
+}
+
 W('')
 W('='.repeat(64))
 W(`RESULT: ${failures === 0 ? 'PASS' : 'FAIL'} checks=${assertions} failures=${failures}`)

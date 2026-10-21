@@ -361,12 +361,58 @@ export class ToolSurface {
   }
 }
 
+/**
+ * R40-SNAP-06：把 diff 文本里的 C0 控制字符转成可见转义。
+ *
+ * 为什么必须在**渲染器**做而不是各消费端各做一次：同一个 `renderCandidateDiff()` 的输出
+ * 同时进 `review.json`、`/winstage diff`、CLI stdout。文件名/文件内容里的 ESC（0x1B）
+ * 会让终端执行 ANSI 序列（清屏/改标题/伪造提示），NUL 等控制字符也会破坏终端/日志。
+ * 保留 TAB（0x09）与 LF（0x0A）；其余 C0 与 DEL 一律显示为 `\xNN`。这不改暂存字节，
+ * 只改**展示文本**（totals 计数不受影响）。
+ */
+const DIFF_CONTROL_RE = /[\u0000-\u0008\u000b-\u001f\u007f]/g
+export function sanitizeDiffText(value) {
+  return String(value ?? '').replace(DIFF_CONTROL_RE, (char) => `\\x${char.charCodeAt(0).toString(16).padStart(2, '0')}`)
+}
+
+/**
+ * R40-SNAP-07：**全量**统计一条 change 的增删行数（不受任何展示上限影响）。
+ *
+ * `renderCandidateDiff()` 的 `maxLines` 同时是展示上限；旧 totals 复用它 ⇒ 超过
+ * `limits.countLines`（4000）的文件会把 totals 封顶在 4000，虽然 `truncated` 会置位，
+ * 但"改了多少行"这个计数本身是错的。这里只数、不拼输出，供 `review-service` 的
+ * `totals` 使用；展示仍由 `renderCandidateDiff()` 按 `maxLinesPerFile` 截断。
+ */
+export function countCandidateDiff(store, change) {
+  const beforeLines = change.before?.hash && change.before.hash !== hashAbsent() && store.hasBlob(change.before.hash)
+    ? store.readBlob(change.before.hash).toString('utf8').split(/\r?\n/)
+    : []
+  const afterLines = change.after?.hash && change.after.hash !== hashAbsent() && store.hasBlob(change.after.hash)
+    ? store.readBlob(change.after.hash).toString('utf8').split(/\r?\n/)
+    : []
+  let added = 0
+  let removed = 0
+  const length = Math.max(beforeLines.length, afterLines.length)
+  for (let i = 0; i < length; i += 1) {
+    const a = beforeLines[i]
+    const b = afterLines[i]
+    if (a === b) continue
+    if (a !== undefined && b === undefined) removed += 1
+    else if (a === undefined && b !== undefined) added += 1
+    else {
+      removed += 1
+      added += 1
+    }
+  }
+  return { added, removed }
+}
+
 /** 从候选生成展示用 diff（两侧都来自候选冻结的 blob，绝不读真实磁盘，见 #12.6） */
 export function renderCandidateDiff(store, candidate, options = {}) {
   const maxLines = options.maxLines ?? 40
   const out = []
   for (const change of candidate.changes) {
-    out.push({ type: 'change-header', path: change.path, op: change.op, kind: change.kind })
+    out.push({ type: 'change-header', path: sanitizeDiffText(change.path), op: change.op, kind: change.kind })
     if (change.kind === 'dir') {
       out.push({ type: 'note', text: '目录变更' })
       continue
@@ -383,11 +429,11 @@ export function renderCandidateDiff(store, candidate, options = {}) {
       const a = beforeLines[i]
       const b = afterLines[i]
       if (a === b) continue
-      if (a !== undefined && b === undefined) out.push({ type: 'remove', line: i + 1, text: a })
-      else if (a === undefined && b !== undefined) out.push({ type: 'add', line: i + 1, text: b })
+      if (a !== undefined && b === undefined) out.push({ type: 'remove', line: i + 1, text: sanitizeDiffText(a) })
+      else if (a === undefined && b !== undefined) out.push({ type: 'add', line: i + 1, text: sanitizeDiffText(b) })
       else {
-        out.push({ type: 'remove', line: i + 1, text: a })
-        out.push({ type: 'add', line: i + 1, text: b })
+        out.push({ type: 'remove', line: i + 1, text: sanitizeDiffText(a) })
+        out.push({ type: 'add', line: i + 1, text: sanitizeDiffText(b) })
       }
       shown += 1
     }

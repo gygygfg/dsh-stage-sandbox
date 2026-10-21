@@ -77,11 +77,17 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmdirSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, join, normalize, relative, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { canonical, maskKey, maskReason } from '../src/paths.ts'
+import { canonical, compareKey, maskKey, maskReason } from '../src/paths.ts'
 import { STATE, hashAbsent, isExternalKey } from '../src/store.ts'
 import { FAILURE_CODE_ENVIRONMENT, FAILURE_SEMANTICS, resolveDshModuleRoot } from '../src/executor.ts'
-import { STAGE_GUARD_UNAVAILABLE, STAGE_ROOT_LOST, checkTransparentMessages } from '../src/stage-guard.ts'
-import { getReviewService, recordReadVisibility, resolveReviewStoreDir, setReadVisibilityPolicy } from './review-service.ts'
+import { STAGE_GUARD_UNAVAILABLE, STAGE_ROOT_LOST, checkTransparentMessages, stageBaseDir } from '../src/stage-guard.ts'
+import {
+  getReviewService,
+  legacyWorkspaceStoreDir,
+  recordReadVisibility,
+  resolveReviewStoreDir,
+  setReadVisibilityPolicy,
+} from './review-service.ts'
 import { rootSessionIdFor, rootSessionIdOf } from './session-identity.ts'
 import { UNSTAGED_REASONS, recordUnstaged } from './unstaged-ledger.ts'
 import { noteEffectiveStaging } from './review-service.ts'
@@ -355,7 +361,7 @@ assertTransparentFailureTexts()
 //    平台/普通化 message。`writeText` 返回对象上多出来的键在真机通道里**渲染不到**，
 //    但它们是"一次 `{...outcome}` 或任何 JSON 化就能到模型"的形状 ⇒ WP9 把它们移出。
 //
-// 因此 outcome 的可见键收紧成 `{ operation, version, before, after }` + `logicalPath`
+// 因此 outcome 的可见键收紧成 `{ operation, version, before, after }`（`logicalPath` **不能**进可见面：DSH write/edit 输出 schema 是 additionalProperties:false，真机实测会报 invalid output）
 // （真实工作区路径），诊断（暂存落点/第二套布局/分裂）走下面的 **Symbol 键非枚举** 旁路：
 // `Object.keys` / `JSON.stringify` / 展开运算符都取不到，也不进 `snapshotJsonValue` 快照。
 // 内部消费者（自测 / 将来的 run-capture 复核面）用 `STAGE_DIAGNOSTICS` 显式读取。
@@ -387,15 +393,15 @@ export function stageDiagnosticsOf(outcome) {
 /** 覆盖级常量：staging 自己的存储树上的机制字样（成功/失败两条路径都不能出现） */
 const STAGE_ROOT_MARKERS = Object.freeze(['.dshstage', 'staged-ext', `${sep}staged${sep}`])
 
-/** 成功回执的可见键白名单（真实文件系统写操作会有的键；`logicalPath` = 真实工作区路径） */
-export const SUCCESS_OUTCOME_KEYS = Object.freeze(['operation', 'version', 'before', 'after', 'logicalPath'])
+/** 成功回执的可见键白名单（真实文件系统写操作会有的键；逻辑路径由 render 的 `<path>` 提供） */
+export const SUCCESS_OUTCOME_KEYS = Object.freeze(['operation', 'version', 'before', 'after'])
 
 /**
  * **成功路径的零自曝机检**（与 `assertTransparentFailureTexts()` 同族，各测一条路径）。
  *
  * 三条判据，逐条说清适用范围（避免"把用户内容当机制泄漏"的假红）：
  *   ① **可见键白名单**：outcome 的可枚举键**只能**是真实文件系统写操作会有的那些
- *      （`operation` / `version` / `before` / `after` / `logicalPath`）。
+ *      （`operation` / `version` / `before` / `after`）。
  *      这是最硬的一条：任何 `staged` / `stagedPath` / `layout` / `splitDetected` 回来都会被点名。
  *   ② **存储树字样扫描**：每个字符串值（含 `after` / `before` 内容）都不得包含
  *      `.dshstage` / `staged-ext` / `\staged\` —— 真落点绝不会长在写回执里。
@@ -406,7 +412,7 @@ export const SUCCESS_OUTCOME_KEYS = Object.freeze(['operation', 'version', 'befo
  * ⚠ 哪些字段**不**做禁用词扫描，以及为什么（第一版实测踩到过全部三种假红）：
  *   · `before` / `after` 是**用户文件内容**：一个叫 `staging-notes.md` 的真实文件、
  *     或内容里写着 "sandbox" 的脚本，都是合法用户数据 —— 拿词表扫它必然假红；
- *   · `logicalPath` 是**调用方给的路径**：真实用户完全可以把工作区放在
+ *   · 逻辑路径由 render 的 `<path>` 提供；`logicalPath` 只走非枚举诊断面，绝不进 write/edit outcome。
  *     `...\WinStageSandbox\...` 这样的目录下（本项目自己就是），扫它同样是假红；
  *   · `version` 是**不透明内容戳**（`dsh-fs` 的 `FsVersion`，如 `winstage:<sha256>`），
  *     模型只把它当 token 回传、从不解读，`winstage:` 里就含子串 `stage`。
@@ -448,15 +454,14 @@ export function assertTransparentSuccessOutcome() {
     version: 'winstage:0000',
     before: null,
     after: 'hello\n',
-    logicalPath: 'C:\\ws\\a.txt',
   })
   if (!clean.ok) throw new Error(`success-path transparency violation: ${JSON.stringify(clean.violations)}`)
   // 阳性对照 1：多出来的可见键必须点名
-  const dirtyKey = checkTransparentSuccessOutcome({ operation: 'create', version: 'winstage:0000', logicalPath: 'C:\\ws\\a.txt', stagedPath: 'C:\\stage\\staged\\a.txt' })
+  const dirtyKey = checkTransparentSuccessOutcome({ operation: 'create', version: 'winstage:0000', stagedPath: 'C:\\stage\\staged\\a.txt' })
   if (dirtyKey.ok) throw new Error('success-path transparency checker is not armed (extra visible key passed)')
-  // 阳性对照 2：可见路径里的暂存落点必须点名
-  const dirtyPath = checkTransparentSuccessOutcome({ operation: 'create', version: 'winstage:0000', logicalPath: `C:\\x\\.dshstage\\staged\\a.txt` })
-  if (dirtyPath.ok) throw new Error('success-path transparency checker is not armed (stage root in logicalPath passed)')
+  // 阳性对照 2：可见字符串里的暂存落点必须点名
+  const dirtyPath = checkTransparentSuccessOutcome({ operation: 'create', version: 'winstage:0000', after: `C:\\x\\.dshstage\\staged\\a.txt` })
+  if (dirtyPath.ok) throw new Error('success-path transparency checker is not armed (stage root in visible string passed)')
   return { ok: true, checked: 3 }
 }
 assertTransparentSuccessOutcome()
@@ -570,27 +575,77 @@ function storeSegmentKey(segment) {
   return lower
 }
 
-/** 该绝对路径是否命中 WinStage 存储的**状态机**（元数据文件或存储目录树） */
-function isStoreStatePath(abs) {
+/**
+ * 该绝对路径是否命中 WinStage 存储的**状态机**（元数据文件或存储目录树）。
+ *
+ * ★ R40-FS-04（P1）：判定必须同时认**当前布局**（Phase 1 之后存储根在 Windows 缓存面，
+ * `%LOCALAPPDATA%\Temp\winstage-stage\<会话>`，路径里**没有** `.dshstage` 段）。
+ * 旧实现只做 `\.dshstage\` 的字面搜索 ⇒ 自从 WP0 把存储搬出工作区后，这条守卫对**真实**
+ * 存储根一次也命中不到（`ctx.fs` 写 `<存储根>\manifest.json` / `blobs\x` 会被当成普通
+ * 工作区外条目暂存，批准后落到活的存储上）。r34 §4 只覆盖了**旧布局**词法夹具，因此
+ * 一直是假绿。
+ *
+ * @param {string} abs 逻辑绝对路径
+ * @param {string[]} [stateRoots] `compareKey()` 归一后的存储根（本会话的新根 + 旧布局根）
+ */
+function isStoreStatePath(abs, stateRoots) {
   if (typeof abs !== 'string' || abs.length === 0) return false
   const normalized = abs.replace(/\//g, '\\')
+  const legacyRule = (rest) => {
+    const slash = rest.indexOf('\\')
+    const head = slash < 0 ? rest : rest.slice(0, slash)
+    const key = storeSegmentKey(head)
+    if (slash < 0) return STORE_METADATA_FILES.has(key) || STORE_STATE_DIRS.has(key)
+    return STORE_STATE_DIRS.has(key)
+  }
   const at = normalized.toLowerCase().lastIndexOf(STORE_SEGMENT_TAIL)
-  if (at < 0) return false
-  const rest = normalized.slice(at + STORE_SEGMENT_TAIL.length)
-  if (rest.length === 0) return false
-  const slash = rest.indexOf('\\')
-  const head = slash < 0 ? rest : rest.slice(0, slash)
-  const key = storeSegmentKey(head)
-  if (slash < 0) return STORE_METADATA_FILES.has(key) || STORE_STATE_DIRS.has(key)
-  return STORE_STATE_DIRS.has(key)
+  if (at >= 0) {
+    const rest = normalized.slice(at + STORE_SEGMENT_TAIL.length)
+    if (rest.length === 0) return false
+    if (legacyRule(rest)) return true
+  }
+  if (!Array.isArray(stateRoots) || stateRoots.length === 0) return false
+  let key
+  try {
+    key = compareKey(normalized)
+  } catch {
+    key = normalized.toLowerCase()
+  }
+  for (const root of stateRoots) {
+    if (typeof root !== 'string' || root.length === 0) continue
+    if (key === root) return true
+    const prefix = root.endsWith('\\') ? root : `${root}\\`
+    if (!key.startsWith(prefix)) continue
+    const rest = key.slice(prefix.length)
+    if (rest.length === 0) return true
+    if (legacyRule(rest)) return true
+  }
+  return false
 }
 
-/** 字面替换，错误码与 fs-local 对齐 */
+/**
+ * 字面替换，错误码与 fs-local 对齐。
+ *
+ * ★ R40-FS-01（P1）：`oldString` / `newString` **必须先做 LF 归一**再匹配/替换 ——
+ * 基类 `dsh-fs-local:applyLiteralEdit` 就是这么做的（`normalizeLineEndings(oldString)` /
+ * `normalizeLineEndings(newString)`），本实现此前漏了这一步，于是 CRLF 文件上：
+ *   · `readText` 返回的是**原样 CRLF**（`readTextInner` 不改换行），模型把它当 `oldString`
+ *     传回来 ⇒ 与归一后的 LF 文本比对 0 命中 ⇒ 假 `FS_EDIT_NOT_FOUND`（读-改-写闭环断在
+ *     最常见的一步上）；
+ *   · 带 `\r\n` 的 `newString` 被插进 LF 归一文本后，再由 `restoreLineEndings()` 把每个
+ *     `\n` 扩成 `\r\n` ⇒ 落盘/批准后是 `\r\r\n`（内容被破坏，且 before/after 与实际落点不一致）。
+ * 归一口径与 `currentOf` 用的一致（同一个 `normalizeLineEndings`），因此两边不会再漂移。
+ */
 function applyLiteralEdit(text, edit, displayPath) {
   if (!edit || typeof edit.oldString !== 'string' || edit.oldString.length === 0) {
     throw new FsError(`cannot edit "${displayPath}": oldString must be a non-empty string`, 'FS_EDIT_NOT_FOUND')
   }
-  const occurrences = text.split(edit.oldString).length - 1
+  const oldString = normalizeLineEndings(edit.oldString)
+  if (oldString.length === 0) {
+    throw new FsError(`cannot edit "${displayPath}": oldString must be a non-empty string`, 'FS_EDIT_NOT_FOUND')
+  }
+  const newString = normalizeLineEndings(typeof edit.newString === 'string' ? edit.newString : '')
+  const occurrences = text.split(oldString).length - 1
   if (occurrences === 0) {
     throw new FsError(`cannot edit "${displayPath}": the text to replace was not found`, 'FS_EDIT_NOT_FOUND')
   }
@@ -598,8 +653,8 @@ function applyLiteralEdit(text, edit, displayPath) {
     throw new FsError(`cannot edit "${displayPath}": the text to replace is ambiguous (${occurrences} matches)`, 'FS_AMBIGUOUS_EDIT')
   }
   const next = edit.replaceAll === true
-    ? text.split(edit.oldString).join(edit.newString ?? '')
-    : text.replace(edit.oldString, edit.newString ?? '')
+    ? text.split(oldString).join(newString)
+    : text.replace(oldString, newString)
   return next
 }
 
@@ -1644,7 +1699,15 @@ export function createStagingFileSystem(options = {}) {
      *     （见 `attachStageDiagnostics()`），人工侧与自测用 `stageDiagnosticsOf()` 读。
      */
     locationReceipt(ws, key, abs, current) {
-      return { logicalPath: abs }
+      /**
+       * R40-E2E（真机实测）：**不要**把 `logicalPath` 放进可见 outcome。
+       * `dsh-tool-fs` 的 write/edit 输出 schema 是 `additionalProperties:false`，只声明
+       * `operation/version/before/after`；多一个 `logicalPath` 会让工具返回
+       * `value.logicalPath is not a declared property` —— 写明明成功进了暂存，模型却拿到
+       * 一条失败回执（实测：两个 write 都报 invalid output，随后 read 仍能读到暂存内容）。
+       * 逻辑路径已由 render 的 `<path>` 呈现；诊断面仍保留 `logicalPath`（非模型可见）。
+       */
+      return {}
     }
 
     /** 真实落点诊断（**非模型可见**；BUG-2 的 `stagedPath` / `otherLayout` / `splitDetected`） */
@@ -1700,6 +1763,63 @@ export function createStagingFileSystem(options = {}) {
      * 外部键用**绝对路径**（与 `src/workspace.ts` 的 `keyOf()` 同一模型），
      * 因此 `entryOf()` 对两种条目是同一个查找，键空间天然不相交。
      */
+    /**
+     * R40-FS-04（P1）：本进程要保护的**存储根**清单（`compareKey` 归一，大小写/分隔符不敏感）。
+     *
+     * 两个来源，缺一不可：
+     *   · 本会话的新根 `resolveReviewStoreDir()`（Phase 1 之后的唯一写入口，
+     *     `%LOCALAPPDATA%\Temp\winstage-stage\<会话>` 或 `WINSTAGE_STAGE_ROOT`）；
+     *   · 旧布局根 `<workspaceRoot>/.dshstage`（只读/搬迁用；词法守卫继续对它生效）。
+     *
+     * 残余（如实标注）：**兄弟会话**的根（同一 `winstage-stage` 下的别的会话目录）不在本
+     * 清单里 —— 那需要枚举 baseDir，超出本守卫的"本会话状态机"口径，本轮不宣称覆盖。
+     */
+    stateRoots() {
+      // 刻意**不缓存**：解析是纯函数（无 IO 副作用），而 `WINSTAGE_STAGE_ROOT`/会话身份
+      // 都可能在同一进程内变化（测试与多会话宿主）；缓存旧根会让守卫在错的目标上生效。
+      const roots = []
+      const add = (path) => {
+        if (typeof path !== 'string' || path.length === 0) return
+        try {
+          roots.push(compareKey(canonical(path)))
+        } catch {
+          roots.push(path.replace(/\//g, '\\').toLowerCase())
+        }
+      }
+      try {
+        add(resolveReviewStoreDir({ workspaceRoot: this.workspaceRoot, sessionId: this.sessionIdOf() }))
+      } catch {
+        /* 解析失败不阻断写路径：词法守卫仍然生效 */
+      }
+      try {
+        add(legacyWorkspaceStoreDir(this.workspaceRoot))
+      } catch {
+        /* 同上 */
+      }
+      /**
+       * R40-FS-04 残余收口：**兄弟会话**的存储根同样不能被 `ctx.fs` 改写。
+       * 同一 `winstage-stage` base 下的每个会话目录（有 manifest/review 的）都加进守卫；
+       * 只枚举本机缓存 base（通常个位数目录），不递归、不跟随链接。
+       */
+      try {
+        const base = stageBaseDir(process.env)
+        if (existsSync(base)) {
+          for (const name of readdirSync(base)) {
+            try {
+              const dir = join(base, name)
+              if (!statSync(dir).isDirectory()) continue
+              if (existsSync(join(dir, 'manifest.json')) || existsSync(join(dir, 'review.json'))) add(dir)
+            } catch {
+              /* 单个目录读不到就跳过，不阻断写路径 */
+            }
+          }
+        }
+      } catch {
+        /* base 不可读 ⇒ 只保护已知根 */
+      }
+      return roots
+    }
+
     /**
      * P0-8：**经 `ctx.fs` 的存储写入一律拒绝**（"失败必须响"）。
      *
@@ -1882,7 +2002,7 @@ export function createStagingFileSystem(options = {}) {
       }
       // ── P0-8：WinStage 自己的存储状态机**不给经 `ctx.fs` 的写权** ──────────────
       // 放在 `stageOutside === 'direct'` 之前：那个逃生口会**直写真实磁盘**，更必须先拦。
-      if (isStoreStatePath(place.abs)) this.denyStoreWrite(place, 'write')
+      if (isStoreStatePath(place.abs, this.stateRoots())) this.denyStoreWrite(place, 'write')
       // 显式逃生口（默认关闭）：直通真实磁盘。**不是**默认路径，也不再有"拒绝"分支。
       if (place.external && stageOutside === 'direct') {
         this.noteUnstaged('write', target?.displayPath ?? place.abs, UNSTAGED_REASONS.STAGE_OUTSIDE_DIRECT, {
@@ -1967,7 +2087,7 @@ export function createStagingFileSystem(options = {}) {
         throw new FsError(`cannot edit "${target.displayPath}": the workspace root is not a regular file`, 'FS_NOT_REGULAR_FILE')
       }
       // ── P0-8：同 writeText（见那里的说明）────────────────────────────────────
-      if (isStoreStatePath(place.abs)) this.denyStoreWrite(place, 'edit')
+      if (isStoreStatePath(place.abs, this.stateRoots())) this.denyStoreWrite(place, 'edit')
       if (place.external && stageOutside === 'direct') {
         this.noteUnstaged('edit', target?.displayPath ?? place.abs, UNSTAGED_REASONS.STAGE_OUTSIDE_DIRECT, {
           sessionId: this.sessionIdOf(sandboxPolicy),
@@ -2144,7 +2264,11 @@ export function createStagingFileSystem(options = {}) {
       } catch {
         text = undefined
       }
-      return { exists: true, kind: 'file', version: String(info.version), text }
+      // ★ R40-FS-02（P2）：`size` 必须来自真实 stat。此前只回了 `text`，而 `statInner`/
+      // `lstatInner` 用 `Buffer.byteLength(current.text ?? '')` 反推大小 ⇒ 任何**非 UTF-8/
+      // 二进制**文件（`super.readText` 抛 `FS_NOT_TEXT` ⇒ `text` 为 undefined）的
+      // `stat().size` / `lstat().size` 都会被报成 **0**，与真实磁盘同一条路径上的读数自相矛盾。
+      return { exists: true, kind: 'file', version: String(info.version), text, size: info.size }
     }
 
     async stat(target, signal) {
@@ -2173,7 +2297,7 @@ export function createStagingFileSystem(options = {}) {
       if (!current.exists) return undefined
       if (current.kind === 'dir') return { version: FsVersion(current.version), type: 'directory', size: 0 }
       if (current.kind !== 'file') return { version: FsVersion(current.version), type: 'other' }
-      return { version: FsVersion(current.version), type: 'file', size: Buffer.byteLength(current.text ?? '', 'utf8') }
+      return { version: FsVersion(current.version), type: 'file', size: current.size ?? Buffer.byteLength(current.text ?? '', 'utf8') }
     }
 
     async lstat(path, opts, signal) {
@@ -2222,7 +2346,7 @@ export function createStagingFileSystem(options = {}) {
       if (!current.exists) return undefined
       if (current.kind === 'dir') return { version: FsVersion(current.version), type: 'directory', size: 0 }
       if (current.kind !== 'file') return { version: FsVersion(current.version), type: 'other' }
-      return { version: FsVersion(current.version), type: 'file', size: Buffer.byteLength(current.text ?? '', 'utf8') }
+      return { version: FsVersion(current.version), type: 'file', size: current.size ?? Buffer.byteLength(current.text ?? '', 'utf8') }
     }
 
     // ==================== 读取面：WP4 读侧可见性 ====================
@@ -2426,7 +2550,16 @@ export function createStagingFileSystem(options = {}) {
       const buffer = Buffer.from(current.text ?? '', 'utf8')
       const offset = Number(range?.offset ?? 0)
       const length = Number(range?.length ?? buffer.length)
-      return new Uint8Array(buffer.subarray(offset, Math.min(buffer.length, offset + length)))
+      // ★ R40-FS-03（P2）：非法区间不得被 `Buffer.subarray()` 静默"解释"成另一个窗口 ——
+      //   · `{offset:-4,length:10}` ⇒ `subarray(-4, 6)` ⇒ 空（谎称"文件末尾之后"）；
+      //   · `{offset:2,length:-3}` ⇒ `subarray(2, -1)` ⇒ 返回 7 个字节（`CDEFGHI`），
+      //     与请求的负长度毫无关系。基类对同一入参直接抛 `ERR_OUT_OF_RANGE`，不给内容。
+      // 这里只对**合法**区间按同一公式裁剪 `[offset, min(len, offset+length))`；非法区间
+      // 交回基类 ⇒ 与"未暂存/关态"走同一条拒绝路径，不会出现两套语义。
+      if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
+        return super.readByteRange(target, range, signal)
+      }
+      return new Uint8Array(buffer.subarray(Math.min(offset, buffer.length), Math.min(buffer.length, offset + length)))
     }
 
     async listDir(target, signal) {

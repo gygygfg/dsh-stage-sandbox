@@ -34,7 +34,7 @@
  * `probeRuntime()` 只如实报告"能否建立受限令牌"，而暂存面与它无关、照常工作。
  */
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { Config } from './schema.ts'
 import { evaluateEnvironment, environmentFailureMessage } from './environment-gate.ts'
@@ -844,7 +844,34 @@ export function readPublishedSnapshot({ workspaceRoot, sessionId, env } = {}) {
   const file = join(dir, REVIEW_BASENAME)
   if (!existsSync(file)) return { ok: false, code: 'no-snapshot', dir }
   try {
-    const snapshot = JSON.parse(readFileSync(file, 'utf8'))
+    /**
+     * R40-SNAP-08（P3）：`review.json` 是**磁盘上的普通文件**，可能被手写/旧版本/半截写入
+     * 污染。旧实现直接把 `JSON.parse()` 的结果原样返回，于是 `files:"nope"`、根为数组、
+     * `version:999`、20000 行等都能 200 通过，客户端再自己 `files.map` 就炸。
+     * 这里做**最小形状校验 + 硬上限**：不是快照形状 ⇒ `snapshot-invalid`，不渲染。
+     */
+    const size = statSync(file).size
+    if (!Number.isFinite(size) || size > 16 * 1024 * 1024) {
+      return { ok: false, code: 'snapshot-too-large', dir, detail: `size=${size}` }
+    }
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false, code: 'snapshot-invalid', dir, detail: 'root-not-object' }
+    }
+    if (parsed.files !== undefined && (!Array.isArray(parsed.files) || parsed.files.length > 100_000)) {
+      return { ok: false, code: 'snapshot-invalid', dir, detail: 'files-not-array-or-too-many' }
+    }
+    if (Array.isArray(parsed.files)) {
+      const bad = parsed.files.find((entry) => !entry || typeof entry !== 'object' || Array.isArray(entry) || typeof entry.path !== 'string' || entry.path.length === 0)
+      if (bad !== undefined) return { ok: false, code: 'snapshot-invalid', dir, detail: 'file-entry-invalid' }
+    }
+    if (parsed.version !== undefined && (typeof parsed.version !== 'number' || !Number.isFinite(parsed.version))) {
+      return { ok: false, code: 'snapshot-invalid', dir, detail: 'version-invalid' }
+    }
+    if (parsed.staging !== undefined && (!parsed.staging || typeof parsed.staging !== 'object' || Array.isArray(parsed.staging))) {
+      return { ok: false, code: 'snapshot-invalid', dir, detail: 'staging-invalid' }
+    }
+    const snapshot = parsed
     /**
      * R34-SEC-05（P3）：快照里的 `workspaceRoot` 用来给客户端做"没串台"自校验
      * （S9）；但它只是**文件内容**，可以被手写/旧版本篡改。路由侧既然已经知道
@@ -1751,6 +1778,17 @@ export function apply(ctx, config = {}) {
   const configuredMasks = compileConfiguredMasks(config.masks, { logError })
 
   /**
+   * 开关的**唯一读法**：每次现读，绝不在这里冻结成常量。
+   * 行表 `winstage-sandbox.config.enabled` 是唯一真源，apply 参数只作离线下回退。
+   * （详细依据见下方 `stagingEnabledRaw` 同源说明与 R17 审计记录。）
+   */
+  const isEnabled = () => {
+    const fromRows = switchEnabledFromRows(ctx?.fiber?.entry?.parent?.data)
+    return typeof fromRows === 'boolean' ? fromRows : config.enabled !== false
+  }
+  const enabledNow = isEnabled()
+
+  /**
    * R34b-G-04：`workspaceRoot` 未配置 / 指向不存在的目录时 **fail-closed**。
    *
    * 旧实现回退到 `new URL('..', import.meta.url)` = 包目录本身：用户没配根时，
@@ -1758,25 +1796,33 @@ export function apply(ctx, config = {}) {
    * 现在要求 profile 显式配置（bundle 默认值见 `cordis.patch.yml`；跨机器安装见 README
    * "三个根必须一起重述"），否则在装配期抛结构化错误，宿主日志里能直接看到原因。
    */
-  if (configuredWorkspaceRoot.length === 0) {
-    const error = new Error(
-      'WinStage workspaceRoot 未配置：拒绝装配。请在 profile 覆盖层设置 winstage-sandbox.config.workspaceRoot，' +
-        '并同时重述 winstage-fs.config.cwd/workspaceRoot 与 winstage-shell.config.workspaceRoot（config 是整体替换）。',
-    )
-    error.code = 'WINSTAGE_WORKSPACE_ROOT_MISSING'
-    logError(error.message)
-    throw error
+  if (enabledNow) {
+    if (configuredWorkspaceRoot.length === 0) {
+      const error = new Error(
+        'WinStage workspaceRoot 未配置：拒绝装配。请在 profile 覆盖层设置 winstage-sandbox.config.workspaceRoot，' +
+          '并同时重述 winstage-fs.config.cwd/workspaceRoot 与 winstage-shell.config.workspaceRoot（config 是整体替换）。',
+      )
+      error.code = 'WINSTAGE_WORKSPACE_ROOT_MISSING'
+      logError(error.message)
+      throw error
+    }
+    if (!existsSync(canonical(configuredWorkspaceRoot))) {
+      const resolved = canonical(configuredWorkspaceRoot)
+      const error = new Error(
+        `WinStage workspaceRoot 指向的目录不存在：${resolved}。请修正 profile 覆盖层里的根（host/fs/shell 三处必须一致）；` +
+          '本插件不会自动创建用户工作区，也不会回退到插件安装目录。',
+      )
+      error.code = 'WINSTAGE_WORKSPACE_ROOT_NOT_FOUND'
+      logError(error.message)
+      throw error
+    }
   }
-  const workspaceRoot = canonical(configuredWorkspaceRoot)
-  if (!existsSync(workspaceRoot)) {
-    const error = new Error(
-      `WinStage workspaceRoot 指向的目录不存在：${workspaceRoot}。请修正 profile 覆盖层里的根（host/fs/shell 三处必须一致）；` +
-        '本插件不会自动创建用户工作区，也不会回退到插件安装目录。',
-    )
-    error.code = 'WINSTAGE_WORKSPACE_ROOT_NOT_FOUND'
-    logError(error.message)
-    throw error
-  }
+  /**
+   * 关态**不校验根**：关闭 = 对原 harness 零影响，缺根/根不存在也不能阻止插件装载
+   * （命令面仍注册但如实拒绝、面板路由 503 disabled）。此时给一个只用于日志/挂载的
+   * 占位路径，绝不建 store、绝不写盘。
+   */
+  const workspaceRoot = canonical(configuredWorkspaceRoot || process.cwd())
 
   /**
    * 开关的**唯一读法**：每次现读，绝不在这里冻结成常量。
@@ -1802,11 +1848,6 @@ export function apply(ctx, config = {}) {
    * 行表在 `EntryGroup.update()` 里被**换整份**（`parent.data = config`），group 对象不变
    * ⇒ 每次现读都能看到新值，不需要重挂行。
    */
-  const isEnabled = () => {
-    const fromRows = switchEnabledFromRows(ctx?.fiber?.entry?.parent?.data)
-    return typeof fromRows === 'boolean' ? fromRows : config.enabled !== false
-  }
-
   if (isEnabled()) {
     log.info(`已启用；工作区根 = ${workspaceRoot}`)
   } else {

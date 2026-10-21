@@ -194,6 +194,17 @@ try {
     check('S3.3 x64 创建 + 32KEY ⇒ stageable, view=1', create32.stageable === true && create32.view === 1, JSON.stringify({ stageable: create32.stageable, view: create32.view }))
     const noop64 = classifyRegistryOperation({ api: 'RegSetValueExW', path: KEY, type: 'REG_SZ', samDesired: KEY_WOW64.KEY_WOW64_64KEY })
     check('S3.4 x64 + 64KEY（文档化 no-op）⇒ 普通暂存 view=0', noop64.stageable === true && noop64.view === 0, JSON.stringify({ stageable: noop64.stageable, view: noop64.view }))
+    const conflict = classifyRegistryOperation({
+      api: 'RegSetValueExW',
+      path: KEY,
+      type: 'REG_SZ',
+      samDesired: KEY_WOW64.KEY_WOW64_32KEY | KEY_WOW64.KEY_WOW64_64KEY,
+    })
+    check(
+      'S3.4b 32KEY|64KEY 同时出现 ⇒ fail-closed（Windows 返回 87，不能伪装成 32 视图暂存）',
+      conflict.stageable === false,
+      JSON.stringify({ stageable: conflict.stageable, reason: conflict.reason }),
+    )
     const wow32 = classifyRegistryOperation({ api: 'RegSetValueExW', path: KEY, type: 'REG_SZ', samDesired: KEY_WOW64.KEY_WOW64_32KEY, wow64Process: true })
     check('S3.5 WOW64 进程 + 32KEY ⇒ fail-closed 原因码 1（纵深防御）', wow32.stageable === false && wow32.hardDenyReason === 'WOW64_32KEY_WRITE_NOT_STAGEABLE', JSON.stringify(wow32))
     const wow64 = classifyRegistryOperation({ api: 'RegSetValueExW', path: KEY, type: 'REG_SZ', samDesired: KEY_WOW64.KEY_WOW64_64KEY, wow64Process: true })

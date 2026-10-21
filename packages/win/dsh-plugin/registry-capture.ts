@@ -189,9 +189,30 @@ export function captureRegistryChanges(options = {}) {
     return fail('stage-construct-failed', error)
   }
 
+  let opened
+  try {
+    opened = stage.open()
+  } catch (error) {
+    return fail('open-failed', error)
+  }
+  /* R40：撕裂尾巴必须**可见**，不能只由 open() 内部修好就当作没发生。
+   * capture() 的返回里有 `errors`（插件会按 error 级日志展示）—— 把"哪几个字节不是
+   * 完整记录、被移到哪个审计副本"写进去；截断失败时必须 fail-closed（否则下一条命令的
+   * 追加会落在半个记录之后，静默丢记录/把整段 WAL 变不可读）。 */
+  if (opened?.torn === true) {
+    const detail =
+      `registry WAL has a torn tail: ${opened.tornTrimmedBytes} trailing byte(s) after offset ` +
+      `${opened.journalBytesConsumed} are not a complete record; ` +
+      (opened.tornRepaired === true
+        ? `trimmed to the last complete record and preserved at ${opened.tornAuditPath ?? 'overlay.journal.torn'}`
+        : 'sealing (truncate) FAILED') +
+      ' — the incomplete record is not replayed (it never became a complete operation)'
+    errors.push(detail)
+    logError(`注册表 WAL 撕裂尾巴 —— ${detail}`)
+    if (opened.tornRepaired !== true) return fail('wal-torn-unrepaired', new Error(detail))
+  }
   let frozen
   try {
-    stage.open()
     frozen = stage.freezeCandidate()
   } catch (error) {
     // 注意：**不**推进标记 —— 下一次还要再试（比如真实 hive 那一刻读不到）。
@@ -209,8 +230,13 @@ export function captureRegistryChanges(options = {}) {
   }
 
   sweepDeadOverlayHives(sessionDir, { isAlive: options.isAlive })
+  /* R40：标记 = **完整记录**消耗到的字节数（open() 解析的边界），不是 stat 到的文件大小。
+   * 撕裂尾巴被截断后 `size` 会大于恢复后的日志；用旧口径会让下一次捕获误以为
+   * "WAL 变小了"并重复冻结。若捕获期间 shim 又追加了新记录，consumed < 新大小 ⇒
+   * 下一次捕获照常处理它们（不会被提前吞掉）。 */
+  const consumedBytes = Number.isInteger(opened?.journalBytesConsumed) ? opened.journalBytesConsumed : size
   writeMarker(sessionDir, {
-    bytes: size,
+    bytes: consumedBytes,
     records: frozen?.changes?.length ?? 0,
     enqueued: frozen?.enqueued === true,
     candidateId: frozen?.candidate?.id ?? null,
@@ -223,6 +249,7 @@ export function captureRegistryChanges(options = {}) {
     changes: frozen?.changes?.length ?? 0,
     enqueued: frozen?.enqueued === true,
     candidateId: frozen?.candidate?.id ?? null,
+    torn: opened?.torn === true,
     errors,
   }
 }

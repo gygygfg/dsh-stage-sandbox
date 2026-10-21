@@ -700,13 +700,23 @@ function stringOption(raw, key) {
  * 现在显式接线：行 `config.networkTier`（或环境变量 `WINSTAGE_NETWORK_TIER`）。
  * **默认仍是 `OBSERVED_ONLINE`** ⇒ 既有行为逐字不变；显式设 `OFFLINE` 时，
  * 执行器会按既有设计尝试安装真实 WFP 过滤器，挡不住就 fail-closed 拒绝执行命令。
- * 取值不合法一律**回落默认**并只记录，绝不静默接受一个拼错的档位。
+ * 取值不合法一律 **fail-closed 到 `OFFLINE`**（R40 更正：旧行为是回落默认 =
+ * 静默放行网络，拼错的 `"offlin"` / 带空格的 `" offline "` 都会变成网络照开）。
  */
 const NETWORK_TIERS = new Set(['OBSERVED_ONLINE', 'OFFLINE'])
 function normalizeNetworkTier(value) {
-  if (typeof value !== 'string' || value.length === 0) return 'OBSERVED_ONLINE'
-  const upper = value.toUpperCase()
-  return NETWORK_TIERS.has(upper) ? upper : 'OBSERVED_ONLINE'
+  if (typeof value !== 'string') return 'OBSERVED_ONLINE'
+  // ★ R40：两边必须有界 —— **空/未设**才回落默认；**设了但不认识**一律 fail-closed
+  //   到 `OFFLINE`（最严档）。旧实现把非法值（含 `" offline "` 这种尾随空格、
+  //   或 `"offlin"` 这种拼写错误）静默回落成 `OBSERVED_ONLINE` = **网络放行**，
+  //   于是"用户打算离线"变成了"网络照开"，且没有任何可见痕迹（R40 实测：
+  //   `.t/r40/snapshot/probe1.ts` B4 段 `offline ` / `offlin` → OBSERVED_ONLINE）。
+  //   fail-closed 的代价是命令可能因网络档位安装失败而被拒 —— 那是**响**，可修；
+  //   静默放行没有修正机会。
+  const trimmed = value.trim()
+  if (trimmed.length === 0) return 'OBSERVED_ONLINE'
+  const upper = trimmed.toUpperCase()
+  return NETWORK_TIERS.has(upper) ? upper : 'OFFLINE'
 }
 
 /**
@@ -946,14 +956,44 @@ export function msiFamilyCommandVerdict(command) {
     return false
   }
 
+  /* ★ R40：语句 / 脚本块包装（`for … do msiexec`、`if (…) { msiexec }`、`Start-Job { msiexec }`）。
+   * 旧实现取"第一个非旗标 token"当有效程序名，而 `for` / `{` / `if` **不是程序** ⇒
+   * 扫描在包装词处停下，整条命令判为不命中（R40 实测 `.t/r40/snapshot/probe1.ts` B2 段：
+   * `for %f in (*.msi) do msiexec /i %f`、`if (Test-Path a.msi) { msiexec … }`、
+   * `Start-Job { msiexec … }`、`Invoke-Command -ScriptBlock { msiexec … }` 等 6 种形态全部
+   * `blocked=false`）。现在：包装词 / 环变量 / 括号分组只**跳过**、不当程序名；只要段内
+   * 出现过包装（`sawWrapper`）就再扫一遍包装后的 token。**保守面不变**：没有任何包装的段
+   * 仍然只看第一个程序名（`Get-Process msiexec` / `echo msiexec` 依旧不拦）。 */
+  const STATEMENT_WORDS = new Set([
+    'for', 'foreach', 'if', 'while', 'switch', 'do', 'then', 'else', 'try', 'catch',
+    'finally', 'until', 'begin', 'process', 'end', 'return', 'in', 'exit',
+  ])
+  const isWrapperToken = (token) => {
+    const t = String(token).trim().replace(/^["']+|["']+$/g, '')
+    if (t === '{' || t === '}' || t === '(' || t === ')' || t === '&') return true
+    // 括号分组的片段（`(Test-Path` / `a.msi)` / `(Get-Item x)`）
+    if (/^[({]/.test(t) || /[)}]$/.test(t)) return true
+    // 环变量：`%f` / `%%f` / `$f` / `${f}` / `$env:X`
+    if (/^%{1,2}[A-Za-z%]$/.test(t) || /^\$[\w:.\\[\]{}'"-]+$/.test(t)) return true
+    return STATEMENT_WORDS.has(basename(t))
+  }
+
   const scan = (segment, depth) => {
     const tokens = tokenize(segment)
+    let sawWrapper = false
     let i = 0
     while (i < tokens.length) {
       if (LAUNCHERS.has(basename(tokens[i])) || isFlag(tokens[i])) { i++; continue }
+      // ★ R40：包装词不是程序名 —— 跳过并记下"这段是语句/脚本块包装"
+      if (isWrapperToken(tokens[i])) { sawWrapper = true; i++; continue }
       break
     }
     if (i >= tokens.length) return null
+    // ★ R40：包装可能出现在**启动器之后**（`Invoke-Command -ScriptBlock { … }` /
+    //   `Start-ThreadJob -ScriptBlock { … }` —— 扫描在 unlisted 启动器处就停了，
+    //   永远走不到 `{`）⇒ 段内只要出现包装 token 就启用"包装后复扫"。实测形态：
+    //   `.t/r40/snapshot/probe1.ts` B2 段 blocked=false，probe2 M1 段同组回归。
+    if (!sawWrapper && tokens.some((token) => isWrapperToken(token))) sawWrapper = true
     const headToken = tokens[i]
     const head = basename(headToken)
     if (head === 'msiexec' || head === 'msiserver') return { matched: head, head: headToken }
@@ -975,6 +1015,15 @@ export function msiFamilyCommandVerdict(command) {
     if (depth < 2 && /^["']/.test(headToken)) {
       const inner = headToken.replace(/^["']|["']$/g, '')
       if (/\s/.test(inner)) return scan(inner, depth + 1)
+    }
+    // ★ R40：语句 / 脚本块包装 ⇒ 扫一遍包装后的 token（见 `isWrapperToken()` 的说明）。
+    //   只在**出现过包装**时启用，因此"提到名字"的保守面（`Get-Process msiexec`）逐字不变。
+    if (sawWrapper) {
+      for (const token of tokens) {
+        if (isWrapperToken(token)) continue
+        const b = basename(token)
+        if (b === 'msiexec' || b === 'msiserver') return { matched: b, head: token }
+      }
     }
     return null
   }
@@ -1188,9 +1237,11 @@ export function createWinStageShellExecutor(options = {}) {
        * 的顺序会让 `WINSTAGE_NETWORK_TIER` **永远被短路**（A/B 实证：`env=OFFLINE`
        * 且行有键 ⇒ 仍 `OBSERVED_ONLINE`、命令照跑），与 `cordis.patch.yml` 注释承诺的
        * "进程级环境变量是显式逃生口"相矛盾，也与 `WINSTAGE_SHELL` 的"进程级强制"语义不一致。
-       * 非法值一律回落 `OBSERVED_ONLINE`（由 `normalizeNetworkTier()` 统一兜底，
-       * 本行只负责**取哪个来源**，不做值校验）。env 未设 + 行键 `OBSERVED_ONLINE`
-       * ⇒ 仍是 `OBSERVED_ONLINE`（默认行为逐字不变）。
+       * 非法值一律**取最严档**（R40 更正：旧注释写的"回落 `OBSERVED_ONLINE`"已被
+       * 实测证明是 fail-open —— `WINSTAGE_NETWORK_TIER=" offline "` / `"offlin"` 会
+       * 静默变成网络放行；现在由 `normalizeNetworkTier()` 统一 fail-closed 到 `OFFLINE`，
+       * 只有**空/未设**才回落默认）。本行只负责**取哪个来源**，不做值校验。
+       * env 未设 + 行键 `OBSERVED_ONLINE` ⇒ 仍是 `OBSERVED_ONLINE`（默认行为逐字不变）。
        */
       this.networkTier = normalizeNetworkTier(
         stringOption(process.env, 'WINSTAGE_NETWORK_TIER') ?? stringOption(raw, 'networkTier'),

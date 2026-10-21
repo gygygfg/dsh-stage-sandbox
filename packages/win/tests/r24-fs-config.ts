@@ -545,6 +545,18 @@ try {
         missingError?.code === 'WINSTAGE_WORKSPACE_ROOT_NOT_FOUND',
         JSON.stringify({ code: missingError?.code }),
       )
+      const disabled = makeFakeCtx()
+      let disabledError
+      try {
+        apply(disabled.ctx, { enabled: false, workspaceRoot: '', probeOnStart: false, verboseLog: false })
+      } catch (error) {
+        disabledError = error
+      }
+      check(
+        '关闭态 + 空 workspaceRoot ⇒ 不抛错（关闭必须对原 harness 零影响）',
+        disabledError === undefined,
+        String(disabledError?.message ?? 'ok'),
+      )
     }
 
     // 5.4 schema 层：masks 字段被真 schemastery 接受，缺省水合为 []
