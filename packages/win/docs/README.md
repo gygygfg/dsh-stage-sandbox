@@ -78,6 +78,7 @@
 - [`round28/R28-apply属性面报告.md`](round28/R28-apply属性面报告.md)：第七批 —— R21-FS-08 apply 属性面（hidden/system 还原：staged→baseWin32→apply 前值，失败 warnings 不吞错，R24 回滚快照含 H/S；ACL 继承明确非暂存语义）、R21-FS-07 口径更新（同 store apply.lock 已加，残余跨 store/崩溃恢复）；附残余。
 - [`round29/R29-属性面残余收口报告.md`](round29/R29-属性面残余收口报告.md)：第八批 —— 属性面残余收口：显式清除 H/S（ADS `:winstage-attr` 显式态标记，存在即采用哪怕 0；非 NTFS 如实 warning 不回退）、目录树回滚子项属性逐项恢复（失败 `ROLLBACK_ATTRIBUTE_FAILED` 如实 partial）；附残余（目录属性不在标记面、非 NTFS、ACL 继承非暂存语义）。
 - [`round30/R30-NT长路径专项报告.md`](round30/R30-NT长路径专项报告.md)：第九批 —— NT 上限长路径专项（`WS_PATH_MAX` 4096→32768 + 堆缓冲/cleanup，无 64KB 栈数组；≤32000 支持，32760–32767 受 staged 物理路径限制显式 fail-closed+归因，>32767 fail-closed；`-Wframe-larger-than=8192` 0 warning + STRESS-OK）；附残余。
+- [`round31/R31-崩溃恢复WAL报告.md`](round31/R31-崩溃恢复WAL报告.md)：第十批 —— R21-FS-07 崩溃恢复 WAL（`<store.dir>/apply.journal` 整批快照+sha256；`recoverApplyJournal()`/applyCandidate/init 自动恢复；崩溃缝 N=1/2 真实子进程 exit 134 ⇒ 逐字节回原态+候选 pending+事件；损坏 fail-closed、并发守卫、幂等）；附残余（无 fsync 断电 durability 等）。
 
 ## 5. archive —— 历史归档（不代表现行口径）
 

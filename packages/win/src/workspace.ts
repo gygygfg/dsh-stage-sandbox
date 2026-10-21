@@ -25,7 +25,7 @@
  *   - 遮蔽前先规范化，符号链接不能绕过（#16.6）；硬拒绝先于软遮蔽（#16.7）
  */
 
-import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { dirname, join, normalize, relative, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
@@ -652,6 +652,8 @@ export class Workspace {
     this.manifest = this.store.manifest({ sessionId: this.sessionId, ...meta })
     this.sessionId = this.manifest.sessionId
     this.queue = this.store.loadQueue()
+    // R31：若上次 apply 崩溃留下 journal，先按并发守卫恢复（失败/损坏 ⇒ fail-closed）
+    this._recoverJournalOnInit()
     // 13.2：持久状态与投影一起恢复 —— 校验每个暂存条目
     this.corruption = this.verifyProjection()
     return this
@@ -1660,6 +1662,329 @@ export class Workspace {
    * 进程崩溃遗留的锁按 mtime >120s 视为陈旧并清除（残余见 findings）。
    * 锁只覆盖**同一 store**的 apply；不同 store/工作区的并发仍由逐文件 hash 闸门兜底。
    */
+  /* ── R31 / R21-FS-07：apply 意图 WAL（崩溃恢复 journal）────────────────────────
+   * 首次写盘前把整批 R24 回滚快照序列化到 `<store.dir>/apply.journal`：
+   *   { version, candidateId, createdAt, phase, maxSnapshotBytes,
+   *     snapshots:[...], changes:[{path,op,afterKind,afterHash,afterMode}] }
+   * 文件 = { payload, checksum:{algo:'sha256', hex:sha256(JSON.stringify(payload))} }；
+   * JSON 损坏/版本不符/校验失败 ⇒ APPLY_JOURNAL_CORRUPT fail-closed（不猜、不静默）。
+   * 成功/回滚成功删除；回滚失败保留并 phase=partial；恢复后候选置回 pending 并记事件
+   * `RECOVERED_APPLY_JOURNAL`（事件 JSONL 写在 store.dir，不碰真实 workspace）。
+   * 快照上限沿用 64MiB（opts.maxSnapshotBytes）；journal 字节数同样受该上限约束，
+   * 超限在**任何真实写之前** APPLY_JOURNAL_TOO_LARGE fail-closed。
+   * 崩溃测试缝：WINSTAGE_TEST_CRASH_AFTER_APPLY_WRITES=N ⇒ 成功写第 N 条后 process.abort()
+   * （仅测试 env；生产不设 ⇒ 无行为变化）。
+   * 恢复并发守卫（R29 口径）：当前 == 原态 ⇒ noop；== 本批 after ⇒ 恢复；其它 ⇒
+   * RECOVERY_CONCURRENT_MODIFICATION 跳过、绝不覆盖。
+   */
+  _applyJournalPath() {
+    return join(this.store.dir, 'apply.journal')
+  }
+
+  _applyEventPath() {
+    return join(this.store.dir, 'apply.events.jsonl')
+  }
+
+  _appendApplyEvent(kind, details = {}) {
+    try {
+      appendFileSync(this._applyEventPath(), `${JSON.stringify({ at: new Date().toISOString(), kind, ...details })}\n`, 'utf8')
+    } catch {
+      /* event log is diagnostic; recovery outcome must not depend on it */
+    }
+  }
+
+  _serializeRollbackSnapshot(snap) {
+    /** @type {any} */
+    const out = { abs: snap.abs, kind: snap.kind }
+    if (snap.mode !== undefined) out.mode = snap.mode
+    if (snap.attrs) out.attrs = snap.attrs
+    if (snap.kind === 'file') {
+      out.hash = snap.hash
+      out.bytes = Buffer.from(snap.bytes).toString('base64')
+    } else if (snap.kind === 'dir') {
+      out.treeHash = snap.treeHash
+      out.entries = (snap.entries || []).map((entry) => {
+        /** @type {any} */
+        const e = { rel: entry.rel, kind: entry.kind, mode: entry.mode }
+        if (entry.attrs) e.attrs = entry.attrs
+        if (entry.kind === 'file') e.bytes = Buffer.from(entry.bytes).toString('base64')
+        return e
+      })
+    } else if (snap.kind === 'absent') {
+      out.newParents = snap.newParents || []
+    }
+    return out
+  }
+
+  _deserializeRollbackSnapshot(raw) {
+    const snap = { abs: raw.abs, kind: raw.kind }
+    if (raw.mode !== undefined) snap.mode = raw.mode
+    if (raw.attrs) snap.attrs = raw.attrs
+    if (raw.kind === 'file') {
+      snap.hash = raw.hash
+      snap.bytes = Buffer.from(String(raw.bytes || ''), 'base64')
+    } else if (raw.kind === 'dir') {
+      snap.treeHash = raw.treeHash
+      snap.entries = (raw.entries || []).map((entry) => {
+        const e = { rel: entry.rel, kind: entry.kind, mode: entry.mode }
+        if (entry.attrs) e.attrs = entry.attrs
+        if (entry.kind === 'file') e.bytes = Buffer.from(String(entry.bytes || ''), 'base64')
+        return e
+      })
+    } else if (raw.kind === 'absent') {
+      snap.newParents = raw.newParents || []
+    }
+    return snap
+  }
+
+  _stagedModeOf(change) {
+    try {
+      const staged = this.store.stagedPath(change.path)
+      if (!existsSync(staged)) return undefined
+      return statSync(staged).mode & 0o777
+    } catch {
+      return undefined
+    }
+  }
+
+  _writeApplyJournal(candidate, chosen, snapshots, snapshotBudget) {
+    const payload = {
+      version: 1,
+      candidateId: candidate.id,
+      createdAt: new Date().toISOString(),
+      phase: 'applying',
+      maxSnapshotBytes: snapshotBudget.limit,
+      snapshots: [...snapshots.values()].map((snap) => this._serializeRollbackSnapshot(snap)),
+      changes: chosen.map((change) => ({
+        path: change.path,
+        op: change.op,
+        afterKind: change.op === 'delete' ? 'absent' : change.after?.kind || 'file',
+        afterHash: change.after?.hash || hashAbsent(),
+        afterMode: this._stagedModeOf(change),
+      })),
+    }
+    const body = JSON.stringify(payload)
+    const bytes = Buffer.byteLength(body, 'utf8')
+    if (bytes > snapshotBudget.limit) {
+      throw new SandboxError('APPLY_JOURNAL_TOO_LARGE', `apply journal exceeds ${snapshotBudget.limit} bytes`, {
+        path: this._applyJournalPath(),
+        bytes,
+        limit: snapshotBudget.limit,
+      })
+    }
+    const envelope = {
+      payload,
+      checksum: { algo: 'sha256', hex: createHash('sha256').update(body, 'utf8').digest('hex') },
+    }
+    const text = JSON.stringify(envelope)
+    const tmp = `${this._applyJournalPath()}.tmp-${process.pid}-${Date.now()}`
+    try {
+      writeFileSync(tmp, text, { encoding: 'utf8', mode: 0o600 })
+      renameSync(tmp, this._applyJournalPath())
+    } catch (error) {
+      try {
+        rmSync(tmp, { force: true })
+      } catch {}
+      throw new SandboxError('APPLY_JOURNAL_UNAVAILABLE', `cannot persist apply journal: ${error.message}`, { path: this._applyJournalPath() })
+    }
+    return { path: this._applyJournalPath(), bytes: Buffer.byteLength(text, 'utf8') }
+  }
+
+  _loadApplyJournal() {
+    const path = this._applyJournalPath()
+    let text
+    try {
+      text = readFileSync(path, 'utf8')
+    } catch (error) {
+      if (error.code === 'ENOENT') return null
+      throw new SandboxError('APPLY_JOURNAL_CORRUPT', `apply journal unreadable: ${error.message}`, { path })
+    }
+    let envelope
+    try {
+      envelope = JSON.parse(text)
+    } catch (error) {
+      throw new SandboxError('APPLY_JOURNAL_CORRUPT', `apply journal is not valid JSON: ${error.message}`, { path })
+    }
+    const payload = envelope?.payload
+    const checksum = envelope?.checksum
+    if (!payload || typeof payload !== 'object' || payload.version !== 1 || !payload.candidateId || !Array.isArray(payload.snapshots) || !Array.isArray(payload.changes)) {
+      throw new SandboxError('APPLY_JOURNAL_CORRUPT', 'apply journal header/version/shape invalid', { path })
+    }
+    if (!checksum || checksum.algo !== 'sha256' || typeof checksum.hex !== 'string') {
+      throw new SandboxError('APPLY_JOURNAL_CORRUPT', 'apply journal checksum missing', { path })
+    }
+    const digest = createHash('sha256').update(JSON.stringify(payload), 'utf8').digest('hex')
+    if (digest !== checksum.hex) {
+      throw new SandboxError('APPLY_JOURNAL_CORRUPT', 'apply journal checksum mismatch', { path })
+    }
+    return { path, payload }
+  }
+
+  _removeApplyJournal() {
+    try {
+      rmSync(this._applyJournalPath(), { force: true })
+    } catch {
+      /* best effort: next recovery attempt will re-check semantics */
+    }
+  }
+
+  _updateApplyJournalPhase(phase) {
+    try {
+      const loaded = this._loadApplyJournal()
+      if (!loaded) return
+      const payload = { ...loaded.payload, phase }
+      const body = JSON.stringify(payload)
+      const envelope = { payload, checksum: { algo: 'sha256', hex: createHash('sha256').update(body, 'utf8').digest('hex') } }
+      const tmp = `${this._applyJournalPath()}.tmp-${process.pid}`
+      writeFileSync(tmp, JSON.stringify(envelope), { encoding: 'utf8', mode: 0o600 })
+      renameSync(tmp, this._applyJournalPath())
+    } catch {
+      /* phase update is diagnostic; the existing journal remains valid */
+    }
+  }
+
+  _currentStateOf(abs) {
+    try {
+      const st = lstatSync(abs)
+      if (st.isSymbolicLink()) return { kind: 'other' }
+      if (st.isFile()) return { kind: 'file', hash: hashFile(abs), mode: st.mode & 0o777 }
+      if (st.isDirectory()) return { kind: 'dir', treeHash: this._hashTreeOfDir(abs) }
+      return { kind: 'other' }
+    } catch (error) {
+      if (error.code === 'ENOENT') return { kind: 'absent' }
+      return { kind: 'other' }
+    }
+  }
+
+  _snapshotOriginalState(snap) {
+    if (snap.kind === 'absent') return { kind: 'absent' }
+    if (snap.kind === 'file') return { kind: 'file', hash: snap.hash }
+    if (snap.kind === 'dir') return { kind: 'dir', treeHash: snap.treeHash }
+    return { kind: 'other' }
+  }
+
+  _isAfterState(change, cur) {
+    if (change.afterKind === 'absent') return cur.kind === 'absent'
+    if (change.afterKind === 'file') return cur.kind === 'file' && cur.hash === change.afterHash
+    if (change.afterKind === 'dir') return cur.kind === 'dir'
+    return false
+  }
+
+  _isOriginalState(snap, cur) {
+    const original = this._snapshotOriginalState(snap)
+    if (original.kind !== cur.kind) return false
+    if (original.kind === 'file') return cur.hash === original.hash
+    if (original.kind === 'dir') return cur.treeHash === original.treeHash
+    return original.kind === 'absent'
+  }
+
+  /**
+   * 恢复 journal（调用方必须持 apply.lock）：返回 { ok, recovery }。
+   * 损坏/版本不符/校验失败 ⇒ throw APPLY_JOURNAL_CORRUPT（fail-closed）。
+   */
+  _recoverApplyJournalLocked(opts = {}) {
+    const loaded = this._loadApplyJournal()
+    if (!loaded) return { ok: true, recovery: null }
+    const payload = loaded.payload
+    const snapshots = new Map()
+    for (const raw of payload.snapshots) {
+      const snap = this._deserializeRollbackSnapshot(raw)
+      snapshots.set(snap.abs, snap)
+    }
+    const restored = []
+    const noop = []
+    const skipped = []
+    const failed = []
+    for (const change of payload.changes) {
+      const abs = this.absolute(change.path)
+      const snap = snapshots.get(abs)
+      if (!snap) {
+        skipped.push({ path: change.path, code: 'RECOVERY_SNAPSHOT_MISSING' })
+        continue
+      }
+      const cur = this._currentStateOf(abs)
+      if (this._isOriginalState(snap, cur)) {
+        noop.push({ path: change.path })
+        continue
+      }
+      if (!this._isAfterState(change, cur)) {
+        skipped.push({ path: change.path, code: 'RECOVERY_CONCURRENT_MODIFICATION', current: cur.kind })
+        continue
+      }
+      const restoredOne = this._restoreRollbackSnapshot(snap, opts)
+      if (restoredOne.ok) restored.push({ path: change.path, action: restoredOne.action })
+      else failed.push({ path: change.path, code: restoredOne.code || 'ROLLBACK_FAILED', message: restoredOne.message })
+    }
+    const recovery = {
+      candidateId: payload.candidateId,
+      createdAt: payload.createdAt,
+      phase: payload.phase,
+      restored: restored.length,
+      noop: noop.length,
+      skipped,
+      failed,
+    }
+    // 候选置回 pending（仍可重试）；失败/跳过如实记录到 lastApply.recovery
+    const candidate = this.store.loadCandidate(payload.candidateId)
+    if (candidate) {
+      candidate.status = CANDIDATE_STATUS.PENDING
+      candidate.lastApply = {
+        applied: [],
+        failed: failed.map((item) => ({ path: item.path, op: 'recovery', code: item.code, message: item.message })),
+        blockedByMask: [],
+        maskWarnings: [],
+        conflicts: [],
+        rollback: [...restored, ...skipped],
+        rolledBack: failed.length === 0,
+        recovered: true,
+        recovery,
+      }
+      this.store.saveCandidate(candidate)
+      this.queue = this.store.loadQueue()
+      this.queue.candidates[candidate.id] = {
+        ...this.queue.candidates[candidate.id],
+        status: CANDIDATE_STATUS.PENDING,
+        appliedFiles: 0,
+        remainingFiles: candidate.changes?.length || 0,
+      }
+      this.store.saveQueue(this.queue)
+    }
+    if (failed.length === 0) {
+      this._removeApplyJournal()
+      this._appendApplyEvent('RECOVERED_APPLY_JOURNAL', recovery)
+      return { ok: true, recovery }
+    }
+    // 恢复本身失败：保留 journal（phase=partial），如实 partial，不谎称已恢复
+    this._updateApplyJournalPhase('partial')
+    this._appendApplyEvent('RECOVERED_APPLY_JOURNAL_PARTIAL', recovery)
+    return { ok: false, recovery }
+  }
+
+  /** 初始化/服务启动时尝试恢复；拿不到锁说明另一个进程正在 apply，它会在锁内恢复。 */
+  _recoverJournalOnInit() {
+    if (!existsSync(this._applyJournalPath())) return null
+    const lock = this._acquireApplyLock(0)
+    if (!lock.ok) return { skipped: 'APPLY_LOCK_BUSY' }
+    try {
+      return this._recoverApplyJournalLocked()
+    } finally {
+      this._releaseApplyLock()
+    }
+  }
+
+  /** 导出恢复 API（供 applyCandidate / loadQueue / gate-runner 独立调用）。 */
+  recoverApplyJournal(opts = {}) {
+    const lock = this._acquireApplyLock(opts.applyLockTimeoutMs)
+    if (!lock.ok) {
+      throw new SandboxError(lock.code || 'APPLY_LOCK_TIMEOUT', lock.message || 'cannot acquire apply lock for recovery', { path: lock.path })
+    }
+    try {
+      return this._recoverApplyJournalLocked(opts)
+    } finally {
+      this._releaseApplyLock()
+    }
+  }
+
   _applyLockPath() {
     return join(this.store.dir, 'apply.lock')
   }
@@ -1689,7 +2014,8 @@ export class Workspace {
         if (error.code !== 'EEXIST') {
           return { ok: false, path, code: error.code || 'APPLY_LOCK_UNAVAILABLE', message: error.message }
         }
-        // 陈旧锁（持锁进程被强杀等）：mtime 超时后清除并重试
+        // 陈旧锁（持锁进程被强杀等）：先看锁里的 pid 是否还活着（崩溃后立即可恢复），
+        // 再退回 mtime 超时清理。
         try {
           const st = statSync(path)
           if (Date.now() - st.mtimeMs > 120000) {
@@ -1698,6 +2024,24 @@ export class Workspace {
           }
         } catch {
           continue
+        }
+        try {
+          const holder = JSON.parse(readFileSync(path, 'utf8'))
+          const pid = Number(holder?.pid)
+          if (Number.isInteger(pid) && pid > 0) {
+            let alive = true
+            try {
+              process.kill(pid, 0)
+            } catch (error) {
+              alive = error.code === 'EPERM'
+            }
+            if (!alive) {
+              rmSync(path, { force: true })
+              continue
+            }
+          }
+        } catch {
+          /* unreadable lock: fall through to timeout handling */
         }
         if (Date.now() >= deadline) {
           return { ok: false, path, code: 'APPLY_LOCK_TIMEOUT', message: `another process is applying (lock ${path})` }
@@ -1744,6 +2088,8 @@ export class Workspace {
   }
 
   _applyCandidateLocked(id, opts = {}) {
+    // R31：持锁后先消费崩溃遗留 journal（损坏 ⇒ APPLY_JOURNAL_CORRUPT fail-closed）
+    this._recoverApplyJournalLocked(opts)
     const { candidate, idempotent } = this.resolveCandidate(id)
     if (idempotent === 'ALREADY_APPLIED') {
       // WP5′：候选可能已被修剪（磁盘上只剩墓碑）⇒ 这里必须仍然返回**旧口径的完整形状**
@@ -1902,6 +2248,27 @@ export class Workspace {
       }
     }
 
+    /** R31：首次真实写盘前持久化整批回滚快照（journal）；失败 ⇒ 一个字节都不写。 */
+    try {
+      this._writeApplyJournal(candidate, chosen, snapshots, snapshotBudget)
+    } catch (error) {
+      return {
+        id: candidate.id,
+        status: candidate.status,
+        applied: [],
+        failed: [{ path: this._applyJournalPath(), op: 'journal', code: error.code || 'APPLY_JOURNAL_UNAVAILABLE', message: error.message }],
+        blockedByMask: [],
+        maskWarnings: [],
+        conflicts: [],
+        remaining: chosen.map((change) => change.path),
+        totalChanged: candidate.changes.length,
+        requeued: true,
+        rolledBack: true,
+        rollback: [],
+        note: 'apply-journal-unavailable: refused to write anything (crash recovery cannot be guaranteed)',
+      }
+    }
+
     let firstFailure = null
     for (const change of chosen) {
       const abs = this.absolute(change.path)
@@ -1944,7 +2311,14 @@ export class Workspace {
         // counted as "applied" (selftest #12.3 expects applied.length===0 on re-apply)
         // and not counted as failed.
         const wrote = this.applyOneChange(change, { ...opts, _attributeWarnings: attributeWarnings })
-        if (wrote !== false) applied.push({ path: change.path, op: change.op })
+        if (wrote !== false) {
+          applied.push({ path: change.path, op: change.op })
+          // R31 test seam: crash a real child process after N successful writes.
+          const crashAfter = Number(process.env.WINSTAGE_TEST_CRASH_AFTER_APPLY_WRITES || 0)
+          if (Number.isFinite(crashAfter) && crashAfter > 0 && applied.length >= crashAfter) {
+            process.abort()
+          }
+        }
       } catch (error) {
         failed.push({
           path: change.path,
@@ -1972,6 +2346,7 @@ export class Workspace {
        */
       const reloaded = this.store.loadCandidate(candidate.id)
       if (reloaded && reloaded.status === CANDIDATE_STATUS.APPLIED) {
+        this._removeApplyJournal()
         this.queue = this.store.loadQueue()
         return {
           id: candidate.id,
@@ -2028,6 +2403,7 @@ export class Workspace {
           remainingFiles: chosen.length,
         }
         this.store.saveQueue(this.queue)
+        this._removeApplyJournal()
         return {
           id: candidate.id,
           status: 'rolled-back',
@@ -2121,6 +2497,12 @@ export class Workspace {
     if (status === CANDIDATE_STATUS.APPLIED) {
       this.pruneCandidates()
       this.store.saveQueue(this.queue)
+    }
+    // R31：回滚失败 ⇒ 保留 journal（phase=partial）供下次恢复；其余路径清理。
+    if (rollbackReport && !rolledBack) {
+      this._updateApplyJournalPhase('partial')
+    } else {
+      this._removeApplyJournal()
     }
 
     return {

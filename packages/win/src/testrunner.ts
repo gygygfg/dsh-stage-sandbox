@@ -232,9 +232,13 @@ export const OFFLINE_SUITES = [
   // R26 逐项修复（第五批）：R13 32 位注册表视图暂存化（/reg:32 写/删进 overlay、apply 落 32 视图）。
   { id: 'r26-wow64-registry', script: 'tests/r26-wow64-registry.ts', title: 'R26 32 位注册表视图暂存（合成路径 + WAL view + apply /reg:32；41 断言）' },
   // R27 收尾：边缘路径（>4095 显式 fail-closed 归因、≤3000 支持、跨卷 rename 无半态、远端 SMB 环境缺口）。
-  { id: 'r27-edge-paths', script: 'tests/r27-edge-paths.ts', title: 'R27 边缘路径（>4095 fail-closed 归因/≤3000 支持/跨卷 rename copy-up/远端 SMB 缺口；15 断言）' },
+  { id: 'r27-edge-paths', script: 'tests/r27-edge-paths.ts', title: 'R27 边缘路径（≤32000 长路径支持/32760+ 显式 fail-closed/跨卷 rename copy-up/远端 SMB 缺口；16 断言）' },
   // R28 收尾：apply 属性面（hidden/system 还原 + ACL 继承口径）。
-  { id: 'r28-apply-attributes', script: 'tests/r28-apply-attributes.ts', title: 'R28 apply 属性面（hidden/system 还原/失败如实/普通文件不误改/ACL 继承口径；12 断言）' },
+  { id: 'r28-apply-attributes', script: 'tests/r28-apply-attributes.ts', title: 'R28 apply 属性面（hidden/system 还原/失败如实/普通文件不误改/ACL 继承口径；19 断言）' },
+  // R29 收尾：属性面残余（显式清除 H/S 的 ADS 标记 + 目录树子项属性回滚）——并入 r28 套件，无独立套件。
+  // R30 收尾：NT 长路径专项（并入 r27-edge-paths），无独立套件。
+  // R31：R21-FS-07 崩溃恢复 WAL（apply journal + 恢复 API + 崩溃测试缝）。
+  { id: 'r31-apply-journal', script: 'tests/r31-apply-journal.ts', title: 'R31 apply 崩溃恢复 WAL（journal 生命周期/崩溃缝恢复/损坏 fail-closed/并发守卫/幂等；10 断言）' },
 ]
 
 /** 需要未受限会话的套件 */
