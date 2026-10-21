@@ -26,6 +26,7 @@
  */
 
 import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { dirname, join, normalize, relative, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import {
@@ -1208,6 +1209,8 @@ export class Workspace {
     const { key: rel, external } = this.keyOf(target)
     if (rel === '') throw new SandboxError('EISDIR', 'cannot write the workspace root')
     const entry = this.ensureEntry(rel, { kind: 'file', origin: opts.origin })
+    // R28: 暂存第一次写时捕获真实文件的 H/S 位（apply 时为"暂存态未显式设置"兜底）
+    this._captureBaseWin32(rel, this.absolute(rel), opts)
 
     const buffer = Buffer.isBuffer(content) ? content : Buffer.from(String(content), 'utf8')
     const hash = this.store.putBlob(buffer)
@@ -1756,6 +1759,8 @@ export class Workspace {
     const blockedByMask = []
     /** 允许落盘、但属敏感档的条目（第二阶段据此标 sensitive/danger，第三阶段据此做二次确认） */
     const maskWarnings = []
+    /** R28：属性面失败（hidden/system 读写失败等）如实上报，绝不静默 */
+    const attributeWarnings = []
     /** 二次确认集合：`true` = 本次全部遮蔽项都已确认；数组 = 逐路径确认 */
     const confirmedMasks = opts.confirmedMasks
     const confirmedSet =
@@ -1938,7 +1943,7 @@ export class Workspace {
         // R21: `false` = already at the desired state (idempotent no-op). It is not
         // counted as "applied" (selftest #12.3 expects applied.length===0 on re-apply)
         // and not counted as failed.
-        const wrote = this.applyOneChange(change, opts)
+        const wrote = this.applyOneChange(change, { ...opts, _attributeWarnings: attributeWarnings })
         if (wrote !== false) applied.push({ path: change.path, op: change.op })
       } catch (error) {
         failed.push({
@@ -2013,7 +2018,7 @@ export class Workspace {
         rolledBack = true
         // 全部恢复成功：真实盘回到 apply 前；候选保持可重试（pending）
         candidate.status = CANDIDATE_STATUS.PENDING
-        candidate.lastApply = { applied: [], failed: [...failed], blockedByMask, maskWarnings, conflicts: [], rollback: results, rolledBack: true }
+        candidate.lastApply = { applied: [], failed: [...failed], blockedByMask, maskWarnings, conflicts: [], rollback: results, rolledBack: true, attributeWarnings }
         this.store.saveCandidate(candidate)
         this.queue = this.store.loadQueue()
         this.queue.candidates[candidate.id] = {
@@ -2036,6 +2041,7 @@ export class Workspace {
           requeued: true,
           rolledBack: true,
           rollback: results,
+          attributeWarnings,
           note: 'atomic-rollback: mid-batch failure rolled back every applied change (real workspace restored byte-for-byte)',
         }
       }
@@ -2071,7 +2077,7 @@ export class Workspace {
     candidate.status = status
     candidate.appliedAt = new Date().toISOString()
     candidate.appliedPaths = [...(candidate.appliedPaths || []), ...applied.map((a) => a.path)]
-    candidate.lastApply = { applied, failed, blockedByMask, maskWarnings, conflicts: [], rollback: rollbackReport || [], rolledBack }
+    candidate.lastApply = { applied, failed, blockedByMask, maskWarnings, conflicts: [], rollback: rollbackReport || [], rolledBack, attributeWarnings }
     this.store.saveCandidate(candidate)
     this.queue.candidates[candidate.id] = {
       ...this.queue.candidates[candidate.id],
@@ -2133,6 +2139,8 @@ export class Workspace {
       // R24：回滚明细（rolled-back 时全部 ok；回滚失败时如实列出失败条目）
       rolledBack,
       rollback: rollbackReport || [],
+      // R28：属性面失败清单（hidden/system 读写失败等；空数组=全部成功/无需处理）
+      attributeWarnings,
     }
   }
 
@@ -2208,6 +2216,107 @@ export class Workspace {
     return { needed: true, ok: true }
   }
 
+  /* ── R28 / R21-FS-08：Windows 属性面（hidden/system/readonly）────────────────
+   * Node 没有 Win32 attributes 字段：短/中路径用系统 attrib.exe 读写；长路径
+   * （≥248 字，≤4095）用 PowerShell 的 [IO.File]::Get/SetAttributes 并加 \\?\ 前缀。
+   * 失败**不吞错**：调用方把警告放进 attributeWarnings（结果/lastApply 如实带出）。
+   * ACL 不在本面：真实 apply 新文件继承**父目录 ACL**，不是暂存语义；既有文件的
+   * 显式 ACL 无法经 rename-replace 忠实复刻（findings/§13 已登记，不声称"已还原"）。
+   * 测试注入缝：opts.attributeIo = { read?(abs), set?(abs, desired) }（离线强制失败用）。
+   */
+  _win32AttrsArg(abs) {
+    return abs.length >= 248 && !abs.startsWith('\\\\?\\') ? `\\\\?\\${abs}` : abs
+  }
+  _readWin32Attributes(abs, ioOverride) {
+    if (ioOverride && typeof ioOverride.read === 'function') return ioOverride.read(abs)
+    try {
+      const arg = this._win32AttrsArg(abs)
+      if (arg.startsWith('\\\\?\\')) {
+        const q = arg.replace(/'/g, "''")
+        const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `[int][IO.File]::GetAttributes('${q}')`], { encoding: 'utf8', timeout: 10000 })
+        const m = /^(\d+)/.exec(String(r.stdout || '').trim())
+        if (r.status === 0 && m) {
+          const v = Number(m[1])
+          return { ok: true, hidden: (v & 0x2) !== 0, system: (v & 0x4) !== 0, readonly: (v & 0x1) !== 0, raw: v }
+        }
+        return { ok: false, code: 'ATTRIB_READ_FAILED', message: `powershell GetAttributes status=${r.status}` }
+      }
+      const r = spawnSync('attrib.exe', [abs], { encoding: 'utf8', timeout: 10000 })
+      if (r.status !== 0) return { ok: false, code: 'ATTRIB_READ_FAILED', message: `attrib status=${r.status}` }
+      const line = String(r.stdout || '').split(/\r?\n/)[0]
+      const flagPart = line.slice(0, 20)
+      return { ok: true, hidden: /H/.test(flagPart), system: /S/.test(flagPart), readonly: /R/.test(flagPart) }
+    } catch (error) {
+      return { ok: false, code: 'ATTRIB_READ_FAILED', message: error.message }
+    }
+  }
+  _setWin32Attributes(abs, desired, ioOverride) {
+    if (ioOverride && typeof ioOverride.set === 'function') return ioOverride.set(abs, desired)
+    try {
+      const arg = this._win32AttrsArg(abs)
+      if (arg.startsWith('\\\\?\\')) {
+        const cur = this._readWin32Attributes(abs)
+        if (!cur.ok) return cur
+        let v = cur.raw || 0
+        v = desired && desired.hidden ? v | 0x2 : v & ~0x2
+        v = desired && desired.system ? v | 0x4 : v & ~0x4
+        const q = arg.replace(/'/g, "''")
+        const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `[IO.File]::SetAttributes('${q}', ${v})`], { encoding: 'utf8', timeout: 10000 })
+        return r.status === 0 ? { ok: true } : { ok: false, code: 'ATTRIB_SET_FAILED', message: `powershell SetAttributes status=${r.status}` }
+      }
+      const args = [desired && desired.hidden ? '+H' : '-H', desired && desired.system ? '+S' : '-S', abs]
+      const r = spawnSync('attrib.exe', args, { encoding: 'utf8', timeout: 10000 })
+      return r.status === 0 ? { ok: true } : { ok: false, code: 'ATTRIB_SET_FAILED', message: `attrib status=${r.status}` }
+    } catch (error) {
+      return { ok: false, code: 'ATTRIB_SET_FAILED', message: error.message }
+    }
+  }
+  _stagedWin32Attributes(change) {
+    try {
+      const staged = this.store.stagedPath(change.path)
+      if (!existsSync(staged)) return null
+      const a = this._readWin32Attributes(staged)
+      return a.ok ? a : null
+    } catch {
+      return null
+    }
+  }
+  /** 暂存态优先（沙箱内显式设置的 H/S）；否则用暂存时捕获的原值；再否则读当前真实值。 */
+  _desiredWin32Attributes(change, abs, opts) {
+    const staged = this._stagedWin32Attributes(change)
+    const entry = this.entryOf(change.path)
+    const captured = entry && entry.baseWin32 ? entry.baseWin32 : null
+    if (staged && (staged.hidden || staged.system)) return { hidden: staged.hidden, system: staged.system }
+    if (captured) return { hidden: captured.hidden === true, system: captured.system === true }
+    const prior = this._readWin32Attributes(abs, opts && opts.attributeIo)
+    if (prior.ok) return { hidden: prior.hidden, system: prior.system }
+    return null
+  }
+  _applyAttributesAfterWrite(change, abs, stagedMode, opts) {
+    const warnings = opts && opts._attributeWarnings
+    const desired = this._desiredWin32Attributes(change, abs, opts)
+    let ok = true
+    if (desired) {
+      const res = this._setWin32Attributes(abs, desired, opts && opts.attributeIo)
+      if (!res.ok) {
+        ok = false
+        if (warnings) warnings.push({ path: change.path, op: 'attributes', code: res.code || 'ATTRIB_SET_FAILED', message: res.message })
+      }
+    }
+    if (stagedMode !== undefined && stagedMode !== null) {
+      try {
+        chmodSync(abs, stagedMode)
+      } catch {}
+    }
+    return ok
+  }
+  _captureBaseWin32(rel, abs, opts) {
+    const entry = this.entryOf(rel)
+    if (!entry || entry.baseWin32 !== undefined) return
+    const attrs = this._readWin32Attributes(abs, opts && opts.attributeIo)
+    if (attrs.ok) entry.baseWin32 = { hidden: attrs.hidden, system: attrs.system }
+  }
+
   /**
    * ── R24 / R14 收窄：批量 apply 的回滚快照与恢复 ────────────────────────────────
    *
@@ -2258,7 +2367,8 @@ export class Workspace {
       } catch (error) {
         throw new SandboxError('ROLLBACK_SNAPSHOT_UNAVAILABLE', `cannot read ${abs} for rollback: ${error.message}`, { path: abs })
       }
-      return { kind: 'file', abs, mode, bytes, hash: hashFile(abs) }
+      const snapAttrs = this._readWin32Attributes(abs)
+      return { kind: 'file', abs, mode, bytes, hash: hashFile(abs), attrs: snapAttrs.ok ? { hidden: snapAttrs.hidden, system: snapAttrs.system } : null }
     }
     if (st.isDirectory()) {
       /** @type {Array<{rel:string, kind:'file'|'dir', mode:number, bytes?:Buffer}>} */
@@ -2292,7 +2402,8 @@ export class Workspace {
         }
       }
       walk(abs, '')
-      return { kind: 'dir', abs, mode, entries, treeHash: this._hashTreeOfDir(abs) }
+      const dirAttrs = this._readWin32Attributes(abs)
+      return { kind: 'dir', abs, mode, entries, treeHash: this._hashTreeOfDir(abs), attrs: dirAttrs.ok ? { hidden: dirAttrs.hidden, system: dirAttrs.system } : null }
     }
     throw new SandboxError('ROLLBACK_SNAPSHOT_UNAVAILABLE', `cannot snapshot ${abs} (unsupported type) for rollback`, { path: abs })
   }
@@ -2323,7 +2434,13 @@ export class Workspace {
         try {
           chmodSync(snap.abs, snap.mode)
         } catch {
-          /* best-effort attribute restore; bytes are the contract */
+          /* best-effort mode restore; bytes are the contract */
+        }
+        if (snap.attrs) {
+          const ares = this._setWin32Attributes(snap.abs, snap.attrs, opts.attributeIo)
+          if (!ares.ok) {
+            return { path: rel, abs: snap.abs, ok: false, action: 'restore', code: 'ROLLBACK_ATTRIBUTE_FAILED', message: ares.message || 'attribute restore failed' }
+          }
         }
         return { path: rel, abs: snap.abs, ok: true, action: 'restored' }
       }
@@ -2352,6 +2469,12 @@ export class Workspace {
         try {
           chmodSync(snap.abs, snap.mode)
         } catch {}
+        if (snap.attrs) {
+          const ares = this._setWin32Attributes(snap.abs, snap.attrs, opts.attributeIo)
+          if (!ares.ok) {
+            return { path: rel, abs: snap.abs, ok: false, action: 'restore', code: 'ROLLBACK_ATTRIBUTE_FAILED', message: ares.message || 'attribute restore failed' }
+          }
+        }
         return { path: rel, abs: snap.abs, ok: true, action: 'restored' }
       }
       return { path: rel, abs: snap.abs, ok: false, action: 'restore', code: 'ROLLBACK_FAILED', message: 'unknown snapshot kind' }
@@ -2631,6 +2754,7 @@ export class Workspace {
       rmdirSync(abs)
       try {
         writeFileAtomicReplacing(abs, content)
+        this._applyAttributesAfterWrite(change, abs, undefined, opts)
       } catch (error) {
         try {
           mkdirSync(abs, { recursive: true })
@@ -2660,6 +2784,14 @@ export class Workspace {
     } catch {
       priorMode = undefined
     }
+    // R28：暂存态（staged materialized file）的 mode 用于 created 文件的只读位
+    let stagedMode
+    try {
+      const staged = this.store.stagedPath(change.path)
+      if (existsSync(staged)) stagedMode = statSync(staged).mode & 0o777
+    } catch {
+      stagedMode = undefined
+    }
     writeFileAtomicReplacing(abs, content)
     if (priorMode !== undefined) {
       try {
@@ -2668,6 +2800,8 @@ export class Workspace {
         /* content is already applied; attribute restore is best-effort */
       }
     }
+    // R28：hidden/system（+ created 的只读位）按暂存态/捕获值还原；失败进 attributeWarnings
+    this._applyAttributesAfterWrite(change, abs, priorMode === undefined ? stagedMode : undefined, opts)
     return true
   }
 

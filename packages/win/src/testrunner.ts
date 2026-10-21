@@ -233,6 +233,8 @@ export const OFFLINE_SUITES = [
   { id: 'r26-wow64-registry', script: 'tests/r26-wow64-registry.ts', title: 'R26 32 位注册表视图暂存（合成路径 + WAL view + apply /reg:32；41 断言）' },
   // R27 收尾：边缘路径（>4095 显式 fail-closed 归因、≤3000 支持、跨卷 rename 无半态、远端 SMB 环境缺口）。
   { id: 'r27-edge-paths', script: 'tests/r27-edge-paths.ts', title: 'R27 边缘路径（>4095 fail-closed 归因/≤3000 支持/跨卷 rename copy-up/远端 SMB 缺口；15 断言）' },
+  // R28 收尾：apply 属性面（hidden/system 还原 + ACL 继承口径）。
+  { id: 'r28-apply-attributes', script: 'tests/r28-apply-attributes.ts', title: 'R28 apply 属性面（hidden/system 还原/失败如实/普通文件不误改/ACL 继承口径；12 断言）' },
 ]
 
 /** 需要未受限会话的套件 */
