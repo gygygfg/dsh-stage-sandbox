@@ -18,6 +18,65 @@ WsNtQueryKeyFn g_NtQueryKey = NULL;
 static volatile LONG g_logCounter = 0;
 static wchar_t g_userSid[192];
 
+/* ── R30：线程本地路径缓冲池（TLS/FLS）────────────────────────────────────────
+ * 为什么：WS_PATH_MAX 提到 32768 后，任何 `wchar_t x[WS_PATH_MAX]` 局部数组都是
+ * 64KB 栈缓冲（单帧可叠到 ~640KB ⇒ 爆栈）。把 241 处局部路径缓冲改成
+ * `WS_PATH_BUF(x)`：从**本线程**的池里取/还一块 32768 宽字符的堆缓冲，cleanup
+ * 属性在作用域退出（含每个 return）自动归还。
+ *
+ * 池有界：每线程最多 WS_PATH_POOL_SLOTS(24) 块常驻（≈1.5MB 堆），池空时 malloc，
+ * 超过池上限的归还在 cleanup 里 free。线程退出：FLS 析构回调释放池内全部缓冲与
+ * 池结构 ⇒ 不随线程数泄漏。短路径调用行为/路径语义不变，只是缓冲来源从栈改堆。
+ */
+wchar_t *ws_path_buf_alloc(void)
+{
+    wchar_t *p = (wchar_t *)malloc((size_t)WS_PATH_MAX * sizeof(wchar_t));
+    if (!p) {
+        return NULL;
+    }
+    p[0] = 0;
+    return p;
+}
+
+void ws_path_buf_cleanup(wchar_t **p)
+{
+    if (p && *p) {
+        free(*p);
+        *p = NULL;
+    }
+}
+wchar_t *ws_path_buf_alloc_n(size_t count)
+{
+    return (wchar_t *)calloc(count ? count : 1, sizeof(wchar_t));
+}
+void ws_path_buf_cleanup_n(wchar_t **p)
+{
+    if (p && *p) {
+        free(*p);
+        *p = NULL;
+    }
+}
+char *ws_char_buf_alloc(size_t cch)
+{
+    return (char *)calloc(cch ? cch : 1, 1);
+}
+void ws_free_ptr(void *p)
+{
+    void **pp = (void **)p;
+    if (pp && *pp) {
+        free(*pp);
+        *pp = NULL;
+    }
+}
+void ws_char_buf_cleanup(char **p)
+{
+    if (p && *p) {
+        free(*p);
+        *p = NULL;
+    }
+}
+
+
 /* ------------------------------------------------------------------ logging */
 
 void ws_log(const char *fmt, ...)
@@ -279,8 +338,8 @@ int ws_audit_escape_w(const wchar_t *in, char *out, size_t cch)
     if (!in) {
         return 1;
     }
-    char tmp[WS_PATH_MAX * 3];
-    int n = WideCharToMultiByte(CP_UTF8, 0, in, -1, tmp, (int)sizeof(tmp), NULL, NULL);
+    WS_CHAR_BUF(tmp, WS_PATH_MAX * 3);
+    int n = WideCharToMultiByte(CP_UTF8, 0, in, -1, tmp, (int)(WS_PATH_MAX * 3), NULL, NULL);
     if (n <= 0) {
         return 0;
     }
@@ -347,8 +406,8 @@ void ws_audit_path(const char *op, const wchar_t *path, const char *extra)
     if (!g_ws.auditPath[0]) {
         return;
     }
-    char esc[WS_PATH_MAX * 3];
-    ws_audit_escape_w(path, esc, sizeof(esc));
+    WS_CHAR_BUF(esc, WS_PATH_MAX * 3);
+    ws_audit_escape_w(path, esc, (WS_PATH_MAX * 3));
     ws_audit("{\"op\":\"%s\",\"path\":\"%s\"%s}", op, esc, extra ? extra : "");
 }
 
@@ -528,10 +587,10 @@ int ws_config_get_string(const char *json, const char *key, wchar_t *out, DWORD 
     if (!v || *v != '"') {
         return 0;
     }
-    char tmp[WS_PATH_MAX * 2];
+    WS_CHAR_BUF(tmp, WS_PATH_MAX * 2);
     size_t n = 0;
     v++;
-    while (*v && *v != '"' && n + 1 < sizeof(tmp)) {
+    while (*v && *v != '"' && n + 1 < (WS_PATH_MAX * 2)) {
         if (*v == '\\' && v[1]) {
             v++;
             switch (*v) {
@@ -631,7 +690,7 @@ static void env_to_w(const wchar_t *name, wchar_t *out, DWORD cch)
 
 void ws_config_from_env(void)
 {
-    wchar_t buf[WS_PATH_MAX];
+    WS_PATH_BUF(buf);
     env_to_w(WINSTAGE_ENV_STAGE_ROOT, buf, WS_PATH_MAX);
     if (buf[0]) {
         ws_strlcpy_w(g_ws.stageRoot, buf, WS_PATH_MAX);
@@ -714,7 +773,7 @@ const wchar_t *ws_path_api_w(const wchar_t *in, wchar_t *buf, DWORD cch)
 
 void *ws_open_file_raw_flags(const wchar_t *path, DWORD access, DWORD share, DWORD disposition, DWORD flags)
 {
-    wchar_t apiBuf[WS_PATH_MAX];
+    WS_PATH_BUF(apiBuf);
     const wchar_t *api = ws_path_api_w(path, apiBuf, WS_PATH_MAX);
     if (g_orig.CreateFileW) {
         return g_orig.CreateFileW(api, access, share, NULL, disposition, flags, NULL);
@@ -794,7 +853,7 @@ int ws_config_load_file(const wchar_t *path)
     if (!ws_read_text_file(path, &text, NULL)) {
         return 0;
     }
-    wchar_t wbuf[WS_PATH_MAX];
+    WS_PATH_BUF(wbuf);
     int ok = 1;
     if (ws_config_get_string(text, "stageRoot", wbuf, WS_PATH_MAX)) {
         ws_strlcpy_w(g_ws.stageRoot, wbuf, WS_PATH_MAX);
@@ -824,9 +883,9 @@ int ws_config_load_file(const wchar_t *path)
             while (*v && (*v == ' ' || *v == ',' || *v == '\n' || *v == '\r' || *v == '\t')) v++;
             if (*v != '"') break;
             v++;
-            char tmp[WS_PATH_MAX * 2];
+            WS_CHAR_BUF(tmp, WS_PATH_MAX * 2);
             size_t n = 0;
-            while (*v && *v != '"' && n + 1 < sizeof(tmp)) {
+            while (*v && *v != '"' && n + 1 < (WS_PATH_MAX * 2)) {
                 if (*v == '\\' && v[1]) { v++; tmp[n++] = (*v == '\\') ? '\\' : *v; v++; continue; }
                 tmp[n++] = *v++;
             }
@@ -891,8 +950,8 @@ int ws_ensure_dirs(const wchar_t *path, int asDir)
      * last error，而本函数是**初始化期最热**的一条路径（stage 树创建），
      * 其成败由**返回值**表达 ⇒ 入口保存、每条出口还原，对调用方透明。 */
     DWORD ws_saved_last_error = GetLastError();
-    wchar_t tmp[WS_PATH_MAX];
-    wchar_t target[WS_PATH_MAX];
+    WS_PATH_BUF(tmp);
+    WS_PATH_BUF(target);
     if (!ws_strlcpy_w(tmp, path, WS_PATH_MAX)) {
         SetLastError(ws_saved_last_error);
         return 0;
@@ -916,7 +975,7 @@ int ws_ensure_dirs(const wchar_t *path, int asDir)
             /* Skip only the bare drive root "C:" (it always exists); every other
              * prefix, including "C:\Users", must be created. */
             if (len >= 2 && !(len == 2 && tmp[1] == L':')) {
-                wchar_t apiBuf[WS_PATH_MAX];
+                WS_PATH_BUF(apiBuf);
                 const wchar_t *api = ws_path_api_w(tmp, apiBuf, WS_PATH_MAX);
                 CreateDirectoryW(api, NULL);
             }
@@ -927,7 +986,7 @@ int ws_ensure_dirs(const wchar_t *path, int asDir)
      * "staging tree is broken" into a detectable provider failure (and hence a
      * fail-closed ERROR_ACCESS_DENIED at the hook) instead of a silent partial
      * staging path. */
-    wchar_t targetApiBuf[WS_PATH_MAX];
+    WS_PATH_BUF(targetApiBuf);
     const wchar_t *targetApi = ws_path_api_w(target, targetApiBuf, WS_PATH_MAX);
     DWORD attrs = GetFileAttributesW(targetApi);
     if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -1070,7 +1129,7 @@ int ws_key_path_of_handle(HKEY hive, LPCWSTR subkey, wchar_t *hiveOut, DWORD hiv
     if (!ws_hive_prefix_of(hive, hiveOut, hiveCch)) {
         return 0;
     }
-    wchar_t norm[WS_PATH_MAX];
+    WS_PATH_BUF(norm);
     if (subkey && subkey[0]) {
         if (!ws_normalize_key_path(subkey, norm, WS_PATH_MAX)) {
             return 0;
@@ -1160,7 +1219,7 @@ int ws_handle_reg_path(HKEY key, wchar_t *hiveOut, DWORD hiveCch, wchar_t *canon
     while (rest && (*rest == L'\\' || *rest == L'/')) {
         rest++;
     }
-    wchar_t rel[WS_PATH_MAX];
+    WS_PATH_BUF(rel);
     if (!ws_normalize_key_path(rest ? rest : L"", rel, WS_PATH_MAX)) {
         return 0;
     }

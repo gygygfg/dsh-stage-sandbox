@@ -77,7 +77,7 @@ static int ws_prepare_stage_root(void)
         SetLastError(ws_saved_last_error);
         return 0;
     }
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     static const wchar_t *parts[] = { L"fs", L"wo", L"reg" };
     for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
         size_t pos = 0;
@@ -116,7 +116,8 @@ static int ws_init_full(const wchar_t *configJsonPath)
     }
     ws_config_defaults();
     ws_config_from_env();
-    wchar_t envRoot[WS_PATH_MAX], envLog[WS_PATH_MAX];
+    WS_PATH_BUF(envRoot);
+    WS_PATH_BUF(envLog);
     int haveEnvRoot = g_ws.haveStageRoot;
     ws_strlcpy_w(envRoot, g_ws.stageRoot, WS_PATH_MAX);
     ws_strlcpy_w(envLog, g_ws.logPath, WS_PATH_MAX);
@@ -149,7 +150,7 @@ static int ws_init_full(const wchar_t *configJsonPath)
      * file staging root. Failure is not fatal for the file layer but makes every
      * registry write fail closed (never a real-hive write). */
     if (!ws_t3_is_attached()) {
-        wchar_t sessionDir[WS_PATH_MAX];
+        WS_PATH_BUF(sessionDir);
         sessionDir[0] = 0;
         ws_env_get(L"WINSTAGE_REGSTAGE_SESSION_DIR", sessionDir, WS_PATH_MAX);
         if (!sessionDir[0]) {
@@ -285,22 +286,22 @@ int __cdecl WinstageShimStatsJson(char *buf, unsigned cch)
 {
     int iatSites = 0, modules = 0, delaySites = 0;
     int installed = ws_hook_stats(&iatSites, &modules, &delaySites);
-    char rootA[WS_PATH_MAX * 2], logA[WS_PATH_MAX * 2], cfgA[WS_PATH_MAX * 2];
-    char rootE[WS_PATH_MAX * 3], logE[WS_PATH_MAX * 3], cfgE[WS_PATH_MAX * 3];
+    WS_CHAR_BUF(rootA, WS_PATH_MAX * 2); WS_CHAR_BUF(logA, WS_PATH_MAX * 2); WS_CHAR_BUF(cfgA, WS_PATH_MAX * 2);
+    WS_CHAR_BUF(rootE, WS_PATH_MAX * 3); WS_CHAR_BUF(logE, WS_PATH_MAX * 3); WS_CHAR_BUF(cfgE, WS_PATH_MAX * 3);
     char providerA[256];
     rootA[0] = logA[0] = cfgA[0] = providerA[0] = 0;
-    WideCharToMultiByte(CP_UTF8, 0, g_ws.stageRoot, -1, rootA, sizeof(rootA), NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, g_ws.stageRoot, -1, rootA, (WS_PATH_MAX * 2), NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, g_ws.logPath, -1, logA, sizeof(logA), NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, g_ws.configPath, -1, cfgA, sizeof(cfgA), NULL, NULL);
     if (g_wsStage.name) {
         WideCharToMultiByte(CP_UTF8, 0, g_wsStage.name, -1, providerA, sizeof(providerA), NULL, NULL);
     }
-    json_escape(rootE, sizeof(rootE), rootA);
+    json_escape(rootE, (WS_PATH_MAX * 3), rootA);
     json_escape(logE, sizeof(logE), logA);
     json_escape(cfgE, sizeof(cfgE), cfgA);
 
-    char tmp[WS_PATH_MAX * 6];
-    int n = snprintf(tmp, sizeof(tmp),
+    WS_CHAR_BUF(tmp, WS_PATH_MAX * 6);
+    int n = snprintf(tmp, (WS_PATH_MAX * 6),
                      "{\"dll\":\"winstage-shim\",\"abi\":%u,\"initialized\":%s,\"hooksInstalled\":%s,"
                      "\"stageRoot\":\"%s\",\"logPath\":\"%s\",\"configPath\":\"%s\",\"provider\":\"%s\","
                      "\"failClosed\":%s,\"readThrough\":%s,\"hooks\":{\"iatSites\":%d,\"modules\":%d,\"delayDescriptors\":%d},"
@@ -329,7 +330,7 @@ static int ws_wants_autoinit(void)
     if (ws_env_truthy(WINSTAGE_ENV_DISABLE)) {
         return 0;
     }
-    wchar_t v[WS_PATH_MAX];
+    WS_PATH_BUF(v);
     ws_env_get(WINSTAGE_ENV_STAGE_ROOT, v, WS_PATH_MAX);
     if (v[0]) {
         return 1;

@@ -599,15 +599,15 @@ static void ws_mask_normalize(const wchar_t *in, wchar_t *out, DWORD cch)
     if (!in || !in[0]) {
         return;
     }
-    wchar_t full[WS_PATH_MAX];
+    WS_PATH_BUF(full);
     if (!GetFullPathNameW(in, WS_PATH_MAX, full, NULL)) {
         ws_strlcpy_w(full, in, WS_PATH_MAX);
     }
-    wchar_t longName[WS_PATH_MAX];
+    WS_PATH_BUF(longName);
     if (GetLongPathNameW(full, longName, WS_PATH_MAX) > 0) {
         ws_strlcpy_w(full, longName, WS_PATH_MAX);
     }
-    wchar_t resolved[WS_PATH_MAX];
+    WS_PATH_BUF(resolved);
     resolved[0] = 0;
     /* MUST NOT call CreateFileW directly: the shim's own import table is not
      * reliably skipped by the IAT pass, so this re-entered ws_CreateFileW ->
@@ -623,17 +623,17 @@ static void ws_mask_normalize(const wchar_t *in, wchar_t *out, DWORD cch)
         }
     }
     if (!resolved[0]) {
-        wchar_t parent[WS_PATH_MAX];
+        WS_PATH_BUF(parent);
         ws_strlcpy_w(parent, full, WS_PATH_MAX);
         wchar_t *slash = wcsrchr(parent, L'\\');
         if (slash && slash != parent) {
-            wchar_t leaf[WS_PATH_MAX];
+            WS_PATH_BUF(leaf);
             ws_strlcpy_w(leaf, slash + 1, WS_PATH_MAX);
             *slash = 0;
             HANDLE ph = ws_open_file_raw_flags(parent, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                                 OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS);
             if (ph != INVALID_HANDLE_VALUE) {
-                wchar_t pr[WS_PATH_MAX];
+                WS_PATH_BUF(pr);
                 DWORD n = GetFinalPathNameByHandleW(ph, pr, WS_PATH_MAX, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
                 CloseHandle(ph);
                 if (n > 0 && n < WS_PATH_MAX) {
@@ -1019,7 +1019,7 @@ static int ws_mask_decide_read_inner(const wchar_t *path, wchar_t *outRule, DWOR
         }
         return 1; /* fail-closed */
     }
-    wchar_t normalized[WS_PATH_MAX];
+    WS_PATH_BUF(normalized);
     ws_mask_normalize(path, normalized, WS_PATH_MAX);
     if (!ws_mask_long_path_consistent(path, normalized)) {
         ws_log("read mask: long-path normalization mismatch -> deny (fail-closed)");
@@ -1062,8 +1062,8 @@ void ws_mask_normalized(const wchar_t *path, wchar_t *out, DWORD cch)
  * compare with the expected `maskClass` (null = must not match). */
 int ws_mask_check_probes(const wchar_t *maskFile, const wchar_t *outFile, char *summary, DWORD summaryCch)
 {
-    WsMask saved;
-    memcpy(&saved, &g_mask, sizeof(WsMask));
+    WS_HEAP_PTR(WsMask, saved);
+    memcpy(saved, &g_mask, sizeof(WsMask));
     memset(&g_mask, 0, sizeof(g_mask));
     if (ws_mask_case_sensitive_env()) {
         g_mask.caseSensitive = 1; /* mutation self-proof only */
@@ -1076,7 +1076,7 @@ int ws_mask_check_probes(const wchar_t *maskFile, const wchar_t *outFile, char *
     int total = 0, agree = 0, mismatch = 0;
     if (!ws_read_text_file(maskFile, &text, &len)) {
         if (summary && summaryCch) snprintf(summary, summaryCch, "cannot read mask file");
-        memcpy(&g_mask, &saved, sizeof(WsMask));
+        memcpy(&g_mask, saved, sizeof(WsMask));
         return -1;
     }
     const char *end = text + len;
@@ -1095,24 +1095,24 @@ int ws_mask_check_probes(const wchar_t *maskFile, const wchar_t *outFile, char *
             if (p >= end || *p != '{') break;
             const char *objEnd = (const char *)memchr(p, '}', (size_t)(end - p));
             if (!objEnd) break;
-            char pathA[2048], expectA[256];
+            WS_CHAR_BUF(pathA, 2048); WS_CHAR_BUF(expectA, 256);
             pathA[0] = expectA[0] = 0;
             const char *pv = NULL;
             if (ws_json_find_key(p, objEnd, "path", &pv)) {
-                ws_json_str(pv, objEnd, pathA, sizeof(pathA));
+                ws_json_str(pv, objEnd, pathA, 2048);
             }
             const char *ev = NULL;
             int hasExpect = ws_json_find_key(p, objEnd, "maskClass", &ev) != NULL;
             int expectNull = 0;
-            if (hasExpect && !ws_json_str(ev, objEnd, expectA, sizeof(expectA))) {
+            if (hasExpect && !ws_json_str(ev, objEnd, expectA, 256)) {
                 expectNull = 1;
             }
-            wchar_t wpath[2048];
+            WS_WCHAR_BUF(wpath, 2048);
             wpath[0] = 0;
             MultiByteToWideChar(CP_UTF8, 0, pathA, -1, wpath, 2048);
-            wchar_t normalized[WS_PATH_MAX];
+            WS_PATH_BUF(normalized);
             ws_mask_normalize(wpath, normalized, WS_PATH_MAX);
-            wchar_t hit[256];
+            WS_WCHAR_BUF(hit, 256);
             hit[0] = 0;
             int deny = 0;
             for (int i = 0; i < g_mask.ruleCount; i++) {
@@ -1127,7 +1127,7 @@ int ws_mask_check_probes(const wchar_t *maskFile, const wchar_t *outFile, char *
             if (ok) agree++; else mismatch++;
             char pathEsc[4096], hitA[512];
             size_t o = 0;
-            for (size_t i = 0; pathA[i] && o + 3 < sizeof(pathEsc); i++) {
+            for (size_t i = 0; pathA[i] && o + 3 < 8192; i++) {
                 if (pathA[i] == '\\' || pathA[i] == '"') pathEsc[o++] = '\\';
                 pathEsc[o++] = pathA[i];
             }
@@ -1146,7 +1146,7 @@ int ws_mask_check_probes(const wchar_t *maskFile, const wchar_t *outFile, char *
                             "],\"total\":%d,\"agree\":%d,\"mismatch\":%d}\n", total, agree, mismatch);
         ws_write_bytes_to_file(outFile, json, (DWORD)written);
     }
-    memcpy(&g_mask, &saved, sizeof(WsMask));
+    memcpy(&g_mask, saved, sizeof(WsMask));
     if (summary && summaryCch) {
         snprintf(summary, summaryCch, "total=%d agree=%d mismatch=%d loaded=%s", total, agree, mismatch,
                  loaded ? "true" : "false");
@@ -1158,15 +1158,15 @@ int ws_mask_check_probes(const wchar_t *maskFile, const wchar_t *outFile, char *
  * Used by the probe export (offline regression / triage). */
 int ws_mask_check_path_file(const wchar_t *maskFile, const wchar_t *path, char *out, DWORD cch)
 {
-    WsMask saved;
-    memcpy(&saved, &g_mask, sizeof(WsMask));
+    WS_HEAP_PTR(WsMask, saved);
+    memcpy(saved, &g_mask, sizeof(WsMask));
     memset(&g_mask, 0, sizeof(g_mask));
     if (ws_mask_case_sensitive_env()) {
         g_mask.caseSensitive = 1; /* mutation self-proof only */
     }
     int hardFailure = 0;
     int loaded = ws_mask_load_rules(maskFile, g_mask.rules, &g_mask.ruleCount, WS_RE_MAX_RULES, &hardFailure);
-    wchar_t normalized[WS_PATH_MAX];
+    WS_PATH_BUF(normalized);
     ws_mask_normalize(path, normalized, WS_PATH_MAX);
     wchar_t hit[256];
     hit[0] = 0;
@@ -1182,12 +1182,12 @@ int ws_mask_check_path_file(const wchar_t *maskFile, const wchar_t *path, char *
             }
         }
     }
-    char pathA[4096], normA[4096], hitA[512];
+    WS_CHAR_BUF(pathA, 4096); WS_CHAR_BUF(normA, 4096); WS_CHAR_BUF(hitA, 512);
     pathA[0] = normA[0] = hitA[0] = 0;
-    WideCharToMultiByte(CP_UTF8, 0, path ? path : L"", -1, pathA, sizeof(pathA), NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, normalized, -1, normA, sizeof(normA), NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, hit, -1, hitA, sizeof(hitA), NULL, NULL);
-    char pathEsc[8192], normEsc[8192];
+    WideCharToMultiByte(CP_UTF8, 0, path ? path : L"", -1, pathA, 4096, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, normalized, -1, normA, 4096, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, hit, -1, hitA, 512, NULL, NULL);
+    WS_CHAR_BUF(pathEsc, 8192); WS_CHAR_BUF(normEsc, 8192);
     size_t o = 0;
     for (size_t i = 0; pathA[i] && o + 3 < sizeof(pathEsc); i++) {
         if (pathA[i] == '\\' || pathA[i] == '"') pathEsc[o++] = '\\';
@@ -1195,13 +1195,13 @@ int ws_mask_check_path_file(const wchar_t *maskFile, const wchar_t *path, char *
     }
     pathEsc[o] = 0;
     o = 0;
-    for (size_t i = 0; normA[i] && o + 3 < sizeof(normEsc); i++) {
+    for (size_t i = 0; normA[i] && o + 3 < 8192; i++) {
         if (normA[i] == '\\' || normA[i] == '"') normEsc[o++] = '\\';
         normEsc[o++] = normA[i];
     }
     normEsc[o] = 0;
-    char json[20000];
-    int n = snprintf(json, sizeof(json),
+    WS_CHAR_BUF(json, 20000);
+    int n = snprintf(json, 20000,
                      "{\"path\":\"%s\",\"normalized\":\"%s\",\"loaded\":%s,\"rules\":%d,\"decision\":\"%s\",\"rule\":\"%s\",\"ruleIndex\":%d}\n",
                      pathEsc, normEsc, loaded ? "true" : "false", g_mask.ruleCount,
                      deny ? "deny" : "allow", hitA, ruleIndex);
@@ -1210,6 +1210,6 @@ int ws_mask_check_path_file(const wchar_t *maskFile, const wchar_t *path, char *
         memcpy(out, json, copy);
         out[copy] = 0;
     }
-    memcpy(&g_mask, &saved, sizeof(WsMask));
+    memcpy(&g_mask, saved, sizeof(WsMask));
     return deny;
 }

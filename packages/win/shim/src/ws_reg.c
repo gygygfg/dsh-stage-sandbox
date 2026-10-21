@@ -82,13 +82,13 @@ static void ws_audit_reg(const char *op, HKEY hKey, LPCWSTR subKey, LPCWSTR valu
     if (!g_ws.auditPath[0]) {
         return;
     }
-    wchar_t full[WS_PATH_MAX];
+    WS_PATH_BUF(full);
     size_t pos = 0;
     full[0] = 0;
     int have = 0;
     wchar_t hive[64];
     if (subKey) {
-        wchar_t sub[WS_PATH_MAX];
+        WS_PATH_BUF(sub);
         if (ws_key_path_of_handle(hKey, subKey, hive, 64, sub, WS_PATH_MAX)) {
             ws_append_w(full, WS_PATH_MAX, &pos, hive);
             if (sub[0]) {
@@ -99,7 +99,7 @@ static void ws_audit_reg(const char *op, HKEY hKey, LPCWSTR subKey, LPCWSTR valu
         }
     }
     if (!have) {
-        wchar_t canon[WS_PATH_MAX];
+        WS_PATH_BUF(canon);
         if (ws_handle_reg_path(hKey, hive, 64, canon, WS_PATH_MAX) ||
             ws_pseudo_key_path(hKey, hive, 64, canon, WS_PATH_MAX, NULL)) {
             ws_strlcpy_w(full, canon, WS_PATH_MAX);
@@ -114,8 +114,8 @@ static void ws_audit_reg(const char *op, HKEY hKey, LPCWSTR subKey, LPCWSTR valu
     if (!have) {
         ws_strlcpy_w(full, L"(unresolved)", WS_PATH_MAX);
     }
-    char esc[WS_PATH_MAX * 3];
-    ws_audit_escape_w(full, esc, sizeof(esc));
+    WS_CHAR_BUF(esc, WS_PATH_MAX * 3);
+    ws_audit_escape_w(full, esc, (WS_PATH_MAX * 3));
     if (value) {
         char ev[1024];
         ws_audit_escape_w(value, ev, sizeof(ev));
@@ -567,7 +567,7 @@ static void ws_reg_unstaged_label(const wchar_t *api, UINT16 reason, const wchar
 
 static void ws_reg_journal_unstaged(const wchar_t *api, UINT16 reason, const wchar_t *canonical)
 {
-    wchar_t label[WS_PATH_MAX + 64];
+    WS_WCHAR_BUF(label, WS_PATH_MAX + 64);
     label[0] = 0;
     ws_reg_unstaged_label(api, reason, canonical, label, WS_PATH_MAX + 64);
     ws_rstore_unstaged(label, reason);
@@ -727,7 +727,7 @@ static WsWriteVerdict ws_reg_write_ctx(HKEY hKey, LPCWSTR lpSubKey, REGSAM samDe
             view = 1;
         }
         if (view) {
-            wchar_t viewPath[WS_PATH_MAX];
+            WS_PATH_BUF(viewPath);
             if (!ws_reg_path_add_view(canonical, viewPath, WS_PATH_MAX)) {
                 ws_reg_hard_deny_reason(canonical[0] ? canonical : L"<wow64-view:path-too-long>",
                                         WS_HARD_DENY_TREE_OP_NOT_STAGEABLE);
@@ -878,7 +878,8 @@ static LONG ws_create_key_inner(HKEY hKey, LPCWSTR lpSubKey, DWORD Reserved, LPW
         ws_rstore_hard_deny(L"<RegCreateKeyExW:unsupported-option>", ERROR_ACCESS_DENIED);
         return ERROR_ACCESS_DENIED;
     }
-    wchar_t hive[64], canonical[WS_PATH_MAX];
+    wchar_t hive[64];
+    WS_PATH_BUF(canonical);
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
     int resolvable = ws_rstore_canonical(hKey, lpSubKey, hive, 64, canonical, WS_PATH_MAX,
@@ -914,7 +915,7 @@ static LONG ws_create_key_inner(HKEY hKey, LPCWSTR lpSubKey, DWORD Reserved, LPW
             view = 1;
         }
         if (view) {
-            wchar_t viewPath[WS_PATH_MAX];
+            WS_PATH_BUF(viewPath);
             if (!ws_reg_path_add_view(canonical, viewPath, WS_PATH_MAX)) {
                 ws_reg_hard_deny_reason(canonical[0] ? canonical : L"<RegCreateKeyExW:wow64-view:path-too-long>",
                                         WS_HARD_DENY_TREE_OP_NOT_STAGEABLE);
@@ -1018,7 +1019,7 @@ LONG WINAPI ws_RegCreateKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD Reserved, LPSTR
 {
     /* ★ round-3c：A 变体自己在钩子体内做 `MultiByteToWideChar`（会改 last error）⇒ 钩子层透明化。 */
     DWORD ws_saved_last_error = GetLastError();
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     sub[0] = 0;
     if (lpSubKey) {
         MultiByteToWideChar(CP_ACP, 0, lpSubKey, -1, sub, WS_PATH_MAX);
@@ -1037,7 +1038,7 @@ LONG WINAPI ws_RegCreateKeyW(HKEY hKey, LPCWSTR lpSubKey, PHKEY phkResult)
 LONG WINAPI ws_RegCreateKeyA(HKEY hKey, LPCSTR lpSubKey, PHKEY phkResult)
 {
     DWORD ws_saved_last_error = GetLastError();
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     sub[0] = 0;
     if (lpSubKey) {
         MultiByteToWideChar(CP_ACP, 0, lpSubKey, -1, sub, WS_PATH_MAX);
@@ -1068,7 +1069,8 @@ LONG ws_open_key(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGSAM samDesired
 
 static LONG ws_open_key_inner(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult)
 {
-    wchar_t hive[64], canonical[WS_PATH_MAX];
+    wchar_t hive[64];
+    WS_PATH_BUF(canonical);
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
 
@@ -1104,14 +1106,14 @@ static LONG ws_open_key_inner(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGS
         /* 读类 open 必须透传（读不投影 staging）：只有**写意图** open 才允许命中覆盖层，
          * 这样 `reg delete /reg:32` 之类的"先 open 再删"能在暂存键上工作，而
          * `reg query /reg:32` 永远读真实 32 视图。 */
-        wchar_t base[WS_PATH_MAX];
+        WS_PATH_BUF(base);
         int pseudoBase = 0, bare = 0;
         if ((samDesired & WS_SAM_WRITE_INTENT) != 0 &&
             ws_rstore_canonical(hKey, lpSubKey, hive, 64, base, WS_PATH_MAX, &pseudoBase, &bare) && !bare) {
             /* 写意图 open：即使真实 32 键存在也**不**返回真实句柄 —— 返回带合成段的
              * pseudo handle，保证后续 Set/Delete 的视图归因不依赖调用方是否保留句柄
              * 的视图位（R26-GATE-01：reg.exe 关闭并重开时视图会丢）。 */
-            wchar_t viewPath[WS_PATH_MAX];
+            WS_PATH_BUF(viewPath);
             if (ws_reg_path_add_view(base, viewPath, WS_PATH_MAX)) {
                 HKEY h = ws_pseudo_key_make(hive, viewPath);
                 if (!h) {
@@ -1166,7 +1168,7 @@ LONG WINAPI ws_RegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM
     /* ★ round-3：A 变体自己在钩子体内做 `MultiByteToWideChar`（会改 last error），
      * 因此必须在**钩子层**做保存/还原（不能只靠 `ws_open_key` 的包装）。 */
     DWORD ws_saved_last_error = GetLastError();
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     sub[0] = 0;
     if (lpSubKey) {
         MultiByteToWideChar(CP_ACP, 0, lpSubKey, -1, sub, WS_PATH_MAX);
@@ -1186,7 +1188,7 @@ LONG WINAPI ws_RegOpenKeyW(HKEY hKey, LPCWSTR lpSubKey, PHKEY phkResult)
 LONG WINAPI ws_RegOpenKeyA(HKEY hKey, LPCSTR lpSubKey, PHKEY phkResult)
 {
     DWORD ws_saved_last_error = GetLastError();
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     sub[0] = 0;
     if (lpSubKey) {
         MultiByteToWideChar(CP_ACP, 0, lpSubKey, -1, sub, WS_PATH_MAX);
@@ -1316,14 +1318,15 @@ static LONG ws_set_value_ex_inner(HKEY hKey, LPCWSTR nameW, LPCSTR nameA, DWORD 
         ws_rstore_hard_deny(L"<RegSetValueEx:unsupported-value-type>", ERROR_ACCESS_DENIED);
         return ERROR_ACCESS_DENIED;
     }
-    wchar_t nameFromA[WS_PATH_MAX];
+    WS_PATH_BUF(nameFromA);
     nameFromA[0] = 0;
     if (isAnsi && nameA) {
         MultiByteToWideChar(CP_ACP, 0, nameA, -1, nameFromA, WS_PATH_MAX);
     }
     const wchar_t *name = isAnsi ? nameFromA : nameW;
 
-    wchar_t hive[64], canonical[WS_PATH_MAX];
+    wchar_t hive[64];
+    WS_PATH_BUF(canonical);
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
     WsWriteVerdict verdict = ws_reg_write_ctx(hKey, NULL, 0, L"RegSetValueExW", hive, 64, canonical,
@@ -1395,14 +1398,15 @@ static LONG ws_query_value_ex(HKEY hKey, LPCWSTR nameW, LPCSTR nameA, LPDWORD lp
                               LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData, int isAnsi)
 {
     (void)lpReserved;
-    wchar_t nameFromA[WS_PATH_MAX];
+    WS_PATH_BUF(nameFromA);
     nameFromA[0] = 0;
     if (isAnsi && nameA) {
         MultiByteToWideChar(CP_ACP, 0, nameA, -1, nameFromA, WS_PATH_MAX);
     }
     const wchar_t *name = isAnsi ? nameFromA : nameW;
 
-    wchar_t hive[64], canonical[WS_PATH_MAX];
+    wchar_t hive[64];
+    WS_PATH_BUF(canonical);
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
     /* task-17 插桩（只日志、不改语义）：D-R1 端到端仍报 ERROR_INVALID_HANDLE(6)，需判定
@@ -1587,7 +1591,8 @@ NTSTATUS NTAPI ws_NtQueryValueKey(HANDLE KeyHandle, const void *ValueName,
         return g_orig.NtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass,
                                       KeyValueInformation, Length, ResultLength);
     }
-    wchar_t hive[64], canonical[WS_PATH_MAX];
+    wchar_t hive[64];
+    WS_PATH_BUF(canonical);
     canonical[0] = 0;
     int isPseudo = 0;
     if (!ws_pseudo_key_path((HKEY)KeyHandle, hive, 64, canonical, WS_PATH_MAX, &isPseudo) ||
@@ -1696,7 +1701,8 @@ NTSTATUS NTAPI ws_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, ULONG KeyVa
         return g_orig.NtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation,
                                          Length, ResultLength);
     }
-    wchar_t hive[64], canonical[WS_PATH_MAX];
+    wchar_t hive[64];
+    WS_PATH_BUF(canonical);
     canonical[0] = 0;
     int isPseudo = 0;
     if (!ws_pseudo_key_path((HKEY)KeyHandle, hive, 64, canonical, WS_PATH_MAX, &isPseudo) || !isPseudo) {
@@ -1789,7 +1795,8 @@ NTSTATUS NTAPI ws_NtQueryKey(HANDLE KeyHandle, ULONG KeyInformationClass, PVOID 
     if (ws_pseudo_index_of((HKEY)KeyHandle) < 0) {
         return g_orig.NtQueryKey(KeyHandle, KeyInformationClass, KeyInformation, Length, ResultLength);
     }
-    wchar_t hive[64], canonical[WS_PATH_MAX];
+    wchar_t hive[64];
+    WS_PATH_BUF(canonical);
     canonical[0] = 0;
     int isPseudo = 0;
     if (!ws_pseudo_key_path((HKEY)KeyHandle, hive, 64, canonical, WS_PATH_MAX, &isPseudo) || !isPseudo) {
@@ -1877,7 +1884,8 @@ static LONG ws_delete_key(HKEY hKey, LPCWSTR lpSubKey, REGSAM samDesired)
 
 static LONG ws_delete_key_inner(HKEY hKey, LPCWSTR lpSubKey, REGSAM samDesired)
 {
-    wchar_t hive[64], canonical[WS_PATH_MAX];
+    wchar_t hive[64];
+    WS_PATH_BUF(canonical);
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
     WsWriteVerdict verdict = ws_reg_write_ctx(hKey, lpSubKey, samDesired, L"RegDeleteKeyExW", hive, 64,
@@ -1893,7 +1901,7 @@ static LONG ws_delete_key_inner(HKEY hKey, LPCWSTR lpSubKey, REGSAM samDesired)
                 if (!root) {
                     return ERROR_FILE_NOT_FOUND;
                 }
-                wchar_t realRel[WS_PATH_MAX];
+                WS_PATH_BUF(realRel);
                 int view = 0;
                 ws_reg_path_strip_view(canonical, NULL, 0, realRel, WS_PATH_MAX, &view);
                 REGSAM sam = samDesired | (view ? KEY_WOW64_32KEY : 0);
@@ -1925,7 +1933,7 @@ LONG WINAPI ws_RegDeleteKeyExA(HKEY hKey, LPCSTR lpSubKey, REGSAM samDesired, DW
 {
     /* ★ round-3c：A 变体自身的 `MultiByteToWideChar` 在钩子体内 ⇒ 钩子层透明化。 */
     DWORD ws_saved_last_error = GetLastError();
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     sub[0] = 0;
     if (lpSubKey) MultiByteToWideChar(CP_ACP, 0, lpSubKey, -1, sub, WS_PATH_MAX);
     (void)Reserved;
@@ -1942,7 +1950,7 @@ LONG WINAPI ws_RegDeleteKeyW(HKEY hKey, LPCWSTR lpSubKey)
 LONG WINAPI ws_RegDeleteKeyA(HKEY hKey, LPCSTR lpSubKey)
 {
     DWORD ws_saved_last_error = GetLastError();
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     sub[0] = 0;
     if (lpSubKey) MultiByteToWideChar(CP_ACP, 0, lpSubKey, -1, sub, WS_PATH_MAX);
     LONG rc = ws_delete_key(hKey, sub[0] ? sub : NULL, 0);
@@ -1963,7 +1971,8 @@ static LONG ws_delete_value(HKEY hKey, LPCWSTR lpValueName)
 
 static LONG ws_delete_value_inner(HKEY hKey, LPCWSTR lpValueName)
 {
-    wchar_t hive[64], canonical[WS_PATH_MAX];
+    wchar_t hive[64];
+    WS_PATH_BUF(canonical);
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
     WsWriteVerdict verdict = ws_reg_write_ctx(hKey, NULL, 0, L"RegDeleteValueW", hive, 64, canonical,
@@ -1999,7 +2008,7 @@ LONG WINAPI ws_RegDeleteValueW(HKEY hKey, LPCWSTR lpValueName)
 LONG WINAPI ws_RegDeleteValueA(HKEY hKey, LPCSTR lpValueName)
 {
     DWORD ws_saved_last_error = GetLastError();
-    wchar_t name[WS_PATH_MAX];
+    WS_PATH_BUF(name);
     name[0] = 0;
     if (lpValueName) MultiByteToWideChar(CP_ACP, 0, lpValueName, -1, name, WS_PATH_MAX);
     LONG rc = ws_delete_value(hKey, name);
@@ -2053,8 +2062,8 @@ LONG WINAPI ws_RegSetKeyValueA(HKEY hKey, LPCSTR lpSubKey, LPCSTR lpValueName, D
                                const void *lpData, DWORD cbData)
 {
     DWORD ws_saved_last_error = GetLastError();
-    wchar_t sub[WS_PATH_MAX];
-    wchar_t name[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
+    WS_PATH_BUF(name);
     sub[0] = 0;
     name[0] = 0;
     if (lpSubKey) MultiByteToWideChar(CP_ACP, 0, lpSubKey, -1, sub, WS_PATH_MAX);
@@ -2094,8 +2103,8 @@ LONG WINAPI ws_RegDeleteKeyValueW(HKEY hKey, LPCWSTR lpSubKey, LPCWSTR lpValueNa
 LONG WINAPI ws_RegDeleteKeyValueA(HKEY hKey, LPCSTR lpSubKey, LPCSTR lpValueName)
 {
     DWORD ws_saved_last_error = GetLastError();
-    wchar_t sub[WS_PATH_MAX];
-    wchar_t name[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
+    WS_PATH_BUF(name);
     sub[0] = 0;
     name[0] = 0;
     if (lpSubKey) MultiByteToWideChar(CP_ACP, 0, lpSubKey, -1, sub, WS_PATH_MAX);
@@ -2109,7 +2118,7 @@ LONG WINAPI ws_RegDeleteKeyValueA(HKEY hKey, LPCSTR lpSubKey, LPCSTR lpValueName
 static LONG ws_fail_closed_delete_tree(HKEY hKey, LPCWSTR lpSubKey)
 {
     wchar_t hive[64];
-    wchar_t canonical[WS_PATH_MAX];
+    WS_PATH_BUF(canonical);
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
     if (!ws_rstore_canonical(hKey, lpSubKey, hive, 64, canonical, WS_PATH_MAX, &isPseudo, &isBareRoot) ||
@@ -2132,7 +2141,7 @@ LONG WINAPI ws_RegDeleteTreeW(HKEY hKey, LPCWSTR lpSubKey)
 LONG WINAPI ws_RegDeleteTreeA(HKEY hKey, LPCSTR lpSubKey)
 {
     DWORD ws_saved_last_error = GetLastError();
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     sub[0] = 0;
     if (lpSubKey) MultiByteToWideChar(CP_ACP, 0, lpSubKey, -1, sub, WS_PATH_MAX);
     LONG rc = ws_fail_closed_delete_tree(hKey, sub[0] ? sub : NULL);
@@ -2185,7 +2194,7 @@ static HKEY ws_reg_open_real(const wchar_t *hive, const wchar_t *rel, REGSAM sam
     }
     /* R26: overlay paths for the 32-bit view carry the synthetic segment; the real
      * API wants the stripped relative path plus KEY_WOW64_32KEY on the open. */
-    wchar_t realRel[WS_PATH_MAX];
+    WS_PATH_BUF(realRel);
     int view = 0;
     ws_reg_path_strip_view(rel, NULL, 0, realRel, WS_PATH_MAX, &view);
     if (view) {
@@ -2302,7 +2311,7 @@ static void ws_reg_build_union(const wchar_t *hive, const wchar_t *rel, const wc
             if (!name[0] || ws_reg_name_in_list(g_enumCache.names, count, name)) {
                 continue;
             }
-            wchar_t childCanonical[WS_PATH_MAX];
+            WS_PATH_BUF(childCanonical);
             size_t pos = 0;
             childCanonical[0] = 0;
             if (ws_append_w(childCanonical, WS_PATH_MAX, &pos, canonical) &&
@@ -2400,7 +2409,8 @@ static LONG ws_query_info_key_inner(HKEY hKey, LPWSTR lpClass, LPDWORD lpcchClas
                                     LPDWORD lpcValues, LPDWORD lpcbMaxValueNameLen, LPDWORD lpcbMaxValueLen,
                                     LPDWORD lpcbSecurityDescriptor, PFILETIME lpftLastWriteTime)
 {
-    wchar_t hive[64], canonical[WS_PATH_MAX];
+    wchar_t hive[64];
+    WS_PATH_BUF(canonical);
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
     /* task-17 扩展（与 ws_query_value_ex 同源）：伪句柄**绝不**直通 advapi32（＝ERROR_INVALID_HANDLE(6)）：
@@ -2513,7 +2523,8 @@ SetLastError(ws_saved_last_error);
 static LONG ws_enum_value_inner(HKEY hKey, DWORD dwIndex, LPWSTR lpValueName, LPDWORD lpcchValueName,
                                 LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData)
 {
-    wchar_t hive[64], canonical[WS_PATH_MAX];
+    wchar_t hive[64];
+    WS_PATH_BUF(canonical);
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
     /* task-17 扩展（与 ws_query_value_ex 同源）：伪句柄**绝不**直通 advapi32（＝ERROR_INVALID_HANDLE(6)）：
@@ -2612,7 +2623,8 @@ static LONG ws_enum_key_ex_inner(HKEY hKey, DWORD dwIndex, LPWSTR lpName, LPDWOR
                                  LPDWORD lpReserved, LPWSTR lpClass, LPDWORD lpcchClass,
                                  PFILETIME lpftLastWriteTime)
 {
-    wchar_t hive[64], canonical[WS_PATH_MAX];
+    wchar_t hive[64];
+    WS_PATH_BUF(canonical);
     canonical[0] = 0;
     int isPseudo = 0, isBareRoot = 0;
     /* task-17 扩展（与 ws_query_value_ex 同源）：伪句柄**绝不**直通 advapi32（＝ERROR_INVALID_HANDLE(6)）：
@@ -2709,7 +2721,7 @@ static void ws_reg_path_for_audit(HKEY hKey, LPCWSTR lpSubKey, const wchar_t *pl
 
 static LONG ws_reg_deny_write_audited(HKEY hKey, LPCWSTR lpSubKey, const wchar_t *placeholder, UINT16 reason)
 {
-    wchar_t path[WS_PATH_MAX];
+    WS_PATH_BUF(path);
     ws_reg_path_for_audit(hKey, lpSubKey, placeholder, path, WS_PATH_MAX);
     ws_reg_hard_deny_reason(path, reason);
     return ERROR_ACCESS_DENIED;
@@ -2771,7 +2783,7 @@ static NTSTATUS ws_reg_nt_deny(POBJECT_ATTRIBUTES oa, HANDLE handle, const wchar
         return WS_NT_ACCESS_DENIED;
     }
     t_wsNtDenyDepth++;
-    wchar_t path[WS_PATH_MAX];
+    WS_PATH_BUF(path);
     ws_reg_nt_path_for_audit(oa, handle, placeholder, path, WS_PATH_MAX);
     ws_reg_hard_deny_reason(path, reason);
     t_wsNtDenyDepth--;
@@ -2803,7 +2815,7 @@ LONG WINAPI ws_RegCreateKeyTransactedA(HKEY hKey, LPCSTR lpSubKey, DWORD Reserve
                                        PHKEY phkResult, LPDWORD lpdwDisposition, HANDLE hTransaction,
                                        PVOID pExtended)
 {
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     ws_reg_widen(lpSubKey, sub, WS_PATH_MAX);
     return ws_RegCreateKeyTransactedW(hKey, lpSubKey ? sub : NULL, Reserved, NULL, dwOptions, samDesired,
                                       sa, phkResult, lpdwDisposition, hTransaction, pExtended);
@@ -2833,7 +2845,7 @@ LONG WINAPI ws_RegOpenKeyTransactedW(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOption
 LONG WINAPI ws_RegOpenKeyTransactedA(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM samDesired,
                                      PHKEY phkResult, HANDLE hTransaction, PVOID pExtended)
 {
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     ws_reg_widen(lpSubKey, sub, WS_PATH_MAX);
     return ws_RegOpenKeyTransactedW(hKey, lpSubKey ? sub : NULL, ulOptions, samDesired, phkResult,
                                     hTransaction, pExtended);
@@ -2850,7 +2862,7 @@ LONG WINAPI ws_RegDeleteKeyTransactedW(HKEY hKey, LPCWSTR lpSubKey, REGSAM samDe
 LONG WINAPI ws_RegDeleteKeyTransactedA(HKEY hKey, LPCSTR lpSubKey, REGSAM samDesired, DWORD Reserved,
                                        HANDLE hTransaction, PVOID pExtended)
 {
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     ws_reg_widen(lpSubKey, sub, WS_PATH_MAX);
     return ws_RegDeleteKeyTransactedW(hKey, lpSubKey ? sub : NULL, samDesired, Reserved,
                                       hTransaction, pExtended);
@@ -2860,13 +2872,13 @@ LONG WINAPI ws_RegDeleteKeyTransactedA(HKEY hKey, LPCSTR lpSubKey, REGSAM samDes
 LONG WINAPI ws_RegCopyTreeW(HKEY hKeySrc, LPCWSTR lpSubKey, HKEY hKeyDest)
 {
     DWORD saved = GetLastError();
-    wchar_t path[WS_PATH_MAX];
+    WS_PATH_BUF(path);
     ws_reg_path_for_audit(hKeySrc, lpSubKey, L"<RegCopyTreeW>", path, WS_PATH_MAX);
     if (hKeyDest && !ws_starts_with_ci_w(path, L"<")) {
-        wchar_t dst[WS_PATH_MAX];
+        WS_PATH_BUF(dst);
         ws_reg_path_for_audit(hKeyDest, NULL, L"", dst, WS_PATH_MAX);
         if (dst[0]) {
-            wchar_t both[WS_PATH_MAX];
+            WS_PATH_BUF(both);
             size_t pos = 0;
             both[0] = 0;
             ws_append_w(both, WS_PATH_MAX, &pos, path);
@@ -2884,7 +2896,7 @@ LONG WINAPI ws_RegCopyTreeW(HKEY hKeySrc, LPCWSTR lpSubKey, HKEY hKeyDest)
 
 LONG WINAPI ws_RegCopyTreeA(HKEY hKeySrc, LPCSTR lpSubKey, HKEY hKeyDest)
 {
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     ws_reg_widen(lpSubKey, sub, WS_PATH_MAX);
     return ws_RegCopyTreeW(hKeySrc, lpSubKey ? sub : NULL, hKeyDest);
 }
@@ -2906,7 +2918,7 @@ LONG WINAPI ws_RegLoadKeyW(HKEY hKey, LPCWSTR lpSubKey, LPCWSTR lpFile)
 
 LONG WINAPI ws_RegLoadKeyA(HKEY hKey, LPCSTR lpSubKey, LPCSTR lpFile)
 {
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     ws_reg_widen(lpSubKey, sub, WS_PATH_MAX);
     (void)lpFile;
     return ws_RegLoadKeyW(hKey, lpSubKey ? sub : NULL, NULL);
@@ -2920,7 +2932,7 @@ LONG WINAPI ws_RegUnLoadKeyW(HKEY hKey, LPCWSTR lpSubKey)
 
 LONG WINAPI ws_RegUnLoadKeyA(HKEY hKey, LPCSTR lpSubKey)
 {
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     ws_reg_widen(lpSubKey, sub, WS_PATH_MAX);
     return ws_RegUnLoadKeyW(hKey, lpSubKey ? sub : NULL);
 }
@@ -2973,7 +2985,7 @@ LONG WINAPI ws_RegReplaceKeyW(HKEY hKey, LPCWSTR lpSubKey, LPCWSTR lpNewFile, LP
 
 LONG WINAPI ws_RegReplaceKeyA(HKEY hKey, LPCSTR lpSubKey, LPCSTR lpNewFile, LPCSTR lpOldFile)
 {
-    wchar_t sub[WS_PATH_MAX];
+    WS_PATH_BUF(sub);
     ws_reg_widen(lpSubKey, sub, WS_PATH_MAX);
     (void)lpNewFile; (void)lpOldFile;
     return ws_RegReplaceKeyW(hKey, lpSubKey ? sub : NULL, NULL, NULL);
@@ -3055,7 +3067,7 @@ LONG WINAPI ws_RegConnectRegistryExA(LPCSTR lpMachineName, HKEY hKey, ULONG flag
 /* Audited fail-closed for handle-based calls that have no stageable representation. */
 static LONG ws_reg_deny_handle_op(HKEY hKey, const wchar_t *placeholder, UINT16 reason, DWORD savedLastError)
 {
-    wchar_t path[WS_PATH_MAX];
+    WS_PATH_BUF(path);
     ws_reg_path_for_audit(hKey, NULL, placeholder, path, WS_PATH_MAX);
     ws_reg_hard_deny_reason(path, reason);
     SetLastError(savedLastError);
@@ -3066,12 +3078,12 @@ LONG WINAPI ws_RegOverridePredefKey(HKEY hKey, HKEY hNewHKey)
 {
     DWORD saved = GetLastError();
     if (hNewHKey) {
-        wchar_t src[WS_PATH_MAX];
-        wchar_t dst[WS_PATH_MAX];
+        WS_PATH_BUF(src);
+        WS_PATH_BUF(dst);
         ws_reg_path_for_audit(hKey, NULL, L"<RegOverridePredefKey>", src, WS_PATH_MAX);
         ws_reg_path_for_audit(hNewHKey, NULL, L"", dst, WS_PATH_MAX);
         if (dst[0] && !ws_starts_with_ci_w(dst, L"<")) {
-            wchar_t both[WS_PATH_MAX];
+            WS_PATH_BUF(both);
             size_t pos = 0;
             both[0] = 0;
             ws_append_w(both, WS_PATH_MAX, &pos, src);

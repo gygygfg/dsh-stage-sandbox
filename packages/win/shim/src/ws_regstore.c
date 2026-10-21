@@ -184,7 +184,7 @@ int ws_rstore_canonical(HKEY hKey, LPCWSTR lpSubKey, wchar_t *hiveShort, DWORD h
 {
     if (isPseudo) *isPseudo = 0;
     if (isBareHiveRoot) *isBareHiveRoot = 0;
-    wchar_t rel[WS_PATH_MAX];
+    WS_PATH_BUF(rel);
     rel[0] = 0;
     if (lpSubKey && lpSubKey[0] && !ws_normalize_key_path(lpSubKey, rel, WS_PATH_MAX)) {
         return 0;
@@ -194,7 +194,7 @@ int ws_rstore_canonical(HKEY hKey, LPCWSTR lpSubKey, wchar_t *hiveShort, DWORD h
     if (ws_pseudo_key_path(hKey, hive, 64, canonical, canonicalCch, isPseudo)) {
         /* pseudo handle: its stored path is the base */
         if (rel[0]) {
-            wchar_t combined[WS_PATH_MAX];
+            WS_PATH_BUF(combined);
             size_t pos = 0;
             combined[0] = 0;
             if (!ws_append_w(combined, WS_PATH_MAX, &pos, canonical) ||
@@ -216,7 +216,7 @@ int ws_rstore_canonical(HKEY hKey, LPCWSTR lpSubKey, wchar_t *hiveShort, DWORD h
             return 0;
         }
         if (rel[0]) {
-            wchar_t combined[WS_PATH_MAX];
+            WS_PATH_BUF(combined);
             size_t pos = 0;
             combined[0] = 0;
             if (canonical[0]) {
@@ -262,7 +262,7 @@ int ws_rstore_canonical(HKEY hKey, LPCWSTR lpSubKey, wchar_t *hiveShort, DWORD h
  * root, ending with the path itself. T3 requires the bare hive root to be
  * excluded -- it always exists, so a CREATE_KEY record for it would be a
  * phantom change (and creating "HKCU" inside the app hive fails). */
-static int build_chain(const wchar_t *canonical, wchar_t levels[WS_RS_MAX_LEVELS][WS_PATH_MAX])
+static int build_chain(const wchar_t *canonical, wchar_t *levels)
 {
     const wchar_t *first = wcschr(canonical, L'\\');
     if (!first || !first[1]) {
@@ -272,13 +272,13 @@ static int build_chain(const wchar_t *canonical, wchar_t levels[WS_RS_MAX_LEVELS
     for (const wchar_t *p = first + 1; *p; p++) {
         if (*p == L'\\' && count < WS_RS_MAX_LEVELS) {
             size_t n = (size_t)(p - canonical);
-            memcpy(levels[count], canonical, n * sizeof(wchar_t));
-            levels[count][n] = 0;
+            memcpy(levels + (size_t)count * WS_PATH_MAX, canonical, n * sizeof(wchar_t));
+            (levels + (size_t)count * WS_PATH_MAX)[n] = 0;
             count++;
         }
     }
     if (count < WS_RS_MAX_LEVELS) {
-        ws_strlcpy_w(levels[count++], canonical, WS_PATH_MAX);
+        ws_strlcpy_w(levels + (size_t)(count++) * WS_PATH_MAX, canonical, WS_PATH_MAX);
     }
     return count;
 }
@@ -289,7 +289,7 @@ static int build_chain(const wchar_t *canonical, wchar_t levels[WS_RS_MAX_LEVELS
  * rules, so there is exactly one place that decides what a CREATE_KEY means. */
 static LSTATUS materialize_chain(const wchar_t *canonical, HKEY *keyOut)
 {
-    wchar_t levels[WS_RS_MAX_LEVELS][WS_PATH_MAX];
+    WS_WCHAR_BUF(levels, (size_t)WS_RS_MAX_LEVELS * WS_PATH_MAX);
     int count = build_chain(canonical, levels);
     if (count <= 0) {
         /* The bare hive root has no container level inside the app hive. The
@@ -302,9 +302,9 @@ static LSTATUS materialize_chain(const wchar_t *canonical, HKEY *keyOut)
     }
     for (int i = 0; i < count; i++) {
         int exists = 0;
-        LSTATUS st = ws_t3_key_exists(levels[i], &exists);
+        LSTATUS st = ws_t3_key_exists((levels + (size_t)i * WS_PATH_MAX), &exists);
         if (st != ERROR_SUCCESS) {
-            ws_log("materialize_chain: key_exists(%ls) failed %lu", levels[i], (unsigned long)st);
+            ws_log("materialize_chain: key_exists(%ls) failed %lu", (levels + (size_t)i * WS_PATH_MAX), (unsigned long)st);
             return st;
         }
         if (exists) {
@@ -315,11 +315,11 @@ static LSTATUS materialize_chain(const wchar_t *canonical, HKEY *keyOut)
          * only created in the app hive to hold the child. */
         int realHas = 0;
         {
-            const wchar_t *bs = wcschr(levels[i], L'\\');
+            const wchar_t *bs = wcschr((levels + (size_t)i * WS_PATH_MAX), L'\\');
             wchar_t levelHive[64];
-            size_t hn = bs ? (size_t)(bs - levels[i]) : wcslen(levels[i]);
+            size_t hn = bs ? (size_t)(bs - (levels + (size_t)i * WS_PATH_MAX)) : wcslen((levels + (size_t)i * WS_PATH_MAX));
             if (hn < 64) {
-                memcpy(levelHive, levels[i], hn * sizeof(wchar_t));
+                memcpy(levelHive, (levels + (size_t)i * WS_PATH_MAX), hn * sizeof(wchar_t));
                 levelHive[hn] = 0;
                 HKEY realProbe = ws_reg_open_real_pub(levelHive, bs ? bs + 1 : L"", KEY_READ);
                 if (realProbe) {
@@ -330,16 +330,16 @@ static LSTATUS materialize_chain(const wchar_t *canonical, HKEY *keyOut)
         }
         if (!realHas) {
             /* DDL must be journalled before it happens (WAL-first). */
-            st = ws_t3_record_create_key(levels[i]);
+            st = ws_t3_record_create_key((levels + (size_t)i * WS_PATH_MAX));
             if (st != ERROR_SUCCESS) {
-                ws_log("materialize_chain: journal append(%ls) failed %lu", levels[i], (unsigned long)st);
+                ws_log("materialize_chain: journal append(%ls) failed %lu", (levels + (size_t)i * WS_PATH_MAX), (unsigned long)st);
                 return st;
             }
         }
         HKEY h = NULL;
-        st = ws_t3_open_key(levels[i], 1, WS_APPKEY_SAM, &h);
+        st = ws_t3_open_key((levels + (size_t)i * WS_PATH_MAX), 1, WS_APPKEY_SAM, &h);
         if (st != ERROR_SUCCESS) {
-            ws_log("materialize_chain: create app-hive key(%ls) failed %lu", levels[i], (unsigned long)st);
+            ws_log("materialize_chain: create app-hive key(%ls) failed %lu", (levels + (size_t)i * WS_PATH_MAX), (unsigned long)st);
             return st;
         }
         if (i == count - 1) {
@@ -382,7 +382,7 @@ int ws_rstore_key_materialize(const wchar_t *hive, const wchar_t *subkey)
     if (!hive || !hive[0]) {
         return ERROR_INVALID_PARAMETER;
     }
-    wchar_t canonical[WS_PATH_MAX];
+    WS_PATH_BUF(canonical);
     size_t pos = 0;
     canonical[0] = 0;
     if (!ws_append_w(canonical, WS_PATH_MAX, &pos, hive)) {
@@ -415,7 +415,7 @@ int ws_rstore_key_resolve(const wchar_t *hive, const wchar_t *subkey, uint32_t i
     if (!out_path || !out_flags || !hive) {
         return -1;
     }
-    wchar_t canonical[WS_PATH_MAX];
+    WS_PATH_BUF(canonical);
     size_t pos = 0;
     canonical[0] = 0;
     if (!ws_append_w(canonical, WS_PATH_MAX, &pos, hive)) {
@@ -452,7 +452,7 @@ int ws_rstore_key_resolve(const wchar_t *hive, const wchar_t *subkey, uint32_t i
 
 int ws_rstore_key_delete(const wchar_t *hive, const wchar_t *subkey)
 {
-    wchar_t canonical[WS_PATH_MAX];
+    WS_PATH_BUF(canonical);
     size_t pos = 0;
     canonical[0] = 0;
     if (!ws_append_w(canonical, WS_PATH_MAX, &pos, hive)) {
@@ -485,7 +485,7 @@ int ws_rstore_key_delete(const wchar_t *hive, const wchar_t *subkey)
     if (!inOverlay) {
         HKEY realRoot = NULL;
         const wchar_t *shortName = NULL;
-        wchar_t rel[WS_PATH_MAX];
+        WS_PATH_BUF(rel);
         /* split canonical into hive + remainder */
         const wchar_t *bs = wcschr(canonical, L'\\');
         wchar_t hive[64];
@@ -503,7 +503,7 @@ int ws_rstore_key_delete(const wchar_t *hive, const wchar_t *subkey)
         else if (ws_wcscmp_ci(hive, L"HKCC") == 0) realRoot = HKEY_CURRENT_CONFIG;
         (void)shortName;
         HKEY probe = NULL;
-        wchar_t realRel[WS_PATH_MAX];
+        WS_PATH_BUF(realRel);
         REGSAM realSam = KEY_READ;
         rs_strip_view(rel, realRel, WS_PATH_MAX, &realSam);
         if (!realRoot || g_orig.RegOpenKeyExW(realRoot, realRel, 0, realSam, &probe) != ERROR_SUCCESS) {
@@ -556,7 +556,7 @@ int ws_rstore_key_delete(const wchar_t *hive, const wchar_t *subkey)
 int ws_rstore_value_set(const wchar_t *hive, const wchar_t *subkey, const wchar_t *name,
                         uint32_t type, const unsigned char *data, uint32_t len)
 {
-    wchar_t canonical[WS_PATH_MAX];
+    WS_PATH_BUF(canonical);
     size_t pos = 0;
     canonical[0] = 0;
     if (!ws_append_w(canonical, WS_PATH_MAX, &pos, hive)) {
@@ -600,7 +600,7 @@ int ws_rstore_value_get(const wchar_t *hive, const wchar_t *subkey, const wchar_
                         uint32_t *type_out, unsigned char *data_out, uint32_t *len_inout,
                         uint32_t *flags_out)
 {
-    wchar_t canonical[WS_PATH_MAX];
+    WS_PATH_BUF(canonical);
     size_t pos = 0;
     canonical[0] = 0;
     if (!ws_append_w(canonical, WS_PATH_MAX, &pos, hive)) {
@@ -650,7 +650,7 @@ int ws_rstore_value_get(const wchar_t *hive, const wchar_t *subkey, const wchar_
 
 int ws_rstore_value_delete(const wchar_t *hive, const wchar_t *subkey, const wchar_t *name)
 {
-    wchar_t canonical[WS_PATH_MAX];
+    WS_PATH_BUF(canonical);
     size_t pos = 0;
     canonical[0] = 0;
     if (!ws_append_w(canonical, WS_PATH_MAX, &pos, hive)) {
@@ -683,7 +683,8 @@ int ws_rstore_value_delete(const wchar_t *hive, const wchar_t *subkey, const wch
     if (!existsSomewhere) {
         /* look in the real hive by canonical path */
         const wchar_t *bs = wcschr(canonical, L'\\');
-        wchar_t hiveName[64], rel[WS_PATH_MAX];
+        wchar_t hiveName[64];
+        WS_PATH_BUF(rel);
         size_t n = bs ? (size_t)(bs - canonical) : wcslen(canonical);
         if (n >= 64) {
             if (overlayKey) g_orig.RegCloseKey(overlayKey);
@@ -699,7 +700,7 @@ int ws_rstore_value_delete(const wchar_t *hive, const wchar_t *subkey, const wch
         else if (ws_wcscmp_ci(hiveName, L"HKU") == 0) realRoot = HKEY_USERS;
         else if (ws_wcscmp_ci(hiveName, L"HKCC") == 0) realRoot = HKEY_CURRENT_CONFIG;
         HKEY realKey = NULL;
-        wchar_t realRel[WS_PATH_MAX];
+        WS_PATH_BUF(realRel);
         REGSAM realSam = KEY_READ;
         rs_strip_view(rel, realRel, WS_PATH_MAX, &realSam);
         if (realRoot && g_orig.RegOpenKeyExW(realRoot, realRel, 0, realSam, &realKey) == ERROR_SUCCESS) {
@@ -733,7 +734,7 @@ int ws_rstore_value_enum(const wchar_t *hive, const wchar_t *subkey, uint32_t in
                          wchar_t *name_out, uint32_t name_cch, uint32_t *type_out,
                          unsigned char *data_out, uint32_t *len_inout, uint32_t *flags_out)
 {
-    wchar_t canonical[WS_PATH_MAX];
+    WS_PATH_BUF(canonical);
     size_t pos = 0;
     canonical[0] = 0;
     if (!ws_append_w(canonical, WS_PATH_MAX, &pos, hive)) {
@@ -784,7 +785,7 @@ int ws_rstore_value_enum(const wchar_t *hive, const wchar_t *subkey, uint32_t in
 int ws_rstore_key_enum(const wchar_t *hive, const wchar_t *subkey, uint32_t index,
                        wchar_t *name_out, uint32_t name_cch)
 {
-    wchar_t canonical[WS_PATH_MAX];
+    WS_PATH_BUF(canonical);
     size_t pos = 0;
     canonical[0] = 0;
     if (!ws_append_w(canonical, WS_PATH_MAX, &pos, hive)) {

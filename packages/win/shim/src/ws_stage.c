@@ -38,7 +38,7 @@ static int ws_stage_root_path(wchar_t *out, DWORD cch)
 /* Map a normalized absolute path to "<root>\<leafRoot>\<...>". */
 static int ws_fs_map(const wchar_t *norm, const wchar_t *leafRoot, wchar_t *out, DWORD cch)
 {
-    wchar_t root[WS_PATH_MAX];
+    WS_PATH_BUF(root);
     if (!ws_stage_root_path(root, WS_PATH_MAX)) {
         return 0;
     }
@@ -78,7 +78,7 @@ static int ws_fs_map(const wchar_t *norm, const wchar_t *leafRoot, wchar_t *out,
 
 static int ws_fs_path(const wchar_t *real, wchar_t *out, DWORD cch)
 {
-    wchar_t norm[WS_PATH_MAX];
+    WS_PATH_BUF(norm);
     if (!ws_normalize_path(real, norm, WS_PATH_MAX)) {
         return 0;
     }
@@ -87,7 +87,7 @@ static int ws_fs_path(const wchar_t *real, wchar_t *out, DWORD cch)
 
 static int ws_wo_path(const wchar_t *real, wchar_t *out, DWORD cch)
 {
-    wchar_t norm[WS_PATH_MAX];
+    WS_PATH_BUF(norm);
     if (!ws_normalize_path(real, norm, WS_PATH_MAX)) {
         return 0;
     }
@@ -103,7 +103,7 @@ static int ws_wo_path(const wchar_t *real, wchar_t *out, DWORD cch)
 static int ws_exists(const wchar_t *path)
 {
     DWORD ws_saved_last_error = GetLastError();
-    wchar_t apiBuf[WS_PATH_MAX];
+    WS_PATH_BUF(apiBuf);
     const wchar_t *api = ws_path_api_w(path, apiBuf, WS_PATH_MAX);
     DWORD a = GetFileAttributesW(api);
     SetLastError(ws_saved_last_error);
@@ -127,7 +127,7 @@ static int ws_marker_exists(const wchar_t *path)
     /* 同 `ws_exists()`：探测结果由返回值表达，不能让 GetFileAttributesW 的
      * "缺件"错误留在调用线程上（whiteout 判定每次打开都会问一次）。 */
     DWORD ws_saved_last_error = GetLastError();
-    wchar_t apiBuf[WS_PATH_MAX];
+    WS_PATH_BUF(apiBuf);
     const wchar_t *api = ws_path_api_w(path, apiBuf, WS_PATH_MAX);
     DWORD a = GetFileAttributesW(api);
     SetLastError(ws_saved_last_error);
@@ -142,7 +142,7 @@ static int dp_file_resolve(const wchar_t *real_path, uint32_t intent, wchar_t *o
     if (!real_path || !out_path || !out_flags || !g_ws.haveStageRoot) {
         return -1;
     }
-    wchar_t staged[WS_PATH_MAX];
+    WS_PATH_BUF(staged);
     if (!ws_fs_path(real_path, staged, WS_PATH_MAX)) {
         return -1;
     }
@@ -150,7 +150,7 @@ static int dp_file_resolve(const wchar_t *real_path, uint32_t intent, wchar_t *o
     out_path[0] = 0;
 
     if (intent == WINSTAGE_IO_READ) {
-        wchar_t wo[WS_PATH_MAX];
+        WS_PATH_BUF(wo);
         if (ws_wo_path(real_path, wo, WS_PATH_MAX) && ws_marker_exists(wo)) {
             *out_flags = WINSTAGE_RES_WHITEOUT;
             return 0;
@@ -177,7 +177,7 @@ static int dp_file_resolve(const wchar_t *real_path, uint32_t intent, wchar_t *o
 
 static int dp_file_whiteout(const wchar_t *real_path)
 {
-    wchar_t wo[WS_PATH_MAX];
+    WS_PATH_BUF(wo);
     if (!ws_wo_path(real_path, wo, WS_PATH_MAX)) {
         return -1;
     }
@@ -197,7 +197,7 @@ static int dp_file_whiteout(const wchar_t *real_path)
 
 static int dp_file_whiteouted(const wchar_t *real_path)
 {
-    wchar_t wo[WS_PATH_MAX];
+    WS_PATH_BUF(wo);
     if (!ws_wo_path(real_path, wo, WS_PATH_MAX)) {
         return -1;
     }

@@ -21,7 +21,25 @@
 
 #include "winstage_shim.h"
 
-#define WS_PATH_MAX 4096
+#define WS_PATH_MAX 32768
+/* R30: 长路径缓冲（NT 上限 32767）。局部路径缓冲不再上栈：WS_PATH_BUF(name)
+ * 从堆取一块 WS_PATH_MAX（含 NUL）的缓冲，cleanup 属性在离开作用域（含提前
+ * return）时自动释放；每缓冲按需 malloc/free，无跨调用常驻状态。短路径逻辑/
+ * 语义不变，仅缓冲来源从栈改为堆。
+ * 注：最初实现过"每线程 FLS 池 + 析构回收"，但在注入进程退出时 FlsAlloc 析构
+ * 会经已卸载 CRT 释放内存，实测触发 0xC0000005（每个操作后进程崩溃）；改为
+ * 直接 malloc/free 后注入/干净进程均正常（见 r30 findings），也天然无线程驻留。 */
+wchar_t *ws_path_buf_alloc(void);
+void ws_path_buf_cleanup(wchar_t **p);
+#define WS_PATH_BUF(name) wchar_t *name __attribute__((cleanup(ws_path_buf_cleanup))) = ws_path_buf_alloc()
+wchar_t *ws_path_buf_alloc_n(size_t count);
+void ws_path_buf_cleanup_n(wchar_t **p);
+#define WS_WCHAR_BUF(name, count) wchar_t *name __attribute__((cleanup(ws_path_buf_cleanup_n))) = ws_path_buf_alloc_n((size_t)(count))
+char *ws_char_buf_alloc(size_t cch);
+void ws_char_buf_cleanup(char **p);
+void ws_free_ptr(void *p);
+#define WS_HEAP_PTR(type, name) type *name __attribute__((cleanup(ws_free_ptr))) = (type *)malloc(sizeof(type))
+#define WS_CHAR_BUF(name, cch) char *name __attribute__((cleanup(ws_char_buf_cleanup))) = ws_char_buf_alloc((size_t)(cch))
 #define WS_LOG_MAX  2048
 #define WS_MAX_PASSTHROUGH 8
 

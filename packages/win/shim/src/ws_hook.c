@@ -884,7 +884,7 @@ static int ws_patch_module(HMODULE base)
                         /* Which module's IAT slot is this? Needed to answer "why was
                          * API X not called?" (a module may import it and still never
                          * use the slot, e.g. cmd's `del`). */
-                        wchar_t mp[WS_PATH_MAX];
+                        WS_PATH_BUF(mp);
                         mp[0] = 0;
                         GetModuleFileNameW(base, mp, WS_PATH_MAX);
                         const wchar_t *bn = wcsrchr(mp, L'\\');

@@ -333,7 +333,7 @@ static void t3_delete_hive_set(const wchar_t *baseName)
 {
     static const wchar_t *suffixes[] = { L"", L".LOG1", L".LOG2" };
     for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
-        wchar_t full[WS_PATH_MAX];
+        WS_PATH_BUF(full);
         size_t pos = 0;
         full[0] = 0;
         if (!ws_append_w(full, WS_PATH_MAX, &pos, g_t3.regRoot) ||
@@ -351,7 +351,7 @@ static int t3_sweep_stale_hives(void)
     if (!g_t3.regRoot[0]) {
         return 0;
     }
-    wchar_t pattern[WS_PATH_MAX];
+    WS_PATH_BUF(pattern);
     size_t pos = 0;
     pattern[0] = 0;
     if (!ws_append_w(pattern, WS_PATH_MAX, &pos, g_t3.regRoot) ||
@@ -645,7 +645,7 @@ static LSTATUS t3_replay_journal(void)
         if (rec->kind == DSH_KIND_HARD_DENY || rec->kind == DSH_KIND_UNSTAGED) {
             skippedAudit++;
         } else {
-            wchar_t pathBuf[WS_PATH_MAX];
+            WS_PATH_BUF(pathBuf);
             wchar_t nameBuf[512];
             if (rec->pathChars >= WS_PATH_MAX || rec->nameChars >= 512) {
                 rc = ERROR_INVALID_DATA;
@@ -690,7 +690,7 @@ LSTATUS __cdecl DshRegStageAttach(const wchar_t *stageRoot, const wchar_t *sessi
      * 表达 ⇒ 入口保存、七条出口全部还原，对调用方透明。
      * 注意 `:306` 的 `g_t3.lastStatus = GetLastError()` 必须在**还原之前**取值。 */
     DWORD ws_saved_last_error = GetLastError();
-    wchar_t sessionDir[WS_PATH_MAX];
+    WS_PATH_BUF(sessionDir);
     if (stageRoot && stageRoot[0]) {
         ws_strlcpy_w(sessionDir, stageRoot, WS_PATH_MAX);
     } else {

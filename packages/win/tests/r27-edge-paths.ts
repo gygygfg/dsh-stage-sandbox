@@ -201,53 +201,79 @@ if (process.platform !== 'win32' || !existsSync(DLL) || !existsSync(INJECTOR)) {
       writeFileSync(long(realRead), 'R27-REAL')
       const w = inj(['write', long(writePath), 'R27-W'])
       const wReal = real(writePath)
+      const wr = inj(['read', long(writePath)])
       const m = inj(['mkdir', long(mkdirPath)])
       const mReal = real(mkdirPath)
+      const mr = inj(['stat', long(mkdirPath)])
       const rd = inj(['read', long(realRead)])
       const st = inj(['stat', long(realRead)])
       const renSrc = join(dir, 'ren.txt')
       writeFileSync(long(renSrc), 'R27-REN')
-      const ren = L >= 32000 ? inj(['renamegen', dir, '0']) : inj(['rename', long(renSrc), long(join(dir, 'ren-dst.txt')), '0'])
+      let ren
+      let renDstPath
+      if (L >= 32000) {
+        renDstPath = join(dir, 'gen-dst.txt')
+        writeFileSync(long(join(dir, 'gen-src.txt')), 'R27-REN')
+        ren = inj(['renamegen', dir, '0'])
+      } else {
+        renDstPath = join(dir, 'ren-dst.txt')
+        ren = inj(['rename', long(renSrc), long(renDstPath), '0'])
+      }
+      const renDstView = inj(['read', long(renDstPath)])
+      const renSrcView = inj(['read', long(L >= 32000 ? join(dir, 'gen-src.txt') : renSrc)])
       const renRealSrc = real(renSrc)
-      const renRealDst = real(join(dir, 'ren-dst.txt'))
+      const renRealDst = real(renDstPath)
       const delPath = join(dir, 'del.txt')
       writeFileSync(long(delPath), 'R27-DEL')
       const del = inj(['delete', long(delPath)])
       const delReal = real(delPath)
+      const delView = inj(['read', long(delPath)])
       const trace = `${writePath.length}`
       check(
-        `A.${L} >4096 路径（pathLen≈${trace}）：write/mkdir/read/stat/delete/rename 全部 fail-closed，真实盘零写`,
-        w.status !== 0 &&
-          w.text.includes('=5') &&
+        `A.${L} >4096 路径（pathLen≈${trace}）：write/mkdir/read/stat/rename/delete 全部支持（暂存+视图可读回），真实盘零写`,
+        w.status === 0 &&
+          w.text.includes('WRITE ok=1') &&
           !wReal &&
-          m.status !== 0 &&
-          m.text.includes('=5') &&
+          wr.text.includes('CONTENT=R27-W') &&
+          m.status === 0 &&
           !mReal &&
-          rd.status !== 0 &&
-          rd.text.includes('=5') &&
-          st.status !== 0 &&
-          st.text.includes('=5') &&
-          ren.status !== 0 &&
-          ren.text.includes('=5') &&
+          mr.text.includes('DIR=1') &&
+          rd.text.includes('CONTENT=R27-REAL') &&
+          st.text.includes('ATTRS=') &&
+          ren.status === 0 &&
+          renDstView.text.includes('CONTENT=R27-REN') &&
+          renSrcView.text.includes('ERR CreateFileW=2') &&
           renRealSrc &&
           !renRealDst &&
-          del.status !== 0 &&
-          del.text.includes('=5') &&
-          delReal,
-        JSON.stringify({ write: w.status, wReal, mkdir: m.status, mReal, read: rd.status, stat: st.status, rename: ren.status, renRealSrc, renRealDst, delete: del.status, delReal }).slice(0, 380),
+          del.status === 0 &&
+          delReal &&
+          delView.text.includes('ERR CreateFileW=2'),
+        JSON.stringify({ write: w.status, wReal, writeView: wr.text.slice(0, 24), mkdir: m.status, mReal, mkdirView: mr.text.slice(0, 16), read: rd.status, stat: st.status, rename: ren.status, renDstView: renDstView.text.slice(0, 22), renameSrcView: renSrcView.text.slice(0, 22), renRealSrc, renRealDst, delete: del.status, delReal, delView: delView.text.slice(0, 22), delete: del.status, delReal }).slice(0, 380),
       )
     }
-    check('A.5 >4096 拒绝在 shim 日志里有可归因 breadcrumb（`R27 edge`）', logText().includes('R27 edge'), `has=${logText().includes('R27 edge')} count=${(logText().match(/R27 edge/g) || []).length}`)
-    const beforeGen = (logText().match(/R27 edge/g) || []).length
+    check('A.5 ≤32000 路径全部成功暂存，日志无 `R30 edge` 拒绝 breadcrumb（不再 fail-closed）', !logText().includes('R30 edge'), `has=${logText().includes('R30 edge')} count=${(logText().match(/R30 edge/g) || []).length}`)
+    const beforeGen = (logText().match(/R30 edge/g) || []).length
     const gen = inj(['writegen', SCRATCH, '33000'])
-    const afterGen = (logText().match(/R27 edge/g) || []).length
+    const afterGen = (logText().match(/R30 edge/g) || []).length
     check(
-      'A.6 >32767 字路径（NT 上限之外，探针在内存构造 33000 字）⇒ 同样 fail-closed + 可归因，真实盘零写',
+      'A.6 >32767 字路径（NT 上限之外，探针在内存构造 33000 字）⇒ 仍 fail-closed + `R30 edge` 归因，真实盘零写',
       gen.status !== 0 && afterGen > beforeGen && !/WRITE ok=1/.test(gen.text),
       JSON.stringify({ status: gen.status, text: gen.text.slice(0, 100), logBefore: beforeGen, logAfter: afterGen }),
     )
 
-    // ── B. 近边界：~2k–3.8k 可暂存；~4k 起 fail-closed（边界依赖 stage 根长度）───
+    {
+      // R30 方案 (b)：32760 虽在 NT 32767 内，但 stageRoot+映射开销后暂存路径会超 32768
+      // ⇒ 显式 fail-closed + 归因（不静默写真实盘）；不实现 hashed staging（Lead 决策）。
+      const before260 = (logText().match(/R30 edge/g) || []).length
+      const w260 = inj(['writegen', SCRATCH, '32760'])
+      const after260 = (logText().match(/R30 edge/g) || []).length
+      check(
+        'B.3 32760 字（NT 上限内，但 stageRoot+映射后超 32768）⇒ 显式 fail-closed + R30 edge 归因，真实盘零写（方案 b）',
+        w260.status !== 0 && after260 > before260 && !/WRITE ok=1/.test(w260.text),
+        JSON.stringify({ status: w260.status, text: w260.text.slice(0, 90), logBefore: before260, logAfter: after260 }),
+      )
+    }
+    // ── B. 近边界：1k–4k 均可暂存（R30 后 4096 不再是边界）───
     const supported = []
     for (const L of [1000, 2000, 3000, 3800]) {
       const dir = makeDir('near', L)
@@ -266,8 +292,8 @@ if (process.platform !== 'win32' || !existsSync(DLL) || !existsSync(INJECTOR)) {
       const p = join(dir, 'w.txt')
       const w = inj(['write', long(p), 'NEAR-DENY'])
       check(
-        'B.2 ~4k 字（stage 根 + 映射后 >4096）fail-closed 且真实盘零写（边界=stage 根长度+内部缓冲，如实记录）',
-        w.status !== 0 && !real(p),
+        'B.2 ~4k 字（原 R27 边界附近）现在也支持：写成功进暂存、真实盘零写',
+        w.status === 0 && real(p) === false,
         JSON.stringify({ pathLen: p.length, status: w.status, real: real(p) }),
       )
     }
