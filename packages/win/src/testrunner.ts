@@ -225,7 +225,7 @@ export const OFFLINE_SUITES = [
   { id: 'r23-long-path', script: 'tests/r23-long-path.ts', title: 'R23 >MAX_PATH 写面（\\\\?\\ 长路径写/建目录/rename/delete 进暂存、whiteout 跨进程、遮蔽读拒绝；13 断言）' },
   // R24 逐项修复（第三批）：readPolicy 生产通道 + 自定义 mask 来源；批量 apply 原子性（回滚）。
   { id: 'r24-fs-config', script: 'tests/r24-fs-config.ts', title: 'R24 fs 生产接线（WINSTAGE_READ_POLICY 三态 + config.masks 值级脱敏 + 非法正则 fail-closed；69 断言）' },
-  { id: 'r24-atomic-apply', script: 'tests/r24-atomic-apply.ts', title: 'R24 批量 apply 原子性（回滚快照 / 全有或全无 / 回滚失败如实 partial；13 断言）' },
+  { id: 'r24-atomic-apply', script: 'tests/r24-atomic-apply.ts', title: 'R24 批量 apply 原子性（回滚快照 / 全有或全无 / 回滚失败如实 partial；21 断言）' },
   // R25 逐项修复（第四批）：T1 真归因（T1S 可选档）；plugin remove 残留清理工具。
   { id: 'r25-t1s', script: 'tests/r25-t1s.ts', title: 'R25 T1S 可选档（受限令牌 + shim：opt-in 解析/装配失败 fail-closed/默认 T1 不变/静态守卫；48 断言）' },
   { id: 'r25-remove-cleanup', script: 'tests/r25-remove-cleanup.ts', title: 'R25 plugin remove 残留清理工具（dry-run/apply/幂等/护栏/越界拒绝；65 断言）' },

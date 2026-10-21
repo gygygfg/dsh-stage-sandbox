@@ -299,6 +299,64 @@ section('J. R34：同一候选分两批应用后，累计状态必须收敛为 a
   )
 }
 
+section('K. R34d：显式 paths 为空/未知 ⇒ NO_MATCHING_PATHS，候选与真实盘零变化')
+{
+  const { ws, root } = makeWs('no-match')
+  const abs = join(root, 'n.txt')
+  writeFileSync(abs, 'N0\n')
+  ws.writeFile(abs, 'N1\n', { origin: 'test' })
+  const frozen = ws.freezeCandidate({})
+  const before = content(abs)
+  const beforeStatus = ws.listReviews().find((candidate) => candidate.id === frozen.candidate.id)?.status
+  let emptyError
+  try {
+    ws.applyCandidate(frozen.candidate.id, { paths: [] })
+  } catch (error) {
+    emptyError = error
+  }
+  let unknownError
+  try {
+    ws.applyCandidate(frozen.candidate.id, { paths: ['nope.txt'] })
+  } catch (error) {
+    unknownError = error
+  }
+  const after = ws.listReviews().find((candidate) => candidate.id === frozen.candidate.id)
+  check(
+    'K1 空选择/未知路径 ⇒ NO_MATCHING_PATHS（不是 partial 假成功）',
+    emptyError?.code === 'NO_MATCHING_PATHS' && unknownError?.code === 'NO_MATCHING_PATHS',
+    JSON.stringify({ empty: emptyError?.code, unknown: unknownError?.code }),
+  )
+  check(
+    'K2 失败没有改写候选状态、没有写真实盘',
+    after?.status === beforeStatus && content(abs) === before,
+    JSON.stringify({ beforeStatus, afterStatus: after?.status, content: content(abs) }),
+  )
+  let mixedError
+  try {
+    ws.applyCandidate(frozen.candidate.id, { paths: ['n.txt', 'nope.txt'] })
+  } catch (error) {
+    mixedError = error
+  }
+  check(
+    'K2b 已知 + 未知混合路径 ⇒ 整批 NO_MATCHING_PATHS，已知项也不写',
+    mixedError?.code === 'NO_MATCHING_PATHS' && content(abs) === before,
+    JSON.stringify({ code: mixedError?.code, content: content(abs) }),
+  )
+  const { ReviewService } = await import('../dsh-plugin/review-service.ts')
+  const svcRoot = join(SCRATCH, `ws-k-svc-${Date.now()}`)
+  mkdirSync(svcRoot, { recursive: true })
+  const svc = new ReviewService({ workspaceRoot: svcRoot, sessionId: 'r24-k-svc', storeDir: join(SCRATCH, `store-k-svc-${Date.now()}`) })
+  svc.workspace.writeFile(join(svcRoot, 's.txt'), 'S1\n', { origin: 'test' })
+  svc.workspace.freezeCandidate({ source: 'test' })
+  svc.publish()
+  const svcResult = svc.approve(['nope.txt'])
+  check(
+    'K3 ReviewService.approve(未知路径) ⇒ ok:false + NO_MATCHING_PATHS（不是 ok:true/approved:0）',
+    svcResult.ok === false && (svcResult.failed || []).some((failure) => failure.code === 'NO_MATCHING_PATHS'),
+    JSON.stringify({ ok: svcResult.ok, approved: svcResult.approved, failed: svcResult.failed }),
+  )
+}
+
 W('')
 W('='.repeat(64))
 W(`RESULT: ${failures === 0 ? 'PASS' : 'FAIL'} checks=${assertions} failures=${failures}`)

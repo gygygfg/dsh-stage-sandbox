@@ -2186,6 +2186,33 @@ export class Workspace {
     }
     const selected = opts.paths ? new Set(opts.paths.map(compareKey)) : undefined
     const chosen = candidate.changes.filter((change) => (selected ? selected.has(compareKey(change.path)) : true))
+    /**
+     * R34d：显式给了 `paths` 就必须**全部命中**（全有或全无），不能只把命中的那部分应用、
+     * 对未知路径一声不响。旧行为：`{paths:['a.txt','nope']}` 会写 a.txt；空选择/全未知
+     * 则返回 `status=partially-applied / applied=[] / failed=[]`（假成功），候选还被
+     * 改成 partially-applied（`appliedAt` 刷新）。`ReviewService.approve(['nope'])` 甚至
+     * 返回 `ok:true, approved:0`。调用方（CLI/命令面/面板）已各自预校验，这里是 API 层
+     * 的最后一道全有或全无闸门。
+     */
+    if (opts.paths !== undefined) {
+      if (opts.paths.length === 0) {
+        throw new SandboxError('NO_MATCHING_PATHS', 'no candidate changes match the requested paths: (empty selection)', {
+          candidate: candidate.id,
+          paths: [],
+          unmatched: [],
+          available: candidate.changes.map((change) => change.path),
+        })
+      }
+      const available = new Set(candidate.changes.map((change) => compareKey(change.path)))
+      const unmatched = (opts.paths || []).filter((path) => !available.has(compareKey(path)))
+      if (unmatched.length > 0) {
+        throw new SandboxError(
+          'NO_MATCHING_PATHS',
+          `no candidate changes match the requested paths: ${unmatched.join(', ') || '(empty selection)'}`,
+          { candidate: candidate.id, paths: opts.paths, unmatched, available: candidate.changes.map((change) => change.path) },
+        )
+      }
+    }
 
     const applied = []
     const failed = []

@@ -1885,10 +1885,52 @@ export class ReviewService {
      * `/winstage approve|reject`）。
      */
     const pendingBefore = this.reload().listReviews()
+    /**
+     * R34d：**显式空选择**不是"批准全部"（`undefined` 才是全部）。旧实现把 `[]` 一路传到
+     * `applyCandidate`，得到 `partially-applied / applied=[] / failed=[]` 的假成功；这里
+     * 统一返回结构化失败，且注册表/文件面都不动。
+     */
+    if (Array.isArray(paths) && paths.length === 0) {
+      return {
+        ok: false,
+        approved: 0,
+        failed: [{ path: '', code: 'NO_MATCHING_PATHS', message: '没有选择任何路径；整批未应用。' }],
+        remaining: this.workspace.diffEntries().map((change) => change.path),
+        conflicts: [],
+        rebased: [],
+        failures: [],
+        message: '没有选择任何路径（整批未应用）',
+      }
+    }
     const registryPending = pendingBefore.filter((candidate) => isRegistryCandidate(candidate))
     const registryKeys = new Set(
       registryPending.flatMap((candidate) => (candidate.changes || []).map((change) => compareKey(change.path))),
     )
+    /**
+     * R34d：显式路径必须**先于注册表 apply** 全部命中，否则整批拒绝。
+     *
+     * 旧顺序是"先 `_approveRegistry()`，再 `applyCandidate(filePaths)`"：如果用户给的是
+     * 已知注册表键 + 未知文件路径，注册表那一半已经落盘，文件面随后才因空选择失败 ⇒
+     * 一次"批准"留下半批副作用。这里在两条路之前用"净 diff 文件路径 ∪ 注册表键"做
+     * 全有或全无校验；未知路径直接返回 ok:false，注册表一个都不写。
+     */
+    if (Array.isArray(paths) && paths.length > 0) {
+      const knownPaths = new Set(this.workspace.diffEntries().map((change) => compareKey(change.path)))
+      for (const key of registryKeys) knownPaths.add(key)
+      const unmatched = paths.filter((path) => !knownPaths.has(compareKey(path)))
+      if (unmatched.length > 0) {
+        return {
+          ok: false,
+          approved: 0,
+          failed: [{ path: unmatched.join(', '), code: 'NO_MATCHING_PATHS', message: '所选路径不在当前待审净变化里；整批未应用（注册表也未写）。' }],
+          remaining: this.workspace.diffEntries().map((change) => change.path),
+          conflicts: [],
+          rebased: [],
+          failures: [],
+          message: `没有匹配的待审路径：${unmatched.join(', ')}（整批未应用）`,
+        }
+      }
+    }
     const selectedRegistry = paths && paths.length > 0 ? paths.filter((p) => registryKeys.has(compareKey(p))) : []
     const wantsRegistry =
       registryPending.length > 0 && ((paths ?? []).length === 0 || selectedRegistry.length > 0)
