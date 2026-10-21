@@ -328,6 +328,194 @@ if (!onWindows || !attribOk) {
   }
 }
 
+  // ═════════════ R29：（① 显式清除/设置的暂存态语义 + ② 树回滚子项属性）
+  // marker 写法与 shim 侧契约一致：staged 文件 ADS `:winstage-attr`，4 字节 LE DWORD。
+  const markerWrite = (staged, value) => {
+    const b = Buffer.alloc(4)
+    b.writeUInt32LE(value >>> 0, 0)
+    writeFileSync(`${staged}:winstage-attr`, b)
+  }
+  const markerRead = (p) => {
+    try {
+      const b = readFileSync(`${p}:winstage-attr`)
+      return b.length >= 4 ? b.readUInt32LE(0) : -1
+    } catch (e) {
+      return e.code
+    }
+  }
+  // R29-A1：显式清除（marker=0x80 NORMAL）⇒ apply 为 NORMAL，不再保留原 hidden
+  {
+    const { ws, root } = makeWs('r29clear')
+    const p = join(root, 'clear.txt')
+    writeFileSync(p, 'OLD')
+    setAttrsSync(p, { hidden: true, system: false })
+    ws.writeFile(p, 'NEW', { origin: 'test' })
+    const staged = stagedOf(ws, 'clear.txt')
+    markerWrite(staged, 0x80)
+    const frozen = ws.freezeCandidate({})
+    const res = ws.applyCandidate(frozen.candidate.id)
+    const a = readAttrsSync(p)
+    check(
+      'R29-A1 显式清除：暂存态 marker=0x80(NORMAL) ⇒ apply 后真实文件 NORMAL（hidden/system 不保留）',
+      res.status === 'applied' && a.hidden === false && a.system === false && content(p) === 'NEW',
+      JSON.stringify({ hidden: a.hidden, system: a.system, warnings: res.attributeWarnings }),
+    )
+  }
+  // R29-A2：显式设置（marker=H|S）仍还原
+  {
+    const { ws, root } = makeWs('r29set')
+    const p = join(root, 'set.txt')
+    writeFileSync(p, 'OLD')
+    ws.writeFile(p, 'NEW', { origin: 'test' })
+    const staged = stagedOf(ws, 'set.txt')
+    markerWrite(staged, 0x2 | 0x4)
+    const frozen = ws.freezeCandidate({})
+    const res = ws.applyCandidate(frozen.candidate.id)
+    const a = readAttrsSync(p)
+    check(
+      'R29-A2 显式设置：暂存态 marker=H|S ⇒ apply 后真实文件 hidden+system（marker 值优先生效）',
+      res.status === 'applied' && a.hidden === true && a.system === true,
+      JSON.stringify({ hidden: a.hidden, system: a.system, warnings: res.attributeWarnings }),
+    )
+  }
+  // R29-A3：marker 不可用 ⇒ 如实 warning，且不回退旧优先级（不改 H/S）
+  {
+    const { ws, root } = makeWs('r29unavail')
+    const p = join(root, 'unavail.txt')
+    writeFileSync(p, 'OLD')
+    setAttrsSync(p, { hidden: true, system: false })
+    ws.writeFile(p, 'NEW', { origin: 'test' })
+    const frozen = ws.freezeCandidate({})
+    const res = ws.applyCandidate(frozen.candidate.id, {
+      attributeMarkerIo: { read: () => ({ state: 'error', code: 'ATTRIB_MARKER_UNAVAILABLE', message: 'non-NTFS forced failure' }) },
+    })
+    const a = readAttrsSync(p)
+    check(
+      'R29-A3 marker 不可用：attributeWarnings 如实含 ATTRIB_MARKER_UNAVAILABLE，且不静默回退旧优先级（属性未知 ⇒ 不猜测/不保留，如实）',
+      res.status === 'applied' &&
+        Array.isArray(res.attributeWarnings) &&
+        res.attributeWarnings.some((w) => w.code === 'ATTRIB_MARKER_UNAVAILABLE') &&
+        a.hidden === false,
+      JSON.stringify({ status: res.status, warnings: res.attributeWarnings, hidden: a.hidden }).slice(0, 360),
+    )
+  }
+  // R29-A4：marker 成功消费后清理；真实盘无 ADS 泄漏
+  {
+    const { ws, root } = makeWs('r29cleanup')
+    const p = join(root, 'cleanup.txt')
+    writeFileSync(p, 'OLD')
+    setAttrsSync(p, { hidden: true, system: false })
+    ws.writeFile(p, 'NEW', { origin: 'test' })
+    const staged = stagedOf(ws, 'cleanup.txt')
+    markerWrite(staged, 0x80)
+    const frozen = ws.freezeCandidate({})
+    const res = ws.applyCandidate(frozen.candidate.id)
+    check(
+      'R29-A4 marker 生命周期：apply 后 staged 上的 :winstage-attr 被清理，真实文件上没有该 ADS（不泄漏）',
+      res.status === 'applied' && markerRead(staged) === 'ENOENT' && markerRead(p) === 'ENOENT',
+      JSON.stringify({ stagedMarker: markerRead(staged), realMarker: markerRead(p) }),
+    )
+  }
+  // R29-A5（C 侧契约，需 injector）：沙箱内 PowerShell SetAttributes(NORMAL) 在 staged 文件上留下 marker=0x80；
+  // 沙箱删除后 staged 文件与 marker 均不残留。
+  {
+    const shimDir = process.env.WINSTAGE_SHIM_OUT
+      ? process.env.WINSTAGE_SHIM_OUT
+      : existsSync(join(REPO, '.t', 'file-shim', 'out', 'winstage-shim.dll'))
+        ? join(REPO, '.t', 'file-shim', 'out')
+        : join(REPO, 'shim', 'out')
+    const injector = join(shimDir, 'winstage-inject.exe')
+    const dll = join(shimDir, 'winstage-shim.dll')
+    if (!existsSync(injector) || !existsSync(dll)) {
+      skip('R29-A5 shim 侧 marker 契约（需要 canonical injector）', 'shim/out 产物缺失')
+    } else {
+      const { ws, root } = makeWs('r29shim')
+      const stage = join(SCRATCH, `stage-r29shim-${process.pid}`)
+      mkdirSync(stage, { recursive: true })
+      const p = join(root, 'shim-marker.txt')
+      writeFileSync(p, 'OLD')
+      setAttrsSync(p, { hidden: true, system: false })
+      const cfg = join(SCRATCH, `cfg-r29shim-${process.pid}.json`)
+      writeFileSync(cfg, JSON.stringify({ stageRoot: stage, logPath: join(stage, 'shim.log'), failClosed: true, readThrough: true, verbose: false, passthrough: [stage] }))
+      const env = { ...process.env, WINSTAGE_STAGE_ROOT: stage, WINSTAGE_SHIM_CONFIG: cfg, WINSTAGE_SHIM_LOG: join(stage, 'shim.log') }
+      const q = p.replace(/'/g, "''")
+      const psWrite = `[IO.File]::WriteAllText('${q}', 'STAGED'); [IO.File]::SetAttributes('${q}', [IO.FileAttributes]::Normal)`
+      const inj1 = spawnSync(injector, ['--dll', dll, '--report', join(SCRATCH, `r-${process.pid}.json`), '--cwd', root, '--', 'powershell.exe', '-NoProfile', '-NonInteractive', '-Command', psWrite], { env, encoding: 'utf8', timeout: 180000 })
+      const drive = p[0]
+      const rest = p.slice(3)
+      const stagedShim = join(stage, 'fs', drive, rest)
+      const mv = markerRead(stagedShim)
+      const psDelete = `Remove-Item -LiteralPath '${q}' -Force`
+      const inj2 = spawnSync(injector, ['--dll', dll, '--report', join(SCRATCH, `r2-${process.pid}.json`), '--cwd', root, '--', 'powershell.exe', '-NoProfile', '-NonInteractive', '-Command', psDelete], { env, encoding: 'utf8', timeout: 180000 })
+      check(
+        'R29-A5 C 侧契约：沙箱 SetAttributes(NORMAL) 在 staged 文件写 marker=0x80；沙箱删除后 staged 文件与 marker 均不残留',
+        inj1.status === 0 && mv === 0x80 && inj2.status === 0 && !existsSync(stagedShim) && markerRead(stagedShim) !== 0x80,
+        JSON.stringify({ write: inj1.status, marker: mv, delete: inj2.status, stagedExists: existsSync(stagedShim) }).slice(0, 320),
+      )
+    }
+  }
+  // R29-B1：目录树回滚 → 子项 H/S/只读逐项恢复
+  {
+    const { ws, root } = makeWs('r29tree')
+    const tree = join(root, 'a-tree')
+    mkdirSync(join(tree, 'sub'), { recursive: true })
+    writeFileSync(join(tree, 'hidden-child.txt'), 'H')
+    setAttrsSync(join(tree, 'hidden-child.txt'), { hidden: true, system: false })
+    writeFileSync(join(tree, 'sys-child.txt'), 'S')
+    setAttrsSync(join(tree, 'sys-child.txt'), { hidden: false, system: true })
+    chmodSync(join(tree, 'sys-child.txt'), 0o444)
+    setAttrsSync(join(tree, 'sub'), { hidden: true, system: false })
+    writeFileSync(join(root, 'z-fail.txt'), 'Z0')
+    ws.remove(tree, { origin: 'test' })
+    ws.writeFile(join(root, 'z-fail.txt'), 'Z1', { origin: 'test' })
+    const frozen = ws.freezeCandidate({})
+    const cand = ws.store.loadCandidate(frozen.candidate.id)
+    const zChange = cand.changes.find((c) => c.path.endsWith('z-fail.txt'))
+    rmSync(ws.store.blobPath(zChange.after.hash), { force: true })
+    const res = ws.applyCandidate(frozen.candidate.id)
+    const aHidden = readAttrsSync(join(tree, 'hidden-child.txt'))
+    const aSys = readAttrsSync(join(tree, 'sys-child.txt'))
+    const aSub = readAttrsSync(join(tree, 'sub'))
+    const sysMode = statSync(join(tree, 'sys-child.txt')).mode & 0o777
+    check(
+      'R29-B1 目录树回滚：子文件 hidden、子文件 system+readonly、子目录 hidden 逐项恢复；整体 rolled-back',
+      res.status === 'rolled-back' &&
+        existsSync(join(tree, 'hidden-child.txt')) &&
+        aHidden.hidden === true &&
+        aSys.system === true &&
+        sysMode === 0o444 &&
+        aSub.hidden === true,
+      JSON.stringify({ status: res.status, hidden: aHidden.hidden, system: aSys.system, sysMode: sysMode.toString(8), subHidden: aSub.hidden }).slice(0, 360),
+    )
+    spawnSync('attrib.exe', ['-S', '-R', join(tree, 'sys-child.txt')], { encoding: 'utf8' })
+  }
+  // R29-B2：回滚属性失败 ⇒ 如实 partially-applied + ROLLBACK_ATTRIBUTE_FAILED（不谎称 rolled-back）
+  {
+    const { ws, root } = makeWs('r29treefail')
+    const tree = join(root, 'a-tree2')
+    mkdirSync(join(tree, 'sub'), { recursive: true })
+    writeFileSync(join(tree, 'hidden-child.txt'), 'H')
+    setAttrsSync(join(tree, 'hidden-child.txt'), { hidden: true, system: false })
+    writeFileSync(join(root, 'z-fail2.txt'), 'Z0')
+    ws.remove(tree, { origin: 'test' })
+    ws.writeFile(join(root, 'z-fail2.txt'), 'Z1', { origin: 'test' })
+    const frozen = ws.freezeCandidate({})
+    const cand = ws.store.loadCandidate(frozen.candidate.id)
+    const zChange = cand.changes.find((c) => c.path.endsWith('z-fail2.txt'))
+    rmSync(ws.store.blobPath(zChange.after.hash), { force: true })
+    const res = ws.applyCandidate(frozen.candidate.id, {
+      attributeIo: { set: () => ({ ok: false, code: 'ATTRIB_SET_FAILED', message: 'forced rollback attr failure' }) },
+    })
+    check(
+      'R29-B2 回滚属性失败：如实 partially-applied + rollback ok=false / ROLLBACK_ATTRIBUTE_FAILED（不谎称 rolled-back）',
+      res.status === 'partially-applied' &&
+        res.rolledBack === false &&
+        Array.isArray(res.rollback) &&
+        res.rollback.some((r) => r.ok === false && r.code === 'ROLLBACK_ATTRIBUTE_FAILED'),
+      JSON.stringify({ status: res.status, rolledBack: res.rolledBack, rollback: res.rollback }).slice(0, 400),
+    )
+  }
+
 W('')
 W('='.repeat(64))
 W(`RESULT: ${failures === 0 ? 'PASS' : 'FAIL'} checks=${assertions} failures=${failures} skips=${skips}`)

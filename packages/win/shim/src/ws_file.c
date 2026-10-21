@@ -725,6 +725,61 @@ static void ws_log_edge_deny(void)
  * provider 侧（ws_stage.c/ws_util.c）已能算出长路径；但真实 Win32 API 在本机
  * （LongPathsEnabled=0）仍需 `\\?\` 前缀。每个包装只做"补前缀 + 直调 original"，
  * 不改变语义；短路径不补前缀（ws_api_path 内部判长）。 */
+/* ── R29：显式属性标记（ADS `:winstage-attr`）─────────────────────────────────
+ * 沙箱内 `SetFileAttributesW(path, NORMAL)` 只改 staged 文件属性，与"从未设置"不可
+ * 区分 ⇒ host apply 会回退保留原 H/S。这里在**成功设置属性后**于 staged 文件上写
+ * NTFS 备用流 `:winstage-attr`（DWORD little-endian = 调用方显式传入的属性值，
+ * 含 0x80/NORMAL 这种"显式清除"）。host 侧（workspace.ts）优先读取该流：**存在即
+ * 采用其值（哪怕 0）**，不存在才回退旧优先级。C/TS 契约：流名固定、4 字节 LE。
+ *
+ * 生命周期/安全：
+ *   · 只写 staged 文件，**永不写真实盘**；ADS 不出现在目录枚举/面板；
+ *   · `SetFileAttributesW` 失败 ⇒ 不写标记；标记写失败（非 NTFS 等）⇒ fail-closed
+ *     （属性设置返回失败，调用方看到 ERROR_ACCESS_DENIED，不静默假装成功）；
+ *   · 写意图打开 staged 文件时先清掉旧标记（内容改写使旧的显式属性失效，之后
+ *     沙箱再设置属性会重新写标记）；
+ *   · delete 删除 staged 文件时 ADS 随之消失；rename 时 ADS 随文件移动（属性属于
+ *     该对象；旧路径不残留）。
+ */
+#define WS_ATTR_MARKER_STREAM L":winstage-attr"
+static int ws_attr_marker_path(const wchar_t *staged, wchar_t *out, DWORD cch)
+{
+    if (!staged || !staged[0] || !out) {
+        return 0;
+    }
+    size_t pos = 0;
+    out[0] = 0;
+    return ws_append_w(out, cch, &pos, staged) && ws_append_w(out, cch, &pos, WS_ATTR_MARKER_STREAM);
+}
+static int ws_attr_marker_write(const wchar_t *staged, DWORD attrs)
+{
+    wchar_t mp[WS_PATH_MAX];
+    if (!ws_attr_marker_path(staged, mp, WS_PATH_MAX)) {
+        return 0;
+    }
+    HANDLE h = g_orig.CreateFileW ? g_orig.CreateFileW(mp, GENERIC_WRITE,
+                                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                                       NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)
+                                  : INVALID_HANDLE_VALUE;
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    DWORD wrote = 0;
+    BOOL ok = WriteFile(h, &attrs, (DWORD)sizeof(attrs), &wrote, NULL);
+    CloseHandle(h);
+    return ok && wrote == (DWORD)sizeof(attrs);
+}
+static void ws_attr_marker_delete(const wchar_t *staged)
+{
+    wchar_t mp[WS_PATH_MAX];
+    if (!ws_attr_marker_path(staged, mp, WS_PATH_MAX)) {
+        return;
+    }
+    if (g_orig.DeleteFileW) {
+        g_orig.DeleteFileW(mp); /* ENOENT is expected/fine */
+    }
+}
+
 static HANDLE ws_create_api(const wchar_t *path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
                             DWORD disp, DWORD flags, HANDLE tmpl)
 {
@@ -2922,6 +2977,11 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
             ws_log_w(L"CreateFileW copy-on-write", staged);
         }
     }
+    /* R29: content write invalidates a previous explicit-attribute marker; the
+     * sandbox may set attributes again after this open (which re-creates it). */
+    if (writeAccess || destructive) {
+        ws_attr_marker_delete(staged);
+    }
     HANDLE h = ws_create_api(staged, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
                              dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
     /* R18-KNOWN-06: register the copy so CloseHandle can revoke it when this open
@@ -3473,8 +3533,22 @@ BOOL WINAPI ws_SetFileAttributesW(LPCWSTR lpFileName, DWORD dwFileAttributes)
             return FALSE;
         }
     }
+    /* R29: 显式属性标记（ADS）。只对**文件**生效：目录无法可靠承载 ADS，且 apply
+     * 目前不为目录设置属性；对目录保留旧的 staged 行为，避免把原本可用的
+     * SetFileAttributesW(dir) 退化成 fail-closed。 */
+    DWORD mappedAttrs = ws_attrs_api(mapped);
+    int mappedIsDir = mappedAttrs != INVALID_FILE_ATTRIBUTES && (mappedAttrs & FILE_ATTRIBUTE_DIRECTORY);
+    if (!mappedIsDir && !ws_attr_marker_write(mapped, dwFileAttributes)) {
+        ws_log_w(L"fail-closed SetFileAttributesW: cannot write unstage attr marker", mapped);
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     BOOL ok = ws_setattrs_api(mapped, dwFileAttributes);
     DWORD lastErr = GetLastError();
+    if (!ok) {
+        /* 失败路径不写标记（已写则清掉） */
+        ws_attr_marker_delete(mapped);
+    }
     ws_log_w(ok ? L"SetFileAttributesW staged" : L"SetFileAttributesW staged FAILED", mapped);
     SetLastError(lastErr);
     return ok;

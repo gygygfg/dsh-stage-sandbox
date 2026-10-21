@@ -76,6 +76,7 @@
 - [`round26/R26-32位视图暂存报告.md`](round26/R26-32位视图暂存报告.md)：第五批 —— R13 32 位注册表视图暂存化（`/reg:32` 写/删进 overlay，合成命名空间 + WAL `reserved`=view，apply 带 `/reg:32` 只改 32 视图；审阅面 `[32]`；读仍透传）；附修前红/修后绿与残余。
 - [`round27/R27-边缘路径与测试基建报告.md`](round27/R27-边缘路径与测试基建报告.md)：第六批 —— 边缘路径收尾（>4095 显式 fail-closed + 归因、≤3000 支持、跨卷 rename copy-up 无半态、真实远端 SMB 环境缺口）、autotest 启动口径统一（plain node 显式跳过 sandbox 段 + exit=2；DSH-as-node 不变）、masks 设置页文案；附 CodeIntegrity 策略环境事件与残余。
 - [`round28/R28-apply属性面报告.md`](round28/R28-apply属性面报告.md)：第七批 —— R21-FS-08 apply 属性面（hidden/system 还原：staged→baseWin32→apply 前值，失败 warnings 不吞错，R24 回滚快照含 H/S；ACL 继承明确非暂存语义）、R21-FS-07 口径更新（同 store apply.lock 已加，残余跨 store/崩溃恢复）；附残余。
+- [`round29/R29-属性面残余收口报告.md`](round29/R29-属性面残余收口报告.md)：第八批 —— 属性面残余收口：显式清除 H/S（ADS `:winstage-attr` 显式态标记，存在即采用哪怕 0；非 NTFS 如实 warning 不回退）、目录树回滚子项属性逐项恢复（失败 `ROLLBACK_ATTRIBUTE_FAILED` 如实 partial）；附残余（目录属性不在标记面、非 NTFS、ACL 继承非暂存语义）。
 
 ## 5. archive —— 历史归档（不代表现行口径）
 

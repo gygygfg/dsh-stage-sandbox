@@ -2281,23 +2281,85 @@ export class Workspace {
       return null
     }
   }
-  /** 暂存态优先（沙箱内显式设置的 H/S）；否则用暂存时捕获的原值；再否则读当前真实值。 */
+  /**
+   * ── R29：`:winstage-attr` ADS 标记（C/TS 契约）──────────────────────────────
+   * shim 在**成功**的 SetFileAttributesW 后把显式属性 DWORD 写进 staged 文件的
+   * `:winstage-attr` 流；存在即表示"调用方显式设置过属性"（值 0/0x80 也有效，
+   * 表示显式清除 H/S）。host apply 优先采用它；读失败（非 NTFS 等）⇒ 如实
+   * warning 且**不回退旧优先级**（fail-closed 方向，不静默假装）。
+   * 测试注入缝：opts.attributeMarkerIo = { read?(staged), clear?(staged) }。
+   */
+  _readWin32AttrMarker(change, opts) {
+    let staged
+    try {
+      staged = this.store.stagedPath(change.path)
+    } catch {
+      return { state: 'absent' }
+    }
+    if (!existsSync(staged)) return { state: 'absent' }
+    const io = opts && opts.attributeMarkerIo
+    try {
+      if (io && typeof io.read === 'function') return io.read(staged)
+      const buf = readFileSync(`${staged}:winstage-attr`)
+      if (!Buffer.isBuffer(buf) || buf.length < 4) {
+        return { state: 'error', code: 'ATTRIB_MARKER_INVALID', message: 'marker stream is not a 4-byte DWORD' }
+      }
+      return { state: 'present', value: buf.readUInt32LE(0) }
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return { state: 'absent' }
+      return { state: 'error', code: 'ATTRIB_MARKER_UNAVAILABLE', message: error.message }
+    }
+  }
+  _clearWin32AttrMarker(change, opts, warnings) {
+    let staged
+    try {
+      staged = this.store.stagedPath(change.path)
+    } catch {
+      return
+    }
+    if (!existsSync(staged)) return
+    const io = opts && opts.attributeMarkerIo
+    try {
+      if (io && typeof io.clear === 'function') {
+        const r = io.clear(staged)
+        if (r && r.ok === false) throw Object.assign(new Error(r.message || 'marker clear failed'), { code: r.code || 'ATTRIB_MARKER_CLEANUP_FAILED' })
+        return
+      }
+      unlinkSync(`${staged}:winstage-attr`)
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return
+      if (warnings) warnings.push({ path: change.path, op: 'attributes', code: 'ATTRIB_MARKER_CLEANUP_FAILED', message: error.message })
+    }
+  }
+  /** marker 存在 ⇒ 采用其值（哪怕 0）；否则旧优先级（staged 实属性 → baseWin32 → 真实值）。 */
   _desiredWin32Attributes(change, abs, opts) {
+    const marker = this._readWin32AttrMarker(change, opts)
+    if (marker.state === 'present') {
+      const v = marker.value >>> 0
+      return { desired: { hidden: (v & 0x2) !== 0, system: (v & 0x4) !== 0 }, marker }
+    }
+    if (marker.state === 'error') return { desired: null, marker }
     const staged = this._stagedWin32Attributes(change)
     const entry = this.entryOf(change.path)
     const captured = entry && entry.baseWin32 ? entry.baseWin32 : null
-    if (staged && (staged.hidden || staged.system)) return { hidden: staged.hidden, system: staged.system }
-    if (captured) return { hidden: captured.hidden === true, system: captured.system === true }
-    const prior = this._readWin32Attributes(abs, opts && opts.attributeIo)
-    if (prior.ok) return { hidden: prior.hidden, system: prior.system }
-    return null
+    let desired = null
+    if (staged && (staged.hidden || staged.system)) desired = { hidden: staged.hidden, system: staged.system }
+    else if (captured) desired = { hidden: captured.hidden === true, system: captured.system === true }
+    else {
+      const prior = this._readWin32Attributes(abs, opts && opts.attributeIo)
+      if (prior.ok) desired = { hidden: prior.hidden, system: prior.system }
+    }
+    return { desired, marker }
   }
   _applyAttributesAfterWrite(change, abs, stagedMode, opts) {
     const warnings = opts && opts._attributeWarnings
-    const desired = this._desiredWin32Attributes(change, abs, opts)
+    const info = this._desiredWin32Attributes(change, abs, opts)
     let ok = true
-    if (desired) {
-      const res = this._setWin32Attributes(abs, desired, opts && opts.attributeIo)
+    if (info.marker && info.marker.state === 'error' && warnings) {
+      warnings.push({ path: change.path, op: 'attributes', code: info.marker.code || 'ATTRIB_MARKER_UNAVAILABLE', message: info.marker.message })
+    }
+    if (info.desired) {
+      const res = this._setWin32Attributes(abs, info.desired, opts && opts.attributeIo)
       if (!res.ok) {
         ok = false
         if (warnings) warnings.push({ path: change.path, op: 'attributes', code: res.code || 'ATTRIB_SET_FAILED', message: res.message })
@@ -2308,6 +2370,8 @@ export class Workspace {
         chmodSync(abs, stagedMode)
       } catch {}
     }
+    // R29：成功消费后清掉标记（避免陈旧显式属性影响后续轮次）；清理失败如实 warning。
+    if (ok) this._clearWin32AttrMarker(change, opts, warnings)
     return ok
   }
   _captureBaseWin32(rel, abs, opts) {
@@ -2388,14 +2452,14 @@ export class Workspace {
           }
           const childStat = lstatSync(childAbs)
           if (childStat.isDirectory()) {
-            entries.push({ rel: childRel, kind: 'dir', mode: childStat.mode & 0o777 })
+            entries.push({ rel: childRel, kind: 'dir', mode: childStat.mode & 0o777, attrs: (() => { const a = this._readWin32Attributes(childAbs); return a.ok ? { hidden: a.hidden, system: a.system } : null })() })
             walk(childAbs, childRel)
           } else if (childStat.isFile()) {
             budget.used += childStat.size
             if (budget.used > budget.limit) {
               throw new SandboxError('ROLLBACK_SNAPSHOT_TOO_LARGE', `rollback snapshot exceeds ${budget.limit} bytes at ${childAbs}`, { path: childAbs, limit: budget.limit })
             }
-            entries.push({ rel: childRel, kind: 'file', mode: childStat.mode & 0o777, bytes: readFileSync(childAbs) })
+            entries.push({ rel: childRel, kind: 'file', mode: childStat.mode & 0o777, bytes: readFileSync(childAbs), attrs: (() => { const a = this._readWin32Attributes(childAbs); return a.ok ? { hidden: a.hidden, system: a.system } : null })() })
           } else {
             throw new SandboxError('ROLLBACK_SNAPSHOT_UNAVAILABLE', `cannot snapshot special file ${childAbs} for rollback`, { path: childAbs })
           }
@@ -2455,16 +2519,29 @@ export class Workspace {
             try {
               chmodSync(target, entry.mode)
             } catch {}
+            if (entry.attrs) {
+              const ares = this._setWin32Attributes(target, entry.attrs, opts.attributeIo)
+              if (!ares.ok) {
+                return { path: rel, abs: snap.abs, ok: false, action: 'restore', code: 'ROLLBACK_ATTRIBUTE_FAILED', message: ares.message || 'child attribute restore failed' }
+              }
+            }
           } else {
             mkdirSync(target, { recursive: true })
             dirs.push(target)
           }
         }
-        // modes after content creation (deepest first so parent chmod cannot block writes)
+        // modes/attrs after content creation (deepest first so parent chmod cannot block writes)
         for (const dir of dirs.reverse()) {
+          const entry = snap.entries.find((e) => join(snap.abs, e.rel) === dir)
           try {
-            chmodSync(dir, snap.entries.find((e) => join(snap.abs, e.rel) === dir)?.mode ?? snap.mode)
+            chmodSync(dir, entry?.mode ?? snap.mode)
           } catch {}
+          if (entry?.attrs) {
+            const ares = this._setWin32Attributes(dir, entry.attrs, opts.attributeIo)
+            if (!ares.ok) {
+              return { path: rel, abs: snap.abs, ok: false, action: 'restore', code: 'ROLLBACK_ATTRIBUTE_FAILED', message: ares.message || 'child directory attribute restore failed' }
+            }
+          }
         }
         try {
           chmodSync(snap.abs, snap.mode)
