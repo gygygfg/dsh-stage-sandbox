@@ -55,7 +55,7 @@ import { basename, dirname, isAbsolute, join, normalize, sep } from 'node:path'
 //   ② 根属于缓存面时**自动**建立守护（`acquireStageGuard`）；
 //   ③ 每一次往暂存面写入**之前**先 `assertAlive()` —— 根没了就抛 `STAGE_ROOT_LOST`，
 //      **绝不静默重建、绝不静默回退写真实盘**。
-import { STAGE_ROOT_LOST, acquireStageGuard, resolveStageRoot, stageBaseDir, verifyStageRootAlive } from './stage-guard.ts'
+import { STAGE_GUARD_UNAVAILABLE, STAGE_ROOT_LOST, acquireStageGuard, resolveStageRoot, stageBaseDir, verifyStageRootAlive } from './stage-guard.ts'
 // ── 三轮接线：暂存配额（磁盘上限）──────────────────────────────────────────────────
 // `store.ts` 是 blob 的**唯一落盘路径**，因此配额闸门必须落在这里（`limits.ts` 文件末的
 // "接线契约①"点名了本文件）。默认配额 = `DEFAULT_LIMITS.stagingBytes`（64 GiB，对齐上游
@@ -316,8 +316,25 @@ export class Store {
   ensureLayout() {
     // 守护必须先于布局建立：根从第一次落盘起就被钉住，而不是"建完再补个锁"。
     this.assertStageAvailable()
-    for (const dir of [this.dir, this.blobDir, this.stagedDir, this.stagedExtDir, this.candidateDir, this.realDir, this.privateDir, this.cacheDir]) {
-      mkdirSync(dir, { recursive: true })
+    try {
+      for (const dir of [this.dir, this.blobDir, this.stagedDir, this.stagedExtDir, this.candidateDir, this.realDir, this.privateDir, this.cacheDir]) {
+        mkdirSync(dir, { recursive: true })
+      }
+    } catch (error) {
+      /**
+       * R34：显式 `stageRoot` / `storeDir`（以及非缓存面）不挂句柄守护，`assertStageAvailable()`
+       * 是 no-op；此时 `mkdirSync` 的原始错误（ENOTDIR/EEXIST/EACCES…）会**原样**冒到
+       * `staging-fs` 的 `mapStageFailure()` 之外 —— 模型/会话看到的是裸 `ENOTDIR`，
+       * 而不是归一后的"环境类可重试失败"。这里统一包成 `STAGE_GUARD_UNAVAILABLE`：
+       * 语义上就是"存储根建不出来"，与守护失败同一族；细节只进 `.reason`/日志。
+       */
+      const wrapped = new Error(`the protected session directory could not be established (root-not-creatable:${error?.code || 'ERR'})`)
+      wrapped.name = 'StageGuardUnavailableError'
+      wrapped.code = STAGE_GUARD_UNAVAILABLE
+      wrapped.reason = `root-not-creatable:${error?.code || 'ERR'}`
+      wrapped.root = this.dir
+      wrapped.cause = error
+      throw wrapped
     }
     return this
   }

@@ -81,7 +81,7 @@ import { canonical, maskKey, maskReason } from '../src/paths.ts'
 import { STATE, hashAbsent, isExternalKey } from '../src/store.ts'
 import { FAILURE_CODE_ENVIRONMENT, FAILURE_SEMANTICS, resolveDshModuleRoot } from '../src/executor.ts'
 import { STAGE_GUARD_UNAVAILABLE, STAGE_ROOT_LOST, checkTransparentMessages } from '../src/stage-guard.ts'
-import { getReviewService, recordReadVisibility, setReadVisibilityPolicy } from './review-service.ts'
+import { getReviewService, recordReadVisibility, resolveReviewStoreDir, setReadVisibilityPolicy } from './review-service.ts'
 import { rootSessionIdFor, rootSessionIdOf } from './session-identity.ts'
 import { UNSTAGED_REASONS, recordUnstaged } from './unstaged-ledger.ts'
 import { noteEffectiveStaging } from './review-service.ts'
@@ -544,6 +544,32 @@ const STORE_SEGMENT_TAIL = '\\.dshstage\\'
 const STORE_METADATA_FILES = new Set(['manifest.json', 'review.json', 'queue.json'])
 const STORE_STATE_DIRS = new Set(['blobs', 'staged', 'staged-ext', 'candidates', 'sessions', 'real', 'private', 'cache'])
 
+/**
+ * R34-SEC-03（P3）：把 `.dshstage` 下的首段归一成**真实长名**再判定。
+ *
+ * 词法守卫的绕过形态（实测）：Windows 打开文件时会**去掉段尾的空格/点**，
+ * 8.3 短名也会别名到长名。于是 `.dshstage\review.json␠`、`review.json.`、
+ * `REVIEW~1.JSON` 在 Win32 上都落到 `review.json`，但旧守卫只做 `toLowerCase()`
+ * ⇒ 判定为"普通文件"、放行写入。归一规则：
+ *   · 去掉段尾空格与点；
+ *   · `~数字` 的 8.3 形态若其基名是某个状态文件/目录的前缀（≥3 字符）⇒ 按该长名判定；
+ * 这是**过度收紧**可接受的地方：`.dshstage` 是插件自己的状态目录，不是用户命名空间。
+ */
+function storeSegmentKey(segment) {
+  const trimmed = String(segment).replace(/[ .]+$/g, '')
+  const lower = trimmed.toLowerCase()
+  if (STORE_METADATA_FILES.has(lower) || STORE_STATE_DIRS.has(lower)) return lower
+  if (/~\d+/.test(lower)) {
+    const base = lower.split('~')[0]
+    if (base.length >= 3) {
+      for (const name of [...STORE_METADATA_FILES, ...STORE_STATE_DIRS]) {
+        if (name.startsWith(base)) return name
+      }
+    }
+  }
+  return lower
+}
+
 /** 该绝对路径是否命中 WinStage 存储的**状态机**（元数据文件或存储目录树） */
 function isStoreStatePath(abs) {
   if (typeof abs !== 'string' || abs.length === 0) return false
@@ -553,8 +579,10 @@ function isStoreStatePath(abs) {
   const rest = normalized.slice(at + STORE_SEGMENT_TAIL.length)
   if (rest.length === 0) return false
   const slash = rest.indexOf('\\')
-  if (slash < 0) return STORE_METADATA_FILES.has(rest.toLowerCase())
-  return STORE_STATE_DIRS.has(rest.slice(0, slash).toLowerCase())
+  const head = slash < 0 ? rest : rest.slice(0, slash)
+  const key = storeSegmentKey(head)
+  if (slash < 0) return STORE_METADATA_FILES.has(key) || STORE_STATE_DIRS.has(key)
+  return STORE_STATE_DIRS.has(key)
 }
 
 /** 字面替换，错误码与 fs-local 对齐 */
@@ -708,16 +736,26 @@ export function createStagingFileSystem(options = {}) {
       //   "外部约定两处写同一个字面值"。
       //   要让守卫真正生效，profile 覆盖层必须**同时**重述 `workspaceRoot` 与 `cwd`
       //   （T1 正在补）。在此之前，3081 上这条守卫是**空转**的。
-      const drift =
-        config?.workspaceRoot !== undefined &&
-        config?.workspaceRoot !== null &&
-        String(config.workspaceRoot).length > 0 &&
-        String(config?.cwd ?? '').length > 0 &&
-        !sameRoot(config.cwd, config.workspaceRoot)
+      const hasWorkspaceRoot =
+        config?.workspaceRoot !== undefined && config?.workspaceRoot !== null && String(config.workspaceRoot).length > 0
+      const hasCwd = typeof config?.cwd === 'string' && config.cwd.length > 0
+      /**
+       * R34-G-03：profile 覆盖层对 `config` 是**整体替换**，不是深合并。只重述
+       * `workspaceRoot`、丢掉 `cwd` 时，旧实现会静默回退 `process.cwd()`：
+       *   ·  `workspaceRoot`（host 行/fs 行）与真实 `cwd`（暂存键映射）分叉；
+       *   ·  `shell-executor` 又把 fs 行的 `workspaceRoot` 当权威根 ⇒ 两半各建一个根；
+       * 这正是"暂存写到 A、快照发布在 B"的原始形态。
+       * 因此：只要显式给了 `workspaceRoot`，`cwd` 就必须同时存在且指向同一目录；
+       * 缺 `cwd` 也算 drift（不再回退到宿主 cwd）。两键都不给（离线自测/无配置）才回退。
+       */
+      const drift = hasWorkspaceRoot && (!hasCwd || !sameRoot(config.cwd, config.workspaceRoot))
       if (drift) {
         const error = new Error(
-          `WinStage 暂存文件系统：配置漂移 —— workspaceRoot(${config.workspaceRoot}) 与 cwd(${config.cwd}) ` +
-            '必须指向同一个暂存根，否则"暂存写到 A、快照发布在 B"',
+          hasCwd
+            ? `WinStage 暂存文件系统：配置漂移 —— workspaceRoot(${config.workspaceRoot}) 与 cwd(${config.cwd}) ` +
+                '必须指向同一个暂存根，否则"暂存写到 A、快照发布在 B"'
+            : `WinStage 暂存文件系统：配置不完整 —— 给了 workspaceRoot(${config.workspaceRoot}) 却没有 cwd。` +
+                'profile 覆盖层对 config 是整体替换，必须同时重述 cwd 与 workspaceRoot（不得回退宿主 cwd）。',
         )
         error.code = 'FS_STAGE_ROOT_DRIFT'
         throw error
@@ -726,7 +764,7 @@ export function createStagingFileSystem(options = {}) {
        * 工作区根（canonical）—— **键映射与存储根解耦**：`keyOf()` 只用它判断内外，
        * 存储根则按会话走（见 `stagingFor()`）。
        */
-      this.workspaceRoot = canonical(config?.cwd || process.cwd())
+      this.workspaceRoot = canonical(hasCwd ? config.cwd : process.cwd())
       /** 装配/自测可固定一个会话身份；生产里不传，按每次调用现解析 */
       this.fixedSessionId =
         typeof options.sessionId === 'string' && options.sessionId.length > 0 ? options.sessionId : undefined
@@ -770,6 +808,10 @@ export function createStagingFileSystem(options = {}) {
       }
       /** 已就"某类操作绕过暂存"报过 error 日志的键（只报一次；账本本身不丢） */
       this.warnedUnstaged = new Set()
+      /** R34：已就"守卫不可用、只读回退真实磁盘"报过 error 日志的会话键（只报一次） */
+      this.warnedReadFallback = new Set()
+      /** R34：已判定"守卫不可用且无暂存状态"的会话键（避免每个读入口重复等守卫超时） */
+      this.readFallbackSessions = new Set()
       /** 本实例登记的 `watch()` 观察者：`{ rel, isDir, changed }`（见下方 watch 覆写） */
       this.watchers = new Set()
       /**
@@ -1018,6 +1060,105 @@ export function createStagingFileSystem(options = {}) {
         this.sessionServices.set(key, service)
       }
       return service
+    }
+
+    /**
+     * R34：**只读**操作对"守卫建不起来"的窄回退。
+     *
+     * 背景（实测）：本插件被装进一个**已经受限**的宿主（例如 DSH 自己的
+     * workspace-write 沙箱，或任何二级受限令牌）时，`acquireStageGuard()` 会以
+     * `root-not-creatable:EPERM` 失败 —— 这是 `R6 / STAGE_GUARD_UNAVAILABLE` 的
+     * 既有边界，写入必须 fail-closed，**不能**放宽。
+     *
+     * 但旧实现让**读也走同一个 `stagingFor()`**（`stat`/`readText`/`listDir`…），
+     * 于是"会话工作目录解析"这种只读动作在第一个 Turn 就抛
+     * `environmentRetryable`，整个会话起不来。这里把两类操作分开：
+     *   · **有既有暂存状态** ⇒ 依旧抛（绝不能把未批准的暂存内容藏起来）；
+     *   · **没有任何暂存状态**（连 manifest 都没有）⇒ 只读回退真实磁盘，
+     *     并一次性记 error 日志；写入路径**不经过本方法**，仍然 fail-closed。
+     *
+     * 判据保守：manifest 存在但读不懂/解析失败 ⇒ 当作"有状态"，fail-closed。
+     */
+    stagingForRead(sessionId) {
+      const key = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : ''
+      if (!this.readFallbackSessions) this.readFallbackSessions = new Set()
+      /**
+       * 已经判定过"守卫建不起来、且无暂存状态" ⇒ 本次进程内不再重试 `stagingFor()`。
+       * 否则每个读入口都会重新走一遍 `acquireStageGuard()`（最坏情况要等 keeper
+       * 超时 20s）——一个会话的启动会因此被放大成 N 个 20s。若之后真的出现了暂存
+       * 状态（例如另一个进程写入），`stagingFor()` 会重新尝试并照旧抛错（fail-closed）。
+       */
+      if (this.readFallbackSessions.has(key)) {
+        if (this.hasExistingStagedState(sessionId)) return this.stagingFor(sessionId)
+        return undefined
+      }
+      try {
+        return this.stagingFor(sessionId)
+      } catch (error) {
+        if (error?.code !== STAGE_GUARD_UNAVAILABLE) throw error
+        if (this.hasExistingStagedState(sessionId)) throw error
+        this.readFallbackSessions.add(key)
+        if (!this.warnedReadFallback) this.warnedReadFallback = new Set()
+        if (!this.warnedReadFallback.has(key)) {
+          this.warnedReadFallback.add(key)
+          this.logError(
+            `会话工作根不可用（code=${error.code}，reason=${error.reason ?? 'n/a'}）且本会话没有既有暂存状态：` +
+              '本次只读操作回退真实磁盘；写入仍按环境类失败拒绝（绝不静默写真实盘）。',
+          )
+        }
+        return undefined
+      }
+    }
+
+    /**
+     * 该会话是否已有**会被投影**的暂存状态。
+     *
+     * 只看 manifest 的 `entries`：它才是"有没有待批/已暂存条目"的权威；缺失或解析失败时
+     * 保守地返回 `true`（fail-closed）。同时检查新布局（缓存根）与旧 `<workspace>/.dshstage`
+     * 布局，避免迁移期把旧暂存内容藏起来。
+     */
+    hasExistingStagedState(sessionId) {
+      const dirs = []
+      try {
+        dirs.push(resolveReviewStoreDir({ workspaceRoot: this.workspaceRoot, sessionId }))
+      } catch {
+        /* 解析失败 ⇒ 下面按"无状态"处理，但仅在两个布局都确实不存在时才回退 */
+      }
+      try {
+        dirs.push(join(this.workspaceRoot, '.dshstage'))
+      } catch {
+        /* ignore */
+      }
+      // 旧布局还有 `<workspace>/.dshstage/sessions/<会话键>/manifest.json` 这一层；
+      // 迁移期一旦存在任何会话的暂存清单，就不允许"只读回退"把内容藏起来。
+      try {
+        const legacySessions = join(this.workspaceRoot, '.dshstage', 'sessions')
+        if (existsSync(legacySessions)) {
+          for (const name of readdirSync(legacySessions)) dirs.push(join(legacySessions, name))
+        }
+      } catch {
+        return true // 列不动旧布局 ⇒ 不能证明没有暂存内容，保守 fail-closed
+      }
+      for (const dir of dirs) {
+        if (!dir) continue
+        let manifestPath
+        try {
+          manifestPath = join(String(dir), 'manifest.json')
+        } catch {
+          continue
+        }
+        if (!existsSync(manifestPath)) continue
+        try {
+          const parsed = JSON.parse(readFileSync(manifestPath, 'utf8'))
+          const entries = parsed?.entries
+          if (entries && typeof entries === 'object' && Object.keys(entries).length > 0) return true
+          // manifest 存在但 entries 为空：没有可投影的条目，允许回退。
+        } catch {
+          // manifest 在但读不懂：保守 fail-closed（不能证明没有暂存内容）。
+          return true
+        }
+      }
+      return false
     }
 
     /**
@@ -2010,7 +2151,10 @@ export function createStagingFileSystem(options = {}) {
       }
       const place = this.keyOf(target)
       if (place === undefined) return super.stat(target, signal)
-      const ws = this.stagingFor(this.sessionIdOf()).fresh()
+      // R34：守卫建不起来且无既有暂存状态 ⇒ 只读回退真实磁盘（写入仍 fail-closed）
+      const service = this.stagingForRead(this.sessionIdOf())
+      if (service === undefined) return super.stat(target, signal)
+      const ws = service.fresh()
       const current = await this.currentOf(ws, target, place.key, signal, place.abs)
       if (!current.exists) return undefined
       if (current.kind === 'dir') return { version: FsVersion(current.version), type: 'directory', size: 0 }
@@ -2056,7 +2200,10 @@ export function createStagingFileSystem(options = {}) {
       if (!validPath) throw new FsError('file_path must be a non-empty string', 'FS_NOT_FOUND')
       const place = this.keyOf({ targetKey: FsTargetKey(abs), displayPath: path })
       if (place === undefined) return super.lstat(path, opts, signal)
-      const ws = this.stagingFor(this.sessionIdOf()).fresh()
+      // R34：守卫建不起来且无既有暂存状态 ⇒ 只读回退真实磁盘（写入仍 fail-closed）
+      const service = this.stagingForRead(this.sessionIdOf())
+      if (service === undefined) return super.lstat(path, opts, signal)
+      const ws = service.fresh()
       const current = await this.currentOf(ws, { targetKey: FsTargetKey(abs), displayPath: path }, place.key, signal, place.abs)
       if (!current.exists) return undefined
       if (current.kind === 'dir') return { version: FsVersion(current.version), type: 'directory', size: 0 }
@@ -2186,7 +2333,10 @@ export function createStagingFileSystem(options = {}) {
       }
       const place = this.keyOf(target)
       if (place === undefined) return super.readText(target, signal)
-      const ws = this.stagingFor(this.sessionIdOf()).fresh()
+      // R34：守卫建不起来且无既有暂存状态 ⇒ 只读回退真实磁盘（写入仍 fail-closed）
+      const service = this.stagingForRead(this.sessionIdOf())
+      if (service === undefined) return super.readText(target, signal)
+      const ws = service.fresh()
       if (!this.hasStagedContent(ws, place.key, place.abs)) return super.readText(target, signal)
       const current = await this.currentOf(ws, target, place.key, signal, place.abs)
       if (!current.exists) throw new FsError(`"${target.displayPath}" does not exist`, 'FS_NOT_FOUND')
@@ -2221,7 +2371,10 @@ export function createStagingFileSystem(options = {}) {
       }
       const place = this.keyOf(target)
       if (place === undefined) return super.readBytes(target, signal, maxBytes)
-      const ws = this.stagingFor(this.sessionIdOf()).fresh()
+      // R34：守卫建不起来且无既有暂存状态 ⇒ 只读回退真实磁盘（写入仍 fail-closed）
+      const service = this.stagingForRead(this.sessionIdOf())
+      if (service === undefined) return super.readBytes(target, signal, maxBytes)
+      const ws = service.fresh()
       if (!this.hasStagedContent(ws, place.key, place.abs)) return super.readBytes(target, signal, maxBytes)
       const current = await this.currentOf(ws, target, place.key, signal, place.abs)
       if (!current.exists) throw new FsError(`"${target.displayPath}" does not exist`, 'FS_NOT_FOUND')
@@ -2248,7 +2401,10 @@ export function createStagingFileSystem(options = {}) {
       }
       const place = this.keyOf(target)
       if (place === undefined) return super.readByteRange(target, range, signal)
-      const ws = this.stagingFor(this.sessionIdOf()).fresh()
+      // R34：守卫建不起来且无既有暂存状态 ⇒ 只读回退真实磁盘（写入仍 fail-closed）
+      const service = this.stagingForRead(this.sessionIdOf())
+      if (service === undefined) return super.readByteRange(target, range, signal)
+      const ws = service.fresh()
       if (!this.hasStagedContent(ws, place.key, place.abs)) return super.readByteRange(target, range, signal)
       const current = await this.currentOf(ws, target, place.key, signal, place.abs)
       if (!current.exists) throw new FsError(`"${target.displayPath}" does not exist`, 'FS_NOT_FOUND')
@@ -2278,7 +2434,10 @@ export function createStagingFileSystem(options = {}) {
       const place = this.keyOf(target)
       if (place === undefined) return finish(await super.listDir(target, signal))
       const rel = place.key
-      const ws = this.stagingFor(this.sessionIdOf()).fresh()
+      // R34：守卫建不起来且无既有暂存状态 ⇒ 只读回退真实磁盘（写入仍 fail-closed）
+      const service = this.stagingForRead(this.sessionIdOf())
+      if (service === undefined) return finish(await super.listDir(target, signal))
+      const ws = service.fresh()
       // ── BUG-2：shim/shell 通道的同一逻辑目录也要参与合并 ────────────────────────
       const shimDir = this.shimMirrorOf(ws, place.abs)
       const shim = this.shimChildrenOf(ws, shimDir)

@@ -85,6 +85,13 @@ export interface ApplyInput {
   force?: boolean
   /** 会话自动审批档。 */
   sessionAuto?: boolean
+  /**
+   * 参数解析失败（缺值/未知开关/引号未闭合）。
+   *
+   * ⚠ 这是**安全字段**：`--file` 缺值绝不能退化成"没有 paths = 应用全部"。
+   * `applyWithGuard()` 见到它一律返回 error 且不调用 `deps.apply()`。
+   */
+  invalid?: string
 }
 
 /**
@@ -109,8 +116,29 @@ export interface ApplyInput {
  * @param input - 路径/确认
  */
 export function applyWithGuard(deps: AlignedCommandDeps, input: ApplyInput = {}): CommandResult {
+  // 参数解析失败 ⇒ 什么都不做。绝不能因为 `paths` 缺失而退化成"应用全部"。
+  if (typeof input.invalid === 'string' && input.invalid.length > 0) {
+    return { kind: 'error', text: `参数错误：${input.invalid}（本次未应用任何文件）` }
+  }
   const allUnits = deps.units()
   const { selected, remaining } = selectForApply(allUnits, input.paths)
+
+  /**
+   * ── R34-11：批量路径必须"全命中或不做" ──────────────────────────────────────
+   * 旧实现只按交集选：`paths: ['src/a.txt','src/nope.txt']` 会应用 a.txt 并对
+   * nope.txt **一声不响** —— 典型的静默半批应用。审批是一次决定，含未命中路径时
+   * 拒绝整批并点名，而不是照写命中的那部分。
+   */
+  if (selected.length > 0 && input.paths !== undefined) {
+    const known = new Set(allUnits.flatMap((unit) => unit.paths))
+    const unmatched = [...new Set(input.paths)].filter((path) => !known.has(path))
+    if (unmatched.length > 0) {
+      return {
+        kind: 'error',
+        text: `没有匹配的待审路径：${unmatched.join(', ')}；为防止半批应用，本次未应用任何文件（其余 ${selected.length} 项也未写入）。`,
+      }
+    }
+  }
 
   /**
    * 路径匹配：给了 `paths` 就按交集；没给 = "全部"（与 `selectForApply` 同口径）。
@@ -218,13 +246,80 @@ export interface CommandsScope {
   logger?: { error?: (message: string) => void }
 }
 
-/** 解析 `--force` 与 `--file <path>`（可选 `--file=<path>`）。 */
+/** 切分 `rawInput`：空白分隔，双引号包住的内容算一个 token（引号本身不进入路径）。 */
+export function splitApplyTokens(rawInput: string | undefined): { tokens: string[]; unterminated: boolean } {
+  const tokens: string[] = []
+  let current = ''
+  let started = false
+  let quoted = false
+  for (const ch of String(rawInput ?? '')) {
+    if (ch === '"') {
+      quoted = !quoted
+      started = true
+      continue
+    }
+    if (!quoted && /\s/.test(ch)) {
+      if (started) {
+        tokens.push(current)
+        current = ''
+        started = false
+      }
+      continue
+    }
+    current += ch
+    started = true
+  }
+  if (quoted) return { tokens: [], unterminated: true }
+  if (started) tokens.push(current)
+  return { tokens, unterminated: false }
+}
+
+/**
+ * 解析 `/winstage-apply` 的输入。
+ *
+ * 语法（与命令 `input.hint` 一致）：
+ *   `/winstage-apply`                          → 应用全部待审单元（无 force）
+ *   `/winstage-apply --force`                  → 应用全部并确认需要确认的项
+ *   `/winstage-apply --file <路径>`            → 只应用该路径（含空格用双引号）
+ *   `/winstage-apply --file=<路径>`            → 等号写法
+ *   `/winstage-apply "<路径>" [<路径>…]`       → 裸路径同样按路径选择（不再静默忽略）
+ *
+ * 失败（缺值/未知开关/引号未闭合/空路径）**不抛异常**，而是返回 `invalid`：
+ * 旧实现对这些输入一律退回"没有 paths ⇒ 应用全部"，正是最危险的静默误批。
+ */
 export function parseApplyArgs(rawInput: string | undefined): ApplyInput {
-  const raw = String(rawInput ?? '')
-  const force = /(^|\s)--force(\s|$)/.test(raw)
-  const fileMatch = /--file(?:=|\s+)(\S+)/.exec(raw)
-  const paths = fileMatch?.[1] !== undefined ? [fileMatch[1]] : undefined
-  return { force, ...(paths === undefined ? {} : { paths }) }
+  const { tokens, unterminated } = splitApplyTokens(rawInput)
+  if (unterminated) {
+    return { force: false, invalid: '双引号未闭合（路径含空格时请成对使用双引号，例如 --file "a b.txt"）' }
+  }
+  let force = false
+  const paths: string[] = []
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i]
+    if (token === '--force') {
+      force = true
+      continue
+    }
+    let value: string | undefined
+    if (token === '--file' || token === '--path') {
+      value = tokens[i + 1]
+      if (value === undefined || value === '' || value.startsWith('--')) {
+        return { force, invalid: `${token} 缺少路径值（含空格的路径请用双引号包住）` }
+      }
+      i += 1
+    } else if (token.startsWith('--file=')) {
+      value = token.slice('--file='.length)
+      if (value === '') return { force, invalid: '--file= 缺少路径值（含空格的路径请用双引号包住）' }
+    } else if (token.startsWith('--')) {
+      return { force, invalid: `未知开关 ${token}；可用：--force、--file <路径>` }
+    } else if (token === '') {
+      return { force, invalid: '路径不能为空' }
+    } else {
+      value = token
+    }
+    paths.push(value)
+  }
+  return { force, ...(paths.length > 0 ? { paths } : {}) }
 }
 
 /**
@@ -239,12 +334,15 @@ export function parseApplyArgs(rawInput: string | undefined): ApplyInput {
 export function registerAlignedCommands(ctx: CommandsScope, deps: AlignedCommandDeps): void {
   const commands = ctx.commands
   if (commands === undefined) return
-  const specs: Array<{ name: string; description: string; handler: () => CommandResult }> = [
+  const specs: Array<{ name: string; description: string; handler: (rawInput?: string) => CommandResult }> = [
     { name: 'winstage-review', description: 'WinStage 暂存：列出待审改动与风险档（对齐 NeoAI 分级）', handler: () => renderReview(deps) },
     {
       name: 'winstage-apply',
-      description: 'WinStage 暂存：按分级确认应用（--force 确认；硬拒绝不可覆盖）',
-      handler: () => applyWithGuard(deps, { force: true }),
+      description: 'WinStage 暂存：按分级确认应用（--force 确认；--file <路径> 只应用该路径；硬拒绝不可覆盖）',
+      // R34-12：旧实现丢弃 `invocation.rawInput`（handler 是零参箭头函数）⇒
+      // `/winstage-apply --file <路径>` 会**应用全部单元**（授权边界被静默放宽），
+      // 且 `--force` 永远被隐式打开。现在按真实输入解析；无 --force 时必须走分级确认。
+      handler: (rawInput) => applyWithGuard(deps, parseApplyArgs(rawInput)),
     },
     { name: 'winstage-discard', description: 'WinStage 暂存：丢弃全部暂存（真实工作区不改）', handler: () => discardAll(deps) },
   ]
@@ -254,8 +352,8 @@ export function registerAlignedCommands(ctx: CommandsScope, deps: AlignedCommand
         commands.register({
           name: spec.name,
           description: spec.description,
-          input: { hint: '可选：--force 确认 / --file <路径>' },
-          handler: () => spec.handler(),
+          input: { hint: '可选：--force 确认 / --file <路径>（含空格用双引号）' },
+          handler: (invocation) => spec.handler(invocation?.rawInput),
         })
       if (typeof ctx.effect === 'function') ctx.effect(registration, `winstage-sandbox: command ${spec.name}`)
       else registration()

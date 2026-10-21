@@ -56,6 +56,37 @@ export class SandboxError extends Error {
 }
 
 /**
+ * 逻辑路径里是否存在 **Win32 无法表达为普通文件名** 的段（R34 staging-hunter 实测）。
+ *
+ * 现场（`.t\r34\staging\repro-hunt.mjs` §4，先红）：
+ *   `ws.writeFile(<root>\base.txt:stream, 'ADS-DATA')` 在暂存树里**成功**了 ——
+ *   `staged\base.txt:stream` 被 Win32 解释成 `staged\base.txt` 的 **NTFS 备用数据流**，
+ *   于是 `existsSync(暂存路径)` 为 true、`verifyProjection()` 认为投影健康、diff 也照常
+ *   产出一条 `create:base.txt:stream`。但 `applyOneChange()` 落盘时走
+ *   `writeFileAtomicReplacing()`（临时文件 → rename 到目标）：rename 的目标是**流名**，
+ *   `MoveFileExW` 返回 `ERROR_FILE_NOT_FOUND` ⇒ 每次 apply 都以 `ENOENT` 失败。
+ *   结果是**候选被永久毒化**：与它同批的正常文件每次都被整批回滚，用户无法批准任何东西，
+ *   且失败原因（ENOENT rename）完全指不到真正原因（名字不可表达）。
+ *
+ * `<>:"|?*` 与 C0 控制符在 Win32 名字层就是非法字符（`:` 会被当成 ADS 分隔符）；
+ * 实测（同机 node v24.21.0）`a<b.txt` 直接 `ENOENT`、`a:b.txt` 建出 `a` 的流。
+ * 保留名（`NUL`/`CON`）与结尾点/空格在本机 Node 下确实可建为普通文件（实测），
+ * 因此**不**在此拒绝 —— 只拒绝真正不可表达的字符，避免过度收紧。
+ *
+ * 外部键（绝对路径）跳过盘符段（`C:` 的冒号是合法的）。
+ */
+const WIN32_UNREPRESENTABLE = /[<>:"|?*\u0000-\u001f]/
+function unrepresentableSegmentOf(rel) {
+  if (typeof rel !== 'string' || rel.length === 0) return undefined
+  const parts = segments(rel)
+  const skipDrive = isExternalKey(rel) && /^[a-zA-Z]:$/.test(parts[0] || '') ? 1 : 0
+  for (let index = skipDrive; index < parts.length; index += 1) {
+    if (WIN32_UNREPRESENTABLE.test(parts[index])) return { segment: parts[index], index }
+  }
+  return undefined
+}
+
+/**
  * 是不是一个**重解析点**（symlink / junction / mount point），即"名字代理"结点。
  *
  * 为什么必须单独判：Windows 上 `statSync().isDirectory()` 对 junction 返回 **true**，
@@ -1138,6 +1169,20 @@ export class Workspace {
   // ==================== 变更面 ====================
 
   ensureEntry(rel, opts = {}) {
+    /**
+     * R34：名字必须先能表达成普通 Win32 文件名，才允许进入暂存清单。
+     * 不可表达的名字（尤其 `:` = ADS 分隔符）会在 apply 时被 rename 拒绝，
+     * 把整份候选永久毒化（详见 `unrepresentableSegmentOf()` 的现场说明）。
+     * 这里**写前 fail-closed**：结构化报错、清单/暂存树都不留条目。
+     */
+    const unrepresentable = unrepresentableSegmentOf(rel)
+    if (unrepresentable) {
+      throw new SandboxError(
+        'PATH_NAME_UNREPRESENTABLE',
+        `refusing to stage ${rel}: path segment ${JSON.stringify(unrepresentable.segment)} contains a character that cannot be a normal Win32 file name`,
+        { path: rel, segment: unrepresentable.segment, index: unrepresentable.index, invalid: '<>:"|?* and C0 control characters' },
+      )
+    }
     const existing = this.entryOf(rel)
     if (existing && existing.state !== STATE.DELETED) {
       // 幂等：已暂存路径不重复暂存（#3.10 —— 只要求"不新增条目"，不要求"不更新基线"）
@@ -1260,6 +1305,28 @@ export class Workspace {
     entry.changed = true
     delete entry.stagedHash
 
+    /**
+     * ── R34：删除目录 = 删除整棵子树（清单层同步）──────────────────────────────────
+     * 旧实现只把**目录条目自身**标成 deleted，子树条目原样留在清单里。三处实测后果
+     * （`.t\r34\staging\repro-hunt.mjs` §1/§13，先红后绿）：
+     *   ① 合成父目录（从未真实存在）被 `remove()` 后，子条目仍是 `create`：目录条目因为
+     *      `baseHash=absent && baseKind=undefined` 被 `diffEntries()` 判为"删除从未存在的东西
+     *      不算变化"跳过，于是候选里**只剩** `create:a\b.txt` —— 批准它会把用户刚删掉的
+     *      文件**复活**到真实盘（实测 applied=`create:a\b.txt`，real a 目录重新出现）。
+     *   ② `rename(dir → newName)` 的目录分支先对每个子项做 `remove()`（留下源侧 delete
+     *      墓碑）再写目标侧；父目录删除后这些墓碑在落盘时是 `!existsSync ⇒ false`（no-op），
+     *      不计入 applied ⇒ 候选**永远**停在 `partially-applied`，重试也不收敛（实测
+     *      status=partially-applied、remaining=["d\sub\y.txt","d\x.txt"]、二次 apply 仍 partial）。
+     *   ③ 目录删除后子条目的 before/after 已无对象可比，属死数据。
+     * 子树的落盘后果由目录条目自身承担（`applyOneChange()` 的 `rmSync(recursive)`）。
+     */
+    if (state.kind === 'dir' && !external) {
+      const prefix = `${compareKey(rel)}${sep}`
+      for (const key of Object.keys(this.manifest.entries)) {
+        if (key !== rel && compareKey(key).startsWith(prefix)) delete this.manifest.entries[key]
+      }
+    }
+
     // 释放临时资源（13.2 顺序：先解除引用，再删资源）
     const stagedPath = this.staged(rel)
     if (existsSync(stagedPath)) {
@@ -1297,6 +1364,27 @@ export class Workspace {
   rename(from, to, opts = {}) {
     const { key: fromRel } = this.keyOf(from)
     const { key: toRel } = this.keyOf(to)
+    /**
+     * ── R34：两条**改名边界**必须先于任何清单改写判定 ─────────────────────────────
+     * ① `rename(x, x)`：POSIX/Win32 语义都是成功 no-op。旧实现走目录分支 ⇒ 先把每个子项
+     *    remove+write，最后 `remove(from)` 把 x 标成 deleted ⇒ 候选里只剩 `delete:x`；
+     *    批准后 `rmSync(x, recursive)` 把真实目录**连同内容**删掉（实测：diff=["delete:d"]、
+     *    apply=applied、真实 d 变成 ENOENT —— 一次"没做什么"的调用造成静默数据丢失）。
+     * ② `rename(dir, dir\sub)`：目标在源子树内，必须显式拒绝（Win32 同样返回 ERROR_INVALID_PARAMETER）。
+     *    旧实现的顺序是"先写目标侧子项 → remove(from) 再 rmSync 整棵 staged 子树 → 清零父条目"，
+     *    于是刚写好的 `staged\dir\sub\...` 被自己删掉，`synthesizeParents()` 只补清单不补物化，
+     *    新进程 init 时 `verifyProjection()` 报 `staged tree object missing`（投影损坏），
+     *    而本次 apply 仍返回 applied —— 暂存层坏了却报成功。
+     * 两条都在入口 fail-closed：清单、暂存树、真实盘都不动。
+     */
+    if (fromRel === toRel) return { from: fromRel, to: toRel, noop: true, reason: 'same-path' }
+    if (compareKey(toRel).startsWith(`${compareKey(fromRel)}${sep}`)) {
+      throw new SandboxError('EINVAL', `cannot move ${fromRel} into its own subtree (${toRel})`, {
+        from: fromRel,
+        to: toRel,
+        reason: 'the target lies below the source; staging would delete the just-written staged subtree',
+      })
+    }
     /**
      * ── R19 修复（P1）：**仅大小写重命名**不得被当作"删除 + 新建"暂存 ─────────────
      *
@@ -2434,7 +2522,14 @@ export class Workspace {
     }
 
     const allChanged = new Set(candidate.changes.map((c) => compareKey(c.path)))
-    const appliedKeys = new Set(applied.map((a) => compareKey(a.path)))
+    /**
+     * R34（CLI-hunter U-04）：`remaining` 必须按候选的**累计**已应用集合算，而不是只看本批。
+     * 旧实现只用 `applied`（本批）⇒ 分两批批准同一候选时，第一批的路径会被重新算成
+     * "未应用"：`status=partially-applied`、`pendingFiles=3` 永远挂着，即使净 diff 已为 0。
+     * 用户会以为还有文件没批（且该候选也不会被回收）。
+     */
+    const appliedKeys = new Set((candidate.appliedPaths || []).map((path) => compareKey(path)))
+    for (const item of applied) appliedKeys.add(compareKey(item.path))
     const remaining = candidate.changes.filter((c) => !appliedKeys.has(compareKey(c.path)))
 
     this.queue = this.store.loadQueue()
@@ -2452,7 +2547,12 @@ export class Workspace {
     }
     candidate.status = status
     candidate.appliedAt = new Date().toISOString()
-    candidate.appliedPaths = [...(candidate.appliedPaths || []), ...applied.map((a) => a.path)]
+    // R34：累计已应用路径按 compareKey 去重，重复批准同一路径不会让计数虚增。
+    const appliedPathMap = new Map()
+    for (const path of [...(candidate.appliedPaths || []), ...applied.map((a) => a.path)]) {
+      if (!appliedPathMap.has(compareKey(path))) appliedPathMap.set(compareKey(path), path)
+    }
+    candidate.appliedPaths = [...appliedPathMap.values()]
     candidate.lastApply = { applied, failed, blockedByMask, maskWarnings, conflicts: [], rollback: rollbackReport || [], rolledBack, attributeWarnings }
     this.store.saveCandidate(candidate)
     this.queue.candidates[candidate.id] = {

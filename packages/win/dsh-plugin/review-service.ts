@@ -730,6 +730,42 @@ export class ReviewService {
       ...(Array.isArray(options.masks) && options.masks.length > 0 ? { masks: options.masks } : {}),
     })
     this.workspace.init({ origin: 'host-plugin' })
+    /**
+     * ★ R34-SEC（P1 · workspaceRoot 漂移）：**存储根属于另一个工作区时 fail-closed**。
+     *
+     * 复现（`.t/r34/sec/probe-main.ts` H 段）：用同一个 `storeDir`（或同一个会话键 /
+     * 同一个 `WINSTAGE_STAGE_ROOT`）先给工作区 A 建清单，再给工作区 B 建服务 ——
+     * `Workspace.init()` 发现清单已存在就**原样收下**（`store.ts::manifest()` 返回 existing），
+     * 从不校验 `manifest.workspaceRoot`。后果（实测）：
+     *   · B 的快照里出现 A 的条目（`files[].path = "shared.txt"`，内容来自 A 的暂存）；
+     *   · 在 B 执行 approve ⇒ 把 **A 的暂存内容写进 B 的真实工作区**（跨工作区污染/覆盖）。
+     *
+     * CLI 早已有同一道闸（`src/cli.ts` U16-7 `WORKSPACE_STORE_MISMATCH`），但 Host 侧
+     * （面板/命令/`getReviewService`）没有 ⇒ 同一份 store 在两条入口上语义不同。
+     * 这里与 CLI 逐字对齐：规范路径不一致就拒绝，不静默继续（宁可报错，也不把 A 的内容
+     * 批进 B）。`canonical()` 两侧都做，大小写/短名/尾分隔符的同一工作区不会被误伤。
+     */
+    const manifestRoot = this.workspace.manifest?.workspaceRoot
+    if (typeof manifestRoot === 'string' && manifestRoot.length > 0) {
+      let mismatched = false
+      let resolvedManifestRoot = manifestRoot
+      try {
+        resolvedManifestRoot = canonical(manifestRoot)
+        mismatched = resolvedManifestRoot !== this.workspace.root
+      } catch {
+        // 解析失败 ⇒ 无法证明同一工作区 ⇒ 同样 fail-closed
+        mismatched = true
+      }
+      if (mismatched) {
+        const error = new Error(
+          `WORKSPACE_STORE_MISMATCH: 暂存存储根 ${this.workspace.store.dir} 的清单属于另一个工作区 ` +
+            `${resolvedManifestRoot}，与当前工作区 ${this.workspace.root} 不一致；` +
+            '拒绝在别的工作区的 store 上读取/批准（检查 storeDir / WINSTAGE_STAGE_ROOT / 会话键）。',
+        )
+        error.code = 'WORKSPACE_STORE_MISMATCH'
+        throw error
+      }
+    }
     this.markFresh()
   }
 

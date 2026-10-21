@@ -131,7 +131,7 @@ const KNOWN_SECRET_RE = /\b(?:sk-[A-Za-z0-9_-]{6,}|Bearer\s+[A-Za-z0-9+/=_.-]{16
  * 纪律，只是把判据从"值像不像"换成"这一行本来就写着它是凭据"。
  */
 const CREDENTIAL_KEY_RE =
-  /(?:^|[^a-z0-9])(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|bearer|token|secret|password|passwd|pwd|credential|credentials|private[_-]?key|client[_-]?secret|session[_-]?key|encryption[_-]?key|signing[_-]?key)(?![a-z0-9])/i
+  /(?:^|[^a-z0-9])(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|bearer|token|secret|password|passwd|pwd|credential|credentials|private[_-]?key|client[_-]?secret|session[_-]?key|encryption[_-]?key|signing[_-]?key|authorization)(?![a-z0-9])/i
 
 /** 键名形态判定（对**已去掉分隔符**的那一段求值）。 */
 export function isCredentialKey(key) {

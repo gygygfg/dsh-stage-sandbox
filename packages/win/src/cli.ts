@@ -23,7 +23,7 @@
  *   4 候选陈旧（STALE_BASELINE）
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
@@ -32,7 +32,7 @@ import { SandboxError, Workspace } from './workspace.ts'
 import { ToolSurface, renderCandidateDiff } from './tools.ts'
 import { COMMAND_RISK, WindowsStageExecutor, classifyCommandRisk } from './executor.ts'
 import { formatReport, probe } from './capability.ts'
-import { canonical } from './paths.ts'
+import { canonical, compareKey } from './paths.ts'
 
 const EXIT = { OK: 0, FAIL: 1, USAGE: 2, FAIL_CLOSED: 3, STALE: 4 }
 
@@ -101,9 +101,25 @@ export function usageFor(command) {
   return `${base}\n`
 }
 
+/**
+ * ── R34-01：参数表的**唯一权威** ─────────────────────────────────────────────
+ *
+ * 旧 `parseArgv()` 有两个静默失效面，实测都会造成"用户以为选了一个路径/工作区，
+ * 实际作用于别处（或全部）"：
+ *   · `--paths --force`（缺值）把 `paths` 记成 `true` ⇒ `paths===undefined`
+ *     ⇒ **把整份候选全部应用**；
+ *   · `--paths=a.txt` / `--workspace=<dir>`（等号形式）根本不被识别 ⇒ 同样退回
+ *     "全部 / 当前目录"，且没有任何提示。
+ * 因此这里显式区分"必须取值"与"布尔"参数：缺值/空值/未知参数都进 `problems`，
+ * 由 `main()` 统一按**用法错误（退出码 2）**拒绝，绝不退化成默认行为。
+ */
+const VALUE_FLAGS = new Set(['workspace', 'session', 'candidate', 'paths', 'max-lines', 'tier', 'timeout', 'reason'])
+const BOOLEAN_FLAGS = new Set(['help', 'json', 'force', 'apply', 'use-cache', 'no-cache', 'read-only'])
+
 function parseArgv(argv) {
   const positional = []
   const flags = {}
+  const problems = []
   let passthrough
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i]
@@ -112,19 +128,44 @@ function parseArgv(argv) {
       break
     }
     if (token.startsWith('--')) {
-      const name = token.slice(2)
-      const next = argv[i + 1]
-      if (next === undefined || next.startsWith('--')) {
-        flags[name] = true
-      } else {
-        flags[name] = next
+      const body = token.slice(2)
+      const eq = body.indexOf('=')
+      const name = eq >= 0 ? body.slice(0, eq) : body
+      let value = eq >= 0 ? body.slice(eq + 1) : undefined
+      if (BOOLEAN_FLAGS.has(name)) {
+        if (value !== undefined) problems.push(`--${name} 是开关，不接受取值（收到 "${value}"）`)
+        else flags[name] = true
+        continue
+      }
+      if (!VALUE_FLAGS.has(name)) {
+        problems.push(`未知参数 --${name}`)
+        continue
+      }
+      if (value === undefined) {
+        const next = argv[i + 1]
+        if (next === undefined || next.startsWith('--')) {
+          problems.push(`参数 --${name} 需要一个值`)
+          continue
+        }
+        value = next
         i += 1
       }
+      if (value === '') problems.push(`参数 --${name} 的值不能为空`)
+      else flags[name] = value
     } else {
       positional.push(token)
     }
   }
-  return { positional, flags, passthrough }
+  return { positional, flags, passthrough, problems }
+}
+
+/** 只接受工作区相对路径列表的子命令（位置参数一律拒绝：`apply a.txt` 误批全部是实测缺陷）。 */
+const NO_POSITIONAL_COMMANDS = new Set(['init', 'status', 'probe', 'review', 'diff', 'apply', 'discard', 'gc', 'audit'])
+
+/** 用法错误统一出口：退出码 2（与文件头的退出码表一致），错误只写 stderr。 */
+function usageError(problems, command) {
+  process.stderr.write(`USAGE: ${problems.join('；')}\n\n${usageFor(command)}`)
+  process.exit(EXIT.USAGE)
 }
 
 function out(value, flags) {
@@ -226,13 +267,17 @@ export function materializeOverlayInto(workspace, destRoot) {
 }
 
 function fail(code, message, extra = {}) {
-  process.stderr.write(`${code}: ${message}\n`)
+  // R34-02：领域错误消息常自带 `CODE:` 前缀（executor 的 SANDBOX_UNAVAILABLE 等），
+  // 旧实现会打印 `SANDBOX_UNAVAILABLE: SANDBOX_UNAVAILABLE: ...`。这里只去掉**同码**前缀。
+  const text = typeof message === 'string' && message.startsWith(`${code}: `) ? message.slice(code.length + 2) : message
+  process.stderr.write(`${code}: ${text}\n`)
   if (Object.keys(extra).length) process.stderr.write(`${JSON.stringify(extra, null, 2)}\n`)
-  process.exit(code === 'SANDBOX_UNAVAILABLE' ? EXIT.FAIL_CLOSED : EXIT.FAIL)
+  // 退出码表（文件头）：2 = 用法错误。旧实现把 USAGE 也映射到 1，与文档不一致。
+  process.exit(code === 'SANDBOX_UNAVAILABLE' ? EXIT.FAIL_CLOSED : code === 'USAGE' ? EXIT.USAGE : EXIT.FAIL)
 }
 
 async function main() {
-  const { positional, flags, passthrough } = parseArgv(process.argv.slice(2))
+  const { positional, flags, passthrough, problems } = parseArgv(process.argv.slice(2))
   const command = positional[0]
   // U16-5：`--help` 是**成功**路径（退出码 0），不是用法错误；`<命令> --help` 给该命令
   // 的真实参数（含 --paths/--force/--candidate/--tier/--max-lines/--timeout/--read-only/
@@ -245,13 +290,63 @@ async function main() {
     process.stderr.write(USAGE)
     process.exit(EXIT.USAGE)
   }
+  /**
+   * ── R34-03：位置参数 / 未知开关 = 用法错误，绝不静默忽略 ──────────────────────
+   * 实测缺陷：`apply --workspace <ws> a.txt` 的 `a.txt` 被忽略 ⇒ **整份候选全部写入**
+   * （用户只授权了一个文件）；`status <ws>` 也静默忽略。路径必须走 `--paths`。
+   */
+  if (NO_POSITIONAL_COMMANDS.has(command) && positional.length > 1) {
+    problems.push(
+      `多余的参数: ${positional.slice(1).join(' ')}（本命令不接受位置参数；路径请用 --paths <a,b>，工作区请用 --workspace <dir>）`,
+    )
+  }
+  if (command !== 'exec' && passthrough !== undefined) {
+    problems.push('只有 exec 支持 `--` 之后的命令参数')
+  }
+  if (problems.length > 0) usageError(problems, command)
 
-  const workspaceRoot = canonical(resolve(flags.workspace || process.cwd()))
+  const workspaceFlag = flags.workspace
+  const workspaceRoot = canonical(resolve(typeof workspaceFlag === 'string' ? workspaceFlag : process.cwd()))
   // U16-7：`--workspace` 指到不存在的目录时不得"原样回显 + 静默读别的 store"。
   // probe 只做能力探测（不建暂存区），保持原有宽容；其余命令必须落在真实工作区上。
-  if (command !== 'probe' && !existsSync(workspaceRoot)) {
-    fail('WORKSPACE_NOT_FOUND', `工作区目录不存在: ${workspaceRoot}（--workspace 必须指向已存在的目录；本工具不会为你创建它）`)
+  // R34-04：存在但不**是目录**（普通文件/设备）此前会被当成工作区根并给出 exit 0 的读数；
+  // 工作区只可能是目录，因此显式 fail-fast。
+  if (command !== 'probe') {
+    if (!existsSync(workspaceRoot)) {
+      fail('WORKSPACE_NOT_FOUND', `工作区目录不存在: ${workspaceRoot}（--workspace 必须指向已存在的目录；本工具不会为你创建它）`)
+    }
+    let isDirectory = false
+    try {
+      isDirectory = statSync(workspaceRoot).isDirectory()
+    } catch {
+      isDirectory = false
+    }
+    if (!isDirectory) {
+      fail(
+        'WORKSPACE_NOT_A_DIRECTORY',
+        `--workspace 指向的不是目录: ${workspaceRoot}（当前是文件或设备）。` +
+          `本工具只在目录形式的工作区上读写；请改传它所在的目录，或不传 --workspace 使用当前目录。`,
+      )
+    }
   }
+
+  /**
+   * R34-13：未知子命令 / 缺必填参数必须在**解析工作区与 store 之前**判定。
+   * 否则（例如 store 已被别的会话占用时）会先撞 WORKSPACE_STORE_MISMATCH，
+   * 用户拿到的是"store 不匹配"而不是"这个命令/参数根本不对"。
+   */
+  const KNOWN_COMMANDS = new Set(['init', 'status', 'probe', 'exec', 'review', 'diff', 'apply', 'discard', 'gc', 'audit'])
+  if (!KNOWN_COMMANDS.has(command)) {
+    process.stderr.write(`未知命令: ${command}\n\n${USAGE}`)
+    process.exit(EXIT.USAGE)
+  }
+  if (command === 'discard' && flags.candidate === undefined) {
+    problems.push('discard 需要 --candidate <id>')
+  }
+  if (command === 'exec' && !(passthrough !== undefined && passthrough.length > 0) && positional.length < 2) {
+    problems.push('exec 需要命令，例如: exec -- pwsh -c "ni a.txt"')
+  }
+  if (problems.length > 0) usageError(problems, command)
 
   // WP11（2026-10-05）：探针缓存**不再落工作区** `<ws>\.dshstage\cache`。
   // owner 已决定工作区不再出现 `.dshstage`，暂存/缓存一律在 Windows 缓存面（`resolveStageRoot()`）。
@@ -374,6 +469,14 @@ async function main() {
     case 'exec': {
       const argv = passthrough && passthrough.length ? passthrough : positional.slice(1)
       if (!argv.length) fail('USAGE', 'exec 需要命令，例如: exec -- pwsh -c "ni a.txt"')
+      // R34-05：`--timeout abc` 旧行为把 NaN 传给执行器（超时语义静默失效）。
+      let timeoutMs
+      if (flags.timeout !== undefined) {
+        timeoutMs = Number(flags.timeout)
+        if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+          fail('USAGE', `--timeout 需要正整数毫秒（收到 "${flags.timeout}"）`)
+        }
+      }
       const readOnlyMode = flags['read-only'] === true
       /**
        * ── R18-KNOWN-05a：只读模式先判命令，**写/判不出来就拒绝** ──────────────────
@@ -424,7 +527,7 @@ async function main() {
           args: argv.slice(1),
           cwd: readOnlyScratch ?? workspace.store.stagedDir,
           logicalCwd: workspace.root,
-          timeoutMs: flags.timeout ? Number(flags.timeout) : undefined,
+          timeoutMs,
         })
         // ── 只读模式：不捕获、不并入、不冻结（暂存副作用都在 scratch，随后删除）──
         const captured = readOnlyScratch ? [] : workspace.captureAfterExecution(before)
@@ -540,11 +643,21 @@ async function main() {
         const pending = workspace.listReviews()
         candidate = pending[pending.length - 1]
       }
+      // R34-06：`--json` 是机读契约 —— 空队列也必须给可解析 JSON（旧实现回显纯文本）。
       if (!candidate) {
-        process.stdout.write('没有可展示的候选\n')
+        if (flags.json) out({ candidate: null, lines: [] }, flags)
+        else process.stdout.write('没有可展示的候选\n')
         process.exit(EXIT.OK)
       }
-      const lines = renderCandidateDiff(workspace.store, candidate, { maxLines: Number(flags['max-lines'] || 40) })
+      // R34-05：`--max-lines abc` 的 NaN 旧行为让截断语义静默失效。
+      let maxLines = 40
+      if (flags['max-lines'] !== undefined) {
+        maxLines = Number(flags['max-lines'])
+        if (!Number.isInteger(maxLines) || maxLines <= 0) {
+          fail('USAGE', `--max-lines 需要正整数值（收到 "${flags['max-lines']}"）`)
+        }
+      }
+      const lines = renderCandidateDiff(workspace.store, candidate, { maxLines })
       if (flags.json) out({ candidate: candidate.id, lines }, flags)
       else {
         process.stdout.write(`候选 ${candidate.id} [${candidate.status}] — before/after 均冻结在候选内\n`)
@@ -559,30 +672,84 @@ async function main() {
     }
 
     case 'apply': {
+      let candidate
       let candidateId = flags.candidate
-      if (!candidateId) {
-        const pending = workspace.listReviews()
-        if (!pending.length) {
-          process.stdout.write('没有待审候选\n')
+      if (candidateId) {
+        // U16-6：显式 --candidate 先按同一套结构化错误解析（未知 id 给 `CODE: message`，不抛栈）。
+        const resolved = resolveCandidateOrFail(candidateId)
+        if (resolved.idempotent === 'ALREADY_APPLIED') {
+          // R34-07：重复批准必须是**显式的 already-applied 成功语义**（不写盘），
+          // 不再打印 `状态 undefined / 已应用 0 项` 这种无法判定的结果。
+          const payload = { ...resolved, alreadyApplied: true, wroteToDisk: false }
+          if (flags.json) out(payload, flags)
+          else {
+            process.stdout.write(
+              `候选 ${resolved.id} 已经是 applied 状态（already-applied）：本次未再次写盘，真实工作区未改动。\n`,
+            )
+          }
           process.exit(EXIT.OK)
         }
-        candidateId = pending[pending.length - 1].id
+        candidate = resolved.candidate
+      } else {
+        const pending = workspace.listReviews()
+        if (!pending.length) {
+          // R34-06：JSON 模式的"没有待审候选"同样必须是可解析 JSON。
+          if (flags.json) {
+            out({ id: null, status: 'no-pending-candidates', applied: [], failed: [], remaining: [], wroteToDisk: false }, flags)
+          } else {
+            process.stdout.write('没有待审候选\n')
+          }
+          process.exit(EXIT.OK)
+        }
+        candidate = pending[pending.length - 1]
+        candidateId = candidate.id
       }
       const paths = typeof flags.paths === 'string' ? flags.paths.split(',').map((s) => s.trim()).filter(Boolean) : undefined
-      // U16-6：显式 --candidate 时先按同一套结构化错误解析（applyCandidate 内部对未知 id 抛
-      // SandboxError，但显式路径此前会以未捕获堆栈的形式冒到 stderr）。
-      if (flags.candidate) resolveCandidateOrFail(candidateId)
+      if (flags.paths !== undefined && (!paths || paths.length === 0)) {
+        fail('USAGE', '--paths 需要至少一个工作区相对路径（逗号分隔），例如: --paths a.txt,src/b.txt')
+      }
+      /**
+       * ── R34-08：路径列表要么全部命中、要么一个字节都不写 ────────────────────────
+       * 实测缺陷：`apply --paths a.txt,nope.txt` 旧行为写入了 a.txt、对 nope.txt **一声不响**
+       * （exit 0、failed=[]），是"静默半批应用"。审批是用户对整批的一次决定，含未知路径
+       * 时必须拒整批并点名未命中的路径，而不是照写命中的那部分。
+       */
+      if (paths) {
+        const known = new Set((candidate?.changes ?? []).map((change) => compareKey(change.path)))
+        const requested = [...new Set(paths)]
+        const unmatched = requested.filter((path) => !known.has(compareKey(path)))
+        if (unmatched.length > 0) {
+          fail(
+            'NO_MATCHING_PATHS',
+            `--paths 中有 ${unmatched.length} 个路径不在候选 ${candidateId} 里：${unmatched.join(', ')}。` +
+              `为防止半批应用，本次一个文件都没有写入；用 review/diff 查看候选内的路径（相对路径、逗号分隔）。`,
+          )
+        }
+      }
       const result = workspace.applyCandidate(candidateId, { paths, force: flags.force === true })
-      if (flags.json) out(result, flags)
+      const noDiskWrite = result.applied.length === 0 && result.failed.length === 0
+      if (flags.json) out(noDiskWrite ? { ...result, wroteToDisk: false, noNetChange: true } : result, flags)
       else {
         process.stdout.write(`候选 ${result.id} → 状态 ${result.status}\n`)
         process.stdout.write(`已应用 ${result.applied.length} 项，失败 ${result.failed.length} 项\n`)
+        // R34-09：0 应用 0 失败不是"模糊成功"：必须明说未写盘、以及为什么。
+        if (noDiskWrite) {
+          process.stdout.write('已无净变化：所选路径已经是目标状态（或没有可应用条目），本次未写盘。\n')
+        }
         for (const item of result.failed) process.stdout.write(`  ✗ ${item.path}: ${item.code} — ${item.message}\n`)
         if (result.remaining?.length) {
           process.stdout.write(`未选择/未应用 ${result.remaining.length} 项，保留为可追踪修订（不会丢弃整份候选）\n`)
         }
       }
-      process.exit(result.failed.some((f) => f.code === 'STALE_BASELINE') ? EXIT.STALE : EXIT.OK)
+      /**
+       * ── R34-10：退出码必须与"有没有失败项"一致 ──────────────────────────────────
+       * 旧实现只把 STALE_BASELINE 映射成 4，其余失败（如 SANDBOX_PATH_MASKED_CONFIRM、
+       * EPERM、回滚失败）一律 exit 0 —— 脚本会把"失败 N 项"当成功。
+       */
+      if (result.failed.length > 0) {
+        process.exit(result.failed.some((f) => f.code === 'STALE_BASELINE') ? EXIT.STALE : EXIT.FAIL)
+      }
+      process.exit(EXIT.OK)
     }
 
     case 'discard': {

@@ -269,6 +269,36 @@ section('I. 基线 stale 预检：整批零写（既有行为不退化）')
   )
 }
 
+section('J. R34：同一候选分两批应用后，累计状态必须收敛为 applied（不是永远 partial）')
+{
+  const { ws, root } = makeWs('two-batch')
+  for (const name of ['a.txt', 'b.txt', 'c.txt']) writeFileSync(join(root, name), `${name} BASE\n`)
+  for (const name of ['a.txt', 'b.txt', 'c.txt']) ws.writeFile(join(root, name), `${name} NEW\n`, { origin: 'test' })
+  const frozen = ws.freezeCandidate({})
+  const first = ws.applyCandidate(frozen.candidate.id, { paths: ['a.txt'] })
+  check(
+    'J1 第一批（a）⇒ partially-applied，remaining 只含尚未应用的 b/c',
+    first.status === 'partially-applied' && first.remaining.length === 2,
+    JSON.stringify({ status: first.status, remaining: first.remaining }),
+  )
+  const second = ws.applyCandidate(frozen.candidate.id, { paths: ['b.txt', 'c.txt'] })
+  check(
+    'J2 第二批（b/c）⇒ 累计已全量应用 ⇒ status=applied、remaining=[]（旧实现会永远 partial）',
+    second.status === 'applied' && (second.remaining || []).length === 0,
+    JSON.stringify({ status: second.status, remaining: second.remaining, applied: second.applied }),
+  )
+  check(
+    'J3 全量应用后该候选不再挂在待审面（listReviews 为空）',
+    ws.listReviews().length === 0,
+    JSON.stringify({ pending: ws.listReviews().map((c) => c.id) }),
+  )
+  check(
+    'J4 真实盘三份内容都是最终版本',
+    content(join(root, 'a.txt')) === 'a.txt NEW\n' && content(join(root, 'b.txt')) === 'b.txt NEW\n' && content(join(root, 'c.txt')) === 'c.txt NEW\n',
+    JSON.stringify({ a: content(join(root, 'a.txt')), b: content(join(root, 'b.txt')), c: content(join(root, 'c.txt')) }),
+  )
+}
+
 W('')
 W('='.repeat(64))
 W(`RESULT: ${failures === 0 ? 'PASS' : 'FAIL'} checks=${assertions} failures=${failures}`)

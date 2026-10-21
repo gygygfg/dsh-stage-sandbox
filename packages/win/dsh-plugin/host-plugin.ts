@@ -40,7 +40,7 @@ import { Config } from './schema.ts'
 import { evaluateEnvironment, environmentFailureMessage } from './environment-gate.ts'
 import { probeWin32Abi } from '../src/capability.ts'
 import { WindowsStageExecutor, resolveDshModuleRoot } from '../src/executor.ts'
-import { compareKey } from '../src/paths.ts'
+import { canonical, compareKey } from '../src/paths.ts'
 import { renderCandidateDiff } from '../src/tools.ts'
 import { verifyStageRootAlive } from '../src/stage-guard.ts'
 import { REVIEW_BASENAME, getReviewService, resolveReviewStoreDir, disposeReviewServices } from './review-service.ts'
@@ -172,14 +172,67 @@ export function parseInvocation(rawInput) {
 }
 
 /** 把一个参数匹配到待审路径（精确相对路径，或"不含分隔符 → 匹配 basename"） */
+/**
+ * R34（CLI-hunter U-02）：路径匹配的**严格版**。
+ *
+ * 旧实现允许"裸 basename 回退"，且**任意一个**命中就采纳 —— `approve b.txt` 会同时
+ * 批准根下的 `b.txt` 与 `dir/b.txt`（用户只授权了一个名字）。新语义：
+ *   · 有**精确相对路径**命中 ⇒ 只取精确命中（`b.txt` 指的就是根下那个）；
+ *   · 否则才做 basename 回退；回退命中**多于一个** ⇒ 记为歧义，调用方必须整批拒绝；
+ *   · 多个参数命中同一路径 ⇒ 去重。
+ * `matchPaths()` 保留旧签名（返回 matches）供 diff 渲染使用；授权路径必须用 detailed。
+ */
+export function matchPathsDetailed(changes, args) {
+  const ambiguous = []
+  const matches = []
+  const seen = new Set()
+  for (const arg of args || []) {
+    const want = compareKey(String(arg).replace(/^\.?[\\/]/, ''))
+    if (want.length === 0) continue
+    let hit = changes.filter((change) => compareKey(change.path) === want)
+    if (hit.length === 0 && want.indexOf('\\') < 0 && want.indexOf('/') < 0) {
+      hit = changes.filter((change) => compareKey(change.path).split(/[\\/]/).pop() === want)
+      if (hit.length > 1) {
+        ambiguous.push({ arg: String(arg), paths: hit.map((change) => change.path) })
+        continue
+      }
+    }
+    for (const change of hit) {
+      if (seen.has(change.path)) continue
+      seen.add(change.path)
+      matches.push(change)
+    }
+  }
+  return { matches, ambiguous }
+}
+
 export function matchPaths(changes, args) {
-  if (!args || args.length === 0) return []
-  const wanted = args.map((arg) => compareKey(arg.replace(/^\.?[\\/]/, '')))
-  return changes.filter((change) => {
-    const key = compareKey(change.path)
-    const base = key.split(/[\\/]/).pop()
-    return wanted.some((want) => want === key || (want.indexOf('\\') < 0 && want.indexOf('/') < 0 && want === base))
-  })
+  return matchPathsDetailed(changes, args).matches
+}
+
+/**
+ * R34（CLI-hunter U-01）：`--` 之后一律当路径（POSIX 惯例）。
+ * 没有它，名为 `--force` 的文件永远无法被单独批准；更糟的是旧实现把所有
+ * `--xxx` 都当开关，`approve --force` = "批准全部"（用户想批一个文件却批了全部）。
+ * 未知开关仍然报错；`--` 本身不出现在 flags/names 里。
+ */
+export function splitCommandFlags(args, allowedFlags) {  const flags = new Set()
+  const names = []
+  const unknown = []
+  let endOfFlags = false
+  for (const arg of args || []) {
+    if (!endOfFlags && arg === '--') {
+      endOfFlags = true
+      continue
+    }
+    if (!endOfFlags && String(arg).startsWith('--')) {
+      if (allowedFlags.has(arg)) flags.add(arg)
+      else unknown.push(String(arg))
+      continue
+    }
+    names.push(String(arg))
+  }
+  return { flags, names, unknown }
 }
 
 /**
@@ -791,7 +844,27 @@ export function readPublishedSnapshot({ workspaceRoot, sessionId, env } = {}) {
   const file = join(dir, REVIEW_BASENAME)
   if (!existsSync(file)) return { ok: false, code: 'no-snapshot', dir }
   try {
-    return { ok: true, dir, snapshot: JSON.parse(readFileSync(file, 'utf8')) }
+    const snapshot = JSON.parse(readFileSync(file, 'utf8'))
+    /**
+     * R34-SEC-05（P3）：快照里的 `workspaceRoot` 用来给客户端做"没串台"自校验
+     * （S9）；但它只是**文件内容**，可以被手写/旧版本篡改。路由侧既然已经知道
+     * 自己服务的是哪个工作区，就在返回前比一次：不一致 ⇒ 不把这份快照当成
+     * "当前工作区的待审内容"返回（fail-closed，不渲染别的工作区的 diff）。
+     * 两侧都做 canonical + compareKey，大小写/短名/尾分隔符的同一工作区不受影响。
+     */
+    const declared = snapshot?.workspaceRoot
+    if (typeof declared === 'string' && declared.length > 0) {
+      let mismatched = false
+      try {
+        mismatched = compareKey(canonical(declared)) !== compareKey(canonical(workspaceRoot))
+      } catch {
+        mismatched = true
+      }
+      if (mismatched) {
+        return { ok: false, code: 'snapshot-workspace-mismatch', dir, detail: `declared=${declared}` }
+      }
+    }
+    return { ok: true, dir, snapshot }
   } catch (error) {
     return { ok: false, code: 'snapshot-unreadable', dir, detail: String(error?.message ?? error) }
   }
@@ -1028,6 +1101,20 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
   const serviceOf = typeof serviceOrResolver === 'function' ? serviceOrResolver : () => serviceOrResolver
   const DISABLED_TEXT =
     'WinStage 沙箱已在设置中关闭：暂存与审阅面未接管（写入走平台沙箱/审批模式），命令不会执行。'
+  /**
+   * R34-E2E-02（P2）：`/winstage` 命令面此前把 `StageGuardUnavailableError` 的原始
+   * message 直接回显（`the protected session directory could not be established
+   * (root-not-creatable:EPERM)`）—— 违反"用户可见文本不暴露机制/不可行动"的透明性约束。
+   * 统一成一句可行动的普通说明；细节只进 `log.warn`。写入/读取的 FsError 已有
+   * `mapStageFailure()` 的普通文案，这里只兜住命令面直接抛出的两个 stage 错误码。
+   */
+  const STAGE_UNAVAILABLE_TEXT =
+    'WinStage 暂存不可用：本宿主无法建立暂存根（受限会话或权限不足），本次命令未执行，真实工作区未被改动。请在未受限的宿主里使用，或在设置中关闭 WinStage 后改用平台沙箱/审批。'
+  const commandFailureText = (prefix, error) => {
+    const code = error?.code
+    if (code === 'STAGE_GUARD_UNAVAILABLE' || code === 'STAGE_ROOT_LOST') return `${prefix}${STAGE_UNAVAILABLE_TEXT}`
+    return `${prefix}${error?.message ?? error}`
+  }
 
   const handlers = {
     list({ service }) {
@@ -1048,7 +1135,8 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
         try {
           snapshot = service.snapshot()
         } catch (error) {
-          return { kind: 'error', text: `读取暂存快照失败：${error?.message ?? error}` }
+          log.warn(`/winstage 快照读取失败：${error?.message ?? error}`)
+          return { kind: 'error', text: commandFailureText('读取暂存快照失败：', error) }
         }
       }
       const listed = snapshot
@@ -1073,7 +1161,28 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
       return { kind: 'success', text: `已刷新审阅快照：${snapshot.counts.files} 个待审文件` }
     },
     rebase({ args, service }) {
-      const result = service.rebase(args.length > 0 ? args : undefined)
+      // R34（CLI-hunter U-03）：未知路径不得静默 success。先按与 approve 同一套
+      // "精确 / 唯一 basename / 歧义"匹配，再交给 service.rebase（拿到的都是确定路径）。
+      const { names, unknown } = splitCommandFlags(args, new Set())
+      if (unknown.length > 0) return { kind: 'error', text: `rebase 不接受开关：${unknown.join(' ')}` }
+      let requested
+      if (names.length > 0) {
+        const changes = service.reload().diffEntries()
+        const matched = matchPathsDetailed(changes, names)
+        if (matched.ambiguous.length > 0) {
+          return {
+            kind: 'error',
+            text:
+              '路径有歧义，整批未 rebase（请写成相对工作区的完整路径）：\n' +
+              matched.ambiguous.map((item) => `  · ${item.arg} ⇒ ${item.paths.join(' | ')}`).join('\n'),
+          }
+        }
+        if (matched.matches.length === 0) {
+          return { kind: 'error', text: `没有匹配的待审路径：${names.join(' ')}（rebase 只对齐当前净 diff 中的条目）` }
+        }
+        requested = matched.matches.map((change) => change.path)
+      }
+      const result = service.rebase(requested)
       const lines = [result.message]
       for (const path of result.rebased) lines.push(`  ↻ ${path}`)
       if (result.rebased.length > 0) lines.push(`  现在可批准 ${result.remaining} 项（/winstage list 查看）`)
@@ -1094,11 +1203,10 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
     approve({ args, service }) {
       // 开关：`--rebase` = 先把基线过期的条目对齐到真实文件再批准；
       //       `--force`  = 跳过 #12.1 的基线检查直接覆盖（更危险，两者可并用）。
-      const flags = new Set(args.filter((arg) => arg.startsWith('--')))
-      const names = args.filter((arg) => !arg.startsWith('--'))
-      const unknown = [...flags].filter((flag) => flag !== '--rebase' && flag !== '--force' && flag !== '--confirm-mask')
+      // R34：`--` 之后一律当路径；未知开关报错（不再把 `--force` 文件名当开关）。
+      const { flags, names, unknown } = splitCommandFlags(args, new Set(['--rebase', '--force', '--confirm-mask']))
       if (unknown.length > 0) {
-        return { kind: 'error', text: `未知开关：${unknown.join(' ')}；可用：--rebase、--force、--confirm-mask` }
+        return { kind: 'error', text: `未知开关：${unknown.join(' ')}；可用：--rebase、--force、--confirm-mask（名为 --xxx 的文件请写成：/winstage approve -- --xxx）` }
       }
       const ws = service.reload()
       const changes = ws.diffEntries()
@@ -1115,7 +1223,16 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
         }
         return { kind: 'success', text: '没有待审文件' }
       }
-      const paths = names.length > 0 ? matchPaths(changes, names).map((c) => c.path) : undefined
+      const matched = matchPathsDetailed(changes, names)
+      if (matched.ambiguous.length > 0) {
+        return {
+          kind: 'error',
+          text:
+            '路径有歧义，整批未批准（请写成相对工作区的完整路径）：\n' +
+            matched.ambiguous.map((item) => `  · ${item.arg} ⇒ ${item.paths.join(' | ')}`).join('\n'),
+        }
+      }
+      const paths = names.length > 0 ? matched.matches.map((c) => c.path) : undefined
       if (names.length > 0 && paths.length === 0) {
         return { kind: 'error', text: `没有匹配的待审路径：${names.join(' ')}` }
       }
@@ -1180,11 +1297,23 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
       //   「拒绝全部」返回 success 而 `review.json` 的 `pending` 仍为 true ⇒ 条目永久留存。
       const live = typeof ws.listReviews === 'function' ? ws.listReviews() : []
       if (changes.length === 0 && live.length === 0) return { kind: 'success', text: '没有待审文件' }
-      const paths = args.length > 0 ? matchPaths(changes, args).map((c) => c.path) : undefined
-      if (args.length > 0 && paths.length === 0) {
+      // R34：与 approve 同一套严格路径解析（`--` 转义、basename 歧义整批拒绝）。
+      const { names, unknown } = splitCommandFlags(args, new Set())
+      if (unknown.length > 0) return { kind: 'error', text: `reject 不接受开关：${unknown.join(' ')}` }
+      const matched = matchPathsDetailed(changes, names)
+      if (matched.ambiguous.length > 0) {
         return {
           kind: 'error',
-          text: `没有匹配的待审路径：${args.join(' ')}（若它只是"仅存档行"，请用不带路径的 /winstage reject 清除）`,
+          text:
+            '路径有歧义，整批未拒绝（请写成相对工作区的完整路径）：\n' +
+            matched.ambiguous.map((item) => `  · ${item.arg} ⇒ ${item.paths.join(' | ')}`).join('\n'),
+        }
+      }
+      const paths = names.length > 0 ? matched.matches.map((c) => c.path) : undefined
+      if (names.length > 0 && paths.length === 0) {
+        return {
+          kind: 'error',
+          text: `没有匹配的待审路径：${names.join(' ')}（若它只是"仅存档行"，请用不带路径的 /winstage reject 清除）`,
         }
       }
       const result = service.reject(paths)
@@ -1268,7 +1397,7 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
             return handler({ args, invocation, raw, service })
           } catch (error) {
             log.warn(`/${spec.name} 失败：${error?.message ?? error}`)
-            return { kind: 'error', text: `/${spec.name} 失败：${error?.message ?? error}` }
+            return { kind: 'error', text: commandFailureText(`/${spec.name} 失败：`, error) }
           }
         },
       })
