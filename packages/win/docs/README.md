@@ -74,6 +74,7 @@
 - [`round24/R24-剩余项修复报告.md`](round24/R24-剩余项修复报告.md)：第三批 —— 生产接线（`WINSTAGE_READ_POLICY` 通道 + host config `masks`，默认行为 deep-equal 不变）、R14 批量 apply 收窄为"全有或全无 + 回滚快照"、R16 hive-file ntdll 独立探针 104/0 + autotest 全量；附残余与下一批。
 - [`round25/R25-剩余项修复报告.md`](round25/R25-剩余项修复报告.md)：第四批 —— T1 真归因（opt-in **T1S** 档：受限令牌 + shim，WAL/audit 归因与 TS 同口径；默认 T1 不变）、`dsh plugin remove` 残留清理工具（R21-LC-04：dry-run/apply/幂等/护栏，隔离 e2e）；附残余与下一批。
 - [`round26/R26-32位视图暂存报告.md`](round26/R26-32位视图暂存报告.md)：第五批 —— R13 32 位注册表视图暂存化（`/reg:32` 写/删进 overlay，合成命名空间 + WAL `reserved`=view，apply 带 `/reg:32` 只改 32 视图；审阅面 `[32]`；读仍透传）；附修前红/修后绿与残余。
+- [`round27/R27-边缘路径与测试基建报告.md`](round27/R27-边缘路径与测试基建报告.md)：第六批 —— 边缘路径收尾（>4095 显式 fail-closed + 归因、≤3000 支持、跨卷 rename copy-up 无半态、真实远端 SMB 环境缺口）、autotest 启动口径统一（plain node 显式跳过 sandbox 段 + exit=2；DSH-as-node 不变）、masks 设置页文案；附 CodeIntegrity 策略环境事件与残余。
 
 ## 5. archive —— 历史归档（不代表现行口径）
 

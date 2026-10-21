@@ -508,7 +508,7 @@ dism /online /get-featureinfo /featurename:Containers-DisposableClientVM
 > （含注册表 apply 批内重放、块标量/URI 内嵌凭据漏明、白障后重建视图、`\\?\` >MAX_PATH 读透传、
 > `build-shim.ts --help` 误重建 canonical）。**R21 新登记残余**（不改变 R1–R20 编号，详见
 > [`round21/R21-证据缺口收口报告.md`](round21/R21-证据缺口收口报告.md) §4）：
-> R21-FS-06（>MAX_PATH 写/建/rename/delete 仍 fail-closed；读已透传）、R21-FS-07（跨进程 apply 无锁）、
+> R21-FS-06（>MAX_PATH 写/建/rename/delete 仍 fail-closed；读已透传；**R23 已收窄**：`\\?\` ≤4095 进暂存；**R27**：>4095 显式 fail-closed + 可归因日志——内部 `WS_PATH_MAX=4096` 边界，NT 上限支持留专项）、R21-FS-07（跨进程 apply 无锁）、
 > R21-FS-08（apply 属性面：hidden/system 不还原、ACL 继承）、R21-FS-R1（`readPolicy:'block'` 生产装配不可达；**R24 已修**：`WINSTAGE_READ_POLICY` 通道）、
 > R21-SENS-R1（自定义 mask 无生产来源；**R24 已修**：host config `masks` fail-closed 装配；内置危险类"整份省略"链路仍有效）、
 > G5 复核后编号：R21-LC-01（P1；**R23 已修**：面板路由接入宿主 `connection.authorizeIndex`，裸请求 401、带 cookie 正常、关态 503 不泄快照；见 round23 报告）、R21-LC-04（P2；**R25 已提供清理工具** `tools/plugin-remove-cleanup.ts`：dry-run/apply/幂等/护栏，隔离 e2e 收口；宿主 `dsh plugin remove` 本身仍不清理）、R21-LC-05（P2，二次 remove 退出码非幂等）、

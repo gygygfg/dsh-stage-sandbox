@@ -95,7 +95,10 @@ export const Config = z.object({
     .array(z.string())
     .default([])
     .extra('volatile', true)
-    .description('自定义遮蔽规则（正则字符串数组；空 = 不启用）。命中条目的内容按值级掩码写入审阅快照。'),
+    .description(
+      '自定义遮蔽规则（正则字符串数组；空 = 不启用）。例：["\\\\\\\\.npmrc$", "/app\\\\.secrets$/i"]。' +
+        '命中条目的内容按值级掩码（<REDACTED len=N>）写入审阅快照；非法正则会拒绝装配（fail-closed）。',
+    ),
 })
 
 /** 字段名清单（便于测试与文档；顺序与 schema 一致）。 */

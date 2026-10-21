@@ -660,6 +660,67 @@ static const wchar_t *ws_api_path(const wchar_t *in, wchar_t *buf, DWORD cch)
     return buf;
 }
 
+
+/* ── R27：>WS_PATH_MAX 显式 fail-closed 边界（Lead 拍板：方案 A）─────────────────
+ * shim 内部路径缓冲是 WS_PATH_MAX（4096）。真实 API 支持到 NT 上限（32767），但
+ * 遮罩/overlay 管线无法解析 >4096 的路径 ⇒ 若继续透传就会**静默写真实盘**（历史
+ * 行为：部分 ops ERR2/静默、部分被 provider 溢出兜底）。本轮显式改为：
+ *
+ *   上限 = WS_PATH_MAX - (len(stageRoot) + 映射开销 + 余量)
+ *
+ * provider 映射后路径 = stageRoot + "\\fs\\" + (norm 去掉盘符冒号)；UNC 再多
+ * "_unc\\"。因此一个真实路径能否被暂存，取决于 **stage 根长度**。用动态上限后，
+ * 所有"映射到暂存树会溢出"的路径都在 hook 入口被拒绝并记日志（可归因），而不是
+ * 依赖后续偶发的 ERR2/ERR5；≤上限的近边界长路径（如 1k–3.8k）仍正常进暂存。
+ * 支持到 NT 32767 需要扩大中央 winstage_internal.h 的 WS_PATH_MAX（Lead 域，本批不做）。
+ * 本 guard 只对**绝对**路径生效；相对路径仍由既有 CWD 解析逻辑处理。 */
+static size_t ws_edge_effective_limit(void)
+{
+    size_t margin = 24; /* "\\fs\\" / "\\wo\\" + "_unc\\" + slack */
+    if (g_ws.haveStageRoot && g_ws.stageRoot[0]) {
+        margin += wcslen(g_ws.stageRoot);
+    }
+    if (margin >= (size_t)WS_PATH_MAX - 32) {
+        return 32;
+    }
+    return (size_t)WS_PATH_MAX - margin;
+}
+
+static size_t ws_edge_effective_len(const wchar_t *p)
+{
+    if (!p || !p[0]) {
+        return 0;
+    }
+    if (ws_starts_with_ci_w(p, L"\\\\?\\UNC\\")) {
+        return wcslen(p + 8) + 2; /* restore "\\" for UNC norm */
+    }
+    if (ws_starts_with_ci_w(p, L"\\\\?\\")) {
+        return wcslen(p + 4);
+    }
+    return wcslen(p);
+}
+
+static int ws_path_over_buffer_w(const wchar_t *p)
+{
+    if (!p || !p[0]) {
+        return 0;
+    }
+    return ws_edge_effective_len(p) >= ws_edge_effective_limit();
+}
+
+static int ws_path_over_buffer_a(const char *p)
+{
+    if (!p || !p[0]) {
+        return 0;
+    }
+    return strlen(p) >= ws_edge_effective_limit();
+}
+
+static void ws_log_edge_deny(void)
+{
+    ws_log("fail-closed: path >= shim edge limit (R27 edge; stageRoot + 4096 buffer; >4095 unsupported -> deny)");
+}
+
 /* ── R23：provider 路径（staged/wo/mapped）>MAX_PATH 的**真实 API 边界**包装 ──
  * provider 侧（ws_stage.c/ws_util.c）已能算出长路径；但真实 Win32 API 在本机
  * （LongPathsEnabled=0）仍需 `\\?\` 前缀。每个包装只做"补前缀 + 直调 original"，
@@ -1442,6 +1503,11 @@ static NTSTATUS ws_hardlink_stage(const wchar_t *srcNorm, const wchar_t *dstNorm
 /* Win32 wrapper body for both the ANSI/WIDE entry points. */
 static BOOL ws_create_hardlink_core(LPCWSTR link, LPCWSTR existing)
 {
+    if (ws_path_over_buffer_w(link) || ws_path_over_buffer_w(existing)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     wchar_t normLink[WS_PATH_MAX];
     wchar_t normExisting[WS_PATH_MAX];
     if (!link || !link[0] || !existing || !existing[0]) {
@@ -1485,6 +1551,11 @@ static BOOL ws_create_hardlink_core(LPCWSTR link, LPCWSTR existing)
 static BOOL ws_replace_file_locked(LPCWSTR replaced, LPCWSTR replacement, LPCWSTR backup, DWORD flags,
                                    LPVOID exclude, LPVOID reserved)
 {
+    if (ws_path_over_buffer_w(replaced) || ws_path_over_buffer_w(replacement)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     wchar_t normReplaced[WS_PATH_MAX];
     wchar_t normReplacement[WS_PATH_MAX];
     wchar_t normBackup[WS_PATH_MAX];
@@ -1902,6 +1973,11 @@ BOOL WINAPI ws_ReplaceFileA(LPCSTR lpReplacedFileName, LPCSTR lpReplacementFileN
 
 HANDLE WINAPI ws_FindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData)
 {
+    if (ws_path_over_buffer_w(lpFileName)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
     ws_callhit_named("FindFirstFileW");
     HANDLE h = g_orig.FindFirstFileW ? g_orig.FindFirstFileW(lpFileName, lpFindFileData)
                                      : FindFirstFileW(lpFileName, lpFindFileData);
@@ -1936,6 +2012,11 @@ HANDLE WINAPI ws_FindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFil
 
 HANDLE WINAPI ws_FindFirstFileA(LPCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData)
 {
+    if (ws_path_over_buffer_a(lpFileName)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
     ws_callhit_named("FindFirstFileA");
     HANDLE h = g_orig.FindFirstFileA ? g_orig.FindFirstFileA(lpFileName, lpFindFileData)
                                      : FindFirstFileA(lpFileName, lpFindFileData);
@@ -1975,6 +2056,11 @@ HANDLE WINAPI ws_FindFirstFileA(LPCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFile
 HANDLE WINAPI ws_FindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInfoLevelId, LPVOID lpFindFileData,
                                   FINDEX_SEARCH_OPS fSearchOp, LPVOID lpSearchFilter, DWORD dwAdditionalFlags)
 {
+    if (ws_path_over_buffer_w(lpFileName)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
     ws_callhit_named("FindFirstFileExW");
     HANDLE h = g_orig.FindFirstFileExW
                    ? g_orig.FindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter,
@@ -2018,6 +2104,11 @@ HANDLE WINAPI ws_FindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInfoLe
 HANDLE WINAPI ws_FindFirstFileExA(LPCSTR lpFileName, FINDEX_INFO_LEVELS fInfoLevelId, LPVOID lpFindFileData,
                                   FINDEX_SEARCH_OPS fSearchOp, LPVOID lpSearchFilter, DWORD dwAdditionalFlags)
 {
+    if (ws_path_over_buffer_a(lpFileName)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
     ws_callhit_named("FindFirstFileExA");
     HANDLE h = g_orig.FindFirstFileExA
                    ? g_orig.FindFirstFileExA(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter,
@@ -2532,6 +2623,11 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
                                   LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
                                   DWORD dwFlagsAndAttributes, HANDLE hTemplateFile, int isAnsi)
 {
+    if (ws_path_over_buffer_w(lpFileName)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
     /* R20 FOLLOW-UP（P0）：先剥 NT 命名空间/Win32 设备别名（\\?\GLOBALROOT\Device\…、
      * \\.\X:、\??\Volume{GUID}\…）。否则下面的遮蔽判定看到的是"设备/相对名"，
      * 会跳过 mask，随后 ws_should_intercept 再映射成功 ⇒ 遮蔽读/写绕过。
@@ -2878,6 +2974,11 @@ HANDLE WINAPI ws_CreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwS
 
 BOOL WINAPI ws_CreateDirectoryW(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes)
 {
+    if (ws_path_over_buffer_w(lpPathName)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     wchar_t norm[WS_PATH_MAX];
     if (!ws_should_intercept(lpPathName, norm, WS_PATH_MAX)) {
         return g_orig.CreateDirectoryW(lpPathName, lpSecurityAttributes);
@@ -2913,6 +3014,11 @@ BOOL WINAPI ws_CreateDirectoryA(LPCSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecur
 BOOL WINAPI ws_DeleteFileW(LPCWSTR lpFileName)
 {
     WS_STUCK("DeleteFileW");
+    if (ws_path_over_buffer_w(lpFileName)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     ws_stuck_path(lpFileName);
     wchar_t norm[WS_PATH_MAX];
     int intercept = ws_should_intercept(lpFileName, norm, WS_PATH_MAX);
@@ -2971,6 +3077,11 @@ BOOL WINAPI ws_DeleteFileA(LPCSTR lpFileName)
 
 static BOOL ws_move_locked(LPCWSTR src, LPCWSTR dst, DWORD flags)
 {
+    if (ws_path_over_buffer_w(src) || ws_path_over_buffer_w(dst)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     wchar_t normSrc[WS_PATH_MAX], normDst[WS_PATH_MAX];
     if (!ws_should_intercept(src, normSrc, WS_PATH_MAX) || !ws_should_intercept(dst, normDst, WS_PATH_MAX)) {
         return g_orig.MoveFileExW(src, dst, flags);
@@ -3059,6 +3170,11 @@ BOOL WINAPI ws_MoveFileA(LPCSTR a, LPCSTR b)
 
 static BOOL ws_remove_directory_locked(LPCWSTR path)
 {
+    if (ws_path_over_buffer_w(path)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     wchar_t norm[WS_PATH_MAX];
     if (!ws_should_intercept(path, norm, WS_PATH_MAX)) {
         return g_orig.RemoveDirectoryW(path);
@@ -3135,6 +3251,11 @@ BOOL WINAPI ws_RemoveDirectoryA(LPCSTR lpPathName)
 
 static BOOL ws_copy_file_locked(LPCWSTR src, LPCWSTR dst, BOOL failIfExists)
 {
+    if (ws_path_over_buffer_w(src) || ws_path_over_buffer_w(dst)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     /* R20 FOLLOW-UP（P0）：设备/卷命名空间路径先映射成普通 Win32，否则 mask 看到的是
      * `\\?\GLOBALROOT\Device\…` 这类名字（不匹配 leaf 遮蔽规则）⇒ 明文被复制。 */
     wchar_t effSrc[WS_PATH_MAX];
@@ -3226,6 +3347,11 @@ BOOL WINAPI ws_CopyFileA(LPCSTR src, LPCSTR dst, BOOL failIfExists)
 BOOL WINAPI ws_CopyFileExW(LPCWSTR src, LPCWSTR dst, LPPROGRESS_ROUTINE progress,
                            LPVOID progressData, LPBOOL cancel, DWORD flags)
 {
+    if (ws_path_over_buffer_w(src) || ws_path_over_buffer_w(dst)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     WS_STUCK("CopyFileExW");
     ws_stuck_path(src);
     wchar_t normSrc[WS_PATH_MAX], normDst[WS_PATH_MAX];
@@ -3286,6 +3412,10 @@ BOOL WINAPI ws_CopyFileExA(LPCSTR src, LPCSTR dst, LPPROGRESS_ROUTINE progress,
  * injected shim log). Same policy as CopyFileExW: staging + mask, HRESULT contract. */
 HRESULT WINAPI ws_CopyFile2(PCWSTR src, PCWSTR dst, COPYFILE2_EXTENDED_PARAMETERS *params)
 {
+    if (ws_path_over_buffer_w(src) || ws_path_over_buffer_w(dst)) {
+        ws_log_edge_deny();
+        return HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
+    }
     WS_STUCK("CopyFile2");
     ws_stuck_path(src);
     wchar_t normSrc[WS_PATH_MAX], normDst[WS_PATH_MAX];
@@ -3307,6 +3437,11 @@ HRESULT WINAPI ws_CopyFile2(PCWSTR src, PCWSTR dst, COPYFILE2_EXTENDED_PARAMETER
 
 BOOL WINAPI ws_SetFileAttributesW(LPCWSTR lpFileName, DWORD dwFileAttributes)
 {
+    if (ws_path_over_buffer_w(lpFileName)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     wchar_t norm[WS_PATH_MAX];
     int intercept = ws_should_intercept(lpFileName, norm, WS_PATH_MAX);
     WS_TRACE_FILE("SetFileAttributesW request raw=%ls normalized=%ls intercept=%d attrs=0x%lx",
@@ -3484,6 +3619,11 @@ static void ws_attr_log_nt(const char *api, const UNICODE_STRING *us)
 
 DWORD WINAPI ws_GetFileAttributesW(LPCWSTR lpFileName)
 {
+    if (ws_path_over_buffer_w(lpFileName)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_FILE_ATTRIBUTES;
+    }
     ws_attr_log("GetFileAttributesW", lpFileName); /* R11-D-13d-attr */
     ws_callhit_named("GetFileAttributesW"); /* R11-D-13d */
     if (ws_stat_read_masked(lpFileName)) {
@@ -3514,6 +3654,11 @@ DWORD WINAPI ws_GetFileAttributesW(LPCWSTR lpFileName)
 
 BOOL WINAPI ws_GetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS level, LPVOID info)
 {
+    if (ws_path_over_buffer_w(lpFileName)) {
+        ws_log_edge_deny();
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     ws_attr_log("GetFileAttributesExW", lpFileName); /* R11-D-13d-attr */
     ws_callhit_named("GetFileAttributesExW"); /* R11-D-13d */
     if (ws_stat_read_masked(lpFileName)) {

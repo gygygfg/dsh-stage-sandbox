@@ -71,10 +71,51 @@ say(cyan('================================================================'))
 
 mkdirSync(join(REPO, '.t'), { recursive: true })
 
+/**
+ * ★ R27：sandbox 段要求 **DSH 运行时（Electron-as-node）** 里的 ACL 后端可加载
+ * （`@deepseek-ai/dsh-sandbox-windows-acl` 只在 Harness 的 node_modules 里）。
+ * plain node 下它不是"产品红"，而是**环境缺口**——旧行为会让 sandbox 段 3 个套件报
+ * `SANDBOX_UNAVAILABLE` 假红，把 autotest 的退出码污染成 1。
+ *
+ * 现在显式探测后端：不可加载 ⇒ **不跑 sandbox 段**、打印明确文案、离线段照跑、
+ * 退出码 **2（环境错误）**；DSH-as-node 下行为不变。`--skip-audit` 语义不变。
+ */
+async function probeSandboxRuntime() {
+  try {
+    await import('@deepseek-ai/dsh-sandbox-windows-acl')
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, reason: String(error?.message ?? error) }
+  }
+}
+
+let environmentError
+let skipAudit = args.skipAudit
+let skipSandbox = false
+const wantedSandbox = args.only ? SANDBOX_SUITES.some((s) => args.only.includes(s.id)) : !skipAudit
+if (wantedSandbox) {
+  const runtime = await probeSandboxRuntime()
+  if (!runtime.ok) {
+    environmentError =
+      '当前运行时（plain node）加载不到 DSH 的 ACL 后端 @deepseek-ai/dsh-sandbox-windows-acl：' +
+      'sandbox 段已跳过（不报假红）。请用 DSH-as-node 启动（ELECTRON_RUN_AS_NODE=1 <Harness.exe> autotest.ts），' +
+      '或显式 `--skip-audit` 只跑离线套件。'
+    say('')
+    say(yellow('================================================================'))
+    say(yellow(` [环境错误] ${environmentError}`))
+    say(yellow(` 探测失败原因: ${runtime.reason.slice(0, 300)}`))
+    say(yellow(` 跳过的 sandbox 段套件：${SANDBOX_SUITES.map((s) => s.id).join(', ')}`))
+    say(yellow('================================================================'))
+    skipAudit = true
+    skipSandbox = true
+  }
+}
+
 const report = await runAll({
   workspace: WORKSPACE,
   outDir: join(REPO, '.t'),
-  skipAudit: args.skipAudit,
+  skipAudit,
+  skipSandbox,
   only: args.only,
 })
 
@@ -123,4 +164,9 @@ if (report.suitesFailed > 0) {
 
 if (args.json) say(`\n${JSON.stringify(report, null, 2)}`)
 
-process.exit(report.overall === 'FAIL' ? 1 : 0)
+if (environmentError) {
+  say('')
+  say(yellow(`环境警告：${environmentError}`))
+}
+
+process.exit(report.overall === 'FAIL' ? 1 : environmentError ? 2 : 0)

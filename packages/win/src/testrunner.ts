@@ -231,6 +231,8 @@ export const OFFLINE_SUITES = [
   { id: 'r25-remove-cleanup', script: 'tests/r25-remove-cleanup.ts', title: 'R25 plugin remove 残留清理工具（dry-run/apply/幂等/护栏/越界拒绝；65 断言）' },
   // R26 逐项修复（第五批）：R13 32 位注册表视图暂存化（/reg:32 写/删进 overlay、apply 落 32 视图）。
   { id: 'r26-wow64-registry', script: 'tests/r26-wow64-registry.ts', title: 'R26 32 位注册表视图暂存（合成路径 + WAL view + apply /reg:32；41 断言）' },
+  // R27 收尾：边缘路径（>4095 显式 fail-closed 归因、≤3000 支持、跨卷 rename 无半态、远端 SMB 环境缺口）。
+  { id: 'r27-edge-paths', script: 'tests/r27-edge-paths.ts', title: 'R27 边缘路径（>4095 fail-closed 归因/≤3000 支持/跨卷 rename copy-up/远端 SMB 缺口；15 断言）' },
 ]
 
 /** 需要未受限会话的套件 */
@@ -495,7 +497,9 @@ export function summarise(suites, audit) {
 
 /**
  * 运行全部套件。
- * @param {{workspace?:string, outDir?:string, skipAudit?:boolean, only?:string[], timeout?:number, onEvent?:(e:object)=>void}} options
+ * @param {{workspace?:string, outDir?:string, skipAudit?:boolean, skipSandbox?:boolean, only?:string[], timeout?:number, onEvent?:(e:object)=>void}} options
+ *   `skipSandbox`：R27 起显式跳过**全部 sandbox 段套件**（不是只跳 audit 探针）。autotest 在
+ *   plain node（DSH 运行时 ACL 后端不可加载）时置 true，避免 3 个环境假红污染退出码。
  * @returns {Promise<object>} 报告对象（与 CLI 的 test-report.json 同构）
  */
 export async function runAll(options = {}) {
@@ -510,8 +514,8 @@ export async function runAll(options = {}) {
 
   const selected = (list) => (wanted ? list.filter((s) => wanted.has(s.id)) : list)
   const offline = selected(OFFLINE_SUITES)
-  const sandbox = selected(SANDBOX_SUITES)
-  const wantAudit = !options.skipAudit && (!wanted || wanted.has('audit'))
+  const sandbox = options.skipSandbox === true ? [] : selected(SANDBOX_SUITES)
+  const wantAudit = !options.skipAudit && options.skipSandbox !== true && (!wanted || wanted.has('audit'))
 
   for (const suite of offline) {
     options.onEvent?.({ type: 'suite-begin', id: suite.id, title: suite.title })

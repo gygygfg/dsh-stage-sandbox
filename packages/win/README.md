@@ -30,14 +30,18 @@ dsh plugin --profile web add github:gygygfg/dsh-winstage-sandbox   # 或直接�
 ## 1. 三条命令
 
 ```powershell
-.\verify.cmd                   # 33 个离线套件关口（轻量、无报告；清单 = OFFLINE_SUITES）
-.\autotest.cmd                 # 全量：离线 33 + 沙箱 4 + audit，写出 .t/test-report.json
+.\verify.cmd                   # 53 个离线套件关口（轻量、无报告；清单 = OFFLINE_SUITES）
+.\autotest.cmd                 # 全量：离线 53 + 沙箱 4 + audit，写出 .t/test-report.json
 .\autotest.cmd --skip-audit    # 只跑离线确定性测试（不需要未受限会话）
 .\diag.cmd                     # 绑定表契约 + 完整 init（需未受限会话）
 node tools\ebk-sandbox-test.ts # Windows E2E 测试台（需 docker + KVM，见 e2e/README.md）
 ```
 
 **退出码**：`0` 无失败（含因机制边界跳过 audit）｜`1` 存在失败｜`2` 环境错误。
+
+**运行时候选（R27 起显式化）**：sandbox 段需要 **DSH-as-node**（`ELECTRON_RUN_AS_NODE=1 <Harness.exe> autotest.ts`），
+因为 ACL 后端 `@deepseek-ai/dsh-sandbox-windows-acl` 只在 Harness 的 node_modules 里。plain node 下 `autotest` 会
+**显式跳过 sandbox 段**（打印跳过清单与原因）、离线照跑、退出码 **2（环境错误）** —— 不再产生 3 个"ACL 后端加载不到"的假红。
 
 **三种总判定**：`PASS` ｜ `PASS-OFFLINE-ONLY`（离线全通过，audit 因当前会话受限而跳过 ——
 是机制边界不是失败，报告中写入 `guaranteesNotProvided`）｜`FAIL`。
