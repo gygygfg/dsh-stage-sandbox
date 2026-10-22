@@ -36,6 +36,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } 
 import { spawnSync } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { skipSuiteWhenAppControlBlocks } from './_app-control.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const REPO = join(HERE, '..')
@@ -64,6 +65,9 @@ function section(t) {
   W('')
   W(`=== ${t} ===`)
 }
+// 环境闸门（2026-10-22）：Smart App Control 强制态会拒绝现场编译的探针 exe（Win32 4551）。
+if (skipSuiteWhenAppControlBlocks(W, 'r27-edge-paths')) process.exit(0)
+
 rmSync(SCRATCH, { recursive: true, force: true })
 mkdirSync(SCRATCH, { recursive: true })
 

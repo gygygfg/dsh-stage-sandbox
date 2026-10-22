@@ -104,6 +104,10 @@ import { pathToFileURL } from 'node:url'
 import {
   WindowsStageExecutor,
   resolveDshModuleRoot,
+  // ── R44：写屏障分类（唯一口径）—— lane 产物里如实报出"内核 or 用户态" ─────────
+  writeBarrierFor,
+  // ── R45：T1S（受限令牌 + shim）是**已生效**档位，不是"降级" ──────────────────
+  T1S_LAUNCH_MODE,
   // ── WP6/WP7′：错误语义分层 + 限制即失败（同一口径，不另造第二套判定）──────────
   //   `classifyFailureSemantics` / `transparencyViolations` 是**纯函数**，
   //   本文件与 `_r3/wp6-test.ts` 复用同一份实现 ⇒ 两处口径不会漂移。
@@ -260,6 +264,15 @@ export function summarizeLane(lane) {
   const off = record.winStageEnabled === false
   const fallback = classifyLaneFallback(record.fallbackReason)
   const tier = record.tierEffective ?? null
+  const barrier = record.writeBarrier ?? writeBarrierFor(reported, record.tierEffective)
+  const boundaryText =
+    barrier === 'kernel-restricted-token'
+      ? '内核写屏障（WRITE_RESTRICTED 受限令牌）'
+      : barrier === 'kernel-appcontainer'
+        ? '内核写屏障（AppContainer 包 SID）'
+        : barrier === 'user-mode-shim'
+          ? '用户态 IAT 钩子（**不是内核边界**）'
+          : '无写屏障'
   const base = {
     /**
      * 对外**原样**透出执行器报出的通道名（`'unknown'` 也如实显示）；
@@ -268,6 +281,14 @@ export function summarizeLane(lane) {
     launchMode: reported ?? null,
     tierEffective: tier,
     requestedTier: record.requestedTier ?? null,
+    /**
+     * ★ R44：写边界分类。`kernel-*` = 受限令牌 / AppContainer 的 OS 强制写拒绝；
+     * `user-mode-shim` = 仅 IAT 钩子（TS）；`none` = 没有屏障。
+     * 这不是"是否启用沙箱"的开关，而是"当前边界由谁提供"的事实字段。
+     */
+    writeBarrier: barrier,
+    /** 与 `writeBarrier` 同源的人类可读文案（状态行/面板直接用，避免各处重写一份） */
+    boundaryText,
     winStageEnabled: !off,
     fallback: fallback.code,
     fallbackText: fallback.text,
@@ -284,12 +305,19 @@ export function summarizeLane(lane) {
           : '沙箱档位未知：本会话还没有记录到任何一次档位判定（没有命令经过执行器）。下一步：跑一条 pwsh 命令后再看这里。',
     }
   }
-  if (launchMode === 'shim') {
+  if (launchMode === 'shim' || launchMode === T1S_LAUNCH_MODE) {
+    const t1s = launchMode === T1S_LAUNCH_MODE
     return {
       ...base,
       status: 'active',
       degraded: false,
-      conclusion: `沙箱已生效：命令走透明垫片（去令牌化）通道（tier=${tier ?? '?'}），文件与注册表写入进暂存。`,
+      conclusion: t1s
+        ? `沙箱已生效：T1S（受限令牌 + 透明垫片；tier=${tier ?? '?'}），文件与注册表写入进暂存，WAL 可归因；` +
+          `写边界=${boundaryText}（raw syscall 仍有「未 hook 面」残余，但真实盘直写被令牌兜底）。`
+        : `沙箱已生效：命令走透明垫片（去令牌化）通道（tier=${tier ?? '?'}），文件与注册表写入进暂存；` +
+          `写边界=${boundaryText}。` +
+          'TS 的写面由用户态 IAT 钩子强制，raw syscall / 未 hook 面不受约束；' +
+          '需要内核写屏障请用 tier=\'T1S\'（受限令牌+shim）或 \'T0\'（AppContainer）。',
     }
   }
   const cause =
@@ -322,7 +350,7 @@ export function summarizeLane(lane) {
     degraded: true,
     conclusion:
       `沙箱未生效：命令在${laneText}（launchMode=${launchMode}, tier=${tier ?? '?'}）执行，` +
-      '写入只剩内核硬拒、子进程 stdio 可能被掐断、文件产出不进暂存；' +
+      `写边界=${boundaryText}；写入只剩内核硬拒、子进程 stdio 可能被掐断、文件产出不进暂存；` +
       `${remedy}${cause}`,
   }
 }
@@ -2085,11 +2113,14 @@ export function createWinStageShellExecutor(options = {}) {
         const lane = {
           launchMode: effectiveLane,
           tierEffective: executor.tierEffective ?? null,
+          // ★ R44：本档位真正的写边界（kernel-restricted-token / kernel-appcontainer /
+          //   user-mode-shim / none）。与执行器闸门同一份纯函数，不在插件侧重算另一套。
+          writeBarrier: writeBarrierFor(effectiveLane, executor.tierEffective),
           fallbackReason: executor.fallbackReason ?? null,
           requestedTier: this.tier,
           winStageEnabled: laneEnabled,
           fallbackClass: classifyLaneFallback(executor.fallbackReason).code,
-          degraded: effectiveLane !== 'shim',
+          degraded: effectiveLane !== 'shim' && effectiveLane !== T1S_LAUNCH_MODE,
           at: new Date().toISOString(),
           /**
            * ── R14 修复 · D5-N2/N5：网络姿态**进 lane 产物** ──────────────────────

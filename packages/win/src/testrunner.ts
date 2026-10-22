@@ -245,6 +245,12 @@ export const OFFLINE_SUITES = [
   // R41：外壳启动噪声过滤（run-capture/shell-executor/CLI 同一判据）+ trust 面板不增加失根计数。
   { id: 'ux-r41-shell-noise', script: 'tests/ux-r41-shell-noise.ts', title: 'R41 外壳启动噪声过滤（PowerShell StartupProfileData/__PSScriptPolicyTest_* 不进候选/审计；36 断言）' },
   { id: 'ux-r41-trust-loss', script: 'tests/ux-r41-trust-loss.ts', title: 'R41 trust 面板只读不记账（recordLoss:false 不增加失根次数；3 断言）' },
+  // R44：对标 NeoAI 第 6 条不变量——"只读豁免"从静态文本判定改为内核/运行时写屏障判定。
+  { id: 'r44-write-barrier', script: 'tests/r44-write-barrier.ts', title: 'R44 写屏障判定（文本只读不得作为边界：T1/T1S/T0 内核屏障放行、TS/无屏障拒绝、lane 可见；41 断言）' },
+  // R45：显式内核边界档（tier=T1S）+ 默认 TS 的边界诚实可见性（T1S 不再误报降级）。
+  { id: 'r45-kernel-lane', script: 'tests/r45-kernel-lane.ts', title: 'R45 显式内核边界档（tier=T1S 探测/装配 fail-closed、TS 边界文案、T1S 不误报降级；34 断言）' },
+  // R46：已保存撤销（对标 NeoAI review undo；文件面 + 冲突整批零写 + 记录 checksum）。
+  { id: 'r46-undo', script: 'tests/r46-undo.ts', title: 'R46 已保存撤销（apply 后 undo/冲突零写/新建删除/删除恢复/幂等/损坏 fail-closed；31 断言）' },
 ]
 
 /** 需要未受限会话的套件 */

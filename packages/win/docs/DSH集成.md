@@ -1091,5 +1091,7 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
   要恢复默认态，把开关再打开或删掉覆盖层里的那一项即可。
 - L6 只核对**配置装配**，不代替端到端：真正的判据是 20.2 那两条（工具写入不进真实磁盘 +
   `review.json` 出现待审）。
-- 本套件未接入 `autotest.cmd` 的 `OFFLINE_SUITES`（与 `appcontainer-runtime.mjs` 的处境相同，
-  属已知缺口，见 README §8.2 的口径说明）。
+- 旧版“本套件未接入 `autotest.cmd` 的 `OFFLINE_SUITES`（与 `appcontainer-runtime.mjs` 的处境相同）”
+  是历史口径，已过期：`appcontainer-runtime` 现已在 `src/testrunner.ts::OFFLINE_SUITES` 与
+  `verify.cmd` 中登记；本套件的登记状态以这两处 + `tests/suite-wiring.ts` 的显式名单为准
+  （该治理套件会把“未登记且未列名”变成硬失败）。

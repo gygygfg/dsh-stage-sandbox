@@ -26,6 +26,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wri
 import { spawnSync } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { skipSuiteWhenAppControlBlocks } from './_app-control.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const REPO = join(HERE, '..')
@@ -52,6 +53,9 @@ function section(title) {
   W('')
   W(`=== ${title} ===`)
 }
+
+// 环境闸门（2026-10-22）：Smart App Control 强制态会拒绝已注入进程/现场探针（Win32 4551）。
+if (skipSuiteWhenAppControlBlocks(W, 'r19-shim-boundaries')) process.exit(0)
 
 if (process.platform !== 'win32') skipAll('requires-win32')
 for (const [label, path] of [['dll', DLL], ['injector', INJECTOR]]) {

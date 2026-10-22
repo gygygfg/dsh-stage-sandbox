@@ -36,6 +36,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { skipSuiteWhenAppControlBlocks } from './_app-control.ts'
 
 import {
   OVERLAY_JOURNAL_NAME,
@@ -87,6 +88,10 @@ function section(title) {
   W('')
   W(`=== ${title} ===`)
 }
+
+// 环境闸门（2026-10-22）：本套件把 injector/DLL **复制到 %TEMP%** 再跑；SAC 强制态会拒绝
+// 这个新写入的 exe（Win32 4551），从而无法测量真实 hive 的变化。
+if (skipSuiteWhenAppControlBlocks(W, 'registry-unstaged-wow64')) process.exit(0)
 
 // ───────────────────────── 产物与启动器 ─────────────────────────
 //

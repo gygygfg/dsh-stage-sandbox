@@ -577,10 +577,13 @@ async function liveSection() {
       /* 2026-10-08 夹具定因（见 git 历史（历史归档已清理） §B4）：旧夹具用的是
        * `cmd /c echo MUST-NOT-RUN`（**纯只读**），而闸门**刻意**放行"正向判定为只读"的
        * 命令（BUG-4：拒绝面只覆盖有风险的那一条命令，`assertStagingWriteEnforceable` 的
-       * ② 分支 `allowed-read-only-bypass`）。实测
-       * `classifyCommandRisk('cmd.exe',['/c','echo','MUST-NOT-RUN']) === 'read-only'`
-       * ⇒ 旧断言把"设计上的豁免"读成了"未 fail-closed"（夹具假红）。
-       * 现在两条都断言：写类命令必须被拒；只读命令必须被**放行但记账**。 */
+       * ② 分支）。
+       *
+       * ★ R44 起：只读命令的放行条件不再是"文本判只读"，而是"本档有**内核写屏障**"。
+       *   T1 = `restricted-token`（WRITE_RESTRICTED 受限令牌）⇒ 内核屏障在场，因此
+       *   只读命令仍应放行；动作名改为 `allowed-kernel-write-barrier`，旧名
+       *   `allowed-read-only-bypass` 已删除（NeoAI 第 6 条不变量：文本不得作为边界）。
+       *   现在两条都断言：写类命令必须被拒；只读命令必须被**放行但记账**。 */
       const writeProbe = join(staged, 'b4-must-not-run.txt')
       let refusal
       try {
@@ -608,10 +611,10 @@ async function liveSection() {
         readOnlyError = error
       }
       check(
-        'B4c 正向只读命令被放行（BUG-4 只读豁免）但闸门记了账',
+        'B4c 正向只读命令被放行（R44：内核写屏障）但闸门记了账',
         readOnlyError === undefined &&
           readOnlyResult?.exitCode === 0 &&
-          (executor.stagingWriteGate?.trips ?? []).some((t) => t.action === 'allowed-read-only-bypass'),
+          (executor.stagingWriteGate?.trips ?? []).some((t) => t.action === 'allowed-kernel-write-barrier'),
         readOnlyError
           ? `unexpected refusal ${readOnlyError.code}`
           : `exitCode=${readOnlyResult?.exitCode} trips=${JSON.stringify((executor.stagingWriteGate?.trips ?? []).map((t) => t.action))}`,

@@ -544,6 +544,40 @@ dism /online /get-featureinfo /featurename:Containers-DisposableClientVM
 > 系统提示里的根仍可能是真实路径——这不是 shell 层能修好的。要让**会话根本身**=暂存副本，
 > 必须在**创建会话时**把 cwd 指向暂存树（session launcher / workspace 集成），并把真实
 > 工作区作为 apply 源；这是后续独立改动，不在本轮实现。
+>
+> **R44 补注（2026-10-22，文本判定不得作为边界）**：对标 NeoAI 当前 HEAD（`52c8de4f`）
+> 的第 6 条核心不变量。此前 `assertStagingWriteEnforceable()` 在暂存写自检未通过时，只要
+> `classifyCommandRisk()` 判“只读”就 `bypassed:'read-only'` 放行 —— 等于让字符串判定成为
+> 安全边界；TS（纯用户态 IAT shim）与未初始化档都没有内核写屏障，文本一旦漏判就会真实
+> 执行且不暂存。本轮改为**结构性写屏障判定**：只有受限令牌（T1/T1S）或 AppContainer（T0）
+> 在场时，文本只读命令才可继续；TS / 无屏障一律 `STAGING_WRITE_UNVERIFIED_NO_BARRIER`
+> fail-closed。`writeBarrier`（`kernel-restricted-token` / `kernel-appcontainer` /
+> `user-mode-shim` / `none`）同时写进闸门决策、`initReport`、`run()` 结果与
+> `sandbox-lane.json`，用户可直接看到“此刻的边界由谁提供”。守卫：
+> `tests/r44-write-barrier.ts`（38 断言，含源码不变量与变异体检查）。
+> **残余不变**：默认 `tier='auto'` 仍可能落到 TS（用户态边界，见 README §3 的诚实口径）；
+> 本轮不改默认值，只把事实可见化。
+>
+> **R45 补注（2026-10-22，显式内核边界档）**：`tier:'T1S'` 成为显式入口（不再需要
+> `WINSTAGE_T1_SHIM=1` + `tier:'T1'` 的组合）：受限令牌（WRITE_RESTRICTED + Low IL + ACL）
+> 提供**内核写屏障**，shim 提供暂存/WAL 归因；shim 不可用/未探测 ⇒ `T1S_UNAVAILABLE`
+> fail-closed，绝不静默降回 T1。同时修两处**状态误报**：`summarizeLane()` 此前只把
+> `launchMode==='shim'` 判为 active，T1S（`shim+restricted-token`）会被报成“沙箱未生效/已降级”；
+> lane 产物的 `degraded` 也把 T1S 算成降级。现在 T1S 报 active + `writeBarrier=kernel-*`；
+> TS 的结论明确写出“写边界=用户态 IAT 钩子（**不是内核边界**）”并给出升级到 T1S/T0 的路径。
+> 守卫：`tests/r45-kernel-lane.ts`（34 断言）。
+> **残余不变**：默认 `tier='auto'` 仍是 TS（用户态边界）；要内核边界必须显式 `tier:'T1S'`
+> 或 `T0`，且 T1S 依赖 shim 产物齐备（缺件时 fail-closed，而不是降级直跑）。
+>
+> **R46 补注（2026-10-22，已保存撤销）**：对标 NeoAI review 的 undo 快照。此前
+> `applyCandidate` 成功后立即删除 `apply.journal`，面板文案写死 “cannot be undone”，
+> 误点批准只能手工回退且原内容已被覆盖。现在成功写入（且非回滚失败）后把**本批实际写入**的
+> 回滚快照持久化到 `<store>/undo/<id>.json`（sha256 checksum，受同一 64 MiB 快照预算约束）；
+> `/winstage undo [--list] [id]` 复用 apply 的并发守卫：任一文件在保存后被外部改过 ⇒
+> `conflict` + **整批零写**，绝不覆盖；撤销成功才归档到 `undo/undone/`。
+> **边界（如实声明）**：只覆盖**文件面**；注册表候选不在这条链上（`/winstage undo` 文案里
+> 明写）。记录写失败**不**回滚已成功的 apply，只报 `undo.available=false` + 原因。
+> 守卫：`tests/r46-undo.ts`（31 断言）。
 
 ---
 

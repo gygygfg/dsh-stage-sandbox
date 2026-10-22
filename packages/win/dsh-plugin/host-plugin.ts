@@ -1322,6 +1322,72 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
       return { kind: 'success', text: formatList(service) }
     },
     /**
+     * `/winstage undo [--list] [recordId]` —— **R46：撤销最近一次已保存的 apply**。
+     *
+     * 只覆盖文件面（注册表候选不在这条链上，如实写在文案里）。撤销前做整批并发预检：
+     * 任一文件在保存后被外部改过 ⇒ `conflict` + **零写**；全部成功才把记录归档。
+     */
+    undo({ args, service }) {
+      const { flags, names, unknown } = splitCommandFlags(args, new Set(['--list']))
+      if (unknown.length > 0) return { kind: 'error', text: `undo 不接受开关：${unknown.join(' ')}` }
+      if (flags.has('--list')) {
+        const records = service.workspace.listUndoable()
+        if (records.length === 0) {
+          return { kind: 'success', text: '没有可撤销的已保存记录（撤销只覆盖文件面；注册表候选不在此列）。' }
+        }
+        const lines = [`可撤销的已保存记录  ${records.length} 份（新→旧）：`]
+        for (const record of records) {
+          lines.push(
+            record.ok
+              ? `  · ${record.id}  ${record.createdAt ?? '?'}  文件 ${record.files ?? '?'} 个  candidate=${record.candidateId ?? '?'}`
+              : `  · ${record.id}  ⚠ 记录损坏（${record.error}）—— 不会用于撤销`,
+          )
+        }
+        lines.push('用法：/winstage undo [recordId]（省略 id = 最近一份）')
+        return { kind: 'success', text: lines.join('\n') }
+      }
+      const requested = names.length > 0 ? names[0] : undefined
+      const result = service.workspace.undoApply(requested, {})
+      const status = result?.status
+      if (status === 'undone') {
+        const lines = [`已撤销保存 ${result.id}（candidate=${result.candidateId ?? '?'}）：恢复 ${result.restored.length} 个文件。`]
+        for (const item of result.restored) lines.push(`  ↺ ${item.path}（${item.action}）`)
+        lines.push('真实工作区已回到保存前；该记录已归档（不再出现在 --list 的可撤销项里）。')
+        return { kind: 'success', text: lines.join('\n') }
+      }
+      if (status === 'already-undone') {
+        return { kind: 'success', text: `无需撤销 ${result.id}：这些文件已经是保存前状态（幂等）。` }
+      }
+      if (status === 'conflict') {
+        const lines = [
+          `拒绝撤销 ${result.id}：有 ${result.conflicts.length} 个文件在保存后被改过，**一个字节都没有写**。`,
+          '冲突明细：',
+        ]
+        for (const conflict of result.conflicts) lines.push(`  · ${conflict.path}: ${conflict.code} — ${conflict.message}`)
+        lines.push('下一步：先备份/处理这些文件，或手工恢复；本功能绝不覆盖保存后的新改动。')
+        return { kind: 'error', text: lines.join('\n') }
+      }
+      if (status === 'partial') {
+        const lines = [`撤销 ${result.id} 只完成一部分（${result.restored.length} 成功 / ${result.failed.length} 失败）：`]
+        for (const item of result.failed) lines.push(`  · ${item.path}: ${item.code} — ${item.message}`)
+        lines.push('记录保留在可撤销列表里；失败项未恢复，请按上面原因处理。')
+        return { kind: 'error', text: lines.join('\n') }
+      }
+      if (status === 'locked') {
+        return { kind: 'error', text: `撤销暂时不可用：另一笔应用/撤销正在进行（${result.failed?.[0]?.code ?? 'APPLY_LOCK_BUSY'}），请稍后重试。` }
+      }
+      if (status === 'not-found') {
+        return { kind: 'error', text: `找不到可撤销记录 ${requested ?? '（最近一份）'}；用 /winstage undo --list 查看。` }
+      }
+      if (status === 'corrupt') {
+        return { kind: 'error', text: `撤销记录损坏（${result.error}）；拒绝用不可信快照覆盖真实文件。` }
+      }
+      if (status === 'session-mismatch') {
+        return { kind: 'error', text: `撤销记录属于另一个会话（record=${result.recordSession}，current=${result.currentSession}），拒绝跨会话恢复。` }
+      }
+      return { kind: 'error', text: `撤销失败：未知状态 ${status ?? '(none)'}` }
+    },
+    /**
      * `/winstage status`（含 `winstage-status`）：暂存清单 + **WP3 可信性状态卡**。
      *
      * 状态卡把六个面合并成一张（档位 / 首次掉档 / 失根 / 未结算审批 / 未确认写入 /
@@ -1546,7 +1612,7 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
   // 命令规格：`sub === null` 表示伞形命令（第一个词是子命令），
   // 其余命令把整个 rawInput 当作参数列表。
   const SPECS = [
-    { name: 'winstage', sub: null, description: '查看 WinStage 暂存待审文件（/winstage list|diff|approve|reject|rebase|refresh）' },
+    { name: 'winstage', sub: null, description: '查看 WinStage 暂存待审文件（/winstage list|diff|approve|reject|rebase|refresh|undo）' },
     { name: 'winstage-status', sub: 'status', description: 'WinStage 暂存：查看待审清单' },
     { name: 'winstage-refresh', sub: 'refresh', description: 'WinStage 暂存：重新发布审阅快照' },
     { name: 'winstage-rebase', sub: 'rebase', description: 'WinStage 暂存：以真实文件为基线重新暂存（基线过期时）' },
@@ -1592,7 +1658,7 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
             if (!handler) {
               return {
                 kind: 'error',
-                text: `未知子命令 "${sub}"；可用：list、status、diff、approve、reject、rebase、refresh`,
+                text: `未知子命令 "${sub}"；可用：list、status、diff、approve、reject、rebase、refresh、undo`,
               }
             }
             return handler({ args, invocation, raw, service })

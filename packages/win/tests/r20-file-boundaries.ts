@@ -46,6 +46,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSync, w
 import { spawnSync } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { skipSuiteWhenAppControlBlocks } from './_app-control.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const REPO = join(HERE, '..')
@@ -91,6 +92,9 @@ function walkFiles(dir) {
   walk(dir)
   return out
 }
+
+// 环境闸门（2026-10-22）：Smart App Control 强制态会拒绝注入器启动的探针进程（Win32 4551）。
+if (skipSuiteWhenAppControlBlocks(W, 'r20-file-boundaries')) process.exit(0)
 function fileHas(path, needle) {
   try {
     return readFileSync(path, 'utf8').includes(needle)

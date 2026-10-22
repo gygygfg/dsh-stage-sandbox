@@ -56,6 +56,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wri
 import { spawnSync } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { skipSuiteWhenAppControlBlocks } from './_app-control.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const REPO = join(HERE, '..')
@@ -70,6 +71,9 @@ const W = (text) => process.stdout.write(`${text}\n`)
 let assertions = 0
 let failures = 0
 let skips = 0
+
+// 环境闸门（2026-10-22）：Smart App Control 强制态会拒绝 C# 现场编译出的 exe（Win32 4551）。
+if (skipSuiteWhenAppControlBlocks(W, 'r20-managed-carrier')) process.exit(0)
 
 // S11「三件套同版」判据的运行时读数（分别由 S2 / S10 填充；csc 缺失时保持 null）。
 let anyCpuRun = null

@@ -6,7 +6,7 @@
 真实工作区始终不被写入；沙箱内产生的变化冻结为**候选**，用户批准后才**逐文件**提交。
 
 > **口径以代码为准**：测试套件的唯一权威是 `src/testrunner.ts`
-> （现为 **58 个离线套件 + 4 个沙箱套件 + 1 段 `audit`**），全部以 `.ts` 为准，
+> （现为 **61 个离线套件 + 4 个沙箱套件 + 1 段 `audit`**），全部以 `.ts` 为准，
 > 遗留的 `.mjs` 已全部删除。完整入口见 [`docs/测试套件总览.md`](docs/测试套件总览.md)。
 
 ---
@@ -48,8 +48,8 @@ bundle patch（`dsh-plugin/cordis.patch.yml`）里的 `workspaceRoot` 现在是*
 ## 1. 三条命令
 
 ```powershell
-.\verify.cmd                   # 58 个离线套件关口（轻量、无报告；清单 = OFFLINE_SUITES）
-.\autotest.cmd                 # 全量：离线 58 + 沙箱 4 + audit，写出 .t/test-report.json
+.\verify.cmd                   # 61 个离线套件关口（轻量、无报告；清单 = OFFLINE_SUITES）
+.\autotest.cmd                 # 全量：离线 61 + 沙箱 4 + audit，写出 .t/test-report.json
 .\autotest.cmd --skip-audit    # 只跑离线确定性测试（不需要未受限会话）
 .\diag.cmd                     # 绑定表契约 + 完整 init（需未受限会话）
 node tools\ebk-sandbox-test.ts # Windows E2E 测试台（需 docker + KVM，见 e2e/README.md）
@@ -131,7 +131,7 @@ node tools\ebk-sandbox-test.ts # Windows E2E 测试台（需 docker + KVM，见 
 | `shim/` | C 注入层源码（`src`/`include`/`injector`/`probe`/`audit`）；构建产物在 `shim/out/`（不入库） |
 | `patches/` | DSH 宿主的可重放补丁包（P1/P2/P3，**默认不应用**）+ 原样副本 `pristine/` |
 | `tools/` | 构建/基线封印/补丁工具/shim 闭环节（受源码封印，见 §5） |
-| `tests/` | 离线关口 58 套件 + 沙箱 4 套件 + 元测试与治理套件 |
+| `tests/` | 离线关口 61 套件 + 沙箱 4 套件 + 元测试与治理套件 |
 | `e2e/` | Windows 实测台（docker + KVM + Windows guest）；`e2e/domains/` 是一次性归档 |
 | `docs/` | 设计与规范（历史轮次报告已在 R33 后清理，git 历史可追溯；见 `docs/README.md`） |
 
@@ -141,12 +141,21 @@ node tools\ebk-sandbox-test.ts # Windows E2E 测试台（需 docker + KVM，见 
 
 | 档位 | 机制 | 读取面 | 网络面 | 实现状态 |
 |---|---|---|---|---|
-| `T0` appcontainer | AppContainer 能力令牌 + Job + Low IL + ACL | ✅ 收敛 | ✅ 默认阻断 | 隔离已 `[实测]` 生效（`proven=true`）**且已接进执行器**；但默认档位是 `T1`，只有显式 `tier:'T0'` 才走 T0 |
-| `T1` restricted-token | WRITE_RESTRICTED + Job + Low IL + ACL | ❌ | ❌ | ✅ **已实现并实测**（默认档位） |
+| `T0` appcontainer | AppContainer 能力令牌 + Job + Low IL + ACL | ✅ 收敛 | ✅ 默认阻断 | 隔离已 `[实测]` 生效（`proven=true`）**且已接进执行器**；只有显式 `tier:'T0'` 才走 T0 |
+| `T1` restricted-token | WRITE_RESTRICTED + Job + Low IL + ACL | ❌ | ❌ | ✅ **已实现并实测**（**库**默认档位） |
+| `T1S` shim+restricted-token | 受限令牌 + shim（WAL 归因） | 仅 shim mask | ❌ | ✅ 显式 opt-in（`WINSTAGE_T1_SHIM=1` + T1，**或直接 `tier:'T1S'`**）；装配失败 `T1S_UNAVAILABLE`，不静默降级；写边界=**内核** |
+| `TS` shim | 普通令牌 + 用户态 IAT 钩子 | 仅 shim mask | ❌ | ✅ 可用；**用户态边界，不是内核屏障**（raw syscall / 未 hook 面可绕过） |
 | `T2` acl-only | 仅 ACL 写边界 | ❌ | ❌ | ✅ 已实现（降级路径） |
 | `T3` none | 无可用原语 | — | — | ✅ **拒绝执行**（fail-closed） |
 
 档位由 `selectTier()` 依据**真实 Win32 调用结果**选择，不据文档推断。
+
+> **默认 lane 的诚实口径（R44 核对）**：**库**默认 `T1`；但 **DSH 插件**的 `tier` 默认
+> `'auto'`（`dsh-plugin/shell-executor.ts`）——`auto` 在透明垫片探测通过时选 `TS`
+> （普通令牌 + 用户态 IAT shim），失败才回退 `T1`。因此“默认档位是 T1”只对库成立，
+> 对插件不成立。执行器的 `initReport` / `run()` 结果与 `sandbox-lane.json` 现在如实报出
+> `writeBarrier`：`kernel-restricted-token` / `kernel-appcontainer` / `user-mode-shim` /
+> `none`——判断“此刻的边界由谁提供”看这个字段，不要只看 tier。
 
 | Windows 原语 | 状态 |
 |---|---|
@@ -160,7 +169,7 @@ node tools\ebk-sandbox-test.ts # Windows E2E 测试台（需 docker + KVM，见 
 
 ## 4. 已知残余边界（必须与任何"通过"一起读）
 
-完整清单见 [`docs/Windows功能开启清单.md`](docs/Windows功能开启清单.md)（R1–R17、R42、R43）。最关键几条：
+完整清单见 [`docs/Windows功能开启清单.md`](docs/Windows功能开启清单.md)（表内 R1–R20 + 补注 R42/R43/R44）。最关键几条：
 
 - **R1 读取面不收敛**：本后端限制写/删，**不限制读**。读取收敛只能靠 AppContainer（默认档位是 `T1`）或工具层硬拒绝清单。
 - **R2 网络面不收敛**：网络策略层存在且 OFFLINE fail-closed，但本机未安装真实过滤器 ⇒ 沙箱内仍可开 socket。
@@ -169,6 +178,9 @@ node tools\ebk-sandbox-test.ts # Windows E2E 测试台（需 docker + KVM，见 
 - **R42-GIT（日常可用性）**：`.git`/`.hg`/`.svn`/`node_modules`/`.venv` 以 **junction 直连真实盘**（不复制内容）—— 否则沙箱内 `git status` 报 `fatal: not a git repository`、node/pnpm/测试解析不到依赖。代价：沙箱内 `git add/commit`、`pnpm install` 会**直接写真实** `.git`/`node_modules`/`.venv`，不经过暂存/候选/审批；用户内容（源码、数据）仍走暂存。命令 cwd 仍是工作副本路径（`Get-Location` 可见），这是透明暂存的残余。另：沙箱 shell 通过 `GIT_CONFIG_PARAMETERS` 注入 `core.excludesFile`，把 `fs/`、`wo/`、`reg/`、`.winstage-*`、`shim.log` 等**沙箱内部条目**从 git 视图排除，`git add -A` 不会把它们提交进用户仓库。
 - **R42-DNS（网络设备放行）**：shim 的 `NtCreateFile` 对非文件系统设备命名空间（`\Device\Afd`/`Nsi`/`KsecDD`/`CNG`/`Tcp`/`Udp`/`Ip`/`RawIp`/`RasAcd`）放行；否则 `getaddrinfo`、socket、TLS 会在沙箱内失败。磁盘/卷/文件系统设备仍 fail-closed，普通文件路径的暂存/遮蔽规则不变。
 - **R43（会话根 vs 沙盒根）**：WinStage 的 shell/fs 工具根是**暂存工作副本**（`store.stagedDir`）：命令的 cwd、工具 workdir、`Get-Location`、`pwd`、`os.getcwd()` 都指向同一个暂存根，不再做"显示真实路径"的虚拟化。**但 DSH 会话 header 的 `cwd` 在会话创建时冻结为真实工作区**（`dsh-workspace` 用 canonical cwd 做 workspace 归属校验），插件无法事后改写；因此会话标题/系统提示里的根仍可能是真实路径。要让**会话根本身**就是暂存副本，必须在创建会话时把 cwd 指向暂存树（session launcher / workspace 集成），这是后续独立改动，不是 shell 层能完成的。
+- **R44（文本判定不得作为边界）**：对标 NeoAI 第 6 条核心不变量。暂存写自检未通过时，旧实现只要文本判“只读”就放行（`bypassed:'read-only'`）——TS（用户态 shim）或未初始化档没有内核写屏障，文本漏判即真实执行且不暂存。本轮改为：只有受限令牌（T1/T1S）或 AppContainer（T0）在场时，文本只读命令才可继续；否则 `STAGING_WRITE_UNVERIFIED_NO_BARRIER` fail-closed。`writeBarrier` 已进入闸门决策、`initReport`、`run()` 与 `sandbox-lane.json`。守卫：`tests/r44-write-barrier.ts`。**默认 `tier='auto'` 仍可能落到 TS（用户态边界）**，本轮只把事实可见化，未改默认值。
+- **R45（显式内核边界档 + 状态诚实性）**：`tier:'T1S'` 成为显式入口（受限令牌 + shim：内核写屏障 + 暂存/WAL），shim 不可用/未探测即 `T1S_UNAVAILABLE` fail-closed；不再需要 `WINSTAGE_T1_SHIM=1` 与 `tier:'T1'` 的组合。修复两处状态误报：`summarizeLane()` 之前把 T1S 报成“未生效/已降级”，lane 产物 `degraded` 也把 T1S 算成降级；TS 结论现在明确写“写边界=用户态 IAT 钩子（不是内核边界）”并给出 T1S/T0 升级路径。守卫：`tests/r45-kernel-lane.ts`。**默认仍是 TS**：要内核边界必须显式 `T1S`/`T0`。
+- **R46（已保存撤销）**：apply 成功后把本批实际写入的回滚快照持久化到 `<store>/undo/`（sha256 checksum），`/winstage undo [--list] [id]` 可撤销最近一次保存；撤销前整批并发预检，任一文件保存后被外部改过 ⇒ `conflict` + **零写**，绝不覆盖；成功后记录归档到 `undo/undone/`。**只覆盖文件面**（注册表候选不在此列）；记录写失败只报 `undo.available=false`，不回滚已成功的 apply。守卫：`tests/r46-undo.ts`。
 
 ---
 
@@ -195,7 +207,7 @@ node tools\ebk-sandbox-test.ts # Windows E2E 测试台（需 docker + KVM，见 
 把本沙箱接进 DSH，使 **DSH 自己的 `write`/`edit` 工具也落暂存树**，并在输入框上方给出
 「待审文件 + 逐文件 diff + 批准/拒绝」的悬浮窗。装配与数据通路、实测证据、已知崩溃风险
 （在线切换该 bundle 会让宿主进程退出）见 [`docs/DSH集成.md`](docs/DSH集成.md)。
-`/winstage [list|diff|approve|reject|refresh]` 是人工侧的批准入口。
+`/winstage [list|diff|approve|reject|refresh|undo]` 是人工侧的批准入口。
 
 ## 7. DSH 补丁工具包（`patches/dsh/`）：**默认不应用**
 

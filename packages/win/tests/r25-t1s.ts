@@ -46,6 +46,7 @@ import {
   registryAttributionFor,
   resolveT1ShimOptIn,
   selectLaunchMode,
+  transparencyProbeNeeded,
 } from '../src/executor.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -198,7 +199,13 @@ section('S6 源码静态守卫：opt-in 门 / fail-closed 先于降级 / 受限�
     src.includes('Refusing to fall back to plain T1') && (src.match(/T1S_UNAVAILABLE/g) ?? []).length >= 3,
     `T1S_UNAVAILABLE occurrences=${(src.match(/T1S_UNAVAILABLE/g) ?? []).length}`,
   )
-  check('S6.4 只有 opt-in 时才探测 shim（默认 T1 不付探测成本、不换档）', /const wantsT1Shim =\s*!wantsTransparent[\s\S]{0,120}this\.t1ShimOptIn\.requested/.test(src), 'wantsT1Shim guard present')
+  check(
+    'S6.4 探测条件收敛到 transparencyProbeNeeded（默认 T1 不探测；R45 起 T1S 显式请求必须探测）',
+    /transparencyProbeNeeded\(requested, this\.t1ShimOptIn\)/.test(src) &&
+      transparencyProbeNeeded('T1', { requested: false }) === false &&
+      transparencyProbeNeeded('T1S', { requested: false }) === true,
+    'transparencyProbeNeeded guard present',
+  )
   check('S6.5 T1S 启动走受限 launcher（注入器 --dll/--report + job 归属）', /launchT1S\([\s\S]{0,1200}this\.launcher\.launch\([\s\S]{0,200}job: this\.job/.test(src) && /const injectorArgv = \['--dll', launch\.artifacts\.dllPath, '--report', reportPath, '--', command, \.\.\.args\]/.test(src), 'restricted injector argv present')
   check('S6.6 T1S 启动用 R22-C 三件套握手（judgeInjectorInit）', /async launchT1S\([\s\S]{0,6000}judgeInjectorInit\(report\)/.test(src), 'judgeInjectorInit present')
   check('S6.7 装配保留 shim 环境契约（stage root / WAL 会话目录 / read-mask / audit）', ['WINSTAGE_STAGE_ROOT', 'WINSTAGE_REGSTAGE_SESSION_DIR', 'read-deny.mask.json', 'WINSTAGE_AUDIT_LOG'].every((name) => src.includes(name)) && /initializeT1S\([\s\S]{0,6000}writeShimConfig\(/.test(src), 'shim env contract present')

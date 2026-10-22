@@ -43,6 +43,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, st
 import { spawnSync } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { skipSuiteWhenAppControlBlocks } from './_app-control.ts'
 import { Workspace } from '../src/workspace.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -70,6 +71,9 @@ function section(title) {
   W('')
   W(`=== ${title} ===`)
 }
+
+// 环境闸门（2026-10-22）：Smart App Control 强制态会拒绝现场编译的探针 exe（Win32 4551）。
+if (skipSuiteWhenAppControlBlocks(W, 'r21-file-adversarial')) process.exit(0)
 function walkFiles(dir) {
   const out = []
   const walk = (current) => {

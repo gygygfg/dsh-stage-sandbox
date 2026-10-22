@@ -923,6 +923,22 @@ function win32Succeeded(value) {
 export const STAGE_GRANT_FAILED = 'STAGE_GRANT_FAILED'
 
 /**
+ * ── R44：暂存写判定未通过、且当前档位**没有内核/运行时写屏障**时的独立错误码 ──────
+ *
+ * 为什么要独立成码（而不是复用 `STAGING_WRITE_UNVERIFIED`）：两者的**可执行修复动作**
+ * 不同。旧码告诉用户"暂存根现在不可写，修好再重试"；本码告诉用户"现在这条命令的
+ * 执行路径上没有任何内核/运行时写屏障，静态文本判定不足以放行"。
+ *
+ * 语义来源（对标 NeoAI 2026-10-22 第 6 条核心不变量）：
+ *   安全边界只能由内核/运行时强制提供；字符串/正则/命令名**不得**作为"可以执行"的
+ *   放行依据（它判定的是命令"长什么样"，而不是进程"实际做了什么"）。
+ * 因此：`verdict !== pass` 时，只有**受限令牌 / AppContainer** 这两种由 OS 强制写拒绝的
+ * 屏障，才允许"静态判为只读"的命令继续执行；TS（纯用户态 IAT shim）与未初始化档位
+ * 都不是边界，必须 fail-closed。
+ */
+export const STAGING_WRITE_UNVERIFIED_NO_BARRIER = 'STAGING_WRITE_UNVERIFIED_NO_BARRIER'
+
+/**
  * `STAGE_GRANT_FAILED` 的机读原因（每条都可归因到唯一一步）。
  * 注意：这些字符串会出现在 message 的括号里，因此**都过透明性机检**（见 wp1-test 的阳性对照）。
  */
@@ -2134,6 +2150,17 @@ export class WindowsStageExecutor {
     const report = typeof override?.evaluate === 'function' ? override.evaluate(this) : this.stagingWriteEnforceability()
     this.stagingWriteCheckReport = report
     const risk = this.commandRisk(context)
+    /**
+     * ★ R44：本档位**实际**的写屏障（内核/运行时 or 纯用户态）。
+     *
+     * 判定只认结构性事实 —— `launchMode` 是 init() 装配后写下的，不由命令文本推导：
+     *   · `restricted-token` / `shim+restricted-token`（T1/T1S）⇒ 受限令牌（WRITE_RESTRICTED）
+     *   · `appcontainer`（T0）                          ⇒ AppContainer 包 SID
+     *   · `shim`（TS）                                  ⇒ **仅用户态 IAT 钩子，不是屏障**
+     *   · 未初始化                                      ⇒ 没有屏障
+     * 文本分类（`commandRisk`）从此**只能用来拒绝/提示**，不能再单独成为"放行"的理由。
+     */
+    const writeBarrier = writeBarrierFor(this.launchMode, this.tierEffective)
     const decisionBase = {
       at: Date.now(),
       command: typeof context.command === 'string' ? context.command : undefined,
@@ -2141,6 +2168,8 @@ export class WindowsStageExecutor {
       riskReasons: risk.reasons,
       verdict: report.verdict,
       lane: report.lane,
+      writeBarrier,
+      readOnlyAdvisoryOnly: true,
     }
     // ── ① 失根优先于"暂存不可信"：两者必须给出**不同**的结论 ────────────────────
     const rootState = this.assertStagingRootPresent('staging-write-gate')
@@ -2170,18 +2199,85 @@ export class WindowsStageExecutor {
     if (report.verdict === 'pass') {
       decisionBase.action = 'allowed'
       this.stagingWriteGate.lastDecision = decisionBase
-      return { allowed: true, ...report, risk }
+      return { allowed: true, writeBarrier, ...report, risk }
     }
-    // ── ② 只读/无副作用 ⇒ 这类门**不该**拦它 ───────────────────────────────────
+    /**
+     * ── ② 只读命令（R44 重写：从"文本放行"改为"内核屏障放行"）──────────────────
+     *
+     * 旧行为（已删除）：只要 `classifyCommandRisk()` 判 READ_ONLY 就放行，
+     * 哪怕本档其实**没有任何**写屏障。那是把安全边界交给了字符串判定 —— 与
+     * NeoAI 2026-10-22 第 6 条不变量（边界只能由内核/运行时提供）相反，
+     * 且本文件历史注释里已记录过多次"文本漏判 ⇒ 真实落盘"的现场。
+     *
+     * 新行为：`verdict !== pass` 时，只有 `writeBarrier` 是**内核/运行时**提供的
+     * （受限令牌或 AppContainer）才允许继续；TS 的 IAT 钩子与"未初始化"都不算屏障。
+     * 文本判定仍保留在 `decisionBase.risk` 里，但显式标 `readOnlyAdvisoryOnly: true`
+     * —— 它只用于提示/拒绝，绝不单独构成放行依据。
+     */
     if (risk.risk === COMMAND_RISK.READ_ONLY) {
-      decisionBase.action = 'allowed-read-only-bypass'
-      decisionBase.bypassReason =
-        '本条命令被正向判定为只读/无副作用：暂存根此刻是否可写不影响它的结果，' +
-        '因此闸门只记录、不拒绝（BUG-4：拒绝面只覆盖有风险的那一条命令）'
-      this.stagingWriteGate.lastDecision = decisionBase
-      this.stagingWriteGate.trips.push(decisionBase)
-      this.stagingWriteGate.latchClearedBy = 'read-only-command'
-      return { allowed: true, bypassed: 'read-only', ...report, risk, decision: decisionBase }
+      if (isKernelWriteBarrier(writeBarrier)) {
+        decisionBase.action = 'allowed-kernel-write-barrier'
+        decisionBase.bypassReason =
+          `本条命令被静态判定为只读，且本档有**内核/运行时写屏障**（${writeBarrier}）：` +
+          '即使文本判定漏判，OS 仍会拒绝真实盘写入。文本判定只作提示（advisory），不是放行依据。' +
+          '（BUG-4：拒绝面只覆盖有风险的那一条命令）'
+        this.stagingWriteGate.lastDecision = decisionBase
+        this.stagingWriteGate.trips.push(decisionBase)
+        this.stagingWriteGate.latchClearedBy = 'kernel-write-barrier'
+        return { allowed: true, bypassed: 'kernel-write-barrier', writeBarrier, ...report, risk, decision: decisionBase }
+      }
+      const noBarrierError = fail(
+        STAGING_WRITE_UNVERIFIED_NO_BARRIER,
+        `refusing to run THIS command: the staged root is not verified writable by the identity this run uses ` +
+          `(${report.verdict === 'unmeasured' ? 'measurement unavailable/incomplete' : 'measured as not writable'}). ` +
+          `reason: ${report.reason}. ` +
+          `This command was classified read-only, but the active launch mode (${this.launchMode ?? 'none'}) has no ` +
+          `kernel/runtime write barrier (barrier=${writeBarrier}); a static text verdict is NOT a security boundary ` +
+          `(NeoAI core invariant 6). ` +
+          `The command was NOT executed and files are unchanged; restore T1/T1S (restricted token) or T0 (AppContainer) and retry.`,
+      )
+      noBarrierError.report = report
+      noBarrierError.risk = risk
+      noBarrierError.writeBarrier = writeBarrier
+      noBarrierError.launchMode = this.launchMode ?? null
+      noBarrierError.retryable = true
+      noBarrierError.retryHint =
+        '本次命令未执行（not executed）、文件未变（files unchanged）；请先恢复到有内核写屏障的档位（T1/T1S 受限令牌，或 T0 AppContainer）再重试。'
+      noBarrierError.policyDenial = false
+      noBarrierError.remediation = [
+        'restore a kernel write barrier: run with tier T1/T1S (restricted token) or explicitly request T0 (AppContainer)',
+        'if the shim lane was selected by tier=auto, start it with WINSTAGE_T1_SHIM=1 to get restricted token + shim (T1S)',
+        'do not treat the read-only text classification as a boundary — it is advisory only (NeoAI core invariant 6)',
+        'this refusal is scoped to that one command and never latches the session',
+      ]
+      noBarrierError.humanChannel = {
+        code: STAGING_WRITE_UNVERIFIED_NO_BARRIER,
+        verdict: report.verdict,
+        lane: report.lane,
+        enforcement: report.enforcement,
+        writeBarrier,
+        launchMode: this.launchMode ?? null,
+        failedChecks: report.failedChecks,
+        missingChecks: report.missingChecks,
+        reason: report.reason,
+        commandRisk: risk.risk,
+        commandRiskReasons: risk.reasons,
+        readOnlyAdvisoryOnly: true,
+        retryable: true,
+        retryHint: noBarrierError.retryHint,
+        remediation: noBarrierError.remediation,
+      }
+      this.stagingWriteGate.trips.push({
+        ...decisionBase,
+        action: 'refused',
+        code: STAGING_WRITE_UNVERIFIED_NO_BARRIER,
+      })
+      this.stagingWriteGate.lastDecision = {
+        ...decisionBase,
+        action: 'refused',
+        code: STAGING_WRITE_UNVERIFIED_NO_BARRIER,
+      }
+      throw noBarrierError
     }
     const indeterminate = risk.risk === COMMAND_RISK.INDETERMINATE
     const code = indeterminate ? 'STAGING_WRITE_UNVERIFIED_INDETERMINATE' : 'STAGING_WRITE_UNVERIFIED'
@@ -2200,6 +2296,8 @@ export class WindowsStageExecutor {
     )
     error.report = report
     error.risk = risk
+    error.writeBarrier = writeBarrier
+    error.launchMode = this.launchMode ?? null
     // ── 可重试文案：明确"命令未执行、文件未变"，并给出稳定错误码 ─────────────────
     error.retryable = true
     error.retryHint =
@@ -2218,11 +2316,14 @@ export class WindowsStageExecutor {
       verdict: report.verdict,
       lane: report.lane,
       enforcement: report.enforcement,
+      writeBarrier,
+      launchMode: this.launchMode ?? null,
       failedChecks: report.failedChecks,
       missingChecks: report.missingChecks,
       reason: report.reason,
       commandRisk: risk.risk,
       commandRiskReasons: risk.reasons,
+      readOnlyAdvisoryOnly: true,
       retryable: true,
       retryHint: error.retryHint,
       remediation: error.remediation,
@@ -2664,6 +2765,8 @@ export class WindowsStageExecutor {
       tierRequested: this.tierRequested,
       tierEffective: this.tierEffective,
       launchMode: this.launchMode,
+      // ★ R44：本档位真正的写边界（内核/用户态/无）。与 launchMode 一一对应，纯派生。
+      writeBarrier: writeBarrierFor(this.launchMode, this.tierEffective),
       fallbackReason: this.fallbackReason,
       // 三轮接线的三个维度摘要
       ...this.dimensionSummaries(),
@@ -3058,10 +3161,11 @@ export class WindowsStageExecutor {
      * 默认（未设）时 `t1ShimPlan.use === false` ⇒ 下面的 T1 路径逐字不变。
      */
     this.t1ShimOptIn = resolveT1ShimOptIn(process.env)
-    const wantsTransparent = String(requested).toUpperCase() === TRANSPARENT_TIER || String(requested).toLowerCase() === 'auto'
-    const wantsT1Shim =
-      !wantsTransparent && String(requested).toUpperCase() === 'T1' && this.t1ShimOptIn.requested
-    if ((wantsTransparent || wantsT1Shim) && typeof cap.probeTransparentShim === 'function') {
+    /**
+     * ★ R45：探测条件收敛到纯函数 `transparencyProbeNeeded()`（T1S 显式请求也必须探测），
+     *   不再在 init() 里手写三个条件 —— 手写时漏掉 T1S 会静默按 T1 装配。
+     */
+    if (transparencyProbeNeeded(requested, this.t1ShimOptIn) && typeof cap.probeTransparentShim === 'function') {
       this.transparent = cap.probeTransparentShim({
         stagingRoot: this.stagingRoot,
         tempDir: this.options.tempDir,
@@ -3395,6 +3499,8 @@ export class WindowsStageExecutor {
       tierRequested: this.tierRequested,
       tierEffective: this.tierEffective,
       launchMode: this.launchMode,
+      // ★ R44：本档位真正的写边界（内核/用户态/无）。与 launchMode 一一对应，纯派生。
+      writeBarrier: writeBarrierFor(this.launchMode, this.tierEffective),
       fallbackReason: this.fallbackReason,
       // 三轮接线的三个维度摘要（同一份口径也出现在 run() 结果里）
       ...this.dimensionSummaries(),
@@ -4116,6 +4222,8 @@ export class WindowsStageExecutor {
       // R25-A：T1S 启动读数（注入器 report / 注入器退出码）供审计面核对；非 T1S 为 undefined
       t1ShimLauncher: t1s ? this.t1sLastLaunch : undefined,
       launchMode: this.launchMode,
+      // ★ R44：本档位真正的写边界（内核/用户态/无）。文本风险分类不是边界。
+      writeBarrier: writeBarrierFor(this.launchMode, this.tierEffective),
       tier: this.tier,
       hasOutput: stdout.length > 0 || stderr.length > 0,
       // #4.2：退出码 0 且无输出 = 执行完成无输出，不是"没执行"
@@ -4314,9 +4422,15 @@ export const SHIM_STAGING_WRITE_CHECKS = Object.freeze([
 //
 // 闸门真正要回答的是**这一条命令**的问题："这条命令有没有可能写？"
 // 而不是"这个会话的暂存根此刻能不能写？"。因此判定三分：
-//   · 正向证明"只读/无副作用" ⇒ 不拦（只读命令没有可被静默降级的写入面）；
+//   · 只读命令 ⇒ 只有**内核/运行时写屏障**在场时放行（R44）；
 //   · 正向证明"有写" ⇒ 拒绝（fail-closed 方向不变）；
 //   · 判不出来 ⇒ 也拒绝，但**必须说清为什么判不出来**（绝不把"不知道"说成"策略拒绝"）。
+//
+// ★ R44 修正（2026-10-22，对标 NeoAI 第 6 条不变量）：旧判定第一分支是"静态文本判只读
+//   ⇒ 直接放行"，与"安全边界不得由字符静态判定提供"冲突 —— 文本只描述命令**长什么样**，
+//   不描述进程**实际做了什么**，历史现场（R17/R19）已多次证明它会漏判。现在"只读"只能
+//   在 OS 已经替我们兜住写面的情况下（受限令牌/AppContainer）才放行；TS 的 IAT shim 是
+//   用户态机制，不是屏障，因此没有放行资格。
 export const COMMAND_RISK = Object.freeze({
   READ_ONLY: 'read-only',
   WRITE: 'write-capable',
@@ -5784,6 +5898,61 @@ export const T1S_STAGING_WRITE_CHECKS = Object.freeze([
   ...SHIM_STAGING_WRITE_CHECKS,
 ])
 
+// ═════════════════════════════════════════════════════════════════════════════
+// R44：写屏障分类（**唯一口径**）—— "这条命令能不能被执行"只由结构性事实决定
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// 对标 NeoAI 2026-10-22 第 6 条核心不变量：安全边界只能由内核/运行时强制提供；
+// 命令文本（正则/词表/命令名）**不得**作为"可以执行"的放行依据。
+//
+// 本项目的结构性事实由 `launchMode` 给出（init() 装配后写下，不由命令推导）：
+//   · `restricted-token`（T1）/ `shim+restricted-token`（T1S）⇒ WRITE_RESTRICTED 受限
+//     令牌：OS 只允许写 ACL 授权面（暂存根/会话目录），是**内核**写屏障；
+//   · `appcontainer`（T0）⇒ AppContainer 包 SID：区外写默认拒绝，是**内核**写屏障；
+//   · `shim`（TS）⇒ 纯用户态 IAT 钩子：可以 fail-closed 暂存，但 raw syscall /
+//     未 hook 模块不受约束，**不是边界**；
+//   · 未初始化/未知 ⇒ 没有屏障。
+//
+// 这张分类同时被写进每次闸门判定（`stagingWriteGate`）、`initReport`、`run()` 结果
+// 与 DSH 侧 `sandbox-lane.json`，因此用户可以直接看到"此刻的写边界是内核还是用户态"。
+export const WRITE_BARRIERS = Object.freeze({
+  RESTRICTED_TOKEN: 'kernel-restricted-token',
+  APPCONTAINER: 'kernel-appcontainer',
+  SHIM: 'user-mode-shim',
+  NONE: 'none',
+})
+
+/** 内核/运行时提供的写屏障（只有这两个有资格支撑"静态只读 ⇒ 放行"） */
+export const KERNEL_WRITE_BARRIERS = Object.freeze([
+  WRITE_BARRIERS.RESTRICTED_TOKEN,
+  WRITE_BARRIERS.APPCONTAINER,
+])
+
+/**
+ * `launchMode` → 写屏障分类（纯函数，离线可测）。
+ * 未知/缺失一律 `none`（fail-closed；绝不把"不认识的档位"读成有屏障）。
+ *
+ * `tierEffective` 只在 **restricted-token** 模式上参与判定：T2（acl-only）与 T3（none）
+ * 虽然在 `selectLaunchMode()` 里也映射到 `restricted-token`，但执行器并没有为它们提供
+ * 独立的受限令牌装配（T3 的设计语义就是"无可用原语"）。把 T2/T3 报成 kernel 屏障
+ * 会让闸门误以为"OS 会兜住写面"——这里保守归 `none`，宁可 fail-closed。
+ */
+export function writeBarrierFor(launchMode, tierEffective) {
+  if (launchMode === 'restricted-token' || launchMode === T1S_LAUNCH_MODE) {
+    const tier = typeof tierEffective === 'string' ? tierEffective.toUpperCase() : undefined
+    if (tier === 'T2' || tier === 'T3') return WRITE_BARRIERS.NONE
+    return WRITE_BARRIERS.RESTRICTED_TOKEN
+  }
+  if (launchMode === 'appcontainer') return WRITE_BARRIERS.APPCONTAINER
+  if (launchMode === 'shim') return WRITE_BARRIERS.SHIM
+  return WRITE_BARRIERS.NONE
+}
+
+/** 这个屏障是不是由内核/运行时提供（而不是用户态 IAT shim） */
+export function isKernelWriteBarrier(barrier) {
+  return KERNEL_WRITE_BARRIERS.includes(barrier)
+}
+
 /**
  * 解析 `WINSTAGE_T1_SHIM`（纯函数，离线可测）。
  *
@@ -5802,10 +5971,32 @@ export function resolveT1ShimOptIn(env = process.env) {
 }
 
 /**
+ * 纯函数：**是否需要探测透明垫片**（离线可测；`init()` 只消费这一个判据）。
+ *
+ * 请求 `TS` / `auto`：需要（auto 探测通过即选 TS）；
+ * 请求 `T1S`：需要（显式内核边界档 = 受限令牌 + shim，必须知道 shim 是否可用）；
+ * 请求 `T1`：只有显式 opt-in（`WINSTAGE_T1_SHIM=1`）时才需要（默认 T1 不变）。
+ *
+ * 抽成纯函数的原因：这几条条件过去写在 `init()` 里，只能靠读代码判断；
+ * 一旦有人改错（例如把 T1S 漏掉），症状是"请求了 T1S 却按 T1 装配"——静默换档。
+ */
+export function transparencyProbeNeeded(requested, optIn) {
+  const want = String(requested ?? 'T1').toUpperCase()
+  if (want === TRANSPARENT_TIER || want === 'AUTO' || want === 'T1S') return true
+  return want === 'T1' && optIn?.requested === true
+}
+
+/**
  * 纯函数：T1S 档位判定（离线可测，不依赖 Win32）。
  *
  * 只回答"这次要不要走 T1S / 能不能走"；真正的装配（ACL 授权 + shim 环境）在
  * `init()` 里做，装配失败同样抛 `T1S_UNAVAILABLE`。
+ *
+ * ── 两种进入方式（R45 补齐第二种）────────────────────────────────────────────
+ *   1. `tier:'T1'` + `WINSTAGE_T1_SHIM=1`（R25 的显式 opt-in，默认 T1 不变）；
+ *   2. `tier:'T1S'`（**显式请求内核边界档**，不依赖环境变量）。这是给"我知道 TS 只是
+ *      用户态钩子、我要受限令牌兜底"的用户准备的入口；shim 不可用/未探测时
+ *      **fail-closed**（绝不静默降回 T1，那会丢掉调用方明确要的 WAL 归因与暂存捕获）。
  *
  * @param {{requested?:string, optIn?:object, shimProbe?:object}} input
  * @returns {{use:boolean, applicable:boolean, mode?:string, tierEffective?:string,
@@ -5814,6 +6005,26 @@ export function resolveT1ShimOptIn(env = process.env) {
 export function planT1ShimMode({ requested, optIn, shimProbe } = {}) {
   const want = String(requested ?? 'T1').toUpperCase()
   const opt = optIn ?? resolveT1ShimOptIn(process.env)
+  const explicitlyRequested = want === 'T1S'
+  if (explicitlyRequested) {
+    if (shimProbe?.available !== true) {
+      return {
+        use: true,
+        applicable: true,
+        failClosed: true,
+        code: T1S_UNAVAILABLE,
+        reason: `tier T1S was requested explicitly but the shim is not available (${shimProbe?.reason ?? 'not probed'})`,
+      }
+    }
+    return {
+      use: true,
+      applicable: true,
+      mode: T1S_LAUNCH_MODE,
+      tierEffective: T1S_TIER,
+      failClosed: false,
+      reason: 'T1S (tier=T1S) : restricted token (WRITE_RESTRICTED + Low IL) + injected shim staging/WAL — kernel write barrier',
+    }
+  }
   if (!opt.requested) {
     return {
       use: false,

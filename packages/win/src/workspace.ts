@@ -27,7 +27,7 @@
 
 import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { dirname, join, normalize, relative, sep } from 'node:path'
+import { basename, dirname, join, normalize, relative, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import {
   CANDIDATE_STATUS,
@@ -1943,6 +1943,334 @@ export class Workspace {
     }
   }
 
+  /* ═══════════════════════════════════════════════════════════════════════════
+   * R46：**已保存撤销**（对标 NeoAI review 的 undo/redo 快照）
+   * ─────────────────────────────────────────────────────────────────────────
+   * 现状：`applyCandidate` 成功后就删除 apply.journal，面板文案也写死
+   * "cannot be undone"；用户误点批准后只能手工恢复（且没有原内容）。
+   *
+   * 本段把**本批实际写入**的回滚快照持久化到 `<store>/undo/<id>.json`：
+   *   · 只在真实写入成功后写记录；记录写不出来**不**回滚已成功的 apply，
+   *     而是在结果里如实报 `undo.available=false` + 原因（辅助能力不能反过来毁掉主操作）。
+   *   · `undoApply()` 复用 apply 的并发守卫（当前内容必须仍是本批写下的那份）：
+   *     任一文件被外部改过 ⇒ **整批零写** + conflict 清单，绝不覆盖。
+   *   · 成功后把记录移入 `undo/undone/`（保留审计，不再出现在可撤销列表）。
+   *   · 只覆盖文件面；注册表候选不在本链（如实声明，不假装能撤销）。
+   * ═══════════════════════════════════════════════════════════════════════════ */
+
+  /** 撤销记录目录（与 apply.journal 同层，避免落进暂存树被当成工作区改动）。 */
+  _undoDir() {
+    return join(this.store.dir, 'undo')
+  }
+
+  _undoDoneDir() {
+    return join(this._undoDir(), 'undone')
+  }
+
+  /** 记录 id 只保留安全字符（candidate id 可能来自外部，不拿它拼路径）。 */
+  _undoRecordId(candidateId) {
+    const stem = String(candidateId ?? 'candidate').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80)
+    return `${Date.now().toString(36)}-${stem}`
+  }
+
+  _undoRecordPath(recordId) {
+    return join(this._undoDir(), `${recordId}.json`)
+  }
+
+  /**
+   * 持久化一份撤销记录（**不抛错**：失败返回 `{available:false, reason}`）。
+   *
+   * `snapshots` 是 apply 前建立的快照 Map（key=绝对路径）；只保留本批 `applied`
+   * 实际写过的路径。记录大小受 `snapshotBudget.limit` 约束（与 apply.journal 同口径），
+   * 超限则放弃撤销能力并如实报原因，**不**影响已成功的 apply。
+   */
+  _writeUndoRecord(candidate, applied, snapshots, snapshotBudget, status) {
+    try {
+      const appliedAbs = new Set(
+        (Array.isArray(applied) ? applied : [])
+          .map((item) => {
+            try {
+              return this.absolute(item.path)
+            } catch {
+              return undefined
+            }
+          })
+          .filter(Boolean),
+      )
+      const relevant = [...snapshots.values()].filter((snap) => appliedAbs.has(snap.abs))
+      if (relevant.length === 0) return { available: false, reason: 'no-applied-snapshots' }
+      const changes = (Array.isArray(applied) ? applied : []).map((item) => {
+        let abs
+        try {
+          abs = this.absolute(item.path)
+        } catch {
+          abs = undefined
+        }
+        const change = candidate.changes.find((entry) => compareKey(entry.path) === compareKey(item.path))
+        return {
+          path: item.path,
+          abs,
+          op: item.op,
+          afterKind: item.op === 'delete' ? 'absent' : change?.after?.kind || 'file',
+          afterHash: change?.after?.hash || hashAbsent(),
+        }
+      })
+      const recordId = this._undoRecordId(candidate.id)
+      const payload = {
+        version: 1,
+        kind: 'winstage-undo',
+        recordId,
+        candidateId: candidate.id,
+        sessionId: this.manifest?.sessionId,
+        createdAt: new Date().toISOString(),
+        status,
+        changes,
+        snapshots: relevant.map((snap) => this._serializeRollbackSnapshot(snap)),
+      }
+      const body = JSON.stringify(payload)
+      const bytes = Buffer.byteLength(body, 'utf8')
+      const limit = Number.isFinite(snapshotBudget?.limit) ? snapshotBudget.limit : 64 * 1024 * 1024
+      if (bytes > limit) return { available: false, reason: 'undo-record-too-large', bytes, limit }
+      mkdirSync(this._undoDir(), { recursive: true })
+      const path = this._undoRecordPath(recordId)
+      const tmp = `${path}.tmp-${process.pid}-${randomUUID().slice(0, 6)}`
+      const envelope = { payload, checksum: { algo: 'sha256', hex: createHash('sha256').update(body, 'utf8').digest('hex') } }
+      try {
+        writeFileSync(tmp, JSON.stringify(envelope), { encoding: 'utf8', mode: 0o600 })
+        renameSync(tmp, path)
+      } catch (error) {
+        try {
+          rmSync(tmp, { force: true })
+        } catch {}
+        return { available: false, reason: 'undo-record-write-failed', message: error.message }
+      }
+      this._appendApplyEvent('undo-record', { recordId, candidateId: candidate.id, files: changes.length, bytes })
+      return { available: true, id: recordId, path, bytes, files: changes.length }
+    } catch (error) {
+      return { available: false, reason: 'undo-record-write-failed', message: error.message }
+    }
+  }
+
+  /** 读一份撤销记录（校验 checksum/shape；损坏返回 `{ok:false, error}`，不抛）。 */
+  _readUndoRecord(path) {
+    let text
+    try {
+      text = readFileSync(path, 'utf8')
+    } catch (error) {
+      return { ok: false, path, error: `unreadable: ${error.code ?? error.message}` }
+    }
+    let envelope
+    try {
+      envelope = JSON.parse(text)
+    } catch (error) {
+      return { ok: false, path, error: `invalid-json: ${error.message}` }
+    }
+    const payload = envelope?.payload
+    const checksum = envelope?.checksum
+    if (!payload || typeof payload !== 'object' || payload.version !== 1 || payload.kind !== 'winstage-undo' || !Array.isArray(payload.snapshots) || !Array.isArray(payload.changes)) {
+      return { ok: false, path, error: 'invalid-shape' }
+    }
+    if (!checksum || checksum.algo !== 'sha256' || typeof checksum.hex !== 'string') {
+      return { ok: false, path, error: 'checksum-missing' }
+    }
+    const digest = createHash('sha256').update(JSON.stringify(payload), 'utf8').digest('hex')
+    if (digest !== checksum.hex) return { ok: false, path, error: 'checksum-mismatch' }
+    return { ok: true, path, payload }
+  }
+
+  /** 可撤销列表（新→旧；损坏条目如实带 `error`，不隐藏）。 */
+  listUndoable() {
+    let names = []
+    try {
+      names = readdirSync(this._undoDir()).filter((name) => name.endsWith('.json'))
+    } catch {
+      return []
+    }
+    const records = names.map((name) => {
+      const path = join(this._undoDir(), name)
+      const loaded = this._readUndoRecord(path)
+      if (!loaded.ok) return { id: name.replace(/\.json$/, ''), path, ok: false, error: loaded.error }
+      const payload = loaded.payload
+      return {
+        id: payload.recordId ?? name.replace(/\.json$/, ''),
+        path,
+        ok: true,
+        candidateId: payload.candidateId,
+        createdAt: payload.createdAt,
+        status: payload.status,
+        files: Array.isArray(payload.changes) ? payload.changes.length : 0,
+      }
+    })
+    records.sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))
+    return records
+  }
+
+  /**
+   * 撤销一次**已保存**的 apply（文件面）。
+   *
+   * @param {string|undefined} recordId 省略 ⇒ 最近一份
+   * @returns {{status:string, id?:string, candidateId?:string, restored?:Array, failed?:Array,
+   *            conflicts?:Array, nothingWritten?:boolean, ...}}
+   *   `undone` / `already-undone` / `conflict` / `partial` / `not-found` / `corrupt` /
+   *   `locked` / `session-mismatch`
+   */
+  undoApply(recordId, opts = {}) {
+    const lock = this._acquireApplyLock(opts.applyLockTimeoutMs)
+    if (!lock.ok) {
+      return {
+        status: 'locked',
+        id: recordId ?? null,
+        restored: [],
+        failed: [{ path: undefined, code: lock.code || 'APPLY_LOCK_TIMEOUT', message: lock.message || 'apply lock busy' }],
+        conflicts: [],
+        nothingWritten: true,
+      }
+    }
+    try {
+      const records = this.listUndoable()
+      const target = recordId ? records.find((record) => record.id === recordId) : records[0]
+      if (!target) return { status: 'not-found', id: recordId ?? null, restored: [], failed: [], conflicts: [], nothingWritten: true }
+      const loaded = this._readUndoRecord(target.path)
+      if (!loaded.ok) return { status: 'corrupt', id: target.id, error: loaded.error, restored: [], failed: [], conflicts: [], nothingWritten: true }
+      const payload = loaded.payload
+      if (payload.sessionId && this.manifest?.sessionId && payload.sessionId !== this.manifest.sessionId) {
+        return {
+          status: 'session-mismatch',
+          id: target.id,
+          recordSession: payload.sessionId,
+          currentSession: this.manifest.sessionId,
+          restored: [],
+          failed: [],
+          conflicts: [],
+          nothingWritten: true,
+        }
+      }
+      const snaps = new Map()
+      for (const raw of payload.snapshots) {
+        const snap = this._deserializeRollbackSnapshot(raw)
+        snaps.set(snap.abs, snap)
+      }
+      const changesByAbs = new Map()
+      for (const change of payload.changes) {
+        if (typeof change.abs === 'string') changesByAbs.set(change.abs, change)
+      }
+      const conflicts = []
+      const needed = []
+      for (const snap of snaps.values()) {
+        const change = changesByAbs.get(snap.abs)
+        const guard = this._undoGuard(snap, change)
+        if (!guard.ok) {
+          conflicts.push({ path: this._rollbackRel(snap.abs), abs: snap.abs, code: guard.code, message: guard.message })
+        } else if (guard.needed) {
+          needed.push({ snap, change })
+        }
+      }
+      if (conflicts.length > 0) {
+        return {
+          status: 'conflict',
+          id: target.id,
+          candidateId: payload.candidateId,
+          conflicts,
+          restored: [],
+          failed: [],
+          nothingWritten: true,
+        }
+      }
+      if (needed.length === 0) {
+        return { status: 'already-undone', id: target.id, candidateId: payload.candidateId, restored: [], failed: [], conflicts: [], nothingWritten: true }
+      }
+      const restored = []
+      const failed = []
+      for (const { snap } of needed) {
+        const result = this._restoreRollbackSnapshot(snap, opts)
+        if (result.ok) restored.push({ path: result.path, action: result.action })
+        else failed.push({ path: result.path, code: result.code || 'UNDO_RESTORE_FAILED', message: result.message })
+      }
+      if (failed.length > 0) {
+        this._appendApplyEvent('undo-partial', { recordId: target.id, candidateId: payload.candidateId, restored: restored.length, failed: failed.length })
+        return { status: 'partial', id: target.id, candidateId: payload.candidateId, restored, failed, conflicts: [], nothingWritten: false }
+      }
+      /**
+       * 撤销后把受影响路径的**暂存条目**清掉：真实盘已回到 apply 前，逻辑视图必须
+       * 回到"真实盘为权威"。否则 entry.stagedHash 仍指向 apply 写入的内容 ——
+       * 工具/`/winstage list` 会读到一份已经不存在的"暂存版本"（视图与现实不一致）。
+       * 只删条目与物化文件；blob 由 GC 按引用回收。注册表不在此链（见文档）。
+       */
+      const cleared = []
+      for (const { change } of needed) {
+        if (!change?.path) continue
+        if (this.entryOf(change.path)) {
+          delete this.manifest.entries[change.path]
+          cleared.push(change.path)
+        }
+        try {
+          rmSync(this.store.stagedPath(change.path), { force: true })
+        } catch {
+          /* 清理失败不影响已恢复的真实文件；下次 GC 会处理 */
+        }
+      }
+      if (needed.length > 0) this.store.touch(this.manifest)
+      try {
+        mkdirSync(this._undoDoneDir(), { recursive: true })
+        renameSync(target.path, join(this._undoDoneDir(), basename(target.path)))
+      } catch {
+        /* 归档失败不影响"已撤销"的事实；记录下次可能仍出现在列表里 */
+      }
+      this._appendApplyEvent('undo-applied', { recordId: target.id, candidateId: payload.candidateId, files: restored.length, cleared })
+      return { status: 'undone', id: target.id, candidateId: payload.candidateId, restored, cleared, failed: [], conflicts: [], nothingWritten: false }
+    } finally {
+      this._releaseApplyLock()
+    }
+  }
+
+  /**
+   * 撤销前的逐路径守卫：只有"当前状态仍是本批写下的那份"才允许恢复。
+   * 与 apply 回滚共用同一套并发语义；"本批新建"额外要求内容仍等于 afterHash
+   * （否则删除用户后来改过的文件 = 丢数据）。
+   */
+  _undoGuard(snap, change) {
+    const kindNow = existsSync(snap.abs) ? statKind(snap.abs)?.kind : undefined
+    if (snap.kind === 'absent') {
+      if (kindNow === undefined) return { needed: false, ok: true } // 已经是 apply 前状态
+      if (kindNow === 'file') {
+        const nowHash = hashFile(snap.abs)
+        if (change?.afterHash && nowHash !== change.afterHash) {
+          return {
+            needed: true,
+            ok: false,
+            code: 'UNDO_CONCURRENT_MODIFICATION',
+            message: 'file content changed after it was saved; refusing to delete it (would lose later edits)',
+          }
+        }
+        return { needed: true, ok: true }
+      }
+      if (kindNow === 'dir') {
+        let entries = []
+        try {
+          entries = readdirSync(snap.abs)
+        } catch {}
+        if (entries.length > 0) {
+          return {
+            needed: true,
+            ok: false,
+            code: 'UNDO_CONCURRENT_MODIFICATION',
+            message: 'directory created by this save now has entries; refusing to remove it (would delete later content)',
+          }
+        }
+        return { needed: true, ok: true }
+      }
+      return { needed: true, ok: true }
+    }
+    const guard = this._rollbackGuard(snap, snap.abs, {
+      path: change?.path,
+      op: change?.op,
+      after: { hash: change?.afterHash },
+    })
+    if (guard.ok || guard.needed === false) return guard
+    // 对外统一成 UNDO_* 原因码（内部复用回滚守卫；不把 ROLLBACK_* 泄漏给撤销面）
+    return { ...guard, code: 'UNDO_CONCURRENT_MODIFICATION' }
+  }
+
   _currentStateOf(abs) {
     try {
       const st = lstatSync(abs)
@@ -2592,7 +2920,17 @@ export class Workspace {
       if (!appliedPathMap.has(compareKey(path))) appliedPathMap.set(compareKey(path), path)
     }
     candidate.appliedPaths = [...appliedPathMap.values()]
-    candidate.lastApply = { applied, failed, blockedByMask, maskWarnings, conflicts: [], rollback: rollbackReport || [], rolledBack, attributeWarnings }
+    /**
+     * ── R46：成功写入后才持久化撤销记录 ──────────────────────────────────────
+     * 条件：至少有一条真实写入，且不是"回滚失败"（那种状态下真实盘状态未知，
+     * 不能拿一份快照假装可撤销）。记录写失败**不**改变 apply 结果，只把
+     * `undo.available=false` + 原因带进 lastApply/返回值（辅助能力不能毁主操作）。
+     */
+    const undo =
+      applied.length > 0 && !(rollbackReport && !rolledBack)
+        ? this._writeUndoRecord(candidate, applied, snapshots, snapshotBudget, status)
+        : { available: false, reason: rollbackReport && !rolledBack ? 'apply-rollback-failed' : 'no-applied-changes' }
+    candidate.lastApply = { applied, failed, blockedByMask, maskWarnings, conflicts: [], rollback: rollbackReport || [], rolledBack, attributeWarnings, undo }
     this.store.saveCandidate(candidate)
     this.queue.candidates[candidate.id] = {
       ...this.queue.candidates[candidate.id],
@@ -2662,6 +3000,8 @@ export class Workspace {
       rollback: rollbackReport || [],
       // R28：属性面失败清单（hidden/system 读写失败等；空数组=全部成功/无需处理）
       attributeWarnings,
+      // R46：这次 apply 的撤销记录（`{available,id,path,bytes,files}` 或 `{available:false,reason}`）
+      undo,
     }
   }
 

@@ -21,9 +21,10 @@
  * ── 定位（务必如实理解）──────────────────────────────────────────────────────
  * 本模块是**纯函数 + 只读文件系统**的一层：
  *   · 它**不**阻止任何写入；它只回答"这一笔该不该放行"（`checkStagingQuota`）。
- *   · 它**已经接线**（不是"由集成方另行接线"）：暂存写入前——`src\store.ts:241`
- *     （`putBlob` 落盘前）；执行前 preflight——`src\executor.ts:2150`（`run()`）；
- *     输出捕获——`src\executor.ts:2265`（stdout/stderr 走 `applyOutputCap`）。
+ *   · 它**已经接线**（不是"由集成方另行接线"）：暂存写入前——`src\store.ts::putBlob`
+ *     （落盘前）；执行前 preflight——`src\executor.ts::run`（`assertStagingQuota`）；
+ *     输出捕获——`src\executor.ts::run` 的 `applyOutputCap` 调用点（stdout/stderr）。
+ *     （按**函数名**引用，不写行号：行号会随每次重构漂移，历史注释已漂移过一次。）
  *     本文件末"接线契约"一节保留的是**接口说明**，不是"尚未接线"的声明。
  *   · 真正的硬边界是 ACL/Job Object/T0；配额是**资源约束**，不是安全边界。
  *     `[实测]` 本机（node v24.21.0 / Windows；**本轮 `danger-full-access` 文件策略**下运行）：
@@ -1361,9 +1362,10 @@ export function summariseLimits(limits) {
 // ═══════════════════════════════════════════════════════════════════════════
 /**
  * 已落地的调用点（`[实测]`：源码定位 + 对应套件在 `verify.cmd` 里全绿）：
- *   · `src\store.ts:241`  —— `putBlob` 写入前调用 `assertStagingQuota`（拒绝即不落盘）；
- *   · `src\executor.ts:2150` —— `run()` 的 preflight（`incomingBytes=0` 的基线判定）；
- *   · `src\executor.ts:2265` —— stdout/stderr 收集之后走 `applyOutputCap`（截断显式上报）。
+ *   · `src\store.ts::putBlob`  —— 写入前调用 `assertStagingQuota`（拒绝即不落盘）；
+ *   · `src\executor.ts::run`   —— preflight（`incomingBytes=0` 的基线判定）；
+ *   · `src\executor.ts::run`   —— stdout/stderr 收集之后走 `applyOutputCap`（截断显式上报）。
+ *   （按函数名引用：行号会随重构漂移，本文件的历史行号已经漂移过一次。）
  *
  * 下面是接口契约（写给集成方/复核者，不是"待办"）：
  *
