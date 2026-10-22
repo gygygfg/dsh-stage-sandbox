@@ -654,46 +654,6 @@ W('=== 5. R18/KNOWN-04：目录↔文件互换 apply 必须结构化/可应用�
 }
 
 W('')
-W('=== 6. R43：shell cwd 虚拟化 preamble ===')
-{
-  const { buildCwdVirtualizationPreamble, buildCommandArgv } = await import('../dsh-plugin/shell-executor.ts')
-  const logical = 'C:\\real ws'
-  const staged = 'C:\\temp\\stage root'
-  const preamble = buildCwdVirtualizationPreamble({ logicalCwd: logical, cwd: staged })
-  check(
-    'preamble 同时包含逻辑根与暂存根，并定义 Get-Location/Set-Location/__cwdView',
-    preamble.includes(`$global:__cwdLogical = '${logical}'`) &&
-      preamble.includes(`$global:__cwdReal = '${staged}'`) &&
-      preamble.includes('function global:Get-Location') &&
-      preamble.includes('function global:Set-Location') &&
-      preamble.includes('function global:__cwdView'),
-    `bytes=${preamble.length}`,
-  )
-  const argv = buildCommandArgv('Get-Location', 'pwsh.exe', { logicalCwd: logical, cwd: staged })
-  const commandIndex = argv.args.indexOf('-Command')
-  check(
-    'buildCommandArgv 把 preamble 注入到 -Command 脚本（在用户脚本之前）',
-    commandIndex >= 0 &&
-      argv.args[commandIndex + 1].indexOf('$global:__cwdLogical') >= 0 &&
-      argv.args[commandIndex + 1].indexOf('Get-Location') > argv.args[commandIndex + 1].indexOf('$global:__cwdLogical'),
-    JSON.stringify(argv.args.slice(0, 2)),
-  )
-  check(
-    '根相同或参数缺失时不注入（不改变既有行为）',
-    buildCwdVirtualizationPreamble({ logicalCwd: 'C:\\x', cwd: 'c:\\X' }) === '' &&
-      buildCwdVirtualizationPreamble({}) === '' &&
-      buildCwdVirtualizationPreamble({ logicalCwd: '', cwd: 'C:\\x' }) === '',
-    'no preamble when not needed',
-  )
-  const quoted = buildCwdVirtualizationPreamble({ logicalCwd: "C:\\real's ws", cwd: "C:\\temp's stage" })
-  check(
-    "单引号路径转义为 PowerShell 的 ''",
-    quoted.includes("C:\\real''s ws") && quoted.includes("C:\\temp''s stage"),
-    'single quote escaped',
-  )
-}
-
-W('')
 W('='.repeat(64))
 W(
   PLANT

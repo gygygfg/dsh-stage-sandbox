@@ -155,108 +155,6 @@ const ENCODING_PREAMBLE =
   '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ' +
   '$OutputEncoding = [System.Text.UTF8Encoding]::new($false); '
 
-/**
- * ── R43：shell cwd 虚拟化（PowerShell 层）───────────────────────────────────────
- *
- * 命令实际在暂存工作副本里执行（cwd = `<store>/staged`），但**对 PowerShell 用户
- * 可见的 cwd 应当是真实工作区根**：`Get-Location` / `pwd` / `$PWD` / 相对 `cd`
- * 都必须像在真实工作区里一样工作。否则：
- *   · 模型一眼就能看出"shell 被切到 winstage-stage\…\staged"；
- *   · `cd` 到真实工作区绝对路径会逃出工作副本（相对写入不再落暂存）；
- *   · `$PWD`/脚本拼出的路径会带暂存前缀，污染日志与后续命令。
- *
- * 做法（只在 PowerShell 解释器这一层，不改内核 cwd）：
- *   · `Get-Location` 把真实 cwd 映射成逻辑路径（暂存根前缀 → 工作区根）；
- *   · `Set-Location`/`Push-Location`/`Pop-Location` 把逻辑路径映射回真实暂存路径，
- *     于是 `cd <真实工作区>` 仍然留在工作副本内；
- *   · `$PWD` 同步为逻辑路径（带 `Path`/`Provider`/`Drive`/`ProviderPath` 与
- *     `ToString()`，`"$PWD"`、`$PWD.Path`、`Set-Location $PWD` 都成立）。
- *
- * 边界（必须在文档里如实写）：
- *   · 只覆盖 **PowerShell**；`cmd /c cd`、Python `os.getcwd()`、Node
- *     `process.cwd()`、原生命令打印的绝对路径仍是暂存路径（内核 cwd 没变）；
- *   · `Resolve-Path`/`Convert-Path`/`Get-Item .` 的 `FullName`、错误消息里的
- *     绝对路径仍可能带暂存前缀；
- *   · 用户脚本自己重定义同名函数时，以用户的定义为准。
- *
- * 只在 `logicalCwd !== cwd` 时注入；参数做单引号转义，避免路径里的 `'` 破坏脚本。
- */
-export function buildCwdVirtualizationPreamble({ logicalCwd, cwd } = {}) {
-  if (typeof logicalCwd !== 'string' || typeof cwd !== 'string') return ''
-  if (logicalCwd.length === 0 || cwd.length === 0) return ''
-  if (logicalCwd.toLowerCase() === cwd.toLowerCase()) return ''
-  const logical = logicalCwd.replace(/'/g, "''")
-  const real = cwd.replace(/'/g, "''")
-  return [
-    '# working-directory view',
-    `$global:__cwdLogical = '${logical}'`,
-    `$global:__cwdReal = '${real}'`,
-    'function global:__cwdToLogical([string]$p) {',
-    '  if ($p -ieq $global:__cwdReal) { return $global:__cwdLogical }',
-    "  if ($p.StartsWith($global:__cwdReal + '\\', [System.StringComparison]::OrdinalIgnoreCase)) { return $global:__cwdLogical + $p.Substring($global:__cwdReal.Length) }",
-    '  return $p',
-    '}',
-    'function global:__cwdToReal([string]$p) {',
-    '  if ($p -ieq $global:__cwdLogical) { return $global:__cwdReal }',
-    "  if ($p.StartsWith($global:__cwdLogical + '\\', [System.StringComparison]::OrdinalIgnoreCase)) { return $global:__cwdReal + $p.Substring($global:__cwdLogical.Length) }",
-    '  return $p',
-    '}',
-    'function global:__cwdView {',
-    '  $r = Microsoft.PowerShell.Management\\Get-Location',
-    '  $p = __cwdToLogical ([string]$r.Path)',
-    '  $o = [string]$p',
-    "  $o = $o | Add-Member -MemberType NoteProperty -Name Path -Value $p -PassThru -Force",
-    "  $o = $o | Add-Member -MemberType NoteProperty -Name Provider -Value $r.Provider -PassThru -Force",
-    "  $o = $o | Add-Member -MemberType NoteProperty -Name Drive -Value $r.Drive -PassThru -Force",
-    "  $o = $o | Add-Member -MemberType NoteProperty -Name ProviderPath -Value $p -PassThru -Force",
-    '  return $o',
-    '}',
-    'function global:Get-Location {',
-    '  [CmdletBinding()] param([string[]]$PSProvider, [string[]]$PSDrive)',
-    '  if ($PSProvider -or $PSDrive) { Microsoft.PowerShell.Management\\Get-Location -PSProvider $PSProvider -PSDrive $PSDrive; return }',
-    '  __cwdView',
-    '}',
-    'function global:Set-Location {',
-    "  [CmdletBinding(DefaultParameterSetName='Path')] param(",
-    "    [Parameter(ParameterSetName='Path', Position=0, ValueFromPipeline=$true)] [string]$Path,",
-    "    [Parameter(ParameterSetName='LiteralPath', Mandatory=$true)] [string]$LiteralPath,",
-    '    [switch]$PassThru,',
-    "    [Parameter(ParameterSetName='StackName', Mandatory=$true)] [string]$StackName)",
-    '  process {',
-    "    if ($PSCmdlet.ParameterSetName -eq 'StackName') { $null = Microsoft.PowerShell.Management\\Set-Location -StackName $StackName }",
-    "    elseif ($PSCmdlet.ParameterSetName -eq 'LiteralPath') { $null = Microsoft.PowerShell.Management\\Set-Location -LiteralPath (__cwdToReal $LiteralPath) }",
-    '    else {',
-    '      if ([string]::IsNullOrEmpty($Path)) { $null = Microsoft.PowerShell.Management\\Set-Location }',
-    '      else { $null = Microsoft.PowerShell.Management\\Set-Location -Path (__cwdToReal $Path) }',
-    '    }',
-    '    $global:PWD = __cwdView',
-    '    if ($PassThru) { __cwdView }',
-    '  }',
-    '}',
-    'function global:Push-Location {',
-    "  [CmdletBinding(DefaultParameterSetName='Path')] param(",
-    "    [Parameter(ParameterSetName='Path', Position=0, ValueFromPipeline=$true)] [string]$Path,",
-    "    [Parameter(ParameterSetName='LiteralPath', Mandatory=$true)] [string]$LiteralPath,",
-    '    [switch]$PassThru,',
-    "    [Parameter(ParameterSetName='StackName', Mandatory=$true)] [string]$StackName)",
-    '  if ($StackName) { $null = Microsoft.PowerShell.Management\\Push-Location -StackName $StackName }',
-    '  elseif ($LiteralPath) { $null = Microsoft.PowerShell.Management\\Push-Location -LiteralPath (__cwdToReal $LiteralPath) }',
-    '  elseif ([string]::IsNullOrEmpty($Path)) { $null = Microsoft.PowerShell.Management\\Push-Location }',
-    '  else { $null = Microsoft.PowerShell.Management\\Push-Location -Path (__cwdToReal $Path) }',
-    '  $global:PWD = __cwdView',
-    '}',
-    'function global:Pop-Location {',
-    '  [CmdletBinding()] param([switch]$PassThru, [Parameter(ParameterSetName=\'StackName\')] [string]$StackName)',
-    '  if ($StackName) { $null = Microsoft.PowerShell.Management\\Pop-Location -StackName $StackName }',
-    '  else { $null = Microsoft.PowerShell.Management\\Pop-Location }',
-    '  $global:PWD = __cwdView',
-    '}',
-    '$global:PWD = __cwdView',
-    '',
-  ].join('\n')
-}
-
-
 // ==================== 档位（lane）判定：分类 + 持久化 + 一句话结论 ====================
 
 /**
@@ -780,9 +678,8 @@ const PWSH_LEADING =
 const PWSH_EXE = /(?:^|[\\/])pwsh(?:\.exe)?$/i
 const LEGACY_POWERSHELL_EXE = /(?:^|[\\/])powershell(?:\.exe)?$/i
 
-export function buildCommandArgv(command, pwshPath, options = {}) {
+export function buildCommandArgv(command, pwshPath) {
   const text = String(command ?? '')
-  const preamble = buildCwdVirtualizationPreamble(options)
   const match = PWSH_LEADING.exec(text)
   if (match?.groups?.script !== undefined) {
     const script = match.groups.script
@@ -798,7 +695,7 @@ export function buildCommandArgv(command, pwshPath, options = {}) {
     if (launcher.length === 0 || PWSH_EXE.test(launcher) || LEGACY_POWERSHELL_EXE.test(launcher)) {
       return {
         command: pwshPath,
-        args: [...flags, '-Command', `${ENCODING_PREAMBLE}${preamble}${script}`],
+        args: [...flags, '-Command', `${ENCODING_PREAMBLE}${script}`],
         recognized: true,
       }
     }
@@ -812,7 +709,7 @@ export function buildCommandArgv(command, pwshPath, options = {}) {
   //       且语义错误的降级（自测 S4.10b 抓到过）。
   const foreignCommand = /^(?:"[^"]+"|(?!-)\S+)(?=\s)\s+(?:-\S+\s+)*-command\s+[\s\S]+$/i.test(text)
   if (!foreignCommand) {
-    return { command: pwshPath, args: ['-Command', `${ENCODING_PREAMBLE}${preamble}${text}`], recognized: true }
+    return { command: pwshPath, args: ['-Command', `${ENCODING_PREAMBLE}${text}`], recognized: true }
   }
   const tokens = text.match(/"[^"]*"|\S+/g) ?? []
   const first = (tokens[0] ?? '').replace(/^"|"$/g, '')
@@ -2255,11 +2152,7 @@ export function createWinStageShellExecutor(options = {}) {
         }
 
         // ── ⑥ 在沙箱内执行：cwd = **暂存树** ─────────────────────────────────
-        const argv = buildCommandArgv(spec.command, resolvePwshPath(this.pwshPathConfig), {
-          // R43：PowerShell 层 cwd 虚拟化 —— 对外显示真实工作区根，对内仍是暂存工作副本。
-          logicalCwd: workspace.root,
-          cwd: stagedDir,
-        })
+        const argv = buildCommandArgv(spec.command, resolvePwshPath(this.pwshPathConfig))
         if (!argv.recognized) {
           this.log(
             `命令未带 pwsh/powershell 前缀，按"裸程序 + 参数"处理：${argv.command}（args=${argv.args.length}）；不做任何 shell 展开。`,

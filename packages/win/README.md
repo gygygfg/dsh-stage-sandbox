@@ -168,7 +168,6 @@ node tools\ebk-sandbox-test.ts # Windows E2E 测试台（需 docker + KVM，见 
 - **R7 环境块需运行时注入**：依赖包的受限 spawn 固定传 `lpEnvironment=NULL`（违反手册 #8.3）；本实现替换绑定表注入显式环境块，结构不符时 **fail-closed 拒绝启动**。
 - **R42-GIT（日常可用性）**：`.git`/`.hg`/`.svn`/`node_modules`/`.venv` 以 **junction 直连真实盘**（不复制内容）—— 否则沙箱内 `git status` 报 `fatal: not a git repository`、node/pnpm/测试解析不到依赖。代价：沙箱内 `git add/commit`、`pnpm install` 会**直接写真实** `.git`/`node_modules`/`.venv`，不经过暂存/候选/审批；用户内容（源码、数据）仍走暂存。命令 cwd 仍是工作副本路径（`Get-Location` 可见），这是透明暂存的残余。另：沙箱 shell 通过 `GIT_CONFIG_PARAMETERS` 注入 `core.excludesFile`，把 `fs/`、`wo/`、`reg/`、`.winstage-*`、`shim.log` 等**沙箱内部条目**从 git 视图排除，`git add -A` 不会把它们提交进用户仓库。
 - **R42-DNS（网络设备放行）**：shim 的 `NtCreateFile` 对非文件系统设备命名空间（`\Device\Afd`/`Nsi`/`KsecDD`/`CNG`/`Tcp`/`Udp`/`Ip`/`RawIp`/`RasAcd`）放行；否则 `getaddrinfo`、socket、TLS 会在沙箱内失败。磁盘/卷/文件系统设备仍 fail-closed，普通文件路径的暂存/遮蔽规则不变。
-- **R43（shell cwd 虚拟化，PowerShell 层）**：命令实际仍在暂存工作副本执行，但 `Get-Location` / `pwd` / `$PWD` / `Set-Location` / `Push-Location` / `Pop-Location` 都以**真实工作区根**呈现；`cd <真实工作区绝对路径>` 会被映射回暂存副本，不会逃出暂存树。残余：`cmd /c cd`、Python `os.getcwd()`、Node `process.cwd()`、`Resolve-Path`/`Get-Item .FullName` 与子进程里的绝对路径仍会看到暂存路径；嵌套 `powershell -File` 不会继承这层包装（它只包住 DSH 直接执行的那一个 PowerShell 进程）。
 
 ---
 
