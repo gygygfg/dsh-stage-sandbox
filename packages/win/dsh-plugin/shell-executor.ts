@@ -1805,13 +1805,22 @@ export function createWinStageShellExecutor(options = {}) {
     resolve(request) {
       const workspace = this.currentWorkspace({ bestEffort: true })
       /**
-       * 逻辑 workdir（契约要求 `string`）：只用于**展示**与"相对路径的解析基准"。
+       * 工作目录（契约要求 `string`）：**就是沙盒工作副本本身**。
        *
-       * ⚠ 最后一档**刻意不是 `process.cwd()`**：那是宿主进程的目录（`C:\Users\Administrator`），
-       * 把它当成"会话工作区"正是"两个根"的成因之一（见 `shell-entry.ts` 文件头）。
-       * 拿不到会话工作区时留空串（= 不知道），绝不用一个猜出来的路径假装知道。
+       * R43 修订：不再把真实工作区路径当成 shell 的 workdir。WinStage 的语义是
+       * "命令在暂存工作副本里执行"，那么工具展示/相对路径解析的基准也必须是
+       * 同一个暂存根 —— 否则一个命令里同时存在"显示的真实根"和"实际写入的暂存根"
+       * （`Get-Location` 与 `os.getcwd()` 各说各话）。这里优先取 `store.stagedDir`。
+       *
+       * 取不到暂存根时才回落到请求的 workdir / 工作区根；**绝不**用 `process.cwd()`
+       * 猜一个根（那是宿主目录，不是会话工作区）。
        */
+      const stagedRoot =
+        typeof workspace?.store?.stagedDir === 'string' && workspace.store.stagedDir.length > 0
+          ? workspace.store.stagedDir
+          : undefined
       const logicalRoot =
+        stagedRoot ??
         (typeof request?.workdir === 'string' && request.workdir.length > 0 ? request.workdir : undefined) ??
         (typeof workspace?.root === 'string' && workspace.root.length > 0 ? workspace.root : undefined) ??
         ''
@@ -2247,7 +2256,7 @@ export function createWinStageShellExecutor(options = {}) {
             command: argv.command,
             args: argv.args,
             cwd: stagedDir,
-            logicalCwd: workspace.root,
+            logicalCwd: stagedDir,
             timeoutMs: spec.timeoutMs,
             env: environment,
           })

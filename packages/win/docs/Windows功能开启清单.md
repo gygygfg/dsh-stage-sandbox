@@ -535,6 +535,15 @@ dism /online /get-featureinfo /featurename:Containers-DisposableClientVM
 >   仍 fail-closed；普通文件路径的暂存/遮蔽/白障规则不变。
 >   守卫：`shim/src/ws_file.c::ws_nt_name_is_safe_device()` + `tests/workspace-regressions.ts` 的
 >   `.git`/`node_modules` 链接断言。
+>
+> **R43 补注（2026-10-22，会话根 vs 沙盒根）**：不做 PowerShell 层的 cwd 伪装。WinStage
+> 的 shell/fs 工具根统一为**暂存工作副本**（`store.stagedDir`）：`resolve().workdir`、
+> 命令 cwd、`Get-Location`、`pwd`、`os.getcwd()` 指向同一个暂存根。**但 DSH 会话 header 的
+> `cwd` 是会话创建时冻结的真实工作区路径**（`@deepseek-ai/dsh-workspace` 用 canonical cwd
+> 校验 session/workspace 归属；header 不可变），插件无法事后把它改成暂存路径。因此会话标题/
+> 系统提示里的根仍可能是真实路径——这不是 shell 层能修好的。要让**会话根本身**=暂存副本，
+> 必须在**创建会话时**把 cwd 指向暂存树（session launcher / workspace 集成），并把真实
+> 工作区作为 apply 源；这是后续独立改动，不在本轮实现。
 
 ---
 
