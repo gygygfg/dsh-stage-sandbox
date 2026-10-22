@@ -2159,6 +2159,49 @@ export function createWinStageShellExecutor(options = {}) {
           )
         }
         const environment = { ...ENV_OVERRIDES, ...(spec.dshEnv ?? {}), ...(spec.env ?? {}) }
+        /**
+         * ── R42-GIT（2/2）：沙箱内部条目不得进入用户仓库的 git 视图 ────────────────
+         *
+         * 暂存树里混着**沙箱自己的**运行产物：`fs/`（shell 写入的 overlay 内容树）、
+         * `wo/`、`reg/`、`shim.log`、`winstage-shim.config.json`、`.winstage-*`（注入器
+         * report / capture 文件）。命令的 cwd 是暂存树，于是 `git status` 会把这些当成
+         * "未跟踪文件"，`git add -A` 更会把它们**提交进真实仓库**（新线程实测：17 个
+         * 文件、27780 行；对真实项目是不可接受的污染）。
+         *
+         * 修法：给**沙箱内**的 git 注入一个 `core.excludesFile`，只排除这些内部名字。
+         *   · 不改真实仓库的 `.gitignore`、不写 `.git/info/exclude`（`.git` 是 junction，
+         *     写它等于写真实仓库）；
+         *   · 只用 `GIT_CONFIG_COUNT/KEY/VALUE` 环境变量（git 原生、优先级高于仓库配置，
+         *     不影响沙箱外的任何命令）；
+         *   · 用户内容（源码、runs/、脚本）一个都不排除。
+         * 这是"日常可用"的一部分：git 必须能直接 `add -A` 而不带沙箱垃圾。
+         */
+        if (workspace?.store?.dir) {
+          try {
+            const sandboxGitIgnore = join(workspace.store.dir, 'sandbox.gitignore')
+            writeFileSync(
+              sandboxGitIgnore,
+              [
+                '# WinStage sandbox internals (generated; never part of the workspace)',
+                '/fs/',
+                '/wo/',
+                '/reg/',
+                '/private/',
+                '/.canary-temp/',
+                '/.winstage-*',
+                '/shim.log',
+                '/winstage-shim.config.json',
+                '',
+              ].join('\n'),
+              'utf8',
+            )
+            environment.GIT_CONFIG_PARAMETERS = `'core.excludesFile'='${sandboxGitIgnore}'`
+          } catch (error) {
+            // 注入失败不阻断命令（git 仍可用），但必须在人工侧留下可归因记录。
+            this.logError(`准备沙箱 git 排除清单失败（git 可能看到沙箱内部文件）：${error?.message ?? error}`)
+          }
+        }
+
 
         /**
          * ── WP7′：**限制即失败** —— 明文出站请求里出现密钥形态 ⇒ 普通失败 ──────────

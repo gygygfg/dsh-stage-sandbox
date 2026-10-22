@@ -25,7 +25,7 @@
  *   - 遮蔽前先规范化，符号链接不能绕过（#16.6）；硬拒绝先于软遮蔽（#16.7）
  */
 
-import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { dirname, join, normalize, relative, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
@@ -153,15 +153,23 @@ const WALK_MAX_DEPTH = 64
  * KNOWN-03：物化真实工作区时的**排除集**与预算（默认值必须可辩护）。
  *
  * 排除的是"明确不是用户内容"的目录：VCS 元数据、依赖树、本工具自己的存储、
- * 构建产物与缓存。它们要么巨大（node_modules）、要么不该被命令看到（.git/
- * .dshstage/.t），要么是派生物（dist/coverage）。**不做**"全量拷贝"：单文件
- * 8 MiB、总量 256 MiB、2 万文件封顶，超限如实记 `truncated` 并跳过。
+ * 构建产物与缓存。它们要么巨大（node_modules）、要么不该被命令看到（.dshstage/.t），
+ * 要么是派生物（dist/coverage）。**不做**"全量拷贝"：单文件 8 MiB、总量 256 MiB、
+ * 2 万文件封顶，超限如实记 `truncated` 并跳过。
+ *
+ * ★ R42-GIT：VCS 元数据 / 依赖树 / 虚拟环境**不再排除，而是用 junction 直连真实盘**：
+ *   命令的 cwd 是工作副本（`<store>/staged`），如果把 `.git`/`node_modules`/`.venv`
+ *   排除掉，沙箱内 `git status` 会 `fatal: not a git repository`、node/pnpm/测试
+ *   会解析不到依赖 —— 这不是隔离，是把"日常开发"整条打断（真实事故：JOS holdout
+ *   在沙箱内写 runs/ 与 git 提交均失败）。
+ *
+ *   junction 不需要特权、不复制内容；对它们而言**真实盘就是工作树**（VCS 元数据、
+ *   依赖树、venv 属于派生/元数据，不是用户内容）。换来的边界必须如实声明：
+ *   沙箱内 `git add/commit`、`pnpm install` 会直接写真实 `.git`/`node_modules`，
+ *   这些路径**不经过**暂存/候选/审批；用户内容（源码、数据）仍走暂存。
+ *   不 link 其他缓存/构建目录（dist/build/.cache/.t）：它们该由沙箱内命令重建。
  */
 const MATERIALIZE_SKIP_DIRS = new Set([
-  '.git',
-  '.hg',
-  '.svn',
-  'node_modules',
   '.dshstage',
   '.t',
   'dist',
@@ -171,6 +179,10 @@ const MATERIALIZE_SKIP_DIRS = new Set([
   '.turbo',
   '.next',
 ])
+
+/** 以 junction 直连真实盘的目录（VCS 元数据 / 依赖树 / 虚拟环境；见上方注释） */
+const MATERIALIZE_LINK_DIRS = new Set(['.git', '.hg', '.svn', 'node_modules', '.venv'])
+
 const MATERIALIZE_MAX_FILE_BYTES = 8 * 1024 * 1024
 const MATERIALIZE_MAX_TOTAL_BYTES = 256 * 1024 * 1024
 const MATERIALIZE_MAX_FILES = 20000
@@ -3477,7 +3489,7 @@ export class Workspace {
   }
   /** 执行前物化当前工作区版本到 staging root */
   materializeForExecution(options = {}) {
-    const report = { copied: 0, failed: [], fromManifest: 0, realFiles: 0, skipped: [], truncated: false }
+    const report = { copied: 0, failed: [], fromManifest: 0, realFiles: 0, skipped: [], truncated: false, linked: 0 }
     for (const [rel, entry] of Object.entries(this.manifest.entries)) {
       if (entry.state === STATE.DELETED) continue
       if (entry.kind === 'dir') {
@@ -3539,7 +3551,36 @@ export class Workspace {
         const rel = relative(this.root, abs)
         if (!rel || rel.startsWith('..')) continue
         if (dirent.isDirectory()) {
-          if (MATERIALIZE_SKIP_DIRS.has(dirent.name.toLowerCase())) {
+          const lower = dirent.name.toLowerCase()
+          if (MATERIALIZE_LINK_DIRS.has(lower)) {
+            /**
+             * R42-GIT：VCS/依赖/venv 用 junction 直连真实盘（不复制）。
+             *   · 已存在就跳过（幂等；也可能是上一轮已建好的 junction）；
+             *   · 目标本身是重解析点 ⇒ 保守跳过（理由同 D8：不跟随无法判定的结点）；
+             *   · 建链失败如实进 `failed`，同时记 `skipped`（不静默少东西）。
+             * 为什么在 SKIP 判断之前：它们现在**不是**"排除目录"，而是"链接目录"。
+             */
+            const stagedTarget = this.staged(rel)
+            if (existsSync(stagedTarget)) {
+              report.skipped.push({ path: rel, reason: 'linked-already' })
+              continue
+            }
+            const reason = classifyEntry(abs, dirent)
+            if (reason !== undefined) {
+              report.skipped.push({ path: rel, reason })
+              continue
+            }
+            try {
+              mkdirSync(dirname(stagedTarget), { recursive: true })
+              symlinkSync(abs, stagedTarget, 'junction')
+              report.linked += 1
+            } catch (error) {
+              report.failed.push({ path: rel, message: `link: ${error.message}` })
+              report.skipped.push({ path: rel, reason: 'link-failed' })
+            }
+            continue
+          }
+          if (MATERIALIZE_SKIP_DIRS.has(lower)) {
             report.skipped.push({ path: rel, reason: 'ignored-dir' })
             continue
           }

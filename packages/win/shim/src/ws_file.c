@@ -1739,6 +1739,55 @@ static int ws_nt_create_write_intent(ACCESS_MASK access, ULONG disposition, ULON
     }
 }
 
+/* R42-DNS：`\Device\Afd\Endpoint` / `\Device\Nsi` 这类**非文件系统设备**的
+ * NtCreateFile，不能按"无法映射的 NT 名字"一律 fail-closed —— 否则
+ * `getaddrinfo`、socket()、TLS 全部在沙箱内失败（实测：`\Device\Afd\Endpoint`
+ * 被拒 ⇒ Python `socket.gaierror: getaddrinfo failed`、Node `EAI_FAIL`）。
+ *
+ * 判据：名字是下列设备命名空间之一（大小写不敏感、按 `\` 边界），且**不**是
+ * 磁盘/卷/文件系统设备。放行这些设备不会绕过文件暂存/读取遮蔽：它们不是文件，
+ * 而是 Winsock(AFD)、网络存储接口(NSI)、内核安全(KsecDD)、加密(CNG)、
+ * 传统 TCP/UDP 设备。写意图作用在设备对象上，不会落到真实磁盘。 */
+static int ws_nt_name_is_safe_device(const UNICODE_STRING *name)
+{
+    static const wchar_t *const kPrefixes[] = {
+        L"\\device\\afd",
+        L"\\device\\nsi",
+        L"\\device\\ksecdd",
+        L"\\device\\cng",
+        L"\\device\\tcp",
+        L"\\device\\udp",
+        L"\\device\\ip",
+        L"\\device\\rawip",
+        L"\\device\\rasacd",
+    };
+    if (!name || !name->Buffer || (name->Length % (USHORT)sizeof(wchar_t)) != 0) {
+        return 0;
+    }
+    const size_t chars = (size_t)name->Length / sizeof(wchar_t);
+    for (size_t i = 0; i < sizeof(kPrefixes) / sizeof(kPrefixes[0]); i++) {
+        const wchar_t *prefix = kPrefixes[i];
+        const size_t n = wcslen(prefix);
+        if (chars < n) {
+            continue;
+        }
+        size_t k = 0;
+        for (; k < n; k++) {
+            wchar_t a = name->Buffer[k];
+            if (a >= L'A' && a <= L'Z') {
+                a = (wchar_t)(a + 32);
+            }
+            if (a != prefix[k]) {
+                break;
+            }
+        }
+        if (k == n && (chars == n || name->Buffer[n] == L'\\')) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 NTSTATUS NTAPI ws_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
                                PIO_STATUS_BLOCK IoStatusBlock, PVOID AllocationSize, ULONG FileAttributes,
                                ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions,
@@ -1775,12 +1824,22 @@ NTSTATUS NTAPI ws_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, PO
          * 写/删一律 deny（永不写真实盘）；mask 已声明时读也 deny（否则可用设备
          * 路径读回被遮蔽文件明文）。未声明 mask 且纯读时维持透传（兼容探测类调用）。 */
         if (ws_is_nt_alias_oa(ObjectAttributes) && (writeIntent || ws_mask_declared())) {
-            ws_log("fail-closed NtCreateFile: unmappable NT-namespace name (write or mask-read)");
-            if (IoStatusBlock) {
-                IoStatusBlock->Status = WS_R20_STATUS_ACCESS_DENIED;
-                IoStatusBlock->Information = 0;
+            if (!ws_nt_name_is_safe_device(ObjectAttributes->ObjectName)) {
+                wchar_t nm[64];
+                size_t cn = (size_t)ObjectAttributes->ObjectName->Length / sizeof(wchar_t);
+                if (cn > 63) {
+                    cn = 63;
+                }
+                memcpy(nm, ObjectAttributes->ObjectName->Buffer, cn * sizeof(wchar_t));
+                nm[cn] = 0;
+                ws_log_w(L"fail-closed NtCreateFile: unmappable NT-namespace name", nm);
+                if (IoStatusBlock) {
+                    IoStatusBlock->Status = WS_R20_STATUS_ACCESS_DENIED;
+                    IoStatusBlock->Information = 0;
+                }
+                return WS_R20_STATUS_ACCESS_DENIED;
             }
-            return WS_R20_STATUS_ACCESS_DENIED;
+            ws_log("R42: NT device passthrough (non-filesystem device)");
         }
         return g_orig.NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize,
                                    FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer,

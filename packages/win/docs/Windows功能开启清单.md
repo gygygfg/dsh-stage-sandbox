@@ -515,6 +515,26 @@ dism /online /get-featureinfo /featurename:Containers-DisposableClientVM
 > 注册表 apply 设计边界（delete-key 恒 recursive、>1MiB 值读取受 C 侧缓冲限制未真机验证、volatile 语义、链接类永久 fail-closed）。
 > 3 项非产品口径（`file-cow 16/19` / `read-security-evtx` / `diag-bindings ace-not-verifiable`）已由 gate-runner
 > 独立复核为**载体/OS ACL/环境残留**，无产品缺陷（见 round21 报告 §3）。
+>
+> **R42 补注（2026-10-22，日常可用性）**：真实事故是沙箱内 `git`、`getaddrinfo`、原子写全部失败，
+> 不是"隔离太严"而是"日常开发整条断了"。本轮修两处：
+> - **R42-GIT**：`materializeForExecution()` 不再把 `.git`/`.hg`/`.svn`/`node_modules`/`.venv`
+>   排除在外，而是用 **NTFS junction 直连真实盘**。命令 cwd 仍是工作副本，但 `git` 能发现真实
+>   `.git`、npm/pnpm/测试能解析依赖、`pytest`/Python 原子写可正常工作。**边界（如实声明）**：
+>   沙箱内 `git add/commit` 与 `pnpm install` 会**直接写真实** `.git`/`node_modules`/`.venv`，
+>   不经暂存/候选/审批；用户内容仍走暂存。cwd 是工作副本路径（`Get-Location` 可见）。
+>   **另（避免仓库污染）**：沙箱 shell 注入 `GIT_CONFIG_PARAMETERS='core.excludesFile'=<...>`
+>   的排除清单，把暂存树里的 `fs/`、`wo/`、`reg/`、`.winstage-*`、`shim.log`、
+>   `winstage-shim.config.json` 从 git 视图排除；不写真实仓库的 `.gitignore`/`.git/info/exclude`
+>   （`.git` 是 junction，写它等于写真实仓库）。守卫：`tests/workspace-regressions.ts`
+>   （junction 不复制内容、快照不跟随、派生目录仍排除）。
+> - **R42-DNS**：shim 的 `NtCreateFile` 对**非文件系统设备**（`\Device\Afd`、`\Device\Nsi`、
+>   `\Device\KsecDD`、`\Device\CNG`、`\Device\Tcp/Udp/Ip/RawIp`、`\Device\RasAcd`）放行；此前这些
+>   名字"无法映射到 Win32 路径"被 fail-closed，直接打崩 `getaddrinfo`/socket/TLS（实测
+>   `\Device\Afd\Endpoint` → Python `socket.gaierror`、Node `EAI_FAIL`）。磁盘/卷/文件系统设备
+>   仍 fail-closed；普通文件路径的暂存/遮蔽/白障规则不变。
+>   守卫：`shim/src/ws_file.c::ws_nt_name_is_safe_device()` + `tests/workspace-regressions.ts` 的
+>   `.git`/`node_modules` 链接断言。
 
 ---
 

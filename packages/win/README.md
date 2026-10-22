@@ -160,12 +160,14 @@ node tools\ebk-sandbox-test.ts # Windows E2E 测试台（需 docker + KVM，见 
 
 ## 4. 已知残余边界（必须与任何"通过"一起读）
 
-完整清单见 [`docs/Windows功能开启清单.md`](docs/Windows功能开启清单.md)（R1–R17）。最关键几条：
+完整清单见 [`docs/Windows功能开启清单.md`](docs/Windows功能开启清单.md)（R1–R17 与 R42）。最关键几条：
 
 - **R1 读取面不收敛**：本后端限制写/删，**不限制读**。读取收敛只能靠 AppContainer（默认档位是 `T1`）或工具层硬拒绝清单。
 - **R2 网络面不收敛**：网络策略层存在且 OFFLINE fail-closed，但本机未安装真实过滤器 ⇒ 沙箱内仍可开 socket。
 - **R6 嵌套隔离不可用**：已受限进程无法再建受限令牌 ⇒ 沙箱**必须由未受限宿主进程建立**。
 - **R7 环境块需运行时注入**：依赖包的受限 spawn 固定传 `lpEnvironment=NULL`（违反手册 #8.3）；本实现替换绑定表注入显式环境块，结构不符时 **fail-closed 拒绝启动**。
+- **R42-GIT（日常可用性）**：`.git`/`.hg`/`.svn`/`node_modules`/`.venv` 以 **junction 直连真实盘**（不复制内容）—— 否则沙箱内 `git status` 报 `fatal: not a git repository`、node/pnpm/测试解析不到依赖。代价：沙箱内 `git add/commit`、`pnpm install` 会**直接写真实** `.git`/`node_modules`/`.venv`，不经过暂存/候选/审批；用户内容（源码、数据）仍走暂存。命令 cwd 仍是工作副本路径（`Get-Location` 可见），这是透明暂存的残余。另：沙箱 shell 通过 `GIT_CONFIG_PARAMETERS` 注入 `core.excludesFile`，把 `fs/`、`wo/`、`reg/`、`.winstage-*`、`shim.log` 等**沙箱内部条目**从 git 视图排除，`git add -A` 不会把它们提交进用户仓库。
+- **R42-DNS（网络设备放行）**：shim 的 `NtCreateFile` 对非文件系统设备命名空间（`\Device\Afd`/`Nsi`/`KsecDD`/`CNG`/`Tcp`/`Udp`/`Ip`/`RawIp`/`RasAcd`）放行；否则 `getaddrinfo`、socket、TLS 会在沙箱内失败。磁盘/卷/文件系统设备仍 fail-closed，普通文件路径的暂存/遮蔽规则不变。
 
 ---
 

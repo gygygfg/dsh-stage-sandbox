@@ -509,11 +509,14 @@ W('=== 4. R18/KNOWN-03：init 之后真实盘新建的文件必须被物化（�
   // init 之后才在真实盘上出现的文件（旧实现只遍历 manifest ⇒ 沙箱内不可见）
   writeFileSync(join(root, 'late.txt'), 'late-content\n')
   writeFileSync(join(root, 'late-mod.txt'), 'v1\n')
-  // 排除集必须真的被排除（不拷贝巨型/非用户内容目录）
+  // R42-GIT：VCS/依赖不再"复制内容"进工作副本，而是 junction 直连真实盘
+  // （否则沙箱内 git / node / pytest 直接不可用；见 src/workspace.ts 的注释）。
   mkdirSync(join(root, '.git'), { recursive: true })
   writeFileSync(join(root, '.git', 'HEAD'), 'ref: refs/heads/main\n')
   mkdirSync(join(root, 'node_modules', 'pkg'), { recursive: true })
   writeFileSync(join(root, 'node_modules', 'pkg', 'index.js'), 'module.exports=1\n')
+  // 对照组：仍应被排除、不链接的派生目录
+  mkdirSync(join(root, '.t'), { recursive: true })
 
   const materialized = ws.materializeForExecution()
   check(
@@ -521,16 +524,32 @@ W('=== 4. R18/KNOWN-03：init 之后真实盘新建的文件必须被物化（�
     existsSync(ws.staged('late.txt')) && readFileSync(ws.staged('late.txt'), 'utf8') === 'late-content\n',
     JSON.stringify({ realFiles: materialized.realFiles, copied: materialized.copied }),
   )
-  check('`.git` 被排除（不拷贝 VCS 元数据）', !existsSync(ws.staged(join('.git', 'HEAD'))), 'no .git/HEAD in staged')
+  const gitLink = ws.staged('.git')
   check(
-    '`node_modules` 被排除（不拷贝依赖树）',
-    !existsSync(ws.staged(join('node_modules', 'pkg', 'index.js'))),
-    'no node_modules/** in staged',
+    '`.git` 以 junction 直连真实盘（VCS 元数据可读，不复制内容）',
+    materialized.linked === 2 &&
+      existsSync(gitLink) &&
+      readFileSync(join(gitLink, 'HEAD'), 'utf8') === 'ref: refs/heads/main\n',
+    JSON.stringify({ linked: materialized.linked, gitLink, exists: existsSync(gitLink) }),
   )
   check(
-    '跳过项结构化记录（忽略目录不静默）',
-    (materialized.skipped ?? []).some((entry) => entry.reason === 'ignored-dir'),
-    JSON.stringify((materialized.skipped ?? []).slice(0, 4)),
+    '`node_modules` 以 junction 直连真实盘（依赖树可解析，不复制内容）',
+    existsSync(ws.staged(join('node_modules', 'pkg', 'index.js'))) &&
+      readFileSync(ws.staged(join('node_modules', 'pkg', 'index.js')), 'utf8') === 'module.exports=1\n',
+    'node_modules linked',
+  )
+  check(
+    '派生目录（.t）仍被排除，不链接、不复制',
+    !existsSync(ws.staged('.t')) &&
+      (materialized.skipped ?? []).some((entry) => entry.reason === 'ignored-dir'),
+    JSON.stringify((materialized.skipped ?? []).slice(0, 6)),
+  )
+  const linkSnapshot = ws.snapshotStagedTree()
+  const linkedKeys = [...(linkSnapshot.hashes?.keys?.() ?? [])]
+  check(
+    '快照不跟随 junction（.git/node_modules 不进哈希树）',
+    !linkedKeys.some((key) => key === '.git' || key.startsWith('.git/') || key.startsWith('node_modules/')),
+    JSON.stringify(linkedKeys.filter((key) => key.includes('.git') || key.includes('node_modules')).slice(0, 3)),
   )
 
   // 模拟沙箱命令：相对路径删除 late.txt（删 staged 副本）→ capture 必须报删除
