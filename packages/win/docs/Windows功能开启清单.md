@@ -535,6 +535,16 @@ dism /online /get-featureinfo /featurename:Containers-DisposableClientVM
 >   仍 fail-closed；普通文件路径的暂存/遮蔽/白障规则不变。
 >   守卫：`shim/src/ws_file.c::ws_nt_name_is_safe_device()` + `tests/workspace-regressions.ts` 的
 >   `.git`/`node_modules` 链接断言。
+>
+> **R43 补注（2026-10-22，shell cwd 虚拟化）**：命令实际在暂存工作副本执行，但 PowerShell
+> 层把 cwd 呈现为真实工作区根：`Get-Location`/`pwd`/`$PWD`/`Set-Location`/`Push-Location`/
+> `Pop-Location` 都映射逻辑路径；`cd <真实工作区绝对路径>` 映射回暂存路径，不会逃出暂存树。
+> 实现：`dsh-plugin/shell-executor.ts::buildCwdVirtualizationPreamble()`，在每个
+> `pwsh -Command` 前注入；`Get-Location` 返回带 `Path`/`Provider`/`Drive`/`ProviderPath`
+> 的字符串视图，`pwd` 输出与真实路径一致。**残余**：`cmd /c cd`、Python `os.getcwd()`、
+> Node `process.cwd()`、`Resolve-Path`/`Get-Item .FullName`、子进程里的绝对路径仍带暂存前缀；
+> 嵌套 `powershell -File` **不继承**该包装（只包 DSH 直接执行的那个 PowerShell 进程）。
+> 这不是内核级 cwd 重定向，故不声称"所有子进程都不可见"。
 
 ---
 
