@@ -43,7 +43,7 @@ import { WindowsStageExecutor, resolveDshModuleRoot } from '../src/executor.ts'
 import { canonical, compareKey, maskSessionId } from '../src/paths.ts'
 import { renderCandidateDiff } from '../src/tools.ts'
 import { verifyStageRootAlive } from '../src/stage-guard.ts'
-import { REVIEW_BASENAME, getReviewService, resolveReviewStoreDir, disposeReviewServices } from './review-service.ts'
+import { REVIEW_BASENAME, getReviewService, isRegistryCandidate, resolveReviewStoreDir, disposeReviewServices } from './review-service.ts'
 import { installBaselineWatch } from './baseline-watch.ts'
 import { createAuditMirror } from './audit-mirror.ts'
 import { createRunCapture } from './run-capture.ts'
@@ -1477,10 +1477,26 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
       }
       const ws = service.reload()
       const changes = ws.diffEntries()
-      if (changes.length === 0) {
+      /**
+       * 注册表候选不是文件净 diff，`ws.diffEntries()` 对它们**永远为空**。
+       * 旧早退只看文件净 diff ⇒ 注册表变更"看得到、批不了"（R48 复现）。
+       * 把注册表候选的**显示路径**并入匹配面：没有显式路径时走
+       * `service.approve(undefined)`（全部注册表候选）；有显式路径时仍走同一套
+       * `matchPathsDetailed()`，歧义/未知路径保持整批拒绝。
+       */
+      const live = typeof ws.listReviews === 'function' ? ws.listReviews() : []
+      const registryLive = live.filter((candidate) => isRegistryCandidate(candidate))
+      const registryPaths = registryLive.flatMap((candidate) =>
+        (candidate.changes || []).map((change) => ({
+          path: change.displayPath ?? change.path,
+          // 保留内部键：32 位视图的 displayPath 与 service.approve() 的
+          // registryKeys（内部合成路径）不同，选中后必须回传内部路径。
+          __registryInternalPath: change.path,
+        })),
+      )
+      if (changes.length === 0 && registryLive.length === 0) {
         // S9（§7.3）：净 diff 为空、但队列里还有候选，**不是**"没有待审文件" ——
         // 用户按下唯一的按钮却拿到 success + 什么都没有，这正是"点了没反应"。
-        const live = typeof ws.listReviews === 'function' ? ws.listReviews() : []
         const frozen = live.reduce((n, c) => n + (c.changes || []).length, 0)
         if (live.length > 0) {
           return {
@@ -1490,7 +1506,8 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
         }
         return { kind: 'success', text: '没有待审文件' }
       }
-      const matched = matchPathsDetailed(changes, names)
+      const matchable = [...changes, ...registryPaths]
+      const matched = matchPathsDetailed(matchable, names)
       if (matched.ambiguous.length > 0) {
         return {
           kind: 'error',
@@ -1499,7 +1516,12 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
             matched.ambiguous.map((item) => `  · ${item.arg} ⇒ ${item.paths.join(' | ')}`).join('\n'),
         }
       }
-      const paths = names.length > 0 ? matched.matches.map((c) => c.path) : undefined
+      const registryInternal = new Map(
+        registryPaths.map((entry) => [entry.path, entry.__registryInternalPath]),
+      )
+      const paths = names.length > 0
+        ? matched.matches.map((c) => registryInternal.get(c.path) ?? c.path)
+        : undefined
       if (names.length > 0 && paths.length === 0) {
         return { kind: 'error', text: `没有匹配的待审路径：${names.join(' ')}` }
       }

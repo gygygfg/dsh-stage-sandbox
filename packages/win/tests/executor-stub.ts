@@ -1005,7 +1005,7 @@ async function main() {
     tlsCredentials: true,
     dshSandboxVars: [],
     dshSandboxCount: 0,
-    winstageVars: ['WINSTAGE_STAGE_ROOT', 'WINSTAGE_SHIM_CONFIG', 'WINSTAGE_SHIM_LOG'],
+    winstageVars: ['DSH_STAGE_ROOT', 'DSH_SHIM_CONFIG', 'DSH_SHIM_LOG'],
     winstageCount: 3,
   }
   const fakeProbe = (available) => ({
@@ -1135,7 +1135,7 @@ async function main() {
     check('注入器参数用 `--` 分隔目标命令', spawnCalls[0]?.args?.includes('--') === true, JSON.stringify(spawnCalls[0]?.args?.slice(0, 8)))
     const injectorEnv = spawnCalls[0]?.options?.env ?? {}
     check('注入器环境里没有任何 DSH_SANDBOX* 变量', !Object.keys(injectorEnv).some((name) => /^DSH_SANDBOX/i.test(name)), JSON.stringify(Object.keys(injectorEnv).filter((n) => /DSH/.test(n))))
-    check('注入器环境带上了 shim 契约变量 WINSTAGE_STAGE_ROOT', samePath(injectorEnv.WINSTAGE_STAGE_ROOT, STAGING), String(injectorEnv.WINSTAGE_STAGE_ROOT))
+    check('注入器环境带上了 shim 契约变量 DSH_STAGE_ROOT', samePath(injectorEnv.DSH_STAGE_ROOT, STAGING), String(injectorEnv.DSH_STAGE_ROOT))
     check('绝不设 WINSTAGE_SHIM_DISABLE（设了就等于裸跑）', injectorEnv.WINSTAGE_SHIM_DISABLE === undefined, String(injectorEnv.WINSTAGE_SHIM_DISABLE))
     check('shim 配置里 passthrough 含暂存根（防自指递归）', (report.shimConfig?.passthrough ?? []).some((p) => samePath(p, STAGING)), JSON.stringify(report.shimConfig?.passthrough))
     check('shim 配置 failClosed=true', report.shimConfig?.failClosed === true, JSON.stringify(report.shimConfig))

@@ -241,7 +241,7 @@ export const ENV_ALLOWLIST = [
   'PATH',
   'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER',
   'PROCESSOR_LEVEL', 'PROCESSOR_REVISION', 'OS',
-  'USERNAME', 'USERDOMAIN', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH',
+  'USERNAME', 'USERDOMAIN', 'USERPROFILE', 'COMPUTERNAME', 'HOMEDRIVE', 'HOMEPATH',
   'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'ProgramFiles', 'ProgramFiles(x86)',
   'ProgramW6432', 'CommonProgramFiles', 'PUBLIC',
   'TZ', 'LANG', 'LC_ALL', 'TERM', 'DSH_PROFILE',
@@ -2702,10 +2702,10 @@ export class WindowsStageExecutor {
       // shim 的环境契约（T4 `winstage_shim.h`）：STAGE_ROOT / CONFIG / LOG。
       // **不设** WINSTAGE_SHIM_DISABLE —— 设了 shim 就完全不生效，等于裸跑。
       env: {
-        WINSTAGE_STAGE_ROOT: this.stagingRoot,
-        WINSTAGE_SHIM_LOG: logPath,
-        WINSTAGE_SHIM_CONFIG: configPath,
-        ...(this.auditPath ? { WINSTAGE_AUDIT_LOG: this.auditPath } : {}),
+        DSH_STAGE_ROOT: this.stagingRoot,
+        DSH_SHIM_LOG: logPath,
+        DSH_SHIM_CONFIG: configPath,
+        ...(this.auditPath ? { DSH_AUDIT_LOG: this.auditPath } : {}),
         // ── 注册表覆盖层**不得**落在暂存树里（本轮修复）─────────────────────────
         // `WINSTAGE_STAGE_ROOT` 同时是文件族的重定向根**和**注册表 overlay 的默认
         // sessionDir（`ws_entry.c` 的取值顺序：REGSTAGE_SESSION_DIR > DSH_REGSTAGE_ROOT
@@ -2721,7 +2721,7 @@ export class WindowsStageExecutor {
         // 读取 WAL、写 `candidates/` + `queue.json` 的契约布局。
         ...(typeof this.options.registryStageDir === 'string' && this.options.registryStageDir.length > 0
           ? {
-              WINSTAGE_REGSTAGE_SESSION_DIR: this.options.registryStageDir,
+              DSH_REGSTAGE_SESSION_DIR: this.options.registryStageDir,
               DSH_REGSTAGE_ROOT: this.options.registryStageDir,
             }
           : {}),
@@ -2853,13 +2853,13 @@ export class WindowsStageExecutor {
     this.auditPath = auditPath
     const shimEnv = {
       // shim 的环境契约（T4 `winstage_shim.h`）；**不设** WINSTAGE_SHIM_DISABLE（设了等于裸跑）
-      WINSTAGE_STAGE_ROOT: this.stagingRoot,
-      WINSTAGE_SHIM_LOG: logPath,
-      WINSTAGE_SHIM_CONFIG: configPath,
-      ...(auditPath ? { WINSTAGE_AUDIT_LOG: auditPath } : {}),
+      DSH_STAGE_ROOT: this.stagingRoot,
+      DSH_SHIM_LOG: logPath,
+      DSH_SHIM_CONFIG: configPath,
+      ...(auditPath ? { DSH_AUDIT_LOG: auditPath } : {}),
       // 注册表覆盖层/WAL **不得**落在暂存树里（自指条目），与 TS 同口径放会话存储根
       ...(registryStageDir
-        ? { WINSTAGE_REGSTAGE_SESSION_DIR: registryStageDir, DSH_REGSTAGE_ROOT: registryStageDir }
+        ? { DSH_REGSTAGE_SESSION_DIR: registryStageDir, DSH_REGSTAGE_ROOT: registryStageDir }
         : {}),
     }
     this.t1sLaunch = {
@@ -6781,16 +6781,16 @@ function probeTransparentShimUncached(options = {}) {
   const allowlisted = buildChildEnvironment({}, { tempDir: canaryTemp, cwd: stageRoot }).env
   const shimEnv = {
     ...allowlisted,
-    WINSTAGE_STAGE_ROOT: stageRoot,
-    WINSTAGE_SHIM_LOG: logPath,
-    WINSTAGE_SHIM_CONFIG: configPath,
+    DSH_STAGE_ROOT: stageRoot,
+    DSH_SHIM_LOG: logPath,
+    DSH_SHIM_CONFIG: configPath,
     // The canary must use the SAME overlay location as the real runs, otherwise the
     // probe's own `registry/overlay*.hive` lands inside the staged tree and the
     // host's "collect staged-tree changes" step tries to ingest it (self-referential
     // entry; observed as `EPERM ... overlay.<pid>.hive.LOG1`).
     ...(typeof options.registryStageDir === 'string' && options.registryStageDir.length > 0
       ? {
-          WINSTAGE_REGSTAGE_SESSION_DIR: options.registryStageDir,
+          DSH_REGSTAGE_SESSION_DIR: options.registryStageDir,
           DSH_REGSTAGE_ROOT: options.registryStageDir,
         }
       : {}),

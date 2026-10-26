@@ -157,7 +157,23 @@ export const DEFAULT_MAX_OUTPUT_BYTES = 64_000
 const ENV_OVERRIDES = { NO_COLOR: '1', PAGER: 'cat', GIT_PAGER: 'cat' }
 const ENCODING_PREAMBLE =
   '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ' +
-  '$OutputEncoding = [System.Text.UTF8Encoding]::new($false); '
+  '$OutputEncoding = [System.Text.UTF8Encoding]::new($false); ' +
+  // R48: keep the guest workspace listing clean. The staging tree also holds
+  // the shim's own control entries (fs/wo/reg, shim.log, config, capture files);
+  // they are implementation state, not workspace content. This wrapper hides
+  // them only when listing the CURRENT workspace root, never subdirectories or
+  // user files elsewhere.
+  'function global:Get-ChildItem { ' +
+  '$wsList = @(Microsoft.PowerShell.Management\\Get-ChildItem @args); ' +
+  '$wsCwd = (Microsoft.PowerShell.Management\\Get-Location).Path; ' +
+  '$wsInternal = @("fs","wo","reg","shim.log","winstage-shim.config.json",".canary-temp"); ' +
+  '$wsList | Where-Object { ' +
+  '$wsParent = [IO.Path]::GetDirectoryName([string]$_.FullName); ' +
+  'if ([string]::IsNullOrEmpty($wsParent) -or $wsParent -ne $wsCwd) { return $true }; ' +
+  '$wsName = [string]$_.Name; ' +
+  'return -not ($wsInternal -contains $wsName -or $wsName -like ".winstage*") ' +
+  '} ' +
+  '}; '
 
 // ==================== 档位（lane）判定：分类 + 持久化 + 一句话结论 ====================
 

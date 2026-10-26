@@ -152,7 +152,10 @@ static int ws_init_full(const wchar_t *configJsonPath)
     if (!ws_t3_is_attached()) {
         WS_PATH_BUF(sessionDir);
         sessionDir[0] = 0;
-        ws_env_get(L"WINSTAGE_REGSTAGE_SESSION_DIR", sessionDir, WS_PATH_MAX);
+        ws_env_get(L"DSH_REGSTAGE_SESSION_DIR", sessionDir, WS_PATH_MAX);
+        if (!sessionDir[0]) {
+            ws_env_get(L"WINSTAGE_REGSTAGE_SESSION_DIR", sessionDir, WS_PATH_MAX);
+        }
         if (!sessionDir[0]) {
             ws_env_get(L"DSH_REGSTAGE_ROOT", sessionDir, WS_PATH_MAX);
         }

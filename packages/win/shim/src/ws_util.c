@@ -691,20 +691,24 @@ static void env_to_w(const wchar_t *name, wchar_t *out, DWORD cch)
 void ws_config_from_env(void)
 {
     WS_PATH_BUF(buf);
-    env_to_w(WINSTAGE_ENV_STAGE_ROOT, buf, WS_PATH_MAX);
+    env_to_w(L"DSH_STAGE_ROOT", buf, WS_PATH_MAX);
+    if (!buf[0]) env_to_w(WINSTAGE_ENV_STAGE_ROOT, buf, WS_PATH_MAX);
     if (buf[0]) {
         ws_strlcpy_w(g_ws.stageRoot, buf, WS_PATH_MAX);
         g_ws.haveStageRoot = 1;
     }
-    env_to_w(WINSTAGE_ENV_CONFIG, buf, WS_PATH_MAX);
+    env_to_w(L"DSH_SHIM_CONFIG", buf, WS_PATH_MAX);
+    if (!buf[0]) env_to_w(WINSTAGE_ENV_CONFIG, buf, WS_PATH_MAX);
     if (buf[0]) {
         ws_strlcpy_w(g_ws.configPath, buf, WS_PATH_MAX);
     }
-    env_to_w(WINSTAGE_ENV_LOG, buf, WS_PATH_MAX);
+    env_to_w(L"DSH_SHIM_LOG", buf, WS_PATH_MAX);
+    if (!buf[0]) env_to_w(WINSTAGE_ENV_LOG, buf, WS_PATH_MAX);
     if (buf[0]) {
         ws_strlcpy_w(g_ws.logPath, buf, WS_PATH_MAX);
     }
-    env_to_w(L"WINSTAGE_AUDIT_LOG", buf, WS_PATH_MAX);
+    env_to_w(L"DSH_AUDIT_LOG", buf, WS_PATH_MAX);
+    if (!buf[0]) env_to_w(L"WINSTAGE_AUDIT_LOG", buf, WS_PATH_MAX);
     if (buf[0]) {
         ws_strlcpy_w(g_ws.auditPath, buf, WS_PATH_MAX);
     }

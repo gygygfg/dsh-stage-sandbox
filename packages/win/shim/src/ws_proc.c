@@ -81,8 +81,8 @@ void ws_proc_set_self_module(HMODULE self)
 
 /* ---------------------------------------------------------- env contract */
 
-/* The shim's DllMain auto-initializes from WINSTAGE_STAGE_ROOT /
- * WINSTAGE_SHIM_CONFIG / WINSTAGE_SHIM_LOG. When the caller passes an explicit
+/* The shim's DllMain auto-initializes from DSH_STAGE_ROOT /
+ * DSH_SHIM_CONFIG / DSH_SHIM_LOG. When the caller passes an explicit
  * environment block those variables are NOT necessarily in it, and an injected
  * child whose shim loads inert is worse than no injection at all (it would look
  * hooked while writing through). Rebuild the block with the three contract
@@ -90,7 +90,7 @@ void ws_proc_set_self_module(HMODULE self)
  * on failure (the caller then fails the CreateProcess* fail-closed). */
 static wchar_t *ws_env_with_contract(const wchar_t *env)
 {
-    static const wchar_t *names[3] = { L"WINSTAGE_STAGE_ROOT", L"WINSTAGE_SHIM_LOG", L"WINSTAGE_SHIM_CONFIG" };
+    static const wchar_t *names[3] = { L"DSH_STAGE_ROOT", L"DSH_SHIM_LOG", L"DSH_SHIM_CONFIG" };
     const wchar_t *values[3] = { g_ws.stageRoot, g_ws.logPath, g_ws.configPath };
     size_t total = 1;
     for (const wchar_t *p = env; p && *p; p += wcslen(p) + 1) {
