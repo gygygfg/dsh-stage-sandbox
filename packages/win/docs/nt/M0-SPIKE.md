@@ -2,6 +2,11 @@
 
 > 目标：在 **Windows VM** 里用微软现成 sample 证明“同路径透明 + ProjFS COW + 内核重定向”
 > 可行，并拿到性能数字。**不写产品代码**，只做 go/no-go。
+>
+> 自动化 runner：`packages/win/native/m0/run-host.sh`（本机 Docker+KVM + 本地 Win10 ISO）。
+> 它会安装 VS Build Tools/WDK/.NET、构建 SimRep + ProjFS SimpleProvider、设置测试签名、
+> 重启一次，然后在 guest 里跑 C 探针并把 `RESULT_M0.json` 写回共享目录。手工步骤见下，
+> 自动化产物与日志约定见 `native/m0/README.md`。
 
 ## 1. 环境
 
