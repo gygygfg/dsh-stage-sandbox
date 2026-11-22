@@ -4,7 +4,8 @@
 >
 > **M0 已完成（GO）**：Windows 10 VM 上实测 ProjFS + SimRep 同路径重定向；C 探针 23/23 通过，
 > 真实 lower SHA-256 不变。证据：[`M0-RESULT.json`](./M0-RESULT.json)、
-> [`M0-REPORT.md`](./M0-REPORT.md)。性能尚未采集（见 M0 报告 §4）。
+> [`M0-REPORT.md`](./M0-REPORT.md)。性能已采集（2026-11-22，见 [`M0-PERF.md`](./M0-PERF.md)）：稳态可接受，
+首次触碰 4 ms/文件（样例 provider）不可接受；产品 provider 必须批量元数据，M1 加入性能门禁。
 
 ## 1. 已完成（控制面契约 + 单测）
 
@@ -74,8 +75,8 @@ apply-manifest=23、session=21。
 
 ## 5. 下一步（M1）
 
-1. **性能补测（M0 缺口）**：5k/10k/50k 文件 ProjFS 首次/二次枚举、copy-up、`git status`、
-   `pnpm install`、`tsc`；决定是否维持 hybrid 或改“完整复制 + 重定向”。
+1. ~~性能补测~~ ✅ 已完成（`M0-PERF.md`）：5k/20k 枚举、stat、copy-up、create/rename/delete；
+   结论：稳态可用，首次触碰必须靠产品 provider 批量元数据。
 2. 产品驱动（从 SimRep 演进）：按域/PID 映射（非全局）、allow/deny/mask、store/view 直接访问拒绝、
    `PsSetCreateProcessNotifyRoutineEx` 域继承、通信端口、审计计数。
 3. 安装器：`simrep.cat` 签名 + `pnputil` + `fltmc load` + `fltmc attach`；**不要**只 `sc create`

@@ -1,0 +1,255 @@
+{
+    "ok":  true,
+    "at":  "2026-11-22T16:09:22.0380375+08:00",
+    "os":  "Microsoft Windows 10 专业版",
+    "projfs":  "Enabled",
+    "testSigning":  true,
+    "lowerUnchanged":  true,
+    "rows":  [
+                 {
+                     "group":  "seed",
+                     "name":  "lower-flat1000-create",
+                     "ms":  759,
+                     "note":  "1000 x 1KiB"
+                 },
+                 {
+                     "group":  "seed",
+                     "name":  "lower-flat5000-create",
+                     "ms":  3690,
+                     "note":  "5000 x 1KiB"
+                 },
+                 {
+                     "group":  "seed",
+                     "name":  "lower-flat20000-create",
+                     "ms":  14794.4,
+                     "note":  "20000 x 1KiB"
+                 },
+                 {
+                     "group":  "lower",
+                     "name":  "enum-flat1000",
+                     "ms":  11.8,
+                     "note":  "GetFiles"
+                 },
+                 {
+                     "group":  "lower",
+                     "name":  "enum-flat5000",
+                     "ms":  3.3,
+                     "note":  "GetFiles"
+                 },
+                 {
+                     "group":  "lower",
+                     "name":  "enum-flat20000",
+                     "ms":  17.3,
+                     "note":  "GetFiles"
+                 },
+                 {
+                     "group":  "lower",
+                     "name":  "enum-tree-recursive",
+                     "ms":  11.5,
+                     "note":  "1000 files / 10 dirs"
+                 },
+                 {
+                     "group":  "lower",
+                     "name":  "stat-5000",
+                     "ms":  507.4,
+                     "note":  "5000 FileInfo"
+                 },
+                 {
+                     "group":  "lower",
+                     "name":  "read-1k-first",
+                     "ms":  10.9,
+                     "note":  "1 KiB"
+                 },
+                 {
+                     "group":  "lower",
+                     "name":  "read-1k-warm",
+                     "ms":  2.3,
+                     "note":  "1 KiB"
+                 },
+                 {
+                     "group":  "lower",
+                     "name":  "create-1000",
+                     "ms":  711.7,
+                     "note":  "1000 x 1 KiB"
+                 },
+                 {
+                     "group":  "lower",
+                     "name":  "rename-100",
+                     "ms":  63.9,
+                     "note":  "100 renames"
+                 },
+                 {
+                     "group":  "lower",
+                     "name":  "delete-500",
+                     "ms":  64.4,
+                     "note":  "500 deletes"
+                 },
+                 {
+                     "group":  "view",
+                     "name":  "enum-flat1000-cold",
+                     "ms":  32.3,
+                     "note":  "first enumeration"
+                 },
+                 {
+                     "group":  "view",
+                     "name":  "enum-flat1000-warm",
+                     "ms":  37.2,
+                     "note":  "second enumeration"
+                 },
+                 {
+                     "group":  "view",
+                     "name":  "enum-flat5000-cold",
+                     "ms":  108.9,
+                     "note":  "first enumeration"
+                 },
+                 {
+                     "group":  "view",
+                     "name":  "enum-flat5000-warm",
+                     "ms":  124.8,
+                     "note":  "second enumeration"
+                 },
+                 {
+                     "group":  "view",
+                     "name":  "enum-flat20000-cold",
+                     "ms":  403.9,
+                     "note":  "first enumeration"
+                 },
+                 {
+                     "group":  "view",
+                     "name":  "enum-flat20000-warm",
+                     "ms":  394.2,
+                     "note":  "second enumeration"
+                 },
+                 {
+                     "group":  "view",
+                     "name":  "enum-tree-recursive-cold",
+                     "ms":  114.1,
+                     "note":  "1000 files"
+                 },
+                 {
+                     "group":  "view",
+                     "name":  "enum-tree-recursive-warm",
+                     "ms":  91.2,
+                     "note":  "1000 files"
+                 },
+                 {
+                     "group":  "view",
+                     "name":  "stat-5000-cold",
+                     "ms":  16722.3,
+                     "note":  "5000 FileInfo"
+                 },
+                 {
+                     "group":  "view",
+                     "name":  "read-1k-first-cold",
+                     "ms":  15.9,
+                     "note":  "hydration"
+                 },
+                 {
+                     "group":  "view",
+                     "name":  "read-1k-warm-warm",
+                     "ms":  2.6,
+                     "note":  "Hydrated"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "enum-flat1000-cold",
+                     "ms":  25,
+                     "note":  "same-path first enumeration"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "enum-flat1000-warm",
+                     "ms":  24.1,
+                     "note":  "same-path second enumeration"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "enum-flat5000-cold",
+                     "ms":  100.3,
+                     "note":  "same-path first enumeration"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "enum-flat5000-warm",
+                     "ms":  99.4,
+                     "note":  "same-path second enumeration"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "enum-flat20000-cold",
+                     "ms":  391.9,
+                     "note":  "same-path first enumeration"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "enum-flat20000-warm",
+                     "ms":  394.9,
+                     "note":  "same-path second enumeration"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "enum-tree-recursive-cold",
+                     "ms":  95.8,
+                     "note":  "1000 files"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "enum-tree-recursive-warm",
+                     "ms":  90,
+                     "note":  "1000 files"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "stat-5000-cold",
+                     "ms":  1067.8,
+                     "note":  "5000 FileInfo"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "read-1k-first-cold",
+                     "ms":  6.2,
+                     "note":  "hydration via redirect"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "read-1k-warm-warm",
+                     "ms":  2,
+                     "note":  "hydrated"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "copyup-write-cold",
+                     "ms":  19.6,
+                     "note":  "first write to existing placeholder"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "copyup-write-again-warm",
+                     "ms":  5.4,
+                     "note":  "second write"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "create-1000-warm",
+                     "ms":  2634.5,
+                     "note":  "1000 x 1 KiB"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "rename-100-warm",
+                     "ms":  301.8,
+                     "note":  "100 renames"
+                 },
+                 {
+                     "group":  "ws",
+                     "name":  "delete-500-warm",
+                     "ms":  581,
+                     "note":  "500 deletes"
+                 }
+             ],
+    "notes":  [
+                  "cold = provider restarted before measurement; NTFS page cache is not flushed, so cold is a lower bound",
+                  "warm = immediately after the cold run",
+                  "files are 1 KiB, flat directories, 100 files per dir in tree"
+              ]
+}
