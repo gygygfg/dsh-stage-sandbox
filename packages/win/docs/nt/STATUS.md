@@ -88,7 +88,12 @@ apply=24、apply-manifest=23、runtime=54）。
   在 launcher 里回读校验失败即 fail-closed。
 - **性能门禁未过**：20k 首次触碰 11.4–12.8 s / 0.55–0.64 ms 每文件（目标 5 s / 0.2 ms）。
   修订后的两段式门禁见 `M1-PERF.md` §4。
-- 完整 `tsc` 类型检查需要 `.dsh-vendor`；本机用 `node --check`/运行时导入验证。
+- 本机没有 TypeScript 编译器。可临时装到 /tmp 后跑（不污染仓库）：
+  `npm i --prefix /tmp/opencode typescript@5.9 @types/node@22`，再
+  `node /tmp/opencode/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json --typeRoots /tmp/opencode/node_modules/@types`。
+  2026-11-23 实测：**只剩两个既有缺包错误**（`@deepseek-ai/schemastery`、
+  `@deepseek-ai/cordis` 在 `plugin/`），`src/nt/`、`tests/nt/`、`dsh-plugin/nt-command.ts`
+  均无类型错误。
 
 ## 4. 与封印/套件的关系
 

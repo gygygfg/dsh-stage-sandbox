@@ -139,13 +139,16 @@ node tests/nt/runtime.ts
 Windows guest 内（管理员）：`\\host.lan\Data\m1\go.bat` 跑 M1 全流程，
 `goperf.bat` 跑性能；结果写 `RESULT_M1.json` / `PERF_M1.json`。
 
-TypeScript 类型检查（本机 vendor 缺 `@deepseek-ai/*` 时，先只检查 `src/nt` 与 `tests/nt`；
-完整 `tsc` 需要先备齐 `.dsh-vendor`）：
+TypeScript 类型检查（本机没有 tsc 时可临时装到 /tmp，不污染仓库）：
 
 ```bash
-# 有完整 node_modules 时
-node node_modules/typescript/bin/tsc --noEmit -p tsconfig.json
+npm i --prefix /tmp/opencode typescript@5.9 @types/node@22
+node /tmp/opencode/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json \
+  --typeRoots /tmp/opencode/node_modules/@types
 ```
+
+2026-11-23 实测：只剩 `plugin/config.ts` / `plugin/index.ts` 的既有缺包错误
+（`@deepseek-ai/schemastery`、`@deepseek-ai/cordis`）；NT 相关源码与测试零错误。
 
 Windows 驱动/ProjFS 的 spike 见 [`M0-SPIKE.md`](./M0-SPIKE.md)。
 

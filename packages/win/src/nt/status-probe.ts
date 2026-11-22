@@ -26,8 +26,12 @@ export interface NtRawFacts {
   providerAlive?: boolean
   /** provider 已注册的视图根。 */
   providerViews?: string[]
-  /** 策略 generation/hash（控制面最后一次成功下发）。 */
-  policy?: { generation: number; hash: string; valid: boolean; error?: string }
+  /**
+   * 策略 generation/hash（控制面最后一次成功下发）。
+   * 失败时可能没有 generation/hash（驱动拒绝/未下发），因此它们是可选的；
+   * `valid` 才是唯一判据。
+   */
+  policy?: { generation?: number; hash?: string; valid: boolean; error?: string }
   /** 网络闸门是否回读为已安装。 */
   network?: { mode: 'offline' | 'allowlist' | 'observed'; enforced: boolean; error?: string }
   /** apply 通道是否就绪。 */
