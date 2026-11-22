@@ -212,7 +212,7 @@ const DICT = {
   }),
   workspaceRoot: field('string', {
     default: '',
-    description: '沙箱工作区根目录（R41-G04 唯一配置入口；fs/shell 未显式配置时由此派生）。留空 = 未配置：开态装配期 fail-closed（WINSTAGE_WORKSPACE_ROOT_MISSING），关态不校验；profile 只需覆盖 host 行。',
+    description: '沙箱工作区根目录（R41-G04 唯一配置入口；fs/shell 未显式配置时由此派生）。留空或目录不存在 = 插件装载但暂存面不接管（平台 fs/shell 保持在场，WINSTAGE_WORKSPACE_ROOT_MISSING/NOT_FOUND）；在此填写真实目录并保存后会自动重新装载。profile 只需覆盖 host 行。',
   }),
   probeOnStart: field('boolean', {
     default: true,

@@ -1592,14 +1592,31 @@ export function createWinStageShellExecutor(options = {}) {
      * 与 `staging-fs` 的 fail-open 口径一致（关不掉比静默不管更安全）。
      */
     winStageEnabled() {
+      let enabled = true
       try {
         const data = this.loaderRows()
-        if (!Array.isArray(data)) return true
-        const row = data.find((item) => item && item.id === 'winstage-sandbox')
-        if (!row || !row.config) return true
-        return row.config.enabled !== false
+        if (Array.isArray(data)) {
+          const row = data.find((item) => item && item.id === 'winstage-sandbox')
+          if (row && row.config) enabled = row.config.enabled !== false
+        }
       } catch {
-        return true
+        enabled = true
+      }
+      if (!enabled) return false
+      /**
+       * 2026-11-23：开关开但**根未配置** ⇒ 不接管执行面（交还平台原生执行器）。
+       *
+       * 与 `staging-fs.stagingEnabledRaw()` 同一判据。不得在 `disabled` 表达式里
+       * 做行级切换：`EntryGroup.update()` 会并发重挂两个 shell 提供方
+       * （实测 `service "shell" has been registered at <WinStageShellExecutor>`）。
+       */
+      try {
+        const root = this.effectiveWorkspaceRoot()
+        if (typeof root !== 'string' || root.length === 0) return false
+        return existsSync(root)
+      } catch (error) {
+        this.logError(`工作区根不可用，交还平台 shell：${error?.message ?? error}`)
+        return false
       }
     }
 

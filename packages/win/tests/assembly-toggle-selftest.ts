@@ -47,12 +47,15 @@
  * 用法：node --import tsx tests\assembly-toggle-selftest.ts
  */
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
 import {
+  PROFILE_ROOT_READER_SOURCE,
   PROFILE_SWITCH_READER_SOURCE,
   configPendingRestart,
+  workspaceRootConfiguredFromProfile,
+  workspaceRootConfiguredInProfileText,
   profilePatchPath,
   profilePatchPathFromBaseUrl,
   resolveProfilePatchPath,
@@ -148,6 +151,25 @@ ok(
     PROFILE_SWITCH_READER_SOURCE.includes('process.env.DSH_PROFILE') === true,
   'A13 共享读取段保留 env 回退（CLI / 自测 / 工具子进程）',
 )
+ok(
+  typeof PROFILE_ROOT_READER_SOURCE === 'string' &&
+    PROFILE_ROOT_READER_SOURCE.startsWith('(') === true &&
+    PROFILE_ROOT_READER_SOURCE.includes(': ') === false,
+  'A14 根读取段满足同一 YAML 形态约束（以 `(` 开头、无 `: `）',
+)
+ok(
+  pwshExpr?.includes(PROFILE_ROOT_READER_SOURCE) !== true && shellExpr?.includes(PROFILE_ROOT_READER_SOURCE) !== true,
+  'A15 根**不参与行装载**（根缺失由运行期交还平台；行级切换会触发 shell 双提供方冲突）',
+)
+ok(
+  workspaceRootConfiguredInProfileText(`- id: winstage-sandbox\n  config:\n    enabled: true\n    workspaceRoot: ${process.cwd()}`) === true,
+  'A16 根读取纯函数：真实存在的目录 ⇒ true（设置页保存后运行期才接管）',
+)
+ok(
+  workspaceRootConfiguredInProfileText('- id: winstage-sandbox\n  config:\n    enabled: true\n') === false &&
+    workspaceRootConfiguredInProfileText('- id: winstage-sandbox\n  config:\n    enabled: true\n    workspaceRoot: \'\'') === false,
+  'A17 根读取纯函数：缺失/空串 ⇒ false（不接管，不猜 cwd）',
+)
 
 // ── B. 宿主真实形态（ctx.baseUrl 有、DSH env 无）─────────────────────────────
 process.stdout.write('\n[B] 宿主真实形态矩阵（ctx.baseUrl 存在 + env 不含 DSH_HOME/DSH_PROFILE）\n')
@@ -158,22 +180,25 @@ function makeProfile(name, body) {
   const file = join(dir, 'cordis.patch.yml')
   if (body === null) rmSync(file, { force: true })
   else writeFileSync(file, `- id: winstage-sandbox\n  config:\n    ${body}`, 'utf8')
-  return { dir, file, baseUrl: pathToFileURL(dir + '\\').href }
+  return { dir, file, baseUrl: pathToFileURL(dir + sep).href }
 }
 const hostEnv = {} // 宿主进程：只有 DSH_CLIENT_VERSION 之类，没有 DSH_HOME/DSH_PROFILE
 const offProfile = makeProfile('off', 'enabled: false\n')
-const onProfile = makeProfile('on', 'enabled: true\n')
+const ROOT_PATH = SCRATCH
+const onProfile = makeProfile('on', 'enabled: true\n    workspaceRoot: ' + ROOT_PATH)
 const missingProfile = makeProfile('missing', null)
+const noRootProfile = makeProfile('no-root', 'enabled: true\n')
 // env 回退来源：scratch home/profiles/{off,on}（B 段 env 回退用例在矩阵里就要能读到文件）
 const SCRATCH_HOME = join(SCRATCH, 'home')
 mkdirSync(join(SCRATCH_HOME, 'profiles', 'off'), { recursive: true })
 mkdirSync(join(SCRATCH_HOME, 'profiles', 'on'), { recursive: true })
 writeFileSync(join(SCRATCH_HOME, 'profiles', 'off', 'cordis.patch.yml'), '- id: winstage-sandbox\n  config:\n    enabled: false\n', 'utf8')
-writeFileSync(join(SCRATCH_HOME, 'profiles', 'on', 'cordis.patch.yml'), '- id: winstage-sandbox\n  config:\n    enabled: true\n', 'utf8')
+writeFileSync(join(SCRATCH_HOME, 'profiles', 'on', 'cordis.patch.yml'), '- id: winstage-sandbox\n  config:\n    enabled: true\n    workspaceRoot: ' + SCRATCH + '\n', 'utf8')
 
 const hostCases = [
   ['host: baseUrl + enabled:false ⇒ 交还平台', offProfile.baseUrl, hostEnv, false],
-  ['host: baseUrl + enabled:true ⇒ WinStage 接管', onProfile.baseUrl, hostEnv, true],
+  ['host: baseUrl + enabled:true + 根可用 ⇒ WinStage 接管', onProfile.baseUrl, hostEnv, true],
+  ['host: baseUrl + enabled:true 但根未配置 ⇒ 行仍装载（运行期交还平台）', noRootProfile.baseUrl, hostEnv, true],
   ['host: baseUrl + profile 缺失 ⇒ fail-closed 交还平台', missingProfile.baseUrl, hostEnv, false],
   ['host: baseUrl 缺失 + env 有 + enabled:false ⇒ env 回退交还', undefined, { DSH_HOME: SCRATCH_HOME, DSH_PROFILE: 'off' }, false],
   ['host: baseUrl 与 env 都缺失 ⇒ fail-closed 交还平台', undefined, {}, false],
@@ -193,6 +218,7 @@ for (const [label, baseUrl, env, expectWinstage] of hostCases) {
   const shellDisabled = evaluate(shellExpr, { env: envFallback, ctx: {} })
   ok(shellDisabled === true, 'B env 回退路径确实读到了 profile 开关（enabled:false ⇒ shell 行禁用）', String(shellDisabled))
   ok(winStageEnabledFromProfile(envFallback) === false, 'B `winStageEnabledFromProfile(env)` 与 YAML 同结论')
+  ok(workspaceRootConfiguredFromProfile(envFallback) === false, 'B 根读取段同样从 env 回退读文件（off profile 无根 ⇒ false）')
 }
 
 // ── C. 优先级：ctx.baseUrl 胜过 env ──────────────────────────────────────────
@@ -200,7 +226,7 @@ process.stdout.write('\n[C] 来源优先级\n')
 {
   const envOn = { DSH_HOME: join(SCRATCH, 'home'), DSH_PROFILE: 'on' }
   mkdirSync(join(SCRATCH, 'home', 'profiles', 'on'), { recursive: true })
-  writeFileSync(join(SCRATCH, 'home', 'profiles', 'on', 'cordis.patch.yml'), '- id: winstage-sandbox\n  config:\n    enabled: true\n', 'utf8')
+  writeFileSync(join(SCRATCH, 'home', 'profiles', 'on', 'cordis.patch.yml'), '- id: winstage-sandbox\n  config:\n    enabled: true\n    workspaceRoot: ' + SCRATCH + '\n', 'utf8')
   const ctxOff = { baseUrl: offProfile.baseUrl }
   ok(evaluate(shellExpr, { env: envOn, ctx: ctxOff }) === true, 'C1 baseUrl(enabled:false) 与 env(enabled:true) 冲突时，以 baseUrl 为准（shell 行禁用）')
   ok(shellProviderPlan({ env: envOn, baseUrl: offProfile.baseUrl }).on === false, 'C2 模块纯函数与 C1 同结论')
@@ -227,6 +253,7 @@ const envStates = [
 const sourceStates = [
   ['src=baseUrl(off)', { ctx: { baseUrl: offProfile.baseUrl } }],
   ['src=baseUrl(on)', { ctx: { baseUrl: onProfile.baseUrl } }],
+  ['src=baseUrl(no-root)', { ctx: { baseUrl: noRootProfile.baseUrl } }],
   ['src=baseUrl(missing)', { ctx: { baseUrl: missingProfile.baseUrl } }],
   ['src=env(off)', { ctx: {}, env: { DSH_HOME: join(SCRATCH, 'home'), DSH_PROFILE: 'off' } }],
   ['src=env(on)', { ctx: {}, env: { DSH_HOME: join(SCRATCH, 'home'), DSH_PROFILE: 'on' } }],
@@ -301,8 +328,9 @@ process.stdout.write('\n[H] 宿主运行期开关：必须现读 loader 行表�
   ok(first === false && second === true, 'H6 行表内容更新后同一读法立即看到新值（不缓存 ⇒ 设置页热写生效）', `first=${first} second=${second}`)
   const hostSrc = readFileSync(join(REPO, 'dsh-plugin', 'host-plugin.ts'), 'utf8')
   ok(
-    /const isEnabled = \(\) => \{\s*\n\s*const fromRows = switchEnabledFromRows\(ctx\?\.fiber\?\.entry\?\.parent\?\.data\)/.test(hostSrc),
-    'H7 `apply` 的 isEnabled 现读 `ctx.fiber.entry.parent.data`（R17 P1 修复接线）',
+    /const requestedEnabled = \(\) => \{\s*\n\s*const fromRows = switchEnabledFromRows\(ctx\?\.fiber\?\.entry\?\.parent\?\.data\)/.test(hostSrc) &&
+      /const isEnabled = \(\) => requestedEnabled\(\) && rootUsable/.test(hostSrc),
+    'H7 `apply` 的开关现读 `ctx.fiber.entry.parent.data`，且与根可用性合成（R17 P1 + 2026-11-23 修）',
   )
   ok(
     /typeof fromRows === 'boolean' \? fromRows : config\.enabled !== false/.test(hostSrc),

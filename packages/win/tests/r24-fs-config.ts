@@ -514,7 +514,8 @@ try {
       disposeReviewServices()
     }
 
-    // 5.3b R34b-G-04：workspaceRoot 缺失/不存在 ⇒ 装配期 fail-closed，不回退插件目录
+    // 5.3b 2026-11-23（DSH desktop 实测）：workspaceRoot 缺失/不存在 ⇒ 插件仍装载，
+    //      但暂存面不接管（命令如实拒绝、设置页可填根）。不再让整包「异常」。
     {
       const empty = makeFakeCtx()
       let emptyError
@@ -523,11 +524,21 @@ try {
       } catch (error) {
         emptyError = error
       }
+      check('空 workspaceRoot ⇒ 不抛错（插件装载、暂存面不接管）', emptyError === undefined, String(emptyError?.message ?? 'ok'))
       check(
-        '空 workspaceRoot ⇒ WINSTAGE_WORKSPACE_ROOT_MISSING（不装配）',
-        emptyError?.code === 'WINSTAGE_WORKSPACE_ROOT_MISSING',
-        JSON.stringify({ code: emptyError?.code }),
+        '空 workspaceRoot ⇒ 留下结构化原因 WINSTAGE_WORKSPACE_ROOT_MISSING',
+        empty.logs.error.join('\n').includes('WINSTAGE_WORKSPACE_ROOT_MISSING'),
+        empty.logs.error.join(' | ').slice(0, 200),
       )
+      const emptyHandler = findBySub(empty.commands)
+      const emptyResult = emptyHandler?.handler({ rawInput: '', agent: { session: { id: 'r24-no-root' } } })
+      check(
+        '空 workspaceRoot ⇒ /winstage 如实拒绝并给出填写指引',
+        emptyResult?.kind === 'error' && /(workspaceRoot|工作区根)/.test(String(emptyResult?.text)) && /设置/.test(String(emptyResult?.text)),
+        String(emptyResult?.text ?? '(no command)').slice(0, 200),
+      )
+      disposeAll(empty)
+
       const missing = makeFakeCtx()
       let missingError
       try {
@@ -541,10 +552,24 @@ try {
         missingError = error
       }
       check(
-        '不存在的 workspaceRoot ⇒ WINSTAGE_WORKSPACE_ROOT_NOT_FOUND（不装配、不回退）',
-        missingError?.code === 'WINSTAGE_WORKSPACE_ROOT_NOT_FOUND',
-        JSON.stringify({ code: missingError?.code }),
+        '不存在的 workspaceRoot ⇒ 不抛错（不回退 cwd/插件目录做真实沙箱）',
+        missingError === undefined,
+        String(missingError?.message ?? 'ok'),
       )
+      check(
+        '不存在的 workspaceRoot ⇒ 留下 WINSTAGE_WORKSPACE_ROOT_NOT_FOUND',
+        missing.logs.error.join('\n').includes('WINSTAGE_WORKSPACE_ROOT_NOT_FOUND'),
+        missing.logs.error.join(' | ').slice(0, 200),
+      )
+      const missingHandler = findBySub(missing.commands)
+      const missingResult = missingHandler?.handler({ rawInput: '', agent: { session: { id: 'r24-no-root-2' } } })
+      check(
+        '不存在的 workspaceRoot ⇒ 命令同样如实拒绝',
+        missingResult?.kind === 'error' && /(workspaceRoot|工作区根)/.test(String(missingResult?.text)),
+        String(missingResult?.text ?? '(no command)').slice(0, 200),
+      )
+      disposeAll(missing)
+
       const disabled = makeFakeCtx()
       let disabledError
       try {
@@ -557,6 +582,7 @@ try {
         disabledError === undefined,
         String(disabledError?.message ?? 'ok'),
       )
+      disposeAll(disabled)
     }
 
     // 5.4 schema 层：masks 字段被真 schemastery 接受，缺省水合为 []

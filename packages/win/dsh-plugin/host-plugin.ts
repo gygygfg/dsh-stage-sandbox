@@ -1770,7 +1770,12 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
               const pending = runtime?.pendingRestart
                 ? `\n\n⚠ 配置漂移：profile 开关=${String(runtime.profileEnabled)}，当前 shell 提供方=${runtime.shellProvider === true ? 'winstage' : runtime.shellProvider === false ? 'platform' : '未知'}。命令面提供方需要重启宿主后才切换。`
                 : ''
-              return { kind: 'error', text: `${DISABLED_TEXT}${pending}` }
+              const rootHint =
+                runtime?.needsWorkspaceRoot === true
+                  ? `\n\n⚠ ${runtime.workspaceRootProblem ?? 'WINSTAGE_WORKSPACE_ROOT_MISSING'}：尚未配置可用的工作区根，暂存面没有接管。请在 设置 → 插件 → WinStage 填写 workspaceRoot 后保存（会自动重新装载）。`
+                  : ''
+              const head = runtime?.needsWorkspaceRoot === true ? 'WinStage 尚未配置工作区根：暂存与审阅面未接管，命令不会执行。' : DISABLED_TEXT
+              return { kind: 'error', text: `${head}${rootHint}${pending}` }
             }
             // **按会话解析**：命令在哪条会话里点的，就只动那条会话的暂存
             const service = serviceOf(invocation)
@@ -2165,44 +2170,59 @@ export function apply(ctx, config = {}) {
    * 行表 `winstage-sandbox.config.enabled` 是唯一真源，apply 参数只作离线下回退。
    * （详细依据见下方 `stagingEnabledRaw` 同源说明与 R17 审计记录。）
    */
-  const isEnabled = () => {
+  const requestedEnabled = () => {
     const fromRows = switchEnabledFromRows(ctx?.fiber?.entry?.parent?.data)
     return typeof fromRows === 'boolean' ? fromRows : config.enabled !== false
   }
-  const enabledNow = isEnabled()
 
   /**
-   * R34b-G-04：`workspaceRoot` 未配置 / 指向不存在的目录时 **fail-closed**。
+   * 2026-11-23（DSH desktop 实测后的修正）：**根未配置不再让整包装载失败**。
    *
-   * 旧实现回退到 `new URL('..', import.meta.url)` = 包目录本身：用户没配根时，
-   * 暂存/快照会落到插件安装目录（甚至 asar 内路径），既不是用户工作区，也没有任何提示。
-   * 现在要求 profile 配置 host 行（bundle 里留空；R41-G04 单源，fs/shell 未显式写根时
-   * 从这里派生，跨机器安装见 README "只配置 host 行的根"），否则在装配期抛结构化错误，
-   * 宿主日志里能直接看到原因。
+   * 桌面版「插件 → 添加插件」只把包加进 profile bundles，不会写 `workspaceRoot`；
+   * 旧实现因此在装配期 throw ⇒ 插件显示「异常」，而本 bundle 已经把平台的
+   * `fs-sandbox`/`pwsh-sandbox` 禁用 ⇒ 宿主连 fs/shell 提供方都没了（实测复现）。
+   *
+   * 现在的语义：
+   *   · 根可用（已配置且存在）⇒ 正常接管（与以前一致）；
+   *   · 根缺失 / 指向不存在的目录 ⇒ **插件仍装载**，但 `isEnabled()` 恒 false：
+   *     fs/shell 行由 `cordis.patch.yml` 的门控保持平台提供方，命令面如实拒绝，
+   *     设置页仍能渲染 Config 表单（用户在这里填 `workspaceRoot`，保存后自动重载）。
+   *   · 绝不回退到 cwd/包目录做真实沙箱：`workspaceRoot` 只是日志/挂载占位，
+   *     所有真实写入路径都过 `isEnabled()` 闸门。
+   *
+   * 这是"可见地不接管"，不是静默降级：`logError` 会留下结构化原因，状态卡与
+   * `/winstage` 拒绝文案都带 `WINSTAGE_WORKSPACE_ROOT_*` 机读码。
    */
-  if (enabledNow) {
-    if (configuredWorkspaceRoot.length === 0) {
-      const error = new Error(
-        'WinStage workspaceRoot 未配置：拒绝装配。请在 profile 覆盖层设置 winstage-sandbox.config.workspaceRoot（R41-G04 单源）；' +
-          'fs/shell 未显式写根时会自动派生它，不需要再重述三处。',
-      )
-      error.code = 'WINSTAGE_WORKSPACE_ROOT_MISSING'
-      logError(error.message)
-      throw error
+  const rootConfigured = configuredWorkspaceRoot.length > 0
+  const rootUsable = (() => {
+    if (!rootConfigured) return false
+    try {
+      return existsSync(canonical(configuredWorkspaceRoot))
+    } catch {
+      return false
     }
-    if (!existsSync(canonical(configuredWorkspaceRoot))) {
-      const resolved = canonical(configuredWorkspaceRoot)
-      const error = new Error(
-        `WinStage workspaceRoot 指向的目录不存在：${resolved}。请修正 profile 覆盖层里的 host 行根（R41-G04 单源；` +
-          'fs/shell 未显式写根时自动派生，显式值冲突仍会 fail-closed）；本插件不会自动创建用户工作区，也不会回退到插件安装目录。',
-      )
-      error.code = 'WINSTAGE_WORKSPACE_ROOT_NOT_FOUND'
-      logError(error.message)
-      throw error
-    }
+  })()
+  const rootProblem = rootConfigured
+    ? rootUsable
+      ? null
+      : 'WINSTAGE_WORKSPACE_ROOT_NOT_FOUND'
+    : 'WINSTAGE_WORKSPACE_ROOT_MISSING'
+  const workspaceRootProblem = rootProblem
+
+  const isEnabled = () => requestedEnabled() && rootUsable
+
+  if (requestedEnabled() && rootProblem !== null) {
+    const resolved = rootConfigured ? canonical(configuredWorkspaceRoot) : ''
+    const message =
+      rootProblem === 'WINSTAGE_WORKSPACE_ROOT_MISSING'
+        ? 'WinStage 已装载，但 workspaceRoot 未配置：暂存面不接管（平台 fs/shell 保持在场）。' +
+          '请在 设置 → 插件 → WinStage 填写工作区根并保存；保存后宿主会自动重新装载。'
+        : `WinStage 已装载，但 workspaceRoot 指向的目录不存在：${resolved}。暂存面不接管（平台 fs/shell 保持在场）；` +
+          '请修正 设置 → 插件 → WinStage 里的工作区根。本插件不会自动创建用户工作区，也不会回退到安装目录。'
+    logError(`${rootProblem}: ${message}`)
   }
   /**
-   * 关态**不校验根**：关闭 = 对原 harness 零影响，缺根/根不存在也不能阻止插件装载
+   * 关态/未配置都**不校验根**：它们对原 harness 零影响，缺根不能阻止插件装载
    * （命令面仍注册但如实拒绝、面板路由 503 disabled）。此时给一个只用于日志/挂载的
    * 占位路径，绝不建 store、绝不写盘。
    */
@@ -2285,7 +2305,12 @@ export function apply(ctx, config = {}) {
       return () => clearInterval(timer)
     }, 'winstage-sandbox: runtime profile-switch watchdog')
   }
-  const runtimeStatus = () => ({ ...runtimeConfig, effective: isEnabled() })
+  const runtimeStatus = () => ({
+    ...runtimeConfig,
+    effective: isEnabled(),
+    needsWorkspaceRoot: requestedEnabled() && !rootUsable,
+    workspaceRootProblem,
+  })
 
   /**
    * NT 内核后端的**惰性**装配：只有真的执行 `/winstage nt status|doctor` 才去
@@ -2399,6 +2424,11 @@ export function apply(ctx, config = {}) {
    */
   if (isEnabled()) {
     log.info(`已启用；工作区根 = ${workspaceRoot}`)
+  } else if (requestedEnabled() && !rootUsable) {
+    log.info(
+      `${rootProblem}: 插件已装载但暂存面未接管（平台 fs/shell 保持在场）；` +
+        '/winstage* 命令仍可见但会如实拒绝执行，设置页可填写 workspaceRoot。',
+    )
   } else {
     log.info('设置里当前为关闭：暂存面已交回平台沙箱（原审批模式）；/winstage* 命令仍可见但会如实拒绝执行。')
   }

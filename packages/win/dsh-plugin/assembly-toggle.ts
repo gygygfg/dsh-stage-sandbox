@@ -78,6 +78,22 @@ import { fileURLToPath } from 'node:url'
 export const PROFILE_SWITCH_READER_SOURCE =
   "(() => { try { const fs = process.getBuiltinModule('node:fs'); let p = null; if (process.env.DSH_HOME && process.env.DSH_PROFILE) p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; try { if (ctx && typeof ctx.baseUrl === 'string' && ctx.baseUrl.length > 0) p = new URL('cordis.patch.yml', ctx.baseUrl) } catch {} if (!p) return false; if (!fs.existsSync(p)) return false; const m = /id:\\s*winstage-sandbox\\b([\\s\\S]*?)(?=\\s*-\\s*id:|\\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return true; const e = /enabled:\\s*(true|false)\\b/.exec(m[1]); return !e || e[1] !== 'false' } catch { return false } })()"
 
+/**
+ * YAML 行共用的**根配置读取段**（逐字内联；与上面开关读取段同源、同一个 profile 文件）。
+ *
+ * 为什么需要它（2026-11-23，DSH desktop 实测）：
+ *   桌面版「插件 → 添加插件」只把包加进 profile bundles，**不会**写 `workspaceRoot`。
+ *   bundle 里该键刻意留空 ⇒ 开态装配期 fail-closed ⇒ 插件整包「异常」，
+ *   而平台的 `fs-sandbox`/`pwsh-sandbox` 已被本 bundle 禁用 ⇒ 连 fs/shell 提供方都没了。
+ *   所以"是否接管"必须同时要求 **开关开 + 根已配置且存在**；根缺失时交还平台，
+ *   插件本身仍装载（设置页才有地方填根）。这里与 `PROFILE_SWITCH_READER_SOURCE`
+ *   用同一段定位逻辑，唯一区别是只认 `workspaceRoot` 非空且路径存在。
+ *
+ * 约束与开关读取段相同：单行、不含 `: `（冒号+空格）、以 `(` 开头、只用 process/ctx/URL。
+ */
+export const PROFILE_ROOT_READER_SOURCE =
+  "(() => { try { const fs = process.getBuiltinModule('node:fs'); let p = null; if (process.env.DSH_HOME && process.env.DSH_PROFILE) p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; try { if (ctx && typeof ctx.baseUrl === 'string' && ctx.baseUrl.length > 0) p = new URL('cordis.patch.yml', ctx.baseUrl) } catch {} if (!p) return false; if (!fs.existsSync(p)) return false; const m = /id:\\s*winstage-sandbox\\b([\\s\\S]*?)(?=\\s*-\\s*id:|\\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return false; const r = /workspaceRoot:\\s*([^\\r\\n]*)/.exec(m[1]); const v = r && r[1].trim().replace(/^['\\x22]|['\\x22]$/g, ''); return !!(v && fs.existsSync(v)) } catch { return false } })()"
+
 /** profile 覆盖层的路径（env 回退来源；DSH 的层序：bundle → profile → home → overlays） */
 export function profilePatchPath(env = process.env) {
   const home = typeof env.DSH_HOME === 'string' && env.DSH_HOME.length > 0 ? env.DSH_HOME : undefined
@@ -135,6 +151,46 @@ export function winStageEnabledInProfileText(source) {
 }
 
 /**
+ * 从一份 entry-list YAML **文本**里判定 `id: winstage-sandbox` 行是否配置了**可用的** `workspaceRoot`。
+ *
+ * 与 {@link PROFILE_ROOT_READER_SOURCE} 逐条等价：没有该行 / 空串 / 引号里为空 /
+ * 路径不存在 ⇒ `false`。**未知不接管**（与开关读取段同一方向）。
+ *
+ * @param {string} source
+ * @returns {boolean} `true` = 根已配置且存在，WinStage 才允许接管执行面/文件面。
+ */
+export function workspaceRootConfiguredInProfileText(source) {
+  if (typeof source !== 'string' || source.length === 0) return false
+  const section = /id:\s*winstage-sandbox\b([\s\S]*?)(?=\n\s*-\s*id:|\s*$)/.exec(source)
+  if (!section) return false
+  const hit = /workspaceRoot:\s*([^\r\n]*)/.exec(section[1])
+  const value = hit ? hit[1].trim().replace(/^['"]|['"]$/g, '') : ''
+  if (value.length === 0) return false
+  try {
+    return existsSync(value)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 读 profile 覆盖层并判定根是否可用。文件/来源不可用 ⇒ `false`（fail-closed）。
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {string} [baseUrl] loader `ctx.baseUrl`（首选；`undefined` 时只看 env）
+ * @returns {boolean}
+ */
+export function workspaceRootConfiguredFromProfile(env = process.env, baseUrl) {
+  try {
+    const resolved = resolveProfilePatchPath({ baseUrl, env })
+    if (!resolved || !existsSync(resolved.path)) return false
+    return workspaceRootConfiguredInProfileText(readFileSync(resolved.path, 'utf8'))
+  } catch {
+    return false
+  }
+}
+
+/**
  * 读 profile 覆盖层并判定。**文件不可读/两源都不可用/读失败返回 `false`**（fail-closed：
  * 未知不接管，交还平台 shell）；文件存在但没有该行/没有 enabled 键时沿用 bundle 默认 true。
  *
@@ -173,6 +229,14 @@ export function configPendingRestart(profileEnabled, effectiveEnabled) {
 export function shellProviderPlan({ env = process.env, baseUrl } = {}) {
   const forced = typeof env.WINSTAGE_SHELL === 'string' ? env.WINSTAGE_SHELL : undefined
   const fromProfile = winStageEnabledFromProfile(env, baseUrl)
+  /**
+   * 2026-11-23：**行装载只看开关**（与 bundle 的 `!!js` 逐字一致）。
+   *
+   * 根是否配置由**运行期**判定：`staging-fs.stagingEnabled()` /
+   * `shell-executor.winStageEnabled()` 会在根缺失时交还平台实现。
+   * 行级切换根会导致 `EntryGroup.update()` 并发重挂两个 shell 提供方
+   * （实测 `service "shell" has been registered`），所以根**不得**参与 `disabled`。
+   */
   const on = forced !== '0' && (forced === '1' || fromProfile)
   return { on, pwshDisabled: on, shellDisabled: !on, forcedByEnv: forced === '0' || forced === '1' }
 }

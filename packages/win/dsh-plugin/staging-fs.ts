@@ -893,6 +893,15 @@ export function createStagingFileSystem(options = {}) {
        * 显式根 > host 行派生 > 无配置时的既有回退（`config.cwd`）。
        */
       const configuredRoot = explicitRoot ?? hostRoot
+      /**
+       * 2026-11-23：**是否配置了根**是运行期"接管/交还"的判据之一。
+       *
+       * 没有根时构造仍然安全（`configuredRoot` 为 undefined ⇒ 用占位 cwd），但
+       * `stagingEnabled()` 必须返回 false ⇒ 所有覆盖层 `super.*` 走平台实现。
+       * 这样"插件已装载但根未配置"不会把暂存写进安装目录，也不需要行级热切换
+       * （后者会让两个 shell/fs 提供方并发注册，实测 `service "shell" has been registered`）。
+       */
+      this.hasConfiguredRoot = configuredRoot !== undefined
       this.workspaceRoot = canonical(configuredRoot ?? configCwd ?? process.cwd())
       /**
        * R34b-G-04：配置了根（显式或 host 行）却指向不存在的目录 ⇒ 装配期 fail-closed。
@@ -1343,7 +1352,9 @@ export function createStagingFileSystem(options = {}) {
         if (!Array.isArray(data)) return true
         const row = data.find((item) => item && item.id === 'winstage-sandbox')
         if (!row || !row.config) return true
-        return row.config.enabled !== false
+        if (row.config.enabled === false) return false
+        // 开关开但根未配置 ⇒ 不接管（`super.*` 就是平台实现）。
+        return this.hasConfiguredRoot === true
       } catch {
         return true
       }

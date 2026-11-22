@@ -3020,7 +3020,7 @@ window.__ModuleLoader__.load({
      * 一行设置。宿主不传 props，因此这里自己画标题、说明与开关。
      * 收到的 props：`useValue`（读 configForms 快照）、`setEnabled`、`t`。
      */
-    function WinStageRow({ useValue, setEnabled, readStaging, t }) {
+    function WinStageRow({ useValue, setEnabled, setWorkspaceRoot, readStaging, t }) {
       const snapshot = useValue((s) => s)
       const [busy, setBusy] = React.useState(false)
       const [failed, setFailed] = React.useState(false)
@@ -3054,9 +3054,25 @@ window.__ModuleLoader__.load({
        * 失败时行内会同时给出原因与出路（见 `forcedHint` 与 `error` 文案）。
        */
       const [lastAttempt, setLastAttempt] = React.useState(null)
+      /**
+       * 2026-11-23（DSH desktop 实测）：**工作区根必须能在设置页里填**。
+       *
+       * 桌面版「插件 → 添加插件」只安装 bundle，不写 `workspaceRoot`；旧实现在装配期
+       * throw ⇒ 整包「异常」。现在宿主会以"已装载但不接管"启动，本行就是用户填根的入口：
+       * 通过 `remote.settings.mutate` 写 profile 覆盖层（与开关同一条通道），
+       * 保存后 fs/shell 两侧需要宿主重新装载才接管（加载期决定，不假装热切换）。
+       */
+      const [rootDraft, setRootDraft] = React.useState('')
+      const [rootAttempt, setRootAttempt] = React.useState(null)
+      const [rootBusy, setRootBusy] = React.useState(false)
+      const [rootDiagnostic, setRootDiagnostic] = React.useState(null)
 
       const writable = snapshot && snapshot.status === 'ready' && snapshot.writable !== false
       const value = snapshot && snapshot.value ? snapshot.value : undefined
+      const configuredRoot = value && typeof value.workspaceRoot === 'string' ? value.workspaceRoot.trim() : ''
+      React.useEffect(() => {
+        setRootDraft(configuredRoot)
+      }, [configuredRoot])
       const enabled = value && typeof value.enabled === 'boolean' ? value.enabled : true
       const unavailable = Boolean(snapshot && (snapshot.status === 'unavailable' || snapshot.writable === false))
       /**
@@ -3227,10 +3243,85 @@ window.__ModuleLoader__.load({
             'div',
             {
               ...DR,
-              style: { marginTop: '2px', fontSize: '12px', lineHeight: '18px', opacity: 0.65 },
+              style: { marginTop: '6px', fontSize: '12px', lineHeight: '18px', opacity: 0.75 },
               'data-winstage-setting-layers': layerAttr,
             },
             layerText,
+          ),
+          /**
+           * 工作区根编辑器：空 = 暂存面未接管。宿主在"已装载但不接管"时仍渲染本行，
+           * 用户在这里填写真实目录并保存；保存的是 profile 覆盖层的 host 行（单源）。
+           */
+          h(
+            'div',
+            {
+              style: { display: 'flex', alignItems: 'center', gap: '8px', marginTop: '6px', flexWrap: 'wrap' },
+            },
+            h('span', { style: { fontSize: '12px', opacity: 0.75, flex: '0 0 auto' } }, '工作区根'),
+            h('input', {
+              type: 'text',
+              value: rootDraft,
+              placeholder: '例如 C:\work\proj（必须是已存在的目录）',
+              spellCheck: 'false',
+              'data-winstage-setting-root': configuredRoot,
+              disabled: !writable || rootBusy,
+              style: {
+                flex: '1 1 220px',
+                minWidth: '160px',
+                fontSize: '12px',
+                padding: '4px 8px',
+                borderRadius: '6px',
+                border: '1px solid var(--dsw-alias-border-l4, rgba(128,128,128,.35))',
+                background: 'var(--dsw-alias-bg-layer-2, rgba(128,128,128,.08))',
+                color: 'inherit',
+                fontFamily: 'inherit',
+              },
+              onInput: (event) => setRootDraft(String(event?.target?.value ?? '')),
+            }),
+            h(
+              'button',
+              {
+                ...DR,
+                type: 'button',
+                disabled: !writable || rootBusy || rootDraft.trim() === configuredRoot,
+                style: styles.inlineToggle,
+                onClick: () => {
+                  if (!writable || rootBusy) return
+                  const next = rootDraft.trim()
+                  setRootBusy(true)
+                  setRootAttempt(null)
+                  setRootDiagnostic(null)
+                  Promise.resolve(setWorkspaceRoot(next))
+                    .then((result) => {
+                      const ok = result && typeof result === 'object' ? result.ok !== false : result !== false
+                      const error = result && typeof result === 'object' ? result.error : undefined
+                      if (error) setRootDiagnostic(error)
+                      setRootAttempt(ok ? 'accepted' : 'rejected')
+                    })
+                    .catch((error) => {
+                      setRootDiagnostic({ code: 'client-threw', message: String(error?.message ?? error) })
+                      setRootAttempt('rejected')
+                    })
+                    .finally(() => setRootBusy(false))
+                },
+              },
+              '保存根',
+            ),
+          ),
+          h(
+            'div',
+            {
+              ...DR,
+              style: { marginTop: '2px', fontSize: '12px', lineHeight: '18px', opacity: 0.75 },
+              'data-winstage-root-attempt': rootAttempt ?? '',
+            },
+            rootAttempt === 'accepted'
+              ? '已写入 profile 覆盖层；fs/shell 命令面需要重启宿主（或让 DSH 重新装载该行）后接管。'
+              : rootAttempt === 'rejected'
+                ? `宿主拒绝了这次写入${rootDiagnostic ? `（${rootDiagnostic.code}: ${String(rootDiagnostic.message).slice(0, 300)}）` : ''}`
+                : rootAttempt
+                  ? `写入抛错：${String(rootAttempt).replace(/^threw:/, '')}`
+                  : null,
           ),
           liveOverride ? h('div', { ...DR, style: { marginTop: '4px', fontSize: '12px', opacity: 0.75 }, 'data-winstage-staging-forced-note': '1' }, t('forcedHint')) : null,
           // S3e 第 2 条退路：默认展开/默认收起。纯客户端偏好（localStorage），
@@ -3402,6 +3493,44 @@ window.__ModuleLoader__.load({
          * 写用 `expectedRevision: undefined`（无条件写）：设置页是单布尔开关，冲突没有意义，
          * 而带一个过期 revision 只会把一次本来能成功的写入变成假失败。
          */
+        /** 工作区根的写入（与开关同一条 settings 通道；成功后 profile 覆盖层得到 host 行根）。 */
+        async function setWorkspaceRootViaHost(next) {
+          const value = typeof next === 'string' ? next.trim() : ''
+          if (value.length === 0) {
+            return { ok: false, error: { code: 'empty-root', message: 'workspaceRoot 不能为空' } }
+          }
+          let remote
+          try {
+            remote = ctx.remote && ctx.remote.settings
+          } catch {
+            remote = undefined
+          }
+          if (!remote || typeof remote.mutate !== 'function') {
+            try {
+              const ok = await form.set('workspaceRoot', value)
+              return ok === false
+                ? { ok: false, error: { code: 'config-forms', message: 'configForms 拒绝了这次写入' } }
+                : { ok: true }
+            } catch (error) {
+              return { ok: false, error: { code: 'config-forms-threw', message: String((error && error.message) || error) } }
+            }
+          }
+          try {
+            const response = await remote.mutate(NAMESPACE, [{ op: 'set', path: ['workspaceRoot'], value }], undefined)
+            if (response && response.ok === true) return { ok: true }
+            const error = response && response.error
+            return {
+              ok: false,
+              error: {
+                code: String((error && error.code) || 'unknown'),
+                message: String((error && error.message) || 'host returned no diagnostic'),
+              },
+            }
+          } catch (error) {
+            return { ok: false, error: { code: 'client-threw', message: String((error && error.message) || error) } }
+          }
+        }
+
         async function setEnabledViaHost(next) {
           lastToggleDiagnostic = null
           const value = next === true
@@ -3512,6 +3641,7 @@ window.__ModuleLoader__.load({
               inject: () => ({
                 hooks: { value: form },
                 setEnabled: setEnabledViaHost,
+                setWorkspaceRoot: setWorkspaceRootViaHost,
                 /**
                  * R12 修复 · D7-d：给设置行一个**与会话无关**的读法，读它自己的根。
                  *

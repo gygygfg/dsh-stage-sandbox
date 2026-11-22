@@ -1095,3 +1095,69 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
   是历史口径，已过期：`appcontainer-runtime` 现已在 `src/testrunner.ts::OFFLINE_SUITES` 与
   `verify.cmd` 中登记；本套件的登记状态以这两处 + `tests/suite-wiring.ts` 的显式名单为准
   （该治理套件会把“未登记且未列名”变成硬失败）。
+
+---
+
+## 21. 2026-11-23 · DSH **桌面端**实测（Electron 0.2.2-rc.5 / Windows 10）
+
+本轮第一次在**真实 DSH 桌面端**（`DeepSeek Harness.exe`，不是 `dsh web` CLI）里安装并启用本插件，
+用截图 + 坐标点击 + guest 命令完成验证。结论与修复如下（全部实测）。
+
+### 21.1 安装路径（与 web profile 不同）
+
+- 安装包：`https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe`
+  （落盘文件名 `deepseek-harness-0.2.2-rc.5-win-x64.exe`；sha512 与官方 feed 一致）。
+- 桌面端「插件 → 添加插件 → 本地目录」接受 `C:\winstage-plugin`，写入
+  `%DSH_HOME%\profiles\desktop\package.json` 的 `dsh.profile.bundles` + `link:C:/winstage-plugin`。
+- 桌面 profile 是 **desktop**（不是 `web`）：`dsh --profile desktop` 会报
+  `profile "desktop" is managed exclusively by the Electron application`，验证必须用桌面 UI
+  或复制 profile（`dbg`）后用 CLI 启动。
+
+### 21.2 真实缺陷：桌面安装不写 `workspaceRoot` ⇒ 整包「异常」
+
+桌面安装只加 bundle，不写任何 config。旧实现的开态装配期检查会抛
+`WINSTAGE_WORKSPACE_ROOT_MISSING`，插件在「插件」页显示 **异常**；更严重的是本 bundle 已经
+无条件禁用了平台 `fs-sandbox`，`winstage-fs/shell` 又因根缺失不可用 ⇒ **宿主连 fs/shell 提供方
+都没了**（实测：插件 3 个组件，0 运行）。
+
+### 21.3 修复（三层，缺一不可）
+
+1. **不再让整包装载失败**：根缺失/不存在时 `apply()` 记 `WINSTAGE_WORKSPACE_ROOT_*` 错误日志，
+   但**继续装载**；`isEnabled()` 恒 false，命令面如实拒绝并提示去设置页填根。
+2. **设置页可直接填根**：设置行新增「工作区根」输入 + 「保存根」，经
+   `remote.settings.mutate(NAMESPACE, [{op:'set', path:['workspaceRoot'], value}])`
+   写 profile 覆盖层（与开关同一条通道）。保存后提示"需要重启宿主"。
+3. **根不得参与行级 `disabled`**：最初把 `workspaceRoot` 写进 `fs-sandbox`/`winstage-fs`/
+   `pwsh-sandbox`/`winstage-shell` 的门控表达式，设置页保存时 `EntryGroup.update()` 并发重挂
+   两个 shell 提供方，实测硬失败：
+   `service "shell" has been registered at <WinStageShellExecutor>`。
+   现在行装载只看开关；根是否存在由**运行期**判定：
+   `staging-fs.stagingEnabledRaw()` / `shell-executor.winStageEnabled()` 在根缺失时返回 false，
+   覆盖层 `super.*` 走平台实现（"一个提供方、两种面"）。
+
+### 21.4 实测结果
+
+| 步骤 | 结果 |
+|---|---|
+| 桌面端安装插件（本地目录） | ✅ 已安装 `dsh-winstage-sandbox 1.0.0` |
+| 未写根时启用 | ✅ 不再「异常」；组件 `共 3 个，1 运行中，2 已停用`（平台 fs/shell 在场） |
+| 设置行填 `C:\Users\Docker` + 保存根 | ✅ 写入 `profiles\desktop\cordis.patch.yml`（`enabled: true` + `workspaceRoot`） |
+| 重启桌面端 | ✅ `共 3 个，3 运行中`（host + fs + shell 全部接管） |
+
+证据（guest 回写的 profile 覆盖层原文）：
+
+```yaml
+- id: winstage-sandbox
+  name: dsh-winstage-sandbox
+  config:
+    enabled: true
+    workspaceRoot: C:\Users\Docker
+    probeOnStart: true
+```
+
+### 21.5 边界
+
+- 保存根后 **fs/shell 命令面需要重启桌面端**（行装载期决定）。设置行已逐字提示；这不是
+  "热切换失败假装成功"。
+- 桌面端与 `dsh web` 共用同一个 exe；用 `ELECTRON_RUN_AS_NODE=1` 启动会**没有窗口**（只跑
+  CLI）。GUI 验证前必须清掉该变量。
