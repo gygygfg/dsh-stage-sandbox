@@ -14,13 +14,13 @@ import {
   summarizeStatus,
   writeBarrierFor,
 } from '../../src/nt/status.ts'
-import { NtError, type NtStatus } from '../../src/nt/types.ts'
+import { NT_DRIVER_ABI_VERSION, NtError, type NtStatus } from '../../src/nt/types.ts'
 import { check, eq, runSuite, section, throwsCode } from './harness.ts'
 
 function readyStatus(overrides: Partial<NtStatus> = {}): NtStatus {
   return createNtStatus({
     enforcement: 'kernel-projfs-minifilter',
-    driver: { loaded: true, abiVersion: 1, version: '0.1.0', altitude: '328000' },
+    driver: { loaded: true, abiVersion: NT_DRIVER_ABI_VERSION, version: '0.1.0', altitude: '328000' },
     projfs: { enabled: true, providerRunning: true, viewRoot: 'D:\\dshnt\\view\\s1' },
     policy: { valid: true, generation: 3, hash: 'a'.repeat(64) },
     domains: 1,

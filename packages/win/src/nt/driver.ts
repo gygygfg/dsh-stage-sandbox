@@ -208,14 +208,32 @@ export class UnavailableDriverPort implements NtDriverPort {
 }
 
 /**
- * 创建驱动端口。
+ * 同步工厂：默认返回 fail-closed 的 `UnavailableDriverPort`。
  *
- * 当前（M0/M1 之间）真实 FFI 尚未接线：默认返回 `UnavailableDriverPort`，
- * 只有显式 `fake: true` 或 `DSH_NT_FAKE_DRIVER=1` 才返回假端口。
- * 这样任何生产路径在驱动未实现/未加载时都会 fail-closed，而不是“看起来成功”。
+ * 真实 Windows 端口需要动态加载 koffi（ESM 里只能 async），因此生产路径用
+ * `createDriverPortAsync()`；这里保留同步 API 给离线测试与“先装配、后探测”的场景。
+ * 任何情况下都**不会**返回一个“看起来可用”的端口。
  */
 export function createDriverPort(options: { fake?: boolean; port?: NtDriverPort } = {}): NtDriverPort {
   if (options.port !== undefined) return options.port
   if (options.fake === true || process.env.DSH_NT_FAKE_DRIVER === '1') return new FakeDriverPort()
-  return new UnavailableDriverPort('real FilterConnectCommunicationPort client is not wired yet')
+  return new UnavailableDriverPort('real driver port is async-only (use createDriverPortAsync)')
+}
+
+/** 异步版本：Windows 上装配真实端口（其它平台等价于 `createDriverPort`）。 */
+export async function createDriverPortAsync(
+  options: { fake?: boolean; port?: NtDriverPort } = {},
+): Promise<NtDriverPort> {
+  if (options.port !== undefined) return options.port
+  if (options.fake === true || process.env.DSH_NT_FAKE_DRIVER === '1') return new FakeDriverPort()
+  if (process.platform === 'win32') {
+    try {
+      const mod = await import('./driver-client.ts')
+      const port = mod.tryCreateWindowsDriverPort()
+      if (port !== undefined) return port
+    } catch {
+      // fall through
+    }
+  }
+  return new UnavailableDriverPort('real driver port is unavailable (Windows + koffi + dshnt.sys required)')
 }

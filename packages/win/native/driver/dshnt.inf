@@ -1,0 +1,83 @@
+;;
+;; dshnt.sys — dshnt NT file-view minifilter
+;;
+;; Install (test signing):
+;;   Inf2Cat /os:10_X64 /driver:<pkg>
+;;   signtool sign /f dshnt-test.pfx dshnt.sys dshnt.cat
+;;   pnputil /add-driver dshnt.inf /install
+;;   fltmc load dshnt
+;;
+;; M0 verified that "sc create + hand-written Instances" is NOT equivalent to an
+;; INF install (fltmc load returned 0x80070002 / FilterManager 0xC0000034).
+;; Always install through the INF.
+;;
+
+[Version]
+Signature       = "$Windows NT$"
+Class           = "ActivityMonitor"
+ClassGuid       = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
+Provider        = %ProviderString%
+DriverVer       = 11/22/2026,0.1.0.0
+CatalogFile     = dshnt.cat
+PnpLockdown     = 1
+
+[DestinationDirs]
+Dshnt.DriverFiles = 12
+
+;
+; Default install sections
+;
+
+[DefaultInstall.NTamd64]
+OptionDesc  = %ServiceDesc%
+CopyFiles   = Dshnt.DriverFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService  = %ServiceName%, , Dshnt.Service
+
+[Dshnt.Service]
+DisplayName     = %ServiceName%
+Description     = %ServiceDesc%
+ServiceBinary   = %12%\dshnt.sys
+Dependencies    = FltMgr
+ServiceType     = 2
+StartType       = 3
+ErrorControl    = 1
+LoadOrderGroup  = "FSFilter Activity Monitor"
+AddReg          = Dshnt.AddRegistry
+
+[Dshnt.AddRegistry]
+HKR, "Parameters", "SupportedFeatures", 0x00010001, 0x3
+HKR, "Parameters\Instances", %RegDefaultInstanceValueName%, 0x00000000, %DefaultInstance%
+HKR, "Parameters\Instances\%Instance1.Name%", %RegAltitudeValueName%, 0x00000000, %Instance1.Altitude%
+HKR, "Parameters\Instances\%Instance1.Name%", %RegFlagsValueName%, 0x00010001, %Instance1.Flags%
+
+[Dshnt.DriverFiles]
+dshnt.sys
+
+;
+; Uninstall
+;
+
+[DefaultUninstall.NTamd64]
+LegacyUninstall = 1
+DelFiles        = Dshnt.DriverFiles
+
+[DefaultUninstall.NTamd64.Services]
+DelService      = %ServiceName%, 0x204
+
+;
+; Strings
+;
+
+[Strings]
+ProviderString              = "DeepSeek Harness"
+ServiceName                 = "dshnt"
+ServiceDesc                 = "dshnt NT file-view sandbox minifilter (ProjFS same-path view)"
+RegDefaultInstanceValueName = "DefaultInstance"
+RegAltitudeValueName        = "Altitude"
+RegFlagsValueName           = "Flags"
+DefaultInstance             = "dshnt"
+Instance1.Name              = "dshnt"
+Instance1.Altitude          = "371100"
+Instance1.Flags             = 0

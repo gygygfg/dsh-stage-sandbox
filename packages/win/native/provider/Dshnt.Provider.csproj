@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- dshnt ProjFS provider helper.
+       One process per user session; multiple sandbox domains (views) per process.
+       Control plane talks to it over a named pipe (JSON lines). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.17763.0</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>false</PublishSingleFile>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>dshnt-provider</AssemblyName>
+    <RootNamespace>Dshnt.Provider</RootNamespace>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- vendor/ is a separate project; do not glob its sources into this one. -->
+    <Compile Remove="vendor/**/*.cs" />
+    <None Remove="vendor/**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="vendor/ProjectedFSLib.Managed/ProjectedFSLib.Managed.csproj" />
+  </ItemGroup>
+
+</Project>

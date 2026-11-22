@@ -8,7 +8,7 @@ import { FakeDriverPort } from '../../src/nt/driver.ts'
 import { defaultRulesForDomain } from '../../src/nt/policy.ts'
 import { NtSession } from '../../src/nt/session.ts'
 import { createNtStatus } from '../../src/nt/status.ts'
-import { defaultJobLimits, type NtDomain, type NtPolicySet } from '../../src/nt/types.ts'
+import { NT_DRIVER_ABI_VERSION, defaultJobLimits, type NtDomain, type NtPolicySet } from '../../src/nt/types.ts'
 import { check, eq, rejectsCode, runSuite, section } from './harness.ts'
 
 const WORKSPACE = 'C:\\work\\proj'
@@ -45,7 +45,7 @@ function policy(d: NtDomain = domain()): NtPolicySet {
 function status() {
   return createNtStatus({
     enforcement: 'kernel-projfs-minifilter',
-    driver: { loaded: true, abiVersion: 1, version: '0.1.0' },
+    driver: { loaded: true, abiVersion: NT_DRIVER_ABI_VERSION, version: '0.1.0' },
     projfs: { enabled: true, providerRunning: true, viewRoot: VIEW },
     policy: { valid: true, generation: 5, hash: 'a'.repeat(64) },
     domains: 1,

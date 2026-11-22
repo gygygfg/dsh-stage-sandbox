@@ -18,7 +18,7 @@
 export const NT_POLICY_VERSION = 1 as const
 
 /** 驱动通信端口 ABI 版本。与 `native/include/dshnt_abi.h` 同名常量必须一致。 */
-export const NT_DRIVER_ABI_VERSION = 1 as const
+export const NT_DRIVER_ABI_VERSION = 2 as const
 
 /** 驱动通信端口名（与驱动侧 `\DshNtPort` 一致）。 */
 export const NT_DRIVER_PORT_NAME = '\\DshNtPort' as const
@@ -154,6 +154,8 @@ export interface NtDriverStats {
   denies: number
   masks: number
   policyGeneration: number
+  /** 当前 PID→域映射数量（含继承子进程）。 */
+  processCount?: number
   lastError?: string
 }
 
@@ -179,12 +181,31 @@ export interface NtDriverPort {
    * `generation` 必须单调递增；驱动对同 generation 幂等，对更小 generation 拒绝。
    */
   setPolicy(payload: Uint8Array, hash: string, generation: number): Promise<{ generation: number }>
-  registerDomain(input: { id: string; viewRoot: string; appContainerSid?: string }): Promise<void>
+  registerDomain(input: {
+    id: string
+    viewRoot: string
+    /** 策略内的根（用于驱动核对，防止控制面/驱动视图漂移）。 */
+    workspaceRoot?: string
+    storeRoot?: string
+    appContainerSid?: string
+  }): Promise<void>
   unregisterDomain(id: string): Promise<void>
   /** 仅对 apply helper 的 PID + image hash 临时授予真实工作区写权。 */
   grantApply(input: { pid: number; imageHash: string; paths: string[] }): Promise<void>
   revokeApply(pid: number): Promise<void>
   queryStats(): Promise<NtDriverStats>
+  /**
+   * PID → 域（ABI v2）。ROOT 的子进程由驱动继承；TRUSTED 不重定向/不拒绝。
+   * 真实驱动必须支持；Fake 仅记录。
+   */
+  registerProcess?(input: {
+    pid: number
+    domainId?: string
+    flags: { root?: boolean; trusted?: boolean }
+  }): Promise<void>
+  unregisterProcess?(pid: number): Promise<void>
+  /** 轮询审计事件（ABI v2；v1 控制面在设备上按需轮询）。 */
+  queryEvents?(): Promise<NtDriverEvent[]>
   onEvent(listener: (event: NtDriverEvent) => void): () => void
 }
 
