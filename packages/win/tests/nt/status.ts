@@ -79,7 +79,7 @@ await runSuite('nt-status', async () => {
   )
   throwsCode(
     'apply helper 缺失',
-    () => assertKernelReady(readyStatus({ apply: { helperReady: false } })),
+    () => assertKernelReady(readyStatus({ apply: { helperReady: false } }), { requireApplyHelper: true }),
     'NT_APPLY_HELPER_UNAVAILABLE',
   )
   throwsCode(
@@ -90,6 +90,14 @@ await runSuite('nt-status', async () => {
   let observedOk = true
   try {
     assertKernelReady(readyStatus({ network: { mode: 'observed', enforced: false } }))
+  check(
+    '按子进程安装（perChild）也算网络就绪',
+    isKernelReady(readyStatus({ network: { mode: 'offline', enforced: false, perChild: true } })),
+  )
+  check(
+    'perChild 不能掩盖其它缺失',
+    !isKernelReady(readyStatus({ network: { mode: 'offline', enforced: false, perChild: true }, policy: { valid: false } })),
+  )
   } catch {
     observedOk = false
   }

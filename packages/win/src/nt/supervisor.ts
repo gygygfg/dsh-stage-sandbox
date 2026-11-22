@@ -264,9 +264,21 @@ export class NtSupervisor {
           policy: status.policy,
         })
       }
+      if (status.network.mode !== 'observed' && !status.network.enforced) {
+        /*
+         * 初始化阶段没有全局闸门可观测：WFP 会话由 launcher 在**每次启动**时建立，
+         * 安装/回读失败即拒绝启动（fail-closed）。这里把“强制点=按子进程”标成事实，
+         * 否则状态卡会永远缺“网络强制”这一项，把已拉起的域误报成未就绪。
+         */
+        status.network = { ...status.network, perChild: true }
+        status.notes.push('network gate is installed per child by the launcher (failure => launch refused)')
+      }
       if (!isKernelReady(status)) {
-        // network.enforced 在初始化阶段不可观测（按子进程安装）；这里只记录，不阻断。
-        status.notes.push('network gate is installed per child by the launcher; ambient enforcement is not observable here')
+        throw new NtError('NT_CAPABILITY_MISSING', {
+          reason: 'data plane is not ready after start',
+          enforcement: status.enforcement,
+          network: status.network,
+        })
       }
 
       this.phase = 'up'

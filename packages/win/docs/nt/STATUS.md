@@ -22,7 +22,7 @@
 | `src/nt/policy.ts` | 校验；编译；特异性/deny 优先；canonical JSON/SHA-256 | `policy`（41） |
 | `src/nt/policy-binary.ts` | 驱动线格式编码（`DOMAIN_ENTRY=104`、消息头 16） | `policy-binary`（43） |
 | `src/nt/view.ts` | ProjFS 视图 diff；placeholder/full/tombstone；corruption | `view`（15） |
-| `src/nt/status.ts` | fail-closed；写屏障；逐项缺失机读码；失败分类 | `status`（32） |
+| `src/nt/status.ts` | fail-closed；写屏障；逐项缺失机读码；失败分类；perChild 网络语义 | `status`（34） |
 | `src/nt/status-probe.ts` | `fltmc`/`sc`/ProjFS/provider 事实 → `NtStatus` | `status-probe`（36） |
 | `src/nt/driver.ts` | 端口契约；Fake/Unavailable；默认 fail-closed | `driver`（27） |
 | `src/nt/driver-wire.ts` | ABI v2 消息编解码（hello/policy/domain/unregister/stats/events） | `driver-wire`（53） |
@@ -35,7 +35,7 @@
 | `src/nt/runtime.ts` | 诊断装配：驱动端口 + 状态探测 + provider 管道 + 域策略校验 | `runtime`（54） |
 | `src/nt/provider-protocol.ts` | provider 管道常量 / 回复解析 | `supervisor`（57） |
 | `src/nt/provider-client.ts` | provider 控制客户端（一请求一连接、超时、id 校验） | `supervisor`（57） |
-| `src/nt/supervisor.ts` | M2 数据面生命周期：校验→探测→spawn provider→start/protect→二进制策略→注册域→复核；失败回滚 | `supervisor`（57） |
+| `src/nt/supervisor.ts` | M2 数据面生命周期：校验→探测→spawn provider→start/protect→二进制策略→注册域→复核；失败回滚 | `supervisor`（59） |
 | `dsh-plugin/nt-command.ts` | `/winstage nt status` / `doctor` / `up` / `down` | `runtime` + `supervisor` |
 | `tests/nt/run-all.ts` | 15 个套件独立子进程运行 | `node tests/nt/run-all.ts` |
 
@@ -47,9 +47,9 @@ nt 控制面套件：15 个，失败 0 个
 RESULT: ALL PASS
 ```
 
-共 **549** 条断言（paths=47、policy=45、policy-binary=43、view=15、status=32、
+共 **553** 条断言（paths=47、policy=45、policy-binary=43、view=15、status=34、
 status-probe=36、driver=27、driver-wire=53、launcher-args=34、session=23、executor=36、
-apply=24、apply-manifest=23、runtime=54、supervisor=57）。
+apply=24、apply-manifest=23、runtime=54、supervisor=59）。
 
 ### 与 DSH 的接线（v1）
 
@@ -59,6 +59,9 @@ apply=24、apply-manifest=23、runtime=54、supervisor=57）。
   provider → `start`/`protect` → 用 `generation+1` 编码二进制策略并下发 → 注册域 →
   重新探测必须到 `kernel-projfs-minifilter`；任一步失败**先回滚再报错**；
 - `/winstage nt down` —— 注销域 → provider `stop`/`shutdown` → kill（幂等，清理不抛）；
+- 状态语义：`network.perChild=true` 表示强制点在 launcher（每次启动安装并回读，失败即拒绝），
+  初始化阶段没有全局闸门也判“就绪”；`apply helper` 默认不再是就绪前置（v1 的 apply 在
+  可信控制面，需要 helper 的调用方显式 `requireApplyHelper: true`）；
 - 装配是**惰性**的：只有执行命令才碰驱动端口/命名管道；加载期零内核交互；
 - 命令在 WinStage 关闭时与其他 `/winstage*` 一样被开关挡住（行为未变）；
 - `ctx.fs`/`ctx.shell` 的路径切换**仍未接管**：当前只到“数据面可拉起/可诊断”，

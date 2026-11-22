@@ -65,13 +65,16 @@ export function createNtStatus(input: Partial<NtStatus> = {}): NtStatus {
  * 断言内核路径就绪。任何一项不满足都抛出带机读码的 `NtError`，并把全部缺失项放进 details。
  *
  * @param status - 当前状态
- * @param options - `requireApplyHelper`（默认 true）；`requireNetwork`（默认按 status.network.mode 判断）
+ * @param options - `requireApplyHelper`（默认 false：v1 的 apply 在可信控制面执行，不需要内核 helper）；
+ *                  `requireNetwork`（默认按 status.network.mode 判断；`network.perChild` 也算就绪）
  */
 export function assertKernelReady(
   status: NtStatus,
   options: { requireApplyHelper?: boolean; requireNetwork?: boolean } = {},
 ): void {
-  const requireApply = options.requireApplyHelper !== false
+  // v1 的 apply 由可信控制面完成（journal/undo），内核 apply helper 只在 M2 使用；
+  // 需要 helper 的调用方必须显式 `requireApplyHelper: true`，不能用默认值把沙箱误判成未就绪。
+  const requireApply = options.requireApplyHelper === true
   const requireNetwork = options.requireNetwork ?? status.network.mode !== 'observed'
   const missing: string[] = []
   let code: NtErrorCode = 'NT_CAPABILITY_MISSING'
@@ -97,7 +100,7 @@ export function assertKernelReady(
     missing.push('policy.valid=false')
     if (code === 'NT_CAPABILITY_MISSING') code = 'NT_POLICY_INVALID'
   }
-  if (requireNetwork && !status.network.enforced) {
+  if (requireNetwork && !status.network.enforced && status.network.perChild !== true) {
     missing.push(`network.enforced=false (mode=${status.network.mode})`)
     if (code === 'NT_CAPABILITY_MISSING') code = 'NT_NETWORK_UNENFORCED'
   }
@@ -178,7 +181,9 @@ export function renderStatusCard(status: NtStatus): string {
   )
   lines.push(`  域: ${status.domains}`)
   lines.push(
-    `  网络: ${status.network.mode} enforced=${status.network.enforced}` + (status.network.error ? `（${status.network.error}）` : ''),
+    `  网络: ${status.network.mode} enforced=${status.network.enforced}` +
+      (status.network.perChild === true ? '（按子进程安装）' : '') +
+      (status.network.error ? `（${status.network.error}）` : ''),
   )
   lines.push(
     `  Apply: ${status.apply.helperReady ? 'ready' : 'unavailable'}` + (status.apply.error ? `（${status.apply.error}）` : ''),
@@ -276,7 +281,6 @@ export function summarizeStatus(status: NtStatus): string {
   if (!status.projfs.enabled) missing.push('ProjFS')
   else if (!status.projfs.providerRunning) missing.push('ProjFS provider')
   if (!status.policy.valid) missing.push('策略')
-  if (status.network.mode !== 'observed' && !status.network.enforced) missing.push('网络强制')
-  if (!status.apply.helperReady) missing.push('apply helper')
+  if (status.network.mode !== 'observed' && !status.network.enforced && status.network.perChild !== true) missing.push('网络强制')
   return `内核视图隔离未就绪：缺少 ${missing.join('、') || '未知能力'}；命令将 fail-closed。`
 }

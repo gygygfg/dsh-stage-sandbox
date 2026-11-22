@@ -234,7 +234,13 @@ export interface NtStatus {
   domains: number
   network: {
     mode: NtNetworkMode
+    /** 是否有**已安装并回读**的全局闸门（初始化阶段通常为 false）。 */
     enforced: boolean
+    /**
+     * 强制点是否**按子进程**安装（launcher 持有 WFP DYNAMIC 会话，失败即拒绝启动）。
+     * 为 true 时，初始化阶段没有全局闸门也算“就绪”；真实强制发生在每次启动。
+     */
+    perChild?: boolean
     error?: string
   }
   apply: {

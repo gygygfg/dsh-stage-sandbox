@@ -257,6 +257,8 @@ await runSuite('nt-supervisor', async () => {
     eq('payload magic', new DataView(payload!.buffer, payload!.byteOffset, 4).getUint32(0, true), POLICY_MAGIC)
     const status = supervisor.status()
     eq('探测到 kernel 档', status?.enforcement, 'kernel-projfs-minifilter')
+    eq('网络标记为按子进程安装', status?.network.perChild, true)
+    check('supervisor 判定就绪', status !== undefined && status.notes.some((note) => note.includes('per child')), status?.notes.join(' | '))
     check('op 顺序包含 start→protect', provider.ops.indexOf('start') >= 0 && provider.ops.indexOf('protect') > provider.ops.indexOf('start'), provider.ops.join(','))
     const again = await supervisor.up()
     eq('up 幂等', again.policyGeneration, 1)
