@@ -117,3 +117,12 @@ credentials.json
 
 # ── 误建目录（历史上曾有命令把 `--dry-run` 当成输出路径，留下空骨架）───────────
 --dry/
+
+# NT native build outputs (regenerated; never commit)
+native/provider/bin/
+native/provider/obj/
+native/provider/out/
+native/driver/obj/
+native/driver/pkg/
+native/launcher/obj/
+native/launcher/out/
