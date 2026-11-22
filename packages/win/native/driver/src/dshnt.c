@@ -25,6 +25,11 @@
 #include <ntstrsafe.h>
 #include "dshnt_abi.h"
 
+/* 指针别名（ABI 头只定义了值类型）；ROUND_UP 在 C 模式下不保证可见。 */
+typedef DSHNT_MSG_HEADER *PDSHNT_MSG_HEADER;
+typedef DSHNT_EVENTS_REPLY *PDSHNT_EVENTS_REPLY;
+#define DSHNT_ROUND_UP(value, align) (((value) + ((align) - 1)) & ~((align) - 1))
+
 #define DSHNT_TAG 'tnhD'
 #define DSHNT_ALTITUDE L"371100"
 #define DSHNT_VERSION_STRING L"0.1.0"
@@ -41,7 +46,7 @@
 typedef struct _DSHNT_PATH {
     UNICODE_STRING Device;  /* \Device\HarddiskVolume3 */
     UNICODE_STRING Rel;     /* \ws\sub（卷内相对，以反斜杠开头） */
-} DSHNT_PATH;
+} DSHNT_PATH, *PDSHNT_PATH;
 
 typedef struct _DSHNT_RULE {
     UNICODE_STRING Id;
@@ -130,6 +135,9 @@ typedef struct _DSHNT_GLOBALS {
 } DSHNT_GLOBALS;
 
 static DSHNT_GLOBALS g_Dshnt;
+
+/* 仅用于诊断：策略解析失败时定位到具体分支（0xD0000000|stage）。 */
+static ULONG g_ParseStage;
 
 /* ---------------------------------------------------------------- prototypes */
 
@@ -444,34 +452,41 @@ static NTSTATUS DshntParsePolicy(_In_ const UCHAR *payload, _In_ ULONG payloadLe
     ULONG i;
 
     if (payload == NULL || payloadLength < sizeof(DSHNT_POLICY_HEADER)) {
+        g_ParseStage = 1;
         return STATUS_INVALID_PARAMETER;
     }
     hdr = (const DSHNT_POLICY_HEADER *)payload;
     if (hdr->Magic != DSHNT_POLICY_MAGIC || hdr->AbiVersion != DSHNT_ABI_VERSION) {
+        g_ParseStage = 2;
         return STATUS_REVISION_MISMATCH;
     }
     if (hdr->DomainCount == 0 || hdr->DomainCount > DSHNT_MAX_DOMAINS ||
         hdr->RuleCount + hdr->GlobalMaskCount > DSHNT_MAX_RULES) {
+        g_ParseStage = 3;
         return STATUS_INVALID_PARAMETER;
     }
     if (hdr->StringBytes > payloadLength - sizeof(*hdr)) {
+        g_ParseStage = 4;
         return STATUS_INVALID_PARAMETER;
     }
 
     strings = payload + sizeof(*hdr);
-    domainsOffset = (ULONG)ROUND_UP(hdr->StringBytes, sizeof(PVOID));
+    domainsOffset = (ULONG)DSHNT_ROUND_UP(hdr->StringBytes, sizeof(PVOID));
     need = sizeof(*hdr) + domainsOffset;
     if (need > payloadLength) {
+        g_ParseStage = 5;
         return STATUS_INVALID_PARAMETER;
     }
     domains = (const DSHNT_DOMAIN_ENTRY *)(strings + domainsOffset);
     need += hdr->DomainCount * sizeof(DSHNT_DOMAIN_ENTRY);
     if (need > payloadLength) {
+        g_ParseStage = 6;
         return STATUS_INVALID_PARAMETER;
     }
     rules = (const DSHNT_RULE_ENTRY *)((const UCHAR *)domains + hdr->DomainCount * sizeof(DSHNT_DOMAIN_ENTRY));
     need += (hdr->RuleCount + hdr->GlobalMaskCount) * sizeof(DSHNT_RULE_ENTRY);
     if (need > payloadLength) {
+        g_ParseStage = 7;
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -487,24 +502,40 @@ static NTSTATUS DshntParsePolicy(_In_ const UCHAR *payload, _In_ ULONG payloadLe
         const DSHNT_DOMAIN_ENTRY *src = &domains[i];
         DSHNT_DOMAIN *dst = &policy->Domains[i];
         UNICODE_STRING workspace, view, store;
+        UNICODE_STRING refString;
         WCHAR drive[3];
 
+        g_ParseStage = 20;
         status = DshntRefString(strings, hdr->StringBytes, src->WorkspaceRoot, &workspace);
         if (!NT_SUCCESS(status)) goto fail;
+        g_ParseStage = 21;
         status = DshntRefString(strings, hdr->StringBytes, src->ViewRoot, &view);
         if (!NT_SUCCESS(status)) goto fail;
+        g_ParseStage = 22;
         status = DshntRefString(strings, hdr->StringBytes, src->StoreRoot, &store);
         if (!NT_SUCCESS(status)) goto fail;
 
-        status = DshntPolicyStrdup(policy, &src->Id, &dst->Id);
+        /* 注意：src->Id 是 STRING_REF，不是 UNICODE_STRING；必须先转成视图再复制。 */
+        g_ParseStage = 23;
+        status = DshntRefString(strings, hdr->StringBytes, src->Id, &refString);
         if (!NT_SUCCESS(status)) goto fail;
-        status = DshntPolicyStrdup(policy, &src->Label, &dst->Label);
+        g_ParseStage = 24;
+        status = DshntPolicyStrdup(policy, &refString, &dst->Id);
+        if (!NT_SUCCESS(status)) goto fail;
+        g_ParseStage = 25;
+        status = DshntRefString(strings, hdr->StringBytes, src->Label, &refString);
+        if (!NT_SUCCESS(status)) goto fail;
+        g_ParseStage = 26;
+        status = DshntPolicyStrdup(policy, &refString, &dst->Label);
         if (!NT_SUCCESS(status)) goto fail;
 
+        g_ParseStage = 30;
         status = DshntPolicyPath(policy, &workspace, &dst->Workspace, drive);
         if (!NT_SUCCESS(status)) goto fail;
+        g_ParseStage = 31;
         status = DshntPolicyPath(policy, &view, &dst->View, NULL);
         if (!NT_SUCCESS(status)) goto fail;
+        g_ParseStage = 32;
         status = DshntPolicyPath(policy, &store, &dst->Store, NULL);
         if (!NT_SUCCESS(status)) goto fail;
 
@@ -520,11 +551,13 @@ static NTSTATUS DshntParsePolicy(_In_ const UCHAR *payload, _In_ ULONG payloadLe
         /* 硬不变量：工作区/视图/store 必须同卷且互不重叠（控制面也校验，双保险）。 */
         if (dst->RuleStart > hdr->RuleCount ||
             dst->RuleCount > hdr->RuleCount - dst->RuleStart) {
+            g_ParseStage = 8;
             status = STATUS_INVALID_PARAMETER;
             goto fail;
         }
         if (!DshntPathEquals(&dst->Workspace.Device, &dst->View.Device) ||
             !DshntPathEquals(&dst->Workspace.Device, &dst->Store.Device)) {
+            g_ParseStage = 9;
             status = STATUS_INVALID_PARAMETER;
             goto fail;
         }
@@ -532,6 +565,7 @@ static NTSTATUS DshntParsePolicy(_In_ const UCHAR *payload, _In_ ULONG payloadLe
             DshntPathHasPrefix(&dst->Workspace.Rel, &dst->View.Rel) ||
             DshntPathHasPrefix(&dst->Store.Rel, &dst->Workspace.Rel) ||
             DshntPathHasPrefix(&dst->Workspace.Rel, &dst->Store.Rel)) {
+            g_ParseStage = 10;
             status = STATUS_INVALID_PARAMETER;
             goto fail;
         }
@@ -541,14 +575,25 @@ static NTSTATUS DshntParsePolicy(_In_ const UCHAR *payload, _In_ ULONG payloadLe
         const DSHNT_RULE_ENTRY *src = &rules[i];
         DSHNT_RULE *dst = &policy->Rules[i];
         UNICODE_STRING path;
+        UNICODE_STRING refString;
 
+        g_ParseStage = 40;
         status = DshntRefString(strings, hdr->StringBytes, src->Path, &path);
         if (!NT_SUCCESS(status)) goto fail;
+        g_ParseStage = 41;
         status = DshntPolicyPath(policy, &path, &dst->Match, NULL);
         if (!NT_SUCCESS(status)) goto fail;
-        status = DshntPolicyStrdup(policy, &src->Id, &dst->Id);
+        g_ParseStage = 42;
+        status = DshntRefString(strings, hdr->StringBytes, src->Id, &refString);
         if (!NT_SUCCESS(status)) goto fail;
-        status = DshntPolicyStrdup(policy, &src->Type, &dst->Type);
+        g_ParseStage = 43;
+        status = DshntPolicyStrdup(policy, &refString, &dst->Id);
+        if (!NT_SUCCESS(status)) goto fail;
+        g_ParseStage = 44;
+        status = DshntRefString(strings, hdr->StringBytes, src->Type, &refString);
+        if (!NT_SUCCESS(status)) goto fail;
+        g_ParseStage = 45;
+        status = DshntPolicyStrdup(policy, &refString, &dst->Type);
         if (!NT_SUCCESS(status)) goto fail;
         dst->AccessMask = src->AccessMask;
         dst->Action = src->Action;
@@ -559,8 +604,10 @@ static NTSTATUS DshntParsePolicy(_In_ const UCHAR *payload, _In_ ULONG payloadLe
         DSHNT_RULE *dst = &policy->Masks[i];
         UNICODE_STRING path;
 
+        g_ParseStage = 50;
         status = DshntRefString(strings, hdr->StringBytes, src->Path, &path);
         if (!NT_SUCCESS(status)) goto fail;
+        g_ParseStage = 51;
         status = DshntPolicyPath(policy, &path, &dst->Match, NULL);
         if (!NT_SUCCESS(status)) goto fail;
         DshntInitUnicode(&dst->Id);
@@ -818,6 +865,50 @@ static ULONG DshntDecideLocked(_In_ DSHNT_DOMAIN *domain,
     return DshntActionDeny;
 }
 
+/*
+ * 视图路径 → 逻辑工作区路径。
+ *
+ * 域内进程对视图根的“直接”打开与重定向后的续开在这里是同一种请求：
+ * 前者是显式访问暂存，后者是 STATUS_REPARSE 之后 IO 管理器用新名字重发的 create。
+ * 我们不（也无法）区分两者，而是把视图路径映射回逻辑路径，再套用**同一套**规则：
+ *   · 规则允许 ⇒ 放行（暂存目录本身就是该进程的数据）；
+ *   · 规则拒绝 ⇒ 拒绝（防止绕过 ws 上的 deny/mask 规则直接写暂存）。
+ *
+ * 这样就不需要 file-object context 来标记“这次打开是重定向续开”。
+ */
+static NTSTATUS DshntLogicalFromView(_In_ const DSHNT_DOMAIN *domain,
+                                     _In_ PCUNICODE_STRING rest,
+                                     _Out_ PUNICODE_STRING logical,
+                                     _Out_ PVOID *heap,
+                                     _In_ PWCHAR stackBuf,
+                                     _In_ ULONG stackChars)
+{
+    ULONG suffixBytes = rest->Length - domain->View.Rel.Length;
+    ULONG totalBytes = domain->Workspace.Rel.Length + suffixBytes;
+    PWCH buffer = stackBuf;
+
+    *heap = NULL;
+    if (totalBytes + sizeof(WCHAR) > stackChars * sizeof(WCHAR)) {
+        buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, totalBytes + sizeof(WCHAR), DSHNT_TAG);
+        if (buffer == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        *heap = buffer;
+    }
+
+    RtlCopyMemory(buffer, domain->Workspace.Rel.Buffer, domain->Workspace.Rel.Length);
+    if (suffixBytes > 0) {
+        RtlCopyMemory((PUCHAR)buffer + domain->Workspace.Rel.Length,
+                      (PUCHAR)rest->Buffer + domain->View.Rel.Length,
+                      suffixBytes);
+    }
+    buffer[totalBytes / sizeof(WCHAR)] = 0;
+    logical->Buffer = buffer;
+    logical->Length = (USHORT)totalBytes;
+    logical->MaximumLength = (USHORT)(totalBytes + sizeof(WCHAR));
+    return STATUS_SUCCESS;
+}
+
 /* ---------------------------------------------------------------- callbacks */
 
 static FLT_PREOP_CALLBACK_STATUS
@@ -934,9 +1025,8 @@ DshntPreCreate(_Inout_ PFLT_CALLBACK_DATA Cbd,
         return result;
     }
 
-    /* 直接访问视图根/store 根：拒绝（防篡改暂存与证据）。 */
-    if (DshntPathHasPrefix(&rest, &domain->View.Rel) ||
-        DshntPathHasPrefix(&rest, &domain->Store.Rel)) {
+    /* store 根：域内进程一律不可访问（证据/候选 blob/journal）。 */
+    if (DshntPathHasPrefix(&rest, &domain->Store.Rel)) {
         UNICODE_STRING pathName = nameInfo->Name;
         InterlockedIncrement64(&g_Dshnt.Denies);
         ExReleaseResourceLite(&g_Dshnt.Lock);
@@ -947,6 +1037,50 @@ DshntPreCreate(_Inout_ PFLT_CALLBACK_DATA Cbd,
     }
 
     access = DshntAccessFromCreate(Cbd);
+
+    /*
+     * 视图根：这既可能是重定向后的续开（STATUS_REPARSE 用新名字重发 create），
+     * 也可能是域内进程显式打开暂存目录。映射回逻辑路径后按同一套规则判定：
+     * 规则拒绝就拒绝，允许就放行（不再二次重定向）。
+     */
+    if (DshntPathHasPrefix(&rest, &domain->View.Rel)) {
+        UNICODE_STRING logical;
+        PVOID heap = NULL;
+        WCHAR stackBuf[512];
+        NTSTATUS build;
+        ULONG viewAction;
+
+        build = DshntLogicalFromView(domain, &rest, &logical, &heap, stackBuf, ARRAYSIZE(stackBuf));
+        if (!NT_SUCCESS(build)) {
+            ExReleaseResourceLite(&g_Dshnt.Lock);
+            FltReleaseFileNameInformation(nameInfo);
+            Cbd->IoStatus.Status = build;
+            return FLT_PREOP_COMPLETE;
+        }
+
+        viewAction = DshntDecideLocked(domain, &nameInfo->Volume, &logical, access, &ruleId);
+        ExReleaseResourceLite(&g_Dshnt.Lock);
+        if (heap != NULL) {
+            ExFreePoolWithTag(heap, DSHNT_TAG);
+        }
+
+        if (viewAction == DshntActionDeny || viewAction == DshntActionMask) {
+            UNICODE_STRING pathName = nameInfo->Name;
+            if (viewAction == DshntActionMask) {
+                InterlockedIncrement64(&g_Dshnt.Masks);
+            } else {
+                InterlockedIncrement64(&g_Dshnt.Denies);
+            }
+            DshntRecordEvent(viewAction == DshntActionMask ? DshntEventMask : DshntEventDeny,
+                             access, viewAction, pid, &domainIdCopy, &pathName, ruleId);
+            FltReleaseFileNameInformation(nameInfo);
+            Cbd->IoStatus.Status = STATUS_ACCESS_DENIED;
+            return FLT_PREOP_COMPLETE;
+        }
+
+        FltReleaseFileNameInformation(nameInfo);
+        return result;
+    }
     action = DshntDecideLocked(domain, &nameInfo->Volume, &rest, access, &ruleId);
 
     if (action == DshntActionDeny || action == DshntActionMask) {
@@ -1104,6 +1238,54 @@ DshntPreSetInformation(_Inout_ PFLT_CALLBACK_DATA Cbd,
         rest.Buffer = destInfo->Name.Buffer + (destInfo->Volume.Length / sizeof(WCHAR));
         rest.Length = destInfo->Name.Length - destInfo->Volume.Length;
         rest.MaximumLength = rest.Length;
+
+        /* store 目标：拒绝（改名到 store 等于把内容搬进证据区）。 */
+        if (DshntPathEquals(&destInfo->Volume, &domain->Workspace.Device) &&
+            DshntPathHasPrefix(&rest, &domain->Store.Rel)) {
+            UNICODE_STRING pathName = destInfo->Name;
+            InterlockedIncrement64(&g_Dshnt.Denies);
+            ExReleaseResourceLite(&g_Dshnt.Lock);
+            DshntRecordEvent(DshntEventDeny, DSHNT_ACCESS_RENAME, DshntActionDeny, pid,
+                             &domainId, &pathName, NULL);
+            FltReleaseFileNameInformation(destInfo);
+            Cbd->IoStatus.Status = STATUS_ACCESS_DENIED;
+            return FLT_PREOP_COMPLETE;
+        }
+
+        /* 视图内的目标（相对改名/已在暂存里）：按逻辑路径判定后放行。 */
+        if (DshntPathEquals(&destInfo->Volume, &domain->Workspace.Device) &&
+            DshntPathHasPrefix(&rest, &domain->View.Rel)) {
+            UNICODE_STRING logical;
+            PVOID heap = NULL;
+            WCHAR stackBuf[512];
+            NTSTATUS build;
+            ULONG viewAction;
+
+            build = DshntLogicalFromView(domain, &rest, &logical, &heap, stackBuf, ARRAYSIZE(stackBuf));
+            viewAction = NT_SUCCESS(build)
+                ? DshntDecideLocked(domain, &destInfo->Volume, &logical, DSHNT_ACCESS_RENAME, NULL)
+                : DshntActionDeny;
+            ExReleaseResourceLite(&g_Dshnt.Lock);
+            if (heap != NULL) {
+                ExFreePoolWithTag(heap, DSHNT_TAG);
+            }
+            if (!NT_SUCCESS(build)) {
+                FltReleaseFileNameInformation(destInfo);
+                Cbd->IoStatus.Status = build;
+                return FLT_PREOP_COMPLETE;
+            }
+            if (viewAction == DshntActionDeny || viewAction == DshntActionMask) {
+                UNICODE_STRING pathName = destInfo->Name;
+                InterlockedIncrement64(&g_Dshnt.Denies);
+                DshntRecordEvent(DshntEventDeny, DSHNT_ACCESS_RENAME, viewAction, pid,
+                                 &domainId, &pathName, NULL);
+                FltReleaseFileNameInformation(destInfo);
+                Cbd->IoStatus.Status = STATUS_ACCESS_DENIED;
+                return FLT_PREOP_COMPLETE;
+            }
+            FltReleaseFileNameInformation(destInfo);
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
 
         if (!DshntPathEquals(&destInfo->Volume, &domain->Workspace.Device) ||
             !DshntPathHasPrefix(&rest, &domain->Workspace.Rel)) {
@@ -1277,7 +1459,7 @@ static NTSTATUS DshntHandleSetPolicy(_In_ const UCHAR *payload, _In_ ULONG paylo
 
     status = DshntParsePolicy(payload, payloadLength, &policy);
     if (!NT_SUCCESS(status)) {
-        g_Dshnt.LastError = status;
+        g_Dshnt.LastError = 0xD0000000u | (g_ParseStage & 0xFFu);
         return status;
     }
 
@@ -1383,7 +1565,7 @@ static NTSTATUS DshntHandleGrantApply(_In_ const DSHNT_GRANT_APPLY *req,
     if (req->PathCount > DSHNT_MAX_GRANT_PATHS) {
         return STATUS_INVALID_PARAMETER;
     }
-    refs = (const DSHNT_STRING_REF *)(strings + (ULONG)ROUND_UP(stringBytes, sizeof(PVOID)));
+    refs = (const DSHNT_STRING_REF *)(strings + (ULONG)DSHNT_ROUND_UP(stringBytes, sizeof(PVOID)));
 
     grant = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*grant), DSHNT_TAG);
     if (grant == NULL) return STATUS_INSUFFICIENT_RESOURCES;

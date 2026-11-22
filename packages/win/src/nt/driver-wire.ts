@@ -13,7 +13,7 @@
 
 import { NT_DRIVER_ABI_VERSION, NtError, type NtAccess, type NtDriverEvent } from './types.ts'
 
-export const MSG_HEADER_BYTES = 24
+export const MSG_HEADER_BYTES = 16
 
 export const Msg = {
   hello: 1,

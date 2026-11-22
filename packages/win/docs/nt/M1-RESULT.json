@@ -1,0 +1,36 @@
+{
+    "ok":  true,
+    "phase":  "m1",
+    "at":  "2026-11-22T19:08:23.1593610+08:00",
+    "checks":  {
+                   "providerRunning":  true,
+                   "driverLoaded":  true,
+                   "policyGeneration":  1,
+                   "clientExit":  0,
+                   "clientChecks":  24,
+                   "clientFailures":  0,
+                   "viewB":  "v2",
+                   "lowerB":  "v1",
+                   "stagedWrite":  true,
+                   "viewHasChild":  true,
+                   "viewHasNew":  true,
+                   "viewHasMasked":  true,
+                   "deletedAFromView":  true,
+                   "lowerUnchanged":  true,
+                   "lowerDiff":  [
+
+                                 ],
+                   "restrictedOfflineExit":  90,
+                   "restrictedOfflineFailClosed":  true,
+                   "appContainerOfflineExit":  0,
+                   "appContainerOfflineOutput":  "dshnt-launch.exe : dshnt-launch: create first=0 final=0 appcontainer=1\n所在位置 \\\\host.lan\\Data\\m1\\m1.ps1:404 字符: 1\n+ \u0026 $launcherBin @netArgs2 *\u003e (Join-Path $Share \u0027m1-net-appcontainer-of ...\n+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n    + CategoryInfo          : NotSpecified: (dshnt-launch: c... appcontainer=1:String) [], RemoteException\n    + FullyQualifiedErrorId : NativeCommandError\n \nNET-BLOCKED 172.30.112.1:445 wsa=10013",
+                   "appContainerObservedExit":  1,
+                   "appContainerObservedOutput":  "dshnt-launch.exe : dshnt-launch: create first=0 final=0 appcontainer=1\n所在位置 \\\\host.lan\\Data\\m1\\m1.ps1:417 字符: 1\n+ \u0026 $launcherBin @netArgs3 *\u003e (Join-Path $Share \u0027m1-net-appcontainer-ob ...\n+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n    + CategoryInfo          : NotSpecified: (dshnt-launch: c... appcontainer=1:String) [], RemoteException\n    + FullyQualifiedErrorId : NativeCommandError\n \nNET-CONNECTED 172.30.112.1:445",
+                   "networkGateWorks":  true,
+                   "stats":  "generation=1 domains=1 rules=11 processes=0 redirects=0 denies=0 masks=0 lastError=0x00000000",
+                   "providerStart":  "{\"id\":1,\"ok\":true,\"pid\":5808}",
+                   "providerProtect":  "{\"id\":1,\"ok\":true,\"lowerProtected\":true}",
+                   "providerLog":  "19:08:22.105 control connected\n19:08:22.147 control request: {\"workspace\":\"C:\\\\m1\\\\ws\",\"op\":\"start\",\"domain\":\"d1\",\"id\":1,\"view\":\"C:\\\\m1\\\\view\"}\n19:08:22.424 view started domain=d1 lower=C:\\m1\\ws view=C:\\m1\\view\n19:08:22.430 domain registered d1\n19:08:22.444 control reply: {\"id\":1,\"ok\":true,\"pid\":5808}\n19:08:22.468 control connected\n19:08:22.474 control request: {\"op\":\"protect\",\"id\":1,\"value\":true}\n19:08:22.483 control reply: {\"id\":1,\"ok\":true,\"lowerProtected\":true}",
+                   "clientConsole":  "dshnt-launch.exe : dshnt-launch: integrity=medium (explicitly disabled by --integrity medium)\n所在位置 \\\\host.lan\\Data\\m1\\m1.ps1:370 字符: 1\n+ \u0026 $launcherBin @launchArgs *\u003e (Join-Path $Share \u0027m1-client-console.lo ...\n+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n    + CategoryInfo          : NotSpecified: (dshnt-launch: i...tegrity medium):String) [], RemoteException\n    + FullyQualifiedErrorId : NativeCommandError\n \ndshnt-launch: create first=0 final=0 appcontainer=0\n[PASS] ntcreatefile_available\n[PASS] read_workspace_a -- hello\n\n\n[PASS] write_workspace_b\n[PASS] read_b_after_write -- v2\n[PASS] enum_has_a\n[PASS] enum_has_b\n[PASS] enum_has_dir\n[PASS] relative_cwd_read -- c\n\n\n[PASS] handle_relative_read -- c\n\n\n[PASS] raw_nt_write\n[PASS] raw_nt_read_back -- raw\n[PASS] delete_a -- err=0\n[PASS] deleted_a_gone\n[PASS] rename_c_to_d -- err=0\n[PASS] read_renamed_d -- c\n\n\n[PASS] child_write_via_redirect -- child \n\n\n[INFO] child_exit=0\n[PASS] view_read_mapped_to_logical\n[PASS] view_list_mapped_to_logical\n[PASS] deny_store_read\n[PASS] deny_rule_read\n[PASS] deny_global_mask\n[PASS] allow_ws_normal_read\n[PASS] create_new_file -- err=0\n[PASS] enum_has_new\nM1-CLIENT checks=24 failures=0"
+               }
+}

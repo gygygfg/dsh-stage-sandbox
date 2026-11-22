@@ -9,7 +9,7 @@
  *
  *   [0, 64)                     DSHNT_POLICY_HEADER
  *   [64, 64+StringBytes)        UTF-16LE 字符串区
- *   align8                      域数组：DomainCount × 112
+ *   align8                      域数组：DomainCount × 104
  *   之后                        规则数组：RuleCount × 40
  *   之后                        globalMask 数组：GlobalMaskCount × 40
  *
@@ -32,7 +32,7 @@ import {
 
 /** 与 `dshnt_abi.h` 保持一致；改这里必须同时改头文件与驱动。 */
 export const POLICY_HEADER_BYTES = 64
-export const DOMAIN_ENTRY_BYTES = 112
+export const DOMAIN_ENTRY_BYTES = 104
 export const RULE_ENTRY_BYTES = 40
 export const POLICY_MAGIC = 0x4453484e
 
@@ -254,8 +254,6 @@ export function encodePolicy(policy: NtPolicySet): EncodedPolicy {
     writer.u32(d.job.cpuPercent)
     writer.u32(d.job.killOnClose ? 1 : 0)
     writer.u32(0)
-    // 结构体尾部补齐到 112 字节（DomainCount 项之间必须同宽）。
-    writer.skip(DOMAIN_ENTRY_BYTES - 104)
   }
 
   // 5. 规则数组

@@ -48,6 +48,11 @@ AddReg          = Dshnt.AddRegistry
 
 [Dshnt.AddRegistry]
 HKR, "Parameters", "SupportedFeatures", 0x00010001, 0x3
+; Filter Manager 按 Services\<name>\Instances 读取高度；Parameters\Instances 是
+; INF 示例里的写法，两者都写（实测缺前者会以 0xC0000034 注册失败）。
+HKR, "Instances", %RegDefaultInstanceValueName%, 0x00000000, %DefaultInstance%
+HKR, "Instances\%Instance1.Name%", %RegAltitudeValueName%, 0x00000000, %Instance1.Altitude%
+HKR, "Instances\%Instance1.Name%", %RegFlagsValueName%, 0x00010001, %Instance1.Flags%
 HKR, "Parameters\Instances", %RegDefaultInstanceValueName%, 0x00000000, %DefaultInstance%
 HKR, "Parameters\Instances\%Instance1.Name%", %RegAltitudeValueName%, 0x00000000, %Instance1.Altitude%
 HKR, "Parameters\Instances\%Instance1.Name%", %RegFlagsValueName%, 0x00010001, %Instance1.Flags%

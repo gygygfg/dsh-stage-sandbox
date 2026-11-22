@@ -19,6 +19,7 @@ struct WfpEndpoint {
     unsigned short port;
 };
 
+// 返回的 gate 必须在子进程整个生命周期内保持打开；关闭即删除规则（DYNAMIC 会话）。
 bool WfpInstall(const std::wstring& sid, bool allowlist,
-                const std::vector<WfpEndpoint>& endpoints, std::wstring* error);
-void WfpRemove(const std::wstring& sid);
+                const std::vector<WfpEndpoint>& endpoints, void** outGate, std::wstring* error);
+void WfpClose(void* gate);

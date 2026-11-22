@@ -41,9 +41,11 @@ struct Options {
     std::wstring domain;
     std::wstring view;
     std::wstring workspace;
+    std::wstring store;
     int policyGeneration = 0;
     std::wstring network = L"offline";
     std::wstring token = L"restricted";
+    std::wstring integrity = L"low";
     std::wstring sid;
     std::wstring cwd;
     unsigned long long jobMemoryMb = 0;
@@ -75,9 +77,11 @@ bool ParseArgs(int argc, wchar_t** argv, Options& o, std::wstring& error) {
         if (a == L"--domain") { if (!need(L"--domain")) return false; o.domain = argv[i]; }
         else if (a == L"--view") { if (!need(L"--view")) return false; o.view = argv[i]; }
         else if (a == L"--workspace") { if (!need(L"--workspace")) return false; o.workspace = argv[i]; }
+        else if (a == L"--store") { if (!need(L"--store")) return false; o.store = argv[i]; }
         else if (a == L"--policy-generation") { if (!need(L"--policy-generation")) return false; o.policyGeneration = _wtoi(argv[i]); }
         else if (a == L"--network") { if (!need(L"--network")) return false; o.network = argv[i]; }
         else if (a == L"--token") { if (!need(L"--token")) return false; o.token = argv[i]; }
+        else if (a == L"--integrity") { if (!need(L"--integrity")) return false; o.integrity = argv[i]; }
         else if (a == L"--sid") { if (!need(L"--sid")) return false; o.sid = argv[i]; }
         else if (a == L"--cwd") { if (!need(L"--cwd")) return false; o.cwd = argv[i]; }
         else if (a == L"--job-memory-mb") { if (!need(L"--job-memory-mb")) return false; o.jobMemoryMb = _wcstoui64(argv[i], nullptr, 10); }
@@ -99,6 +103,7 @@ bool ParseArgs(int argc, wchar_t** argv, Options& o, std::wstring& error) {
     if (o.policyGeneration <= 0) { error = L"--policy-generation must be positive"; return false; }
     if (o.argv.empty()) { error = L"target argv missing after --"; return false; }
     if (o.token != L"appcontainer" && o.token != L"restricted") { error = L"--token must be appcontainer|restricted"; return false; }
+    if (o.integrity != L"low" && o.integrity != L"medium") { error = L"--integrity must be low|medium"; return false; }
     return true;
 }
 
@@ -127,16 +132,213 @@ bool EnablePrivilege(const wchar_t* name) {
     return ok;
 }
 
-bool SetLowIntegrity(HANDLE token) {
+bool SetLowIntegrity(HANDLE token, std::wstring* error) {
     SID_IDENTIFIER_AUTHORITY auth = SECURITY_MANDATORY_LABEL_AUTHORITY;
     PSID sid = nullptr;
-    if (!AllocateAndInitializeSid(&auth, 1, SECURITY_MANDATORY_LOW_RID, 0, 0, 0, 0, 0, 0, 0, &sid)) return false;
+    if (!AllocateAndInitializeSid(&auth, 1, SECURITY_MANDATORY_LOW_RID, 0, 0, 0, 0, 0, 0, 0, &sid)) {
+        if (error) *error = L"AllocateAndInitializeSid(LOW) err=" + std::to_wstring(GetLastError());
+        return false;
+    }
     TOKEN_MANDATORY_LABEL label{};
     label.Label.Attributes = SE_GROUP_INTEGRITY;
     label.Label.Sid = sid;
-    bool ok = SetTokenInformation(token, TokenIntegrityLevel, &label, sizeof(label) + GetLengthSid(sid)) != 0;
+    SetLastError(0);
+    DWORD sidLen = GetLengthSid(sid);
+    bool ok = SetTokenInformation(token, TokenIntegrityLevel, &label,
+                                  sizeof(label) + sidLen - sizeof(DWORD)) != 0;
+    DWORD err = GetLastError();
+    if (!ok) {
+        if (error) *error = L"SetTokenInformation(TokenIntegrityLevel) err=" + std::to_wstring(err) +
+                            L" sidLen=" + std::to_wstring(sidLen);
+    }
     FreeSid(sid);
     return ok;
+}
+
+// 把目录标为 Low 完整性：受限令牌（Low IL）要能在视图里创建/写文件。
+// 这是**故意的降级**，只对视图根（沙箱自己的数据）做；真实工作区保持 Medium。
+bool SetLowMandatoryLabel(const std::wstring& path, std::wstring* error) {
+    SID_IDENTIFIER_AUTHORITY authority = SECURITY_MANDATORY_LABEL_AUTHORITY;
+    PSID label = nullptr;
+    if (!AllocateAndInitializeSid(&authority, 1, SECURITY_MANDATORY_LOW_RID, 0, 0, 0, 0, 0, 0, 0, &label)) {
+        if (error) *error = L"AllocateAndInitializeSid(label) failed";
+        return false;
+    }
+    DWORD sidLen = GetLengthSid(label);
+    DWORD aceSize = sizeof(SYSTEM_MANDATORY_LABEL_ACE) + sidLen - sizeof(DWORD);
+    PACL acl = (PACL)LocalAlloc(LPTR, sizeof(ACL) + aceSize);
+    if (acl == nullptr || !InitializeAcl(acl, sizeof(ACL) + aceSize, ACL_REVISION)) {
+        FreeSid(label);
+        if (acl != nullptr) LocalFree(acl);
+        if (error) *error = L"InitializeAcl failed";
+        return false;
+    }
+    SYSTEM_MANDATORY_LABEL_ACE* ace = (SYSTEM_MANDATORY_LABEL_ACE*)((PBYTE)acl + sizeof(ACL));
+    ace->Header.AceType = SYSTEM_MANDATORY_LABEL_ACE_TYPE;
+    ace->Header.AceSize = (WORD)aceSize;
+    ace->Mask = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | SYSTEM_MANDATORY_LABEL_NO_WRITE_UP;
+    memcpy(&ace->SidStart, label, sidLen);
+    FreeSid(label);
+
+    bool secPriv = EnablePrivilege(SE_SECURITY_NAME);
+    std::fwprintf(stderr, L"dshnt-launch: SeSecurityPrivilege=%ls\n", secPriv ? L"ok" : L"missing");
+    /*
+     * 关键：强制完整性标签在 SACL 里，但必须用 LABEL_SECURITY_INFORMATION 设置；
+     * 用 SACL_SECURITY_INFORMATION 只会创建空 SACL（实测 S:AI，标签丢失），
+     * Low IL 子进程随后所有写操作都会被 MAC 拒绝。
+     */
+    DWORD rc = SetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT,
+                                     LABEL_SECURITY_INFORMATION, nullptr, nullptr, nullptr, acl);
+    LocalFree(acl);
+    std::fwprintf(stderr, L"dshnt-launch: SetNamedSecurityInfo(label) rc=%lu path=%ls\n", rc, path.c_str());
+    if (rc != ERROR_SUCCESS) {
+        if (error) *error = L"SetNamedSecurityInfo(label) failed rc=" + std::to_wstring(rc);
+        return false;
+    }
+    {
+        // 回读并打印 SDDL，确认 mandatory label ACE 真的写进去了。
+        PSECURITY_DESCRIPTOR probe = nullptr;
+        DWORD prc = GetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT,
+                                          LABEL_SECURITY_INFORMATION, nullptr, nullptr, nullptr, nullptr, &probe);
+        std::fwprintf(stderr, L"dshnt-launch: GetNamedSecurityInfo(label) rc=%lu\n", prc);
+        if (prc == ERROR_SUCCESS && probe != nullptr) {
+            LPWSTR text = nullptr;
+            if (ConvertSecurityDescriptorToStringSecurityDescriptorW(probe, SDDL_REVISION_1,
+                                                                     LABEL_SECURITY_INFORMATION, &text, nullptr)) {
+                std::fwprintf(stderr, L"dshnt-launch: label sddl=%ls\n", text);
+                LocalFree(text);
+            }
+            LocalFree(probe);
+        }
+    }
+    return true;
+}
+
+// CreateAppContainerToken 在不同 SDK/头文件版本里的声明位置不一致；按导出名动态解析，
+// 解析不到就失败（绝不退化成非 AppContainer 令牌）。
+typedef HRESULT(WINAPI* PFN_CreateAppContainerToken)(HANDLE baseToken, PSECURITY_CAPABILITIES capabilities, PHANDLE newToken);
+
+bool CreateAppContainerTokenDyn(HANDLE baseToken, PSID sid, PSID_AND_ATTRIBUTES caps, unsigned long capCount,
+                                PHANDLE out, std::wstring* error) {
+    static PFN_CreateAppContainerToken fn = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        // 导出位置随版本变化：KERNELBASE (6.3+) 优先，再退回 userenv / kernel32。
+        const wchar_t* dlls[] = { L"kernelbase.dll", L"userenv.dll", L"kernel32.dll" };
+        for (const wchar_t* name : dlls) {
+            HMODULE module = GetModuleHandleW(name);
+            if (module == nullptr) module = LoadLibraryW(name);
+            if (module == nullptr) continue;
+            fn = (PFN_CreateAppContainerToken)GetProcAddress(module, "CreateAppContainerToken");
+            if (fn != nullptr) break;
+        }
+    }
+    if (fn == nullptr) {
+        if (error) *error = L"CreateAppContainerToken not found in kernelbase/userenv/kernel32";
+        return false;
+    }
+    SECURITY_CAPABILITIES sec{};
+    sec.AppContainerSid = sid;
+    sec.Capabilities = caps;
+    sec.CapabilityCount = capCount;
+    sec.Reserved = 0;
+    HRESULT hr = fn(baseToken, &sec, out);
+    if (FAILED(hr) || *out == nullptr) {
+        if (error) *error = L"CreateAppContainerToken failed";
+        return false;
+    }
+    return true;
+}
+
+// 回读：确认 SACL 里确实有 mandatory label ACE（设置“成功”不代表真的写上）。
+bool HasMandatoryLabel(const std::wstring& path) {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    PACL sacl = nullptr;
+    DWORD rc = GetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT,
+                                     LABEL_SECURITY_INFORMATION, nullptr, nullptr, nullptr, &sacl, &sd);
+    bool found = false;
+    if (rc == ERROR_SUCCESS && sacl != nullptr) {
+        for (WORD i = 0; i < sacl->AceCount; i++) {
+            LPVOID ace = nullptr;
+            if (GetAce(sacl, i, &ace) && ace != nullptr &&
+                ((PACE_HEADER)ace)->AceType == SYSTEM_MANDATORY_LABEL_ACE_TYPE) {
+                found = true;
+                break;
+            }
+        }
+    }
+    if (sd != nullptr) LocalFree(sd);
+    return found;
+}
+
+// AppContainer：没有显式 SID 时按 domain 派生/创建 profile。
+// 返回的 SID 由调用方 LocalFree。
+bool EnsureAppContainerSid(const std::wstring& domain, PSID* out, std::wstring* error) {
+    std::wstring name = L"dshnt." + domain;
+    PSID sid = nullptr;
+    HRESULT hr = CreateAppContainerProfile(name.c_str(), name.c_str(), name.c_str(), nullptr, 0, &sid);
+    if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
+        hr = DeriveAppContainerSidFromAppContainerName(name.c_str(), &sid);
+    }
+    if (FAILED(hr) || sid == nullptr) {
+        if (error) *error = L"cannot create/derive AppContainer profile";
+        return false;
+    }
+    *out = sid;
+    return true;
+}
+
+// 取令牌的 user SID（新建副本，调用方 LocalFree）。
+PSID TokenUserSid(HANDLE token) {
+    DWORD size = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || size == 0) return nullptr;
+    std::vector<unsigned char> buffer(size);
+    if (!GetTokenInformation(token, TokenUser, buffer.data(), size, &size)) return nullptr;
+    TOKEN_USER* user = (TOKEN_USER*)buffer.data();
+    DWORD sidLen = GetLengthSid(user->User.Sid);
+    PSID copy = LocalAlloc(LPTR, sidLen);
+    if (copy != nullptr && !CopySid(sidLen, copy, user->User.Sid)) {
+        LocalFree(copy);
+        copy = nullptr;
+    }
+    return copy;
+}
+
+// 给 AppContainer SID 授予目录的 (OI)(CI) 完全控制；失败即失败（不静默降级）。
+bool GrantDirectoryToSid(const std::wstring& path, PSID sid, std::wstring* error) {
+    EXPLICIT_ACCESSW access{};
+    access.grfAccessPermissions = GENERIC_ALL;
+    access.grfAccessMode = SET_ACCESS;
+    access.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+    access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    access.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    access.Trustee.ptstrName = (LPWSTR)sid;
+
+    PACL oldAcl = nullptr;
+    PACL newAcl = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (SetEntriesInAclW(1, &access, nullptr, &newAcl) != ERROR_SUCCESS) {
+        if (error) *error = L"SetEntriesInAcl failed";
+        return false;
+    }
+    DWORD rc = GetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT,
+                                     DACL_SECURITY_INFORMATION, nullptr, nullptr, &oldAcl, nullptr, &sd);
+    if (rc != ERROR_SUCCESS) {
+        LocalFree(newAcl);
+        if (error) *error = L"GetNamedSecurityInfo failed";
+        return false;
+    }
+    rc = SetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT,
+                               DACL_SECURITY_INFORMATION, nullptr, nullptr, newAcl, nullptr);
+    LocalFree(newAcl);
+    if (sd != nullptr) LocalFree(sd);
+    if (rc != ERROR_SUCCESS) {
+        if (error) *error = L"SetNamedSecurityInfo failed";
+        return false;
+    }
+    return true;
 }
 
 // 从允许清单重建环境块（不继承父进程环境）。
@@ -281,15 +483,45 @@ int wmain(int argc, wchar_t** argv) {
     PSID appContainerSid = nullptr;
 
     if (o.token == L"appcontainer") {
-        if (o.sid.empty() || !ConvertStringSidToSidW(o.sid.c_str(), &appContainerSid)) {
+        std::wstring sidError;
+        if (!o.sid.empty()) {
+            if (!ConvertStringSidToSidW(o.sid.c_str(), &appContainerSid)) {
+                CloseHandle(primary);
+                return Fail("NT_CAPABILITY_MISSING", L"--sid must be a valid SID");
+            }
+        } else if (!EnsureAppContainerSid(o.domain, &appContainerSid, &sidError)) {
             CloseHandle(primary);
-            return Fail("NT_CAPABILITY_MISSING", L"--sid must be a valid SID for appcontainer mode");
+            return Fail("NT_CAPABILITY_MISSING", sidError);
         }
-        HRESULT hr = CreateAppContainerToken(primary, appContainerSid, &childToken);
-        if (FAILED(hr) || childToken == nullptr) {
+
+        // AppContainer 默认访问不了普通目录：把视图根（和 store）授权给该 SID。
+        if (!GrantDirectoryToSid(o.view, appContainerSid, &sidError)) {
             LocalFree(appContainerSid);
             CloseHandle(primary);
-            return Fail("NT_CAPABILITY_MISSING", L"CreateAppContainerToken failed");
+            return Fail("NT_CAPABILITY_MISSING", L"view ACL: " + sidError);
+        }
+        if (!GrantDirectoryToSid(o.workspace, appContainerSid, &sidError)) {
+            // 工作区只授权“列出/读取”，实际写入仍由驱动重定向到视图。
+            LocalFree(appContainerSid);
+            CloseHandle(primary);
+            return Fail("NT_CAPABILITY_MISSING", L"workspace ACL: " + sidError);
+        }
+
+        // 首选：显式 AppContainer 令牌（文档路径）。失败时退回内核派生（见创建处）。
+        std::wstring tokenError;
+        PSID internetCap = nullptr;
+        PSID privateCap = nullptr;
+        ConvertStringSidToSidW(L"S-1-15-3-1", &internetCap);
+        ConvertStringSidToSidW(L"S-1-15-3-3", &privateCap);
+        SID_AND_ATTRIBUTES tokenCaps[2]{};
+        UINT32 tokenCapCount = 0;
+        if (internetCap != nullptr) { tokenCaps[tokenCapCount].Sid = internetCap; tokenCaps[tokenCapCount].Attributes = SE_GROUP_ENABLED; tokenCapCount++; }
+        if (privateCap != nullptr) { tokenCaps[tokenCapCount].Sid = privateCap; tokenCaps[tokenCapCount].Attributes = SE_GROUP_ENABLED; tokenCapCount++; }
+        if (!CreateAppContainerTokenDyn(primary, appContainerSid,
+                                        tokenCapCount > 0 ? tokenCaps : nullptr, tokenCapCount,
+                                        &childToken, &tokenError)) {
+            std::fwprintf(stderr, L"dshnt-launch: %ls (falling back to CreateProcessW)\n", tokenError.c_str());
+            childToken = nullptr;
         }
     } else {
         if (o.network == L"allowlist") {
@@ -300,35 +532,95 @@ int wmain(int argc, wchar_t** argv) {
             CloseHandle(primary);
             return Fail("NT_CAPABILITY_MISSING", L"CreateRestrictedToken failed");
         }
-        if (!SetLowIntegrity(childToken)) {
-            CloseHandle(childToken);
+        /*
+         * CreateRestrictedToken 返回的句柄不带 TOKEN_ADJUST_DEFAULT，直接
+         * SetTokenInformation 会 ERROR_ACCESS_DENIED（实测 err=5）。用
+         * DuplicateTokenEx(MAXIMUM_ALLOWED) 拿一个可调整的副本（创建者对新令牌
+         * 有完全控制），再设置完整性级别。
+         */
+        HANDLE adjustable = nullptr;
+        if (!DuplicateTokenEx(childToken, MAXIMUM_ALLOWED, nullptr, SecurityImpersonation,
+                              TokenPrimary, &adjustable)) {
+            std::wstring dupError = L"DuplicateTokenEx err=" + std::to_wstring(GetLastError());
+            if (childToken != nullptr) CloseHandle(childToken);
             CloseHandle(primary);
-            return Fail("NT_CAPABILITY_MISSING", L"SetLowIntegrity failed");
+            return Fail("NT_CAPABILITY_MISSING", dupError);
         }
+        if (childToken != nullptr) CloseHandle(childToken);
+        childToken = adjustable;
+
+        if (o.integrity == L"low") {
+            std::wstring ilError;
+            if (!SetLowIntegrity(childToken, &ilError)) {
+                if (childToken != nullptr) CloseHandle(childToken);
+                CloseHandle(primary);
+                return Fail("NT_CAPABILITY_MISSING", ilError);
+            }
+        } else {
+            std::fwprintf(stderr, L"dshnt-launch: integrity=medium (explicitly disabled by --integrity medium)\n");
+        }
+
+        /*
+         * 受限令牌仍以当前用户身份运行，但管理员组是 deny-only、视图目录默认只有
+         * 用户读权限，ProjFS copy-up 需要写 ⇒ 显式把视图根授权给该用户。
+         * （真实工作区不授权：域内进程只能经驱动重定向到视图读它。）
+         */
+        PSID userSid = TokenUserSid(childToken);
+        if (userSid == nullptr) {
+            if (childToken != nullptr) CloseHandle(childToken);
+            CloseHandle(primary);
+            return Fail("NT_CAPABILITY_MISSING", L"cannot read token user SID");
+        }
+        std::wstring aclError;
+        bool aclOk = GrantDirectoryToSid(o.view, userSid, &aclError);
+        LocalFree(userSid);
+        if (!aclOk) {
+            if (childToken != nullptr) CloseHandle(childToken);
+            CloseHandle(primary);
+            return Fail("NT_CAPABILITY_MISSING", L"view ACL: " + aclError);
+        }
+
+        if (o.integrity == L"low") {
+            std::wstring labelError;
+            if (!SetLowMandatoryLabel(o.view, &labelError) || !HasMandatoryLabel(o.view)) {
+                if (childToken != nullptr) CloseHandle(childToken);
+                CloseHandle(primary);
+                return Fail("NT_CAPABILITY_MISSING", L"view label: " + labelError + L" (readback failed)");
+            }
+            std::fwprintf(stderr, L"dshnt-launch: integrity=low view-label=ok\n");
+        }
+        /* 真实工作区保持 Medium：域内进程不应有它的写权限（writes go through view）。 */
     }
     CloseHandle(primary);
 
     // 3) WFP（按 SID；不是 appcontainer 时无法按包 ID 过滤）。
-    bool wfpInstalled = false;
+    std::wstring sidText = o.sid;
+    if (appContainerSid != nullptr && sidText.empty()) {
+        LPWSTR text = nullptr;
+        if (ConvertSidToStringSidW(appContainerSid, &text)) {
+            sidText = text;
+            LocalFree(text);
+        }
+    }
+    void* wfpGate = nullptr;
     if (o.network != L"observed") {
         if (o.network != L"offline" && o.network != L"allowlist") {
-            CloseHandle(childToken);
+            if (childToken != nullptr) CloseHandle(childToken);
             return Fail("NT_NETWORK_UNSUPPORTED", L"unknown --network mode");
         }
         std::wstring wfpError;
-        if (!WfpInstall(o.sid, o.network == L"allowlist", {}, &wfpError)) {
-            CloseHandle(childToken);
+        if (!WfpInstall(sidText, o.network == L"allowlist", {}, &wfpGate, &wfpError)) {
+            if (childToken != nullptr) CloseHandle(childToken);
             return Fail("NT_NETWORK_UNENFORCED", wfpError);
         }
-        wfpInstalled = true;
     }
 
     // 4) Job。
     HANDLE job = nullptr;
     std::wstring jobError;
     if (!CreateJob(o, &job, jobError)) {
-        if (wfpInstalled) WfpRemove(o.sid);
-        CloseHandle(childToken);
+        WfpClose(wfpGate);
+        if (childToken != nullptr) CloseHandle(childToken);
         return Fail("NT_CAPABILITY_MISSING", jobError);
     }
 
@@ -336,13 +628,28 @@ int wmain(int argc, wchar_t** argv) {
     std::wstring cwd = o.cwd.empty() ? o.view : o.cwd;
     if (!PathInside(cwd, o.view)) {
         CloseHandle(job);
-        if (wfpInstalled) WfpRemove(o.sid);
-        CloseHandle(childToken);
+        WfpClose(wfpGate);
+        if (childToken != nullptr) CloseHandle(childToken);
         return Fail("NT_PATH_ESCAPE", L"--cwd must be inside --view");
     }
     std::wstring tempDir = o.view + L"\\.dshnt-tmp";
     CreateDirectoryW(tempDir.c_str(), nullptr);
     std::vector<wchar_t> envBlock = BuildEnvironment(o, tempDir);
+
+    /*
+     * AppContainer 进程要求环境块来自该 profile（否则 CreateProcess 返回
+     * ERROR_ENVVAR_NOT_FOUND 203，实测）。用 CreateEnvironmentBlock 从令牌
+     * 构造（仍不是“继承父进程环境”：它由用户 profile/注册表推导）。
+     */
+    LPVOID profileEnv = nullptr;
+    const wchar_t* envPtr = envBlock.data();
+    if (appContainerSid != nullptr && childToken != nullptr) {
+        if (CreateEnvironmentBlock(&profileEnv, childToken, FALSE)) {
+            envPtr = (const wchar_t*)profileEnv;
+        } else {
+            std::fwprintf(stderr, L"dshnt-launch: CreateEnvironmentBlock failed err=%lu\n", GetLastError());
+        }
+    }
 
     // 6) 创建（挂起）+ AppContainer 属性 + mitigation。
     SIZE_T attrSize = 0;
@@ -351,8 +658,8 @@ int wmain(int argc, wchar_t** argv) {
     LPPROC_THREAD_ATTRIBUTE_LIST attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)attrBuffer.data();
     if (!InitializeProcThreadAttributeList(attrs, 2, 0, &attrSize)) {
         CloseHandle(job);
-        if (wfpInstalled) WfpRemove(o.sid);
-        CloseHandle(childToken);
+        WfpClose(wfpGate);
+        if (childToken != nullptr) CloseHandle(childToken);
         return Fail("NT_CAPABILITY_MISSING", L"InitializeProcThreadAttributeList failed");
     }
 
@@ -367,10 +674,33 @@ int wmain(int argc, wchar_t** argv) {
                               &mitigation, sizeof(mitigation), nullptr, nullptr);
 
     SECURITY_CAPABILITIES caps{};
+    PSID internetSid = nullptr;
+    PSID privateSid = nullptr;
+    SID_AND_ATTRIBUTES appCaps[2]{};
+    UINT32 appCapCount = 0;
     if (appContainerSid != nullptr) {
+        /*
+         * AppContainer 默认没有任何网络能力（connect 返回 WSAEACCES 10013），
+         * 这会让“observed”对照组也连不上。授予 internetClient
+         * (S-1-15-3-1)；offline/allowlist 仍由 WFP 按包 SID 拦截。
+         */
+        ConvertStringSidToSidW(L"S-1-15-3-1", &internetSid);   // internetClient
+        ConvertStringSidToSidW(L"S-1-15-3-3", &privateSid);    // privateNetworkClientServer
+        if (internetSid != nullptr) {
+            appCaps[appCapCount].Sid = internetSid;
+            appCaps[appCapCount].Attributes = SE_GROUP_ENABLED;
+            appCapCount++;
+        }
+        if (privateSid != nullptr) {
+            appCaps[appCapCount].Sid = privateSid;
+            appCaps[appCapCount].Attributes = SE_GROUP_ENABLED;
+            appCapCount++;
+        }
+        if (appCapCount > 0) {
+            caps.Capabilities = appCaps;
+            caps.CapabilityCount = appCapCount;
+        }
         caps.AppContainerSid = appContainerSid;
-        caps.Capabilities = nullptr;
-        caps.CapabilityCount = 0;
         caps.Reserved = 0;
         UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
                                   &caps, sizeof(caps), nullptr, nullptr);
@@ -392,26 +722,50 @@ int wmain(int argc, wchar_t** argv) {
     DWORD flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT |
                   CREATE_BREAKAWAY_FROM_JOB;
 
-    BOOL created = CreateProcessAsUserW(childToken, nullptr, cmd.data(), nullptr, nullptr, TRUE,
-                                        flags, envBlock.data(), cwd.c_str(),
-                                        &si.StartupInfo, &pi);
+    /*
+     * AppContainer：用 CreateProcessW + PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES，
+     * 由内核从当前令牌派生 LowBox 令牌（MS 的 AppContainer 样例路径）。
+     * 实测 CreateProcessAsUser + CreateAppContainerToken 在 19041 上返回 err=203。
+     * 受限令牌：仍走 CreateProcessAsUser。
+     */
+    BOOL created;
+    DWORD firstError = 0;
+    if (childToken != nullptr) {
+        created = CreateProcessAsUserW(childToken, nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                                       flags, (LPVOID)envPtr, cwd.c_str(), &si.StartupInfo, &pi);
+    } else {
+        created = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                                 flags, (LPVOID)envPtr, cwd.c_str(), &si.StartupInfo, &pi);
+    }
     if (!created) {
-        DWORD err = GetLastError();
-        if (err == ERROR_ACCESS_DENIED) {
+        firstError = GetLastError();
+        if (appContainerSid != nullptr && childToken != nullptr) {
+            /*
+             * CreateProcessAsUser + AppContainer 令牌在 19041 上返回 203
+             * (ERROR_ENVVAR_NOT_FOUND)。改用 CreateProcessW：内核按
+             * SECURITY_CAPABILITIES 属性从当前令牌派生 LowBox 令牌。
+             */
+            CloseHandle(childToken);
+            childToken = nullptr;
+            created = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                                     flags, (LPVOID)envPtr, cwd.c_str(), &si.StartupInfo, &pi);
+        } else if (firstError == ERROR_ACCESS_DENIED) {
             flags &= ~CREATE_BREAKAWAY_FROM_JOB;
             created = CreateProcessAsUserW(childToken, nullptr, cmd.data(), nullptr, nullptr, TRUE,
-                                           flags, envBlock.data(), cwd.c_str(),
-                                           &si.StartupInfo, &pi);
+                                           flags, (LPVOID)envPtr, cwd.c_str(), &si.StartupInfo, &pi);
         }
     }
+    std::fwprintf(stderr, L"dshnt-launch: create first=%lu final=%lu appcontainer=%d\n",
+                  firstError, created ? 0 : GetLastError(), appContainerSid != nullptr ? 1 : 0);
+    if (profileEnv != nullptr) DestroyEnvironmentBlock(profileEnv);
     DeleteProcThreadAttributeList(attrs);
 
     if (!created) {
         DWORD err = GetLastError();
         CloseHandle(job);
-        if (wfpInstalled) WfpRemove(o.sid);
-        CloseHandle(childToken);
-        return Fail("NT_ACCESS_DENIED", L"CreateProcessAsUser failed err=" + std::to_wstring(err));
+        WfpClose(wfpGate);
+        if (childToken != nullptr) CloseHandle(childToken);
+        return Fail("NT_ACCESS_DENIED", L"CreateProcess failed err=" + std::to_wstring(err));
     }
 
     // 7) 入 Job + 注册域（先注册再 resume：避免子进程在注册前执行）。
@@ -420,8 +774,8 @@ int wmain(int argc, wchar_t** argv) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
         CloseHandle(job);
-        if (wfpInstalled) WfpRemove(o.sid);
-        CloseHandle(childToken);
+        WfpClose(wfpGate);
+        if (childToken != nullptr) CloseHandle(childToken);
         return Fail("NT_CAPABILITY_MISSING", L"AssignProcessToJobObject failed");
     }
 
@@ -431,14 +785,14 @@ int wmain(int argc, wchar_t** argv) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
         CloseHandle(job);
-        if (wfpInstalled) WfpRemove(o.sid);
-        CloseHandle(childToken);
+        WfpClose(wfpGate);
+        if (childToken != nullptr) CloseHandle(childToken);
         return Fail("NT_DOMAIN_NOT_REGISTERED", regError);
     }
 
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
-    CloseHandle(childToken);
+    if (childToken != nullptr) CloseHandle(childToken);
     if (appContainerSid != nullptr) LocalFree(appContainerSid);
 
     WaitForSingleObject(pi.hProcess, INFINITE);
@@ -451,7 +805,7 @@ int wmain(int argc, wchar_t** argv) {
         TerminateJobObject(job, exitCode);
     }
     CloseHandle(job);
-    if (wfpInstalled) WfpRemove(o.sid);
+    WfpClose(wfpGate);
 
     return (int)exitCode;
 }

@@ -1,8 +1,17 @@
 // dshnt-launch: \DshNtPort 客户端实现。
 #include "port.h"
 
-#include <fltuser.h>
 #include <cstring>
+
+// 手工声明两个 fltlib 导出：避免 fltuser.h 的头部前置条件（SDK 版本差异）。
+extern "C" {
+__declspec(dllimport) long __stdcall FilterConnectCommunicationPort(
+    const wchar_t* lpPortName, unsigned long dwOptions, const void* lpContext,
+    unsigned short wSizeOfContext, void* lpSecurityAttributes, void** lpPort);
+__declspec(dllimport) long __stdcall FilterSendMessage(
+    void* hPort, void* lpInBuffer, unsigned long dwInBufferSize,
+    void* lpOutBuffer, unsigned long dwOutBufferSize, unsigned long* lpBytesReturned);
+}
 
 #pragma comment(lib, "fltlib.lib")
 
@@ -27,7 +36,7 @@ std::wstring StatusText(unsigned long status) {
 DshntPort::~DshntPort() { Close(); }
 
 bool DshntPort::Connect(std::wstring* error) {
-    HRESULT hr = FilterConnectCommunicationPort(DSHNT_PORT_NAME, 0, nullptr, 0, nullptr, &port_);
+    long hr = FilterConnectCommunicationPort(DSHNT_PORT_NAME, 0, nullptr, 0, nullptr, &port_);
     if (FAILED(hr)) {
         if (error) *error = L"FilterConnectCommunicationPort " + StatusText((unsigned long)hr);
         port_ = INVALID_HANDLE_VALUE;
@@ -63,7 +72,7 @@ bool DshntPort::Send(unsigned short type, const std::vector<unsigned char>& payl
 
     std::vector<unsigned char> out(64 * 1024);
     DWORD returned = 0;
-    HRESULT hr = FilterSendMessage(port_, in.data(), (DWORD)in.size(), out.data(), (DWORD)out.size(), &returned);
+    long hr = FilterSendMessage(port_, in.data(), (DWORD)in.size(), out.data(), (DWORD)out.size(), &returned);
     if (FAILED(hr)) {
         if (error) *error = L"FilterSendMessage " + StatusText((unsigned long)hr);
         return false;
@@ -96,6 +105,25 @@ bool DshntPort::Hello(DshntHello* out, std::wstring* error) {
     wcscpy_s(out->driverVersion, r->DriverVersion);
     wcscpy_s(out->altitude, r->Altitude);
     return true;
+}
+
+bool DshntPort::SetPolicy(const std::vector<unsigned char>& payload, std::wstring* error) {
+    return Send(DshntMsgSetPolicy, payload, nullptr, error);
+}
+
+bool DshntPort::RegisterDomain(const std::wstring& id, const std::wstring& workspace,
+                               const std::wstring& view, const std::wstring& store, std::wstring* error) {
+    DSHNT_REGISTER_DOMAIN req{};
+    std::vector<unsigned char> strings;
+    PutRef(strings, id, &req.Id);
+    PutRef(strings, workspace, &req.WorkspaceRoot);
+    PutRef(strings, view, &req.ViewRoot);
+    PutRef(strings, store, &req.StoreRoot);
+
+    std::vector<unsigned char> payload(sizeof(req) + strings.size());
+    std::memcpy(payload.data(), &req, sizeof(req));
+    if (!strings.empty()) std::memcpy(payload.data() + sizeof(req), strings.data(), strings.size());
+    return Send(DshntMsgRegisterDomain, payload, nullptr, error);
 }
 
 bool DshntPort::QueryStats(DshntStats* out, std::wstring* error) {

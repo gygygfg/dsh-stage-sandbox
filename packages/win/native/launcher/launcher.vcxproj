@@ -39,9 +39,10 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <PreprocessorDefinitions>%(PreprocessorDefinitions);UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;_WIN32_WINNT=0x0A00;WINVER=0x0A00</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\include;$(ProjectDir)..\common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ExceptionHandling>Sync</ExceptionHandling>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <TreatWarningAsError>false</TreatWarningAsError>
@@ -54,9 +55,9 @@
 
   <ItemGroup>
     <ClCompile Include="src\dshnt-launch.cpp" />
-    <ClCompile Include="src\port.cpp" />
+    <ClCompile Include="..\common\port.cpp" />
     <ClCompile Include="src\wfp.cpp" />
-    <ClInclude Include="src\port.h" />
+    <ClInclude Include="..\common\port.h" />
     <ClInclude Include="src\wfp.h" />
     <ClInclude Include="..\..\include\dshnt_abi.h" />
   </ItemGroup>

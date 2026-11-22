@@ -32,6 +32,11 @@ public:
     void Close();
 
     bool Hello(DshntHello* out, std::wstring* error);
+    /** 下发二进制策略（payload 由控制面 `encodePolicy` 生成）。 */
+    bool SetPolicy(const std::vector<unsigned char>& payload, std::wstring* error);
+    /** 注册域（驱动会与策略里的根核对）。 */
+    bool RegisterDomain(const std::wstring& id, const std::wstring& workspace,
+                        const std::wstring& view, const std::wstring& store, std::wstring* error);
     bool QueryStats(DshntStats* out, std::wstring* error);
     bool RegisterProcess(unsigned long pid, unsigned long flags, const std::wstring& domain, std::wstring* error);
     bool UnregisterProcess(unsigned long pid);

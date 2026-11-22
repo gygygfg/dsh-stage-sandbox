@@ -83,7 +83,7 @@ await runSuite('nt-policy-binary', async () => {
     encoded.stats.rules * RULE_ENTRY_BYTES +
     encoded.stats.masks * RULE_ENTRY_BYTES
   eq('总大小 = header + strings(pad8) + domains + rules + masks', encoded.payload.length, expectedSize)
-  eq('domain 结构大小', DOMAIN_ENTRY_BYTES, 112)
+  eq('domain 结构大小', DOMAIN_ENTRY_BYTES, 104)
   eq('rule 结构大小', RULE_ENTRY_BYTES, 40)
   eq('header 大小', POLICY_HEADER_BYTES, 64)
 
@@ -109,7 +109,7 @@ await runSuite('nt-policy-binary', async () => {
   eq('job activeProcessLimit', view.getUint32(domainAt + 88, true), 64)
   eq('job cpuPercent', view.getUint32(domainAt + 92, true), 50)
   eq('job killOnClose', view.getUint32(domainAt + 96, true), 1)
-  eq('domain 条目尾部补齐', domainAt + DOMAIN_ENTRY_BYTES, domainAt + 112)
+  eq('domain 条目宽度', domainAt + DOMAIN_ENTRY_BYTES, domainAt + 104)
 
   section('4. 规则顺序（与 compilePolicy 同源）')
   const rulesAt = domainAt + encoded.stats.domains * DOMAIN_ENTRY_BYTES

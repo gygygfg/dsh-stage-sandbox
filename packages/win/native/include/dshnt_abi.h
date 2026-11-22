@@ -135,7 +135,7 @@ typedef struct _DSHNT_HELLO_REPLY {
  * 策略 payload 布局（全部相对 payload 起点 = header 之后）：
  *
  *   [0 .. StringBytes)                    UTF-16LE 字符串区
- *   align8(StringBytes)                   domain 数组（DomainCount 项）
+ *   align8(StringBytes)                   domain 数组（DomainCount × sizeof(DOMAIN_ENTRY)=104）
  *   + DomainCount * sizeof(DOMAIN_ENTRY)  rule 数组（RuleCount 项）
  *   + RuleCount * sizeof(RULE_ENTRY)      endpoint 数组（按域 EndpointStart 索引）
  *

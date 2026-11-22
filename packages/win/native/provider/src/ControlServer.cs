@@ -66,23 +66,42 @@ namespace Dshnt.Provider
                         PipeOptions.None))
                     {
                         server.WaitForConnection();
+                        _log("control connected");
                         using (var reader = new StreamReader(server, System.Text.Encoding.UTF8, false, 4096, leaveOpen: true))
-                        using (var writer = new StreamWriter(server, new System.Text.UTF8Encoding(false), 4096, leaveOpen: true))
                         {
-                            writer.AutoFlush = true;
-                            string line;
-                            while ((line = reader.ReadLine()) != null)
+                            var writer = new StreamWriter(server, new System.Text.UTF8Encoding(false), 4096, leaveOpen: true);
+                            try
                             {
-                                string response = Handle(line);
-                                writer.WriteLine(response);
-                                if (_shutdownRequested) break;
+                                writer.AutoFlush = true;
+                                string line;
+                                while ((line = reader.ReadLine()) != null)
+                                {
+                                    _log("control request: " + line);
+                                    string response = Handle(line);
+                                    _log("control reply: " + response);
+                                    writer.WriteLine(response);
+                                    if (_shutdownRequested) break;
+                                }
+                            }
+                            catch (IOException)
+                            {
+                                // 客户端在我们写完之前断开（例如 PowerShell 只发一条请求）：
+                                // 不是错误，等下一个连接即可。
+                            }
+                            finally
+                            {
+                                try { writer.Dispose(); } catch (IOException) { }
                             }
                         }
                     }
                 }
                 catch (Exception ex)
                 {
-                    if (!_cts.IsCancellationRequested) _log("control loop: " + ex.Message);
+                    if (!_cts.IsCancellationRequested)
+                    {
+                        _log("control loop: " + ex.GetType().FullName + ": " + ex.Message +
+                             " | " + ex.StackTrace);
+                    }
                     Thread.Sleep(50);
                 }
             }
