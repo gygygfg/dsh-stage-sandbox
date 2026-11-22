@@ -50,6 +50,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "nt:test": "node tests/nt/run-all.ts",
     "build": "node tools/build-plugin.ts",
     "prepack": "node tools/build-plugin.ts",
     "prepare": "node tools/build-plugin.ts"
