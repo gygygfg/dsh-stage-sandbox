@@ -64,7 +64,8 @@
 
 1. 同路径透明、ProjFS 合并视图、内核级重定向、tombstone、raw NT 写、子进程继承、rename 均实测成立。
 2. 真实 lower 在全部操作后 SHA-256 不变。
-3. 生产驱动必须自己实现：按域/PID 的映射（SimRep 是全局映射）、策略 allow/deny/mask、store/view 直接访问拒绝、
+3. 生产驱动必须自己实现：按域/PID 的映射（SimRep 是全局映射）、策略 allow/deny/mask、store 直接访问拒绝
+   （M1 修订：视图路径改为映射回逻辑路径后按同一规则判定，见 `M1-REPORT.md` §3.1）、
    通信端口、签名/安装/attach 流程；不能直接发布 SimRep。
 4. 安装路径必须走 **INF + pnputil + 签名 cat + `fltmc attach`**，不能只 `sc create`。
 5. 性能待补测；若 ProjFS 枚举不可接受，备选是“完整复制 + 重定向”（见 `M0-SPIKE.md` §6）。

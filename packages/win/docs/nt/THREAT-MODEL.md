@@ -39,8 +39,11 @@
 
 1. **真实工作区零写**：沙箱与宿主对真实工作区的写都被驱动拒绝；只有 apply helper
    在批准后按 CAS 写。
-2. **视图根/store 不可直接访问**：沙箱只能通过重定向后的逻辑路径访问视图；直接打开
-   store/view 根一律拒绝。
+2. **store 不可直接访问；视图访问与逻辑路径规则等价**：store（候选/证据/journal）对
+   域内进程一律拒绝。视图根则**不是**一刀切拒绝：M1 实测重定向续开会用视图新名字
+   重发 create，驱动把视图路径映射回逻辑工作区路径，套用同一套 allow/deny/mask
+   规则——因此“直接打开视图”与“打开同一逻辑路径”权限相同，不构成绕过（见
+   `M1-REPORT.md` §3.1）。
 3. **删除权威**：ProjFS tombstone = 删除；base 存在但视图既无 tombstone 也无 full/placeholder
    = corruption，不得按真实盘推断为未删除。
 4. **默认拒绝**：未显式允许的写/删/改名/执行/属性一律拒绝；读按 domain 的 `defaultRead`。
@@ -56,7 +59,7 @@
 | 句柄上溯 | 继承目录 fd，`openat(dir, "..")` 等价 | launcher 只保留 stdio；`HANDLE_LIST`；驱动按 handle 解析 | 宿主遗留句柄需审计 |
 | 相对路径 | cwd 在真实工作区 | v1 cwd=视图根；绝对 `C:\ws` 重定向；子进程继承域 | `pwd` 泄漏由 conceal 还原 |
 | 子进程逃逸 | `cmd /c`、脚本、包管理器 | `PsSetCreateProcessNotifyRoutineEx` 域继承；Job kill-on-close | 未注册的既存进程不自动入域 |
-| 直接访问 store | 打开 `D:\dshnt\view\...` | 驱动 deny 规则；ACL；重定向标记 | 驱动 flag 实现错误即绕过 |
+| 直接访问 store / 视图 | 打开 `D:\dshnt\store\...` / `...\view\...` | store：驱动硬拒绝（在规则判定之前）；视图：映射回逻辑路径后按同一规则判定 | 视图语义依赖映射实现正确；store 若有新的旁路必须先过同一判定 |
 | 硬链接/ADS | 链接到真实文件；写 `:stream` | v1 明确拒绝（`STATUS_NOT_SUPPORTED`） | 阶段 2 再支持 |
 | 重解析点 | junction/symlink 指向真实盘/凭据 | 驱动解析最终路径；越界拒绝；不跟随到未允许根 | 复杂 reparse 需专项 |
 | 网络 | 直连、DNS rebinding、云元数据 | WFP 按 AppContainer SID，默认 offline；allowlist 只放行 host:port | 无独立 netns；连接表仍可见 |
