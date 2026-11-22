@@ -106,12 +106,12 @@ apply=24、apply-manifest=23、runtime=54）。
 
 - `tests/nt/*.ts` 已通过 `tests/nt/run-all.ts` **登记进** `OFFLINE_SUITES` 与
   `verify.cmd`（两处逐字一致，`tests/suite-wiring.ts` 机器检查）。
-- 封印收录面仍是“深度 1”：`src/nt/`、`tests/nt/`、`native/` **尚未**进
-  `docs/源码基线.sha256`。本轮刷新只反映 `dsh-plugin/nt-command.ts`（新）+ 
-  `host-plugin.ts`/`testrunner.ts`/`verify.cmd`（接线），清单 187 → 188 条。
-- 扩展收录面（`src/**/*.ts`、native 源）是一次**独立**的契约变更：要同时改
-  `tools/baseline-sha256.ts` 的 glob 与 `tests/baseline-integrity.ts` 的形状断言，
-  不能顺手放宽；列为 M2 的治理项。
+- 封印收录面已扩展（M1 收口治理）：`src/**/*.ts`、`tests/**/*.ts`、`native/**` 的
+  c/h/cpp/cs/ps1/ts/inf/vcxproj/csproj 全部进 `docs/源码基线.sha256`（188 → **253** 条）。
+  构建产物与第三方 vendored 源显式排除（`vendor`/`obj`/`bin`/`out`/`pkg`/`x64`）。
+  `tests/baseline-integrity.ts` 增加形状断言（只允许 `src/nt/`、`tests/nt/`、`native/`
+  这些显式递归面）与 M1 文件必封印检查，防止收录面被顺手放宽。哈希前把 CRLF 归一为
+  LF（与 `.gitattributes` 的 eol 设置解耦，fresh checkout 不因换行变红）。
 - `enforcement` 默认保持 `legacy`；生产路径不会因为本轮代码改变行为。
 
 ## 5. 下一步（M2）

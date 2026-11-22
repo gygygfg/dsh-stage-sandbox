@@ -20,6 +20,11 @@
  *   `src/*.mjs`、`tests/*.mjs`、`dsh-plugin/*.mjs`、`tools/*.mjs`
  *   加上根目录四个入口：`autotest.ts`、`verify.cmd`、`run.cmd`、`testservice.cmd`
  *
+ * M1 收口追加（治理）：递归收录 src/ 与 tests/ 下的全部 .ts，以及 native/ 的
+ *   源码/工程文件（c/h/cpp/cs/ps1/ts/inf/vcxproj/csproj）。此前这些文件落在
+ *   “深度 1”收录面之外，改坏了 `git status` 看得见、封印却看不见。
+ *   构建产物与 vendor 目录显式排除。
+ *
  * R16 追加：`dsh-plugin/*.yml`（即 `dsh-plugin/cordis.patch.yml`）。
  *   理由（R16 实测，独立复核者发现）：该 yml 是**沙箱门控与装配的唯一真源**
  *   （`winstage-fs` / `winstage-shell` / `pwsh-sandbox` 三行的 `disabled` 表达式、
@@ -54,22 +59,70 @@ export const MANIFEST_PATH = join(REPO, MANIFEST_REL)
  * 新增收录面时**改这里**（以及 tests/baseline-integrity.ts 的形状断言）。
  */
 export const INCLUDED_GLOBS = Object.freeze([
-  'src/*.ts',
-  'tests/*.ts',
   'dsh-plugin/*.ts',
   'plugin/*.ts',
   'dsh-plugin/*.yml',
   'tools/*.ts',
   'e2e/**/*.ts',
+  // M1 收口（治理）：NT 控制面与原生数据面此前只在“深度 1”之外，改坏了没有基线可比。
+  // 递归收录面按**扩展名**逐类列出（工具只支持 `dir/**/*.ext` 形状），
+  // 并排除构建产物/第三方 vendored 源（见 EXCLUDED_DIRS）。
+  // 用 `**` 而不是 `dir/nt/*.ts`：工具只支持 `<dir>/*.ext` 与 `<dir>/**/*.ext` 两种形状。
+  // 注意 `**` 也包含该目录的第一层文件，因此它**替代**了原来的 `src/*.ts` / `tests/*.ts`
+  // （同时保留两者会让每个文件在清单里出现两次）。
+  // 形状断言（tests/baseline-integrity.ts）仍只允许 `src/nt/`、`tests/nt/` 这些
+  // 显式递归面；若以后出现 `src/<其它子目录>`，收集器会收进来并让形状断言变红。
+  'src/**/*.ts',
+  'tests/**/*.ts',
+  'native/**/*.c',
+  'native/**/*.h',
+  'native/**/*.cpp',
+  'native/**/*.cs',
+  'native/**/*.ps1',
+  'native/**/*.ts',
+  'native/**/*.inf',
+  'native/**/*.vcxproj',
+  'native/**/*.csproj',
 ])
 /** 收录的根目录单个文件。 */
 export const INCLUDED_ROOT_FILES = Object.freeze(['autotest.ts', 'verify.cmd', 'run.cmd', 'testservice.cmd'])
 /** 排除的目录名（任意层级都排除；本清单的收录面是深度 1，这里仍做段级过滤以免范围被误改宽）。 */
-export const EXCLUDED_DIRS = Object.freeze(['.t', 'node_modules', 'shim', 'esc', 'filemod', 'retest', '.dshstage'])
+export const EXCLUDED_DIRS = Object.freeze([
+  '.t',
+  'node_modules',
+  'shim',
+  'esc',
+  'filemod',
+  'retest',
+  '.dshstage',
+  // 构建产物与第三方 vendored 源：不是本仓维护的代码，不进封印。
+  // native/provider/{obj,bin,out} 合计约 190 MB；vendor 是 ProjectedFSLib.Managed。
+  'vendor',
+  'obj',
+  'bin',
+  'out',
+  'pkg',
+  'x64',
+])
 
 export const EXIT = Object.freeze({ OK: 0, USAGE: 1, MISSING: 2, DRIFT: 4 })
 
 export const sha256 = (data) => createHash('sha256').update(data).digest('hex')
+
+/**
+ * 封印哈希前把文本行尾统一成 LF。
+ *
+ * 为什么需要：`.gitattributes` 对 `.ps1`/`.cmd` 指定 `eol=crlf`，对 `.ts` 指定
+ * `eol=lf`；但工作树里同一份文件可能是 LF（例如刚由工具写入）或 CRLF（fresh
+ * checkout）。封印要钉的是**内容**，不是平台换行；否则“换一台机器 checkout”
+ * 就会让整个关口变红，而真正的改动反而被噪声淹没。
+ *
+ * 只对含 CR 的字节做一次 UTF-8 往返；二进制文件不在收录面内。
+ */
+export function normalizeSealBuffer(buffer) {
+  if (!buffer.includes(0x0d)) return buffer
+  return Buffer.from(buffer.toString('utf8').replace(/\r\n/g, '\n'), 'utf8')
+}
 
 /** 仓库相对路径一律用 `/`，保证清单与平台无关、可比对。 */
 const toPosix = (path) => path.split('\\').join('/')
@@ -103,7 +156,7 @@ export function collectEntries() {
       const full = recursive ? join(absolute, rel) : join(absolute, name)
       if (!statSync(full).isFile()) continue
       const buffer = readFileSync(full)
-      entries.push({ path: relPath, sha256: sha256(buffer), bytes: buffer.length })
+      entries.push({ path: relPath, sha256: sha256(normalizeSealBuffer(buffer)), bytes: buffer.length })
     }
   }
   for (const name of INCLUDED_ROOT_FILES) {
@@ -112,7 +165,7 @@ export function collectEntries() {
     const full = join(REPO, name)
     if (!existsSync(full) || !statSync(full).isFile()) continue
     const buffer = readFileSync(full)
-    entries.push({ path: rel, sha256: sha256(buffer), bytes: buffer.length })
+    entries.push({ path: rel, sha256: sha256(normalizeSealBuffer(buffer)), bytes: buffer.length })
   }
   entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
   return entries

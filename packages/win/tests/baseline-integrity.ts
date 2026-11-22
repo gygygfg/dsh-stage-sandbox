@@ -10,6 +10,7 @@
  *   整理轮（测试套件入库）已把收录面全部纳入版本库，但封印仍是硬判据：它同时钉住
  *   **内容**（逐条哈希）与**覆盖面**（清单条数 == 磁盘受封印文件数），后者 `git diff` 给不出。
  *   本套件把 `docs/源码基线.sha256` 变成硬判据：受封印文件（`src/*.ts`、`tests/*.ts`、
+ *   `src/nt/*.ts`、`tests/nt/*.ts`、`native/**` 源码、
  *   `dsh-plugin/*.ts`、`plugin/*.ts`、`tools/*.ts` 与四个根入口）必须逐条与清单相符；一旦有人改了源码
  *   而没**有意识地**刷新清单，本套件立刻判红，并打印确切的修复指令。
  *
@@ -38,10 +39,12 @@ import {
   collectEntries,
   diffManifest,
   isExcluded,
+  normalizeSealBuffer,
   parseManifest,
   readManifestText,
   remediation,
   renderManifest,
+  sha256,
 } from '../tools/baseline-sha256.ts'
 
 const PLANT = process.argv.includes('--plant')
@@ -70,19 +73,47 @@ check('收录非空，且 src/ tests/ dsh-plugin/ tools/ 四类都有条目', en
 const badHash = entries.filter((entry) => !/^[0-9a-f]{64}$/.test(entry.sha256))
 check('每条记录的 sha256 都是 64 位小写十六进制', badHash.length === 0, badHash.map((entry) => entry.path).join(', ') || `${entries.length} 条合法`)
 
+const lfHash = sha256(normalizeSealBuffer(Buffer.from('a\nb\n', 'utf8')))
+const crlfHash = sha256(normalizeSealBuffer(Buffer.from('a\r\nb\r\n', 'utf8')))
+check('封印哈希与行尾无关（LF / CRLF 同值；fresh checkout 不因 eol 变红）', lfHash === crlfHash, `${lfHash.slice(0, 12)} / ${crlfHash.slice(0, 12)}`)
+
 const sortedOk = entries.every((entry, index) => index === 0 || entries[index - 1].path < entry.path)
 check('路径严格按字典序排序且无重复', sortedOk, sortedOk ? `${entries[0]?.path} … ${entries[entries.length - 1]?.path}` : '存在乱序或重复')
 
 const excludedLeaks = entries.filter((entry) => isExcluded(entry.path) || entry.path === MANIFEST_REL)
 check('清单自身与被排除目录（.t/node_modules/shim/esc/filemod/retest/.dshstage）都不在收录里', excludedLeaks.length === 0, excludedLeaks.map((entry) => entry.path).join(', ') || `排除面生效（收录 ${entries.length} 条）`)
 
-const subDirLeaks = entries.filter((entry) => !entry.path.startsWith('e2e/') && entry.path.split('/').length > 2)
-check('收录面形状（非 e2e 为"深度 1"；e2e 为递归收录面 e2e/**/*.ts）', subDirLeaks.length === 0, subDirLeaks.map((entry) => entry.path).join(', ') || '全部落在 <目录>/<文件> 或 e2e/ 递归面内')
+/**
+ * 显式递归面：这些目录允许 `<root>/<sub>/<file>` 甚至更深。
+ * 其余目录必须保持“深度 1”，防止收录面被无意放宽成“整仓”。
+ */
+const RECURSIVE_ROOTS = ['e2e/', 'src/nt/', 'tests/nt/', 'native/']
+const subDirLeaks = entries.filter(
+  (entry) => entry.path.split('/').length > 2 && !RECURSIVE_ROOTS.some((root) => entry.path.startsWith(root)),
+)
+check(
+  '收录面形状（深度 1 + 显式递归面 e2e/、src/nt/、tests/nt/、native/）',
+  subDirLeaks.length === 0,
+  subDirLeaks.map((entry) => entry.path).join(', ') || '全部落在 <目录>/<文件> 或显式递归面内',
+)
 
-const mustSeal = ['src/limits.ts', 'tests/suite-wiring.ts', 'tools/baseline-sha256.ts', 'tools/dsh-patches.ts', 'verify.cmd']
+const mustSeal = [
+  'src/limits.ts',
+  'tests/suite-wiring.ts',
+  'tools/baseline-sha256.ts',
+  'tools/dsh-patches.ts',
+  'verify.cmd',
+  // M1 收口（治理）：NT 控制面/测试与原生数据面必须在封印面内，否则“改坏了没人知道”。
+  'src/nt/runtime.ts',
+  'tests/nt/runtime.ts',
+  'native/driver/src/dshnt.c',
+  'native/launcher/src/dshnt-launch.cpp',
+  'native/provider/src/ViewHost.cs',
+  'native/m1/guest/m1.ps1',
+]
 const sealedPaths = new Set(entries.map((entry) => entry.path))
 const missingMust = mustSeal.filter((path) => !sealedPaths.has(path))
-check('动机所指的文件确实被封印（src/limits.ts、tests/*、tools/*、verify.cmd）', missingMust.length === 0, missingMust.join(', ') || mustSeal.join(', '))
+check('动机所指与 M1 数据面文件确实被封印（src/limits.ts、tests/*、tools/*、verify.cmd、src/nt、tests/nt、native）', missingMust.length === 0, missingMust.join(', ') || mustSeal.join(', '))
 
 // ── 2. 清单校验 ────────────────────────────────────────────────────────────
 

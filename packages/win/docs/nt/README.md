@@ -158,9 +158,9 @@ Windows 驱动/ProjFS 的 spike 见 [`M0-SPIKE.md`](./M0-SPIKE.md)。
 - `enforcement: 'kernel'` 未就绪时默认 fail-closed；诊断可显式切 legacy；
 - `tests/nt/*.ts` 已通过 `tests/nt/run-all.ts` 登记进 `OFFLINE_SUITES` 与
   `verify.cmd`（`tests/suite-wiring.ts` 机器检查两处逐字一致）；
-- 但**封印收录面**仍是深度 1，`src/nt/`、`tests/nt/`、`native/` 不在
-  `docs/源码基线.sha256` 里。扩展收录面需要同时改 `tools/baseline-sha256.ts` 的 glob
-  与 `tests/baseline-integrity.ts` 的形状断言，是一次独立契约变更（M2 治理项）。
+- 封印收录面已扩展：`src/**/*.ts`、`tests/**/*.ts`、`native/**` 的源码/工程文件
+  都进 `docs/源码基线.sha256`（253 条）；形状断言只允许 `src/nt/`、`tests/nt/`、
+  `native/` 这些显式递归面，构建产物与 vendor 排除。
 
 ## 9. 参考
 
