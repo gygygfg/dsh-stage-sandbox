@@ -30,10 +30,16 @@
 | view 根直接访问 → 映射回逻辑路径后按同一规则判定 | ✅ |
 | 网络：`appcontainer + offline` → `NET-BLOCKED wsa=10013` | ✅ |
 | 网络：`appcontainer + observed` → `NET-CONNECTED` | ✅ |
+| 网络：`appcontainer + allowlist`，端点端口不匹配 → 仍被阻断 | ✅ |
+| 网络：`appcontainer + allowlist`，端点命中 → `NET-CONNECTED` | ✅ |
+| 网络：`appcontainer + allowlist` 但空列表 → launcher 拒绝启动（exit 2） | ✅ |
 | 网络：`restricted + offline` → launcher 拒绝启动（fail-closed） | ✅ |
+| 进程缓解（DEP/ASLR/ACG/CFG/扩展点/签名）+ Job 限制回读 | ✅ 8/8 + Job 4 项 |
 
 `RESULT_M1.json` 的机读字段：`clientChecks=24 / clientFailures=0`、`stagedWrite=true`、
-`lowerUnchanged=true`、`lowerDiff=[]`、`networkGateWorks=true`。
+`lowerUnchanged=true`、`lowerDiff=[]`、`networkGateWorks=true`、
+`allowlistBlockedExit=0`、`allowlistAllowedExit=1`、`allowlistEmptyExit=2`、
+`mitigateExit=0`（`MITIGATION dep=1 aslr=1 buaslr=1 win32k=1 ext=1 acg=1 cfg=1 msft=1`）。
 
 ## 2. 生产布局（与 M0 的差别）
 
@@ -121,12 +127,37 @@ offline/allowlist 仍由 WFP 按包 SID 拦截，能力只决定“能不能走�
   （取自 SDK `fwpmu.h`）；
 - WFP 会话是 **DYNAMIC**，launcher 持有句柄直到子进程退出（`WfpInstall(..., &gate)` /
   `WfpClose(gate)`），不做“装完就关会话”的伪持久化。
+- allowlist 的 permit 条件必须用**主机字节序**：`FWPM_CONDITION_IP_REMOTE_ADDRESS`
+  的 `FWP_UINT32` 按 MS 文档要 `ntohl`（SOCKADDR 是网络序，过滤引擎要主机序；
+  端口同理）。写成网络序时条件永远不匹配，表现为“放行了端点却仍被阻断”
+  （M1 第一次 allowlist 跑就是这样）。空 allowlist 在 launcher 与策略校验两处都
+  直接拒绝，**不会**静默退化成 offline。
 
 ### 4.4 `restricted + offline` 是**按设计** fail-closed
 
 受限令牌没有 package SID，WFP 无法按包过滤；launcher 直接拒绝启动并返回
 `NT_NETWORK_UNSUPPORTED`/非零退出。M1 的 `restrictedOfflineFailClosed=true`
 是期望行为，不是缺陷。需要 offline/allowlist ⇒ 用 AppContainer。
+
+### 4.5 进程缓解位序：一档错位（已修，并加了回读探针）
+
+`UpdateProcThreadAttribute(PROCESS_CREATION_MITIGATION_POLICY)` 的位序容易记错。
+M1 之前的代码把 28 当 CFG、36 当扩展点、40 当“只允许 Microsoft 签名”——实际
+winnt.h 的顺序是：28 Win32k 禁用、32 扩展点、36 ACG、40 CFG、44 签名策略。
+结果是“以为设了缓解，其实设成了别的（且 Win32k 的值 2 是保留值）”。
+
+修复后由 `native/m1/guest/m1-mitigate.c` 在域内用 `GetProcessMitigationPolicy`
+回读，全部命中才退出 0：
+
+```text
+MITIGATION dep=1 aslr=1 buaslr=1 win32k=1 ext=1 acg=1 cfg=1 msft=1
+JOB injob=1 active=16 memmb=1024 kill=1 cpu=5000
+```
+
+同一探针还验证 Job：在 Job 内、ActiveProcessLimit=16、内存 1024 MB、
+kill-on-close、CPU 硬上限 50%（`CpuRate=5000`）。这些是内核回读值，不是 launcher
+自述。注意 `Block non-Microsoft binaries` 不会阻止本进程启动（主映像在策略生效前
+已映射）；它约束的是之后加载的模块。
 
 ## 5. 完整性标签：本 VM 上写不进去（已定位，未绕过）
 
@@ -154,6 +185,7 @@ offline/allowlist 仍由 WFP 按包 SID 拦截，能力只决定“能不能走�
 | WFP 层名解析 | `FwpmLayerGetByName0` | 内置 GUID | 无行为差异 |
 | `CreateAppContainerToken` | userenv | kernelbase + `SECURITY_CAPABILITIES` | 无行为差异 |
 | 完整性标签 low | 默认 | 本 VM 不可用；显式 medium | 需在正常机器复验 |
+| mitigation 位序 | 28/36/40 | 28/32/36/40/44（回读验证） | 修正了错位；行为已实测 |
 | 性能门禁 | 0.2 ms/文件、20k ≤ 5 s | 0.55–0.64 / 11.4–12.8 s | 未达标，见 `M1-PERF.md` |
 | apply helper | 内核授权写 | v1 在可信控制面执行（journal/undo） | `grantApply` 留给 M2 |
 

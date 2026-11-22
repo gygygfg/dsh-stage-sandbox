@@ -23,6 +23,7 @@ import {
   defaultJobLimits,
   type NtDomain,
   type NtDriverPort,
+  type NtEndpoint,
   type NtNetworkMode,
   type NtPolicySet,
   type NtStatus,
@@ -45,6 +46,8 @@ export interface NtProviderOptions {
   tokenMode?: NtTokenMode
   /** 缺省网络档位（默认 offline）。 */
   network?: NtNetworkMode
+  /** `network='allowlist'` 的端点（IP 字面量）。 */
+  networkAllow?: NtEndpoint[]
   job?: Partial<NtDomain['job']>
   /** 额外规则（默认规则已包含“工作区写/删/改名 = stage”）。 */
   extraRules?: NtDomain['rules']
@@ -69,6 +72,7 @@ export function buildDomainPolicy(input: {
   domainId?: string
   tokenMode?: NtTokenMode
   network?: NtNetworkMode
+  networkAllow?: NtEndpoint[]
   job?: Partial<NtDomain['job']>
   extraRules?: NtDomain['rules']
   appContainerSid?: string
@@ -89,7 +93,7 @@ export function buildDomainPolicy(input: {
     tokenMode,
     ...(input.appContainerSid === undefined ? {} : { appContainerSid: input.appContainerSid }),
     job,
-    network: { mode: network, allow: [] },
+    network: { mode: network, allow: [...(input.networkAllow ?? [])] },
     defaultRead: 'allow',
     rules: [
       ...defaultRulesForDomain({
@@ -134,6 +138,7 @@ export class NtSandboxProvider {
       ...(options.domainId === undefined ? {} : { domainId: options.domainId }),
       ...(options.tokenMode === undefined ? {} : { tokenMode: options.tokenMode }),
       ...(options.network === undefined ? {} : { network: options.network }),
+      ...(options.networkAllow === undefined ? {} : { networkAllow: options.networkAllow }),
       ...(options.job === undefined ? {} : { job: options.job }),
       ...(options.extraRules === undefined ? {} : { extraRules: options.extraRules }),
       ...(options.appContainerSid === undefined ? {} : { appContainerSid: options.appContainerSid }),
@@ -198,6 +203,7 @@ export class NtSandboxProvider {
       workspaceRoot: this.domain.workspaceRoot,
       policyGeneration: this.policy.generation,
       network: this.domain.network.mode,
+      allow: this.domain.network.allow,
       job: this.domain.job,
       tokenMode: this.domain.tokenMode,
       ...(this.domain.appContainerSid === undefined ? {} : { appContainerSid: this.domain.appContainerSid }),

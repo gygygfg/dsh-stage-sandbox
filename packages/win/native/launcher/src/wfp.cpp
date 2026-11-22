@@ -65,6 +65,18 @@ bool LayerKey(HANDLE, const wchar_t* name, GUID* out, std::wstring* error) {
     return false;
 }
 
+/*
+ * WFP 的 FWP_UINT32 地址条件要**主机字节序**（MS 文档 populating-filter-conditions：
+ * “SOCKADDR 是网络序，但过滤引擎期望主机序”，示例用 ntohl）。IN_ADDR 里存的是网络序
+ * 字节，这里按字节拼出主机序数值；写成 network order 会导致条件永远不匹配，
+ * 表现就是“allowlist 里放行了端点却仍被阻断”。
+ */
+static UINT32 HostOrderV4(const IN_ADDR& v4) {
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(&v4.S_un.S_addr);
+    return (static_cast<UINT32>(b[0]) << 24) | (static_cast<UINT32>(b[1]) << 16) |
+           (static_cast<UINT32>(b[2]) << 8) | static_cast<UINT32>(b[3]);
+}
+
 bool AddFilter(HANDLE engine, const GUID& subLayer, const GUID& layer, PSID packageSid,
                bool permit, UINT64 weight, const wchar_t* name,
                const FWP_VALUE0* remoteValue, unsigned short remotePort, std::wstring* error) {
@@ -174,12 +186,12 @@ bool WfpInstall(const std::wstring& sid, bool allowlist, const std::vector<WfpEn
                 FwpmEngineClose0(engine);
                 return false;
             }
-            // V4 用 FWP_UINT32（网络字节序），V6 用 FWP_BYTE_ARRAY16_TYPE。
+            // V4 用 FWP_UINT32（**主机字节序**），V6 用 FWP_BYTE_ARRAY16_TYPE。
             FWP_VALUE0 addrValue{};
             FWP_BYTE_ARRAY16 addr16{};
             if (isV4) {
                 addrValue.type = FWP_UINT32;
-                addrValue.uint32 = v4.S_un.S_addr;
+                addrValue.uint32 = HostOrderV4(v4);
             } else {
                 memcpy(addr16.byteArray16, &v6, 16);
                 addrValue.type = FWP_BYTE_ARRAY16_TYPE;

@@ -32,6 +32,7 @@ import {
   type NtDomain,
   type NtDriverHello,
   type NtDriverPort,
+  type NtEndpoint,
   type NtDriverStats,
   type NtNetworkMode,
   type NtStatus,
@@ -191,6 +192,8 @@ export interface NtRuntimeOptions {
   applyReady?: boolean
   tokenMode?: NtTokenMode
   networkMode?: NtNetworkMode
+  /** `networkMode='allowlist'` 的端点（IP 字面量）。 */
+  networkAllow?: NtEndpoint[]
   appContainerSid?: string
   job?: Partial<NtDomain['job']>
   extraRules?: NtDomain['rules']
@@ -247,6 +250,7 @@ export class NtRuntime {
       storeRoot: this.options.storeRoot,
       ...(this.options.tokenMode === undefined ? {} : { tokenMode: this.options.tokenMode }),
       ...(this.options.networkMode === undefined ? {} : { network: this.options.networkMode }),
+      ...(this.options.networkAllow === undefined ? {} : { networkAllow: this.options.networkAllow }),
       ...(this.options.job === undefined ? {} : { job: this.options.job }),
       ...(this.options.extraRules === undefined ? {} : { extraRules: this.options.extraRules }),
       ...(this.options.appContainerSid === undefined ? {} : { appContainerSid: this.options.appContainerSid }),

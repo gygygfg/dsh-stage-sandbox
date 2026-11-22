@@ -204,6 +204,20 @@ export function viewToLogical(viewPath: string, workspaceRoot: string, viewRoot:
   return joinWin32(workspace, relativeToRoot(candidate, view))
 }
 
+/**
+ * IPv4 点分十进制或宽松 IPv6 字面量。
+ *
+ * WFP 的 allowlist 用 `InetPtonW` 解析地址；域名在 v1 没有解析器，传进去只会让
+ * 安装失败。因此控制面在**下发前**就拒绝非 IP 字面量，而不是等到子进程启动。
+ */
+export function isIpLiteral(host: string): boolean {
+  if (typeof host !== 'string' || host.length === 0) return false
+  const ipv4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/
+  if (ipv4.test(host)) return true
+  if (!host.includes(':')) return false
+  return /^[0-9a-fA-F:.]+$/.test(host) && (host.match(/:/g)?.length ?? 0) >= 2
+}
+
 /** 前缀/精确匹配的“特异性”分数；数值越大越具体。 */
 export function matchSpecificity(match: { kind: 'exact' | 'prefix'; path: string }): number {
   return match.kind === 'exact' ? 1_000_000 + match.path.length : match.path.length

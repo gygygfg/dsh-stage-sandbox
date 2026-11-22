@@ -79,6 +79,13 @@ apply=24、apply-manifest=23、runtime=54）。
   能力必须含 `S-1-15-3-1` 与 `S-1-15-3-3`。
 - WFP `ALE_PACKAGE_ID` 用 `FWP_SID`；层 GUID 内置（`FwpmLayerGetByName0` 不导出）。
 - `restricted + offline` 按设计 fail-closed（无 package SID）。
+- allowlist 已实测：错端口仍阻断、命中端点放行、空列表 launcher 拒绝启动
+  （`allowlistBlockedExit=0 / allowlistAllowedExit=1 / allowlistEmptyExit=2`）。
+- allowlist 的 permit 地址条件必须用**主机字节序**（WFP 文档：SOCKADDR 是网络序，
+  过滤引擎要主机序）；写成网络序会永远不匹配。
+- 进程缓解/Job 由 `m1-mitigate.exe` 回读验证：DEP/ASLR/ACG/CFG/扩展点/签名 8/8，
+  Job（in-job、ActiveProcessLimit=16、1024 MB、kill-on-close、CPU 50%）全部命中。
+  修掉了 mitigation 位序一档错位（28/32/36/40/44）。
 
 ## 3. 本机限制（如实）
 

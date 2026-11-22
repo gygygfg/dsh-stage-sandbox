@@ -13,8 +13,8 @@
  * @module winstage-sandbox/nt/launcher-args
  */
 
-import { isPathInside, normalizeWin32Path } from './paths.ts'
-import { NtError, type NtJobLimits, type NtNetworkMode, type NtTokenMode } from './types.ts'
+import { isIpLiteral, isPathInside, normalizeWin32Path } from './paths.ts'
+import { NtError, type NtEndpoint, type NtJobLimits, type NtNetworkMode, type NtTokenMode } from './types.ts'
 
 /** 凭据类环境变量键（默认拒绝；显式 `allowSensitiveEnv` 才放行）。 */
 export const SENSITIVE_ENV_KEY = /(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|API_KEY|ACCESS_KEY|SESSION_KEY|COOKIE)/i
@@ -28,6 +28,11 @@ export interface LauncherArgvInput {
   workspaceRoot: string
   policyGeneration: number
   network: NtNetworkMode
+  /**
+   * `allowlist` 的端点（IP 字面量 + 端口）。v1 不支持域名：
+   * WFP 安装时用 `InetPtonW` 解析，域名会让安装失败（fail-closed）。
+   */
+  allow?: readonly NtEndpoint[]
   job: NtJobLimits
   tokenMode: NtTokenMode
   /** AppContainer SID；`tokenMode='appcontainer'` 时必填。 */
@@ -66,6 +71,31 @@ export function buildLauncherArgv(input: LauncherArgvInput): string[] {
   }
   if (input.network === 'allowlist' && input.tokenMode !== 'appcontainer') {
     throw new NtError('NT_NETWORK_UNSUPPORTED', { reason: 'allowlist requires appcontainer token' })
+  }
+  const allow = input.allow ?? []
+  if (input.network === 'allowlist') {
+    if (allow.length === 0) {
+      throw new NtError('NT_NETWORK_UNSUPPORTED', {
+        reason: 'allowlist requires at least one endpoint (an empty allowlist is not offline; refusing to fake it)',
+      })
+    }
+    for (const [index, endpoint] of allow.entries()) {
+      if (!isIpLiteral(endpoint.host)) {
+        throw new NtError('NT_NETWORK_UNSUPPORTED', {
+          reason: `allowlist endpoint must be an IP literal (v1 has no DNS resolver in the gate)`,
+          index,
+          host: endpoint.host,
+        })
+      }
+      if (!Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535) {
+        throw new NtError('NT_NETWORK_UNSUPPORTED', { reason: 'allowlist port must be 1..65535', index, port: endpoint.port })
+      }
+      if (endpoint.protocol !== undefined && endpoint.protocol !== 'tcp' && endpoint.protocol !== 'udp') {
+        throw new NtError('NT_NETWORK_UNSUPPORTED', { reason: 'protocol must be tcp or udp', index })
+      }
+    }
+  } else if (allow.length > 0) {
+    throw new NtError('NT_NETWORK_UNSUPPORTED', { reason: 'allow endpoints are only valid with network=allowlist' })
   }
   if (input.tokenMode !== 'appcontainer' && input.tokenMode !== 'restricted') {
     throw new NtError('NT_CAPABILITY_MISSING', { reason: `unknown token mode: ${String(input.tokenMode)}` })
@@ -115,6 +145,12 @@ export function buildLauncherArgv(input: LauncherArgvInput): string[] {
     input.job.killOnClose ? '1' : '0',
   ]
   if (input.tokenMode === 'appcontainer') args.push('--sid', String(input.appContainerSid))
+  if (input.network === 'allowlist') {
+    for (const endpoint of allow) {
+      // IPv6 必须写成 [addr]:port，否则冒号会与 host:port 分隔符混淆。
+      args.push('--allow', endpoint.host.includes(':') ? `[${endpoint.host}]:${endpoint.port}` : `${endpoint.host}:${endpoint.port}`)
+    }
+  }
 
   for (const [key, value] of sortedEnv(input.env ?? {}, input.allowSensitiveEnv === true)) {
     args.push('--env-allow', `${key}=${value}`)

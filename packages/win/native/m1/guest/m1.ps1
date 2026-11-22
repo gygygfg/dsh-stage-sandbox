@@ -113,6 +113,7 @@ $policyInfo = Get-Content (Join-Path $Root 'policy.json') -Raw | ConvertFrom-Jso
 Log "policy generation=$($policyInfo.generation) bytes=$($policyInfo.bytes)"
 Copy-Item -Force (Join-Path $Src 'guest\m1-client.c') (Join-Path $Root 'm1-client.c')
 Copy-Item -Force (Join-Path $Src 'guest\m1-net.c') (Join-Path $Root 'm1-net.c')
+Copy-Item -Force (Join-Path $Src 'guest\m1-mitigate.c') (Join-Path $Root 'm1-mitigate.c')
 
 # 2. toolchain
 $msbuild = $null
@@ -174,10 +175,13 @@ cd /d $Root
 cl /nologo /W3 /Fe:$Root\bin\m1-client.exe m1-client.c ntdll.lib
 if errorlevel 1 exit /b 1
 cl /nologo /W3 /Fe:$Root\bin\m1-net.exe m1-net.c ws2_32.lib
+if errorlevel 1 exit /b 1
+cl /nologo /W3 /Fe:$Root\bin\m1-mitigate.exe m1-mitigate.c
 "@ | Set-Content -Path $clBat -Encoding ASCII
 cmd.exe /c $clBat *> (Join-Path $Share 'm1-build-client.log')
 Log "client build exit=$LASTEXITCODE"
 if (-not (Test-Path (Join-Path $Root 'bin\m1-client.exe'))) { Fail 'm1-client.exe not produced' @{ buildLog = Tail (Join-Path $Share 'm1-build-client.log') 60 } }
+if (-not (Test-Path (Join-Path $Root 'bin\m1-mitigate.exe'))) { Fail 'm1-mitigate.exe not produced' @{ buildLog = Tail (Join-Path $Share 'm1-build-client.log') 40 } }
 
 # 6. signing material
 $signtool = Find-Tool 'signtool.exe'
@@ -419,7 +423,60 @@ $acObservedExit = $LASTEXITCODE
 $acObservedOut = Tail (Join-Path $Share 'm1-net-appcontainer-observed.log') 10
 Log "appcontainer+observed exit=$acObservedExit out=$acObservedOut"
 
-# 15. verify lower unchanged + view state
+# 15. appcontainer + allowlist：只放行显式端点
+#     15a 端点端口不对 ⇒ 仍被阻断（证明 allow 不是“一键放行”）
+$allowArgs = @(
+  '--domain', $policyInfo.domainId, '--view', 'C:\m1\view', '--workspace', 'C:\m1\ws',
+  '--policy-generation', "$($policyInfo.generation)", '--network', 'allowlist', '--token', 'appcontainer',
+  '--allow', '172.30.112.1:446',
+  '--integrity', $env:DSHNT_INTEGRITY,
+  '--job-memory-mb', '1024', '--job-active-processes', '16', '--job-cpu-percent', '50', '--job-kill-on-close', '1',
+  '--', 'C:\m1\bin\m1-net.exe'
+)
+& $launcherBin @allowArgs *> (Join-Path $Share 'm1-net-allowlist-blocked.log')
+$allowBlockedExit = $LASTEXITCODE
+$allowBlockedOut = Tail (Join-Path $Share 'm1-net-allowlist-blocked.log') 10
+Log "allowlist(wrong port) exit=$allowBlockedExit out=$allowBlockedOut"
+
+#     15b 端点命中 ⇒ 连接成功（证明 allow 条件真的生效）
+$allowArgs2 = @(
+  '--domain', $policyInfo.domainId, '--view', 'C:\m1\view', '--workspace', 'C:\m1\ws',
+  '--policy-generation', "$($policyInfo.generation)", '--network', 'allowlist', '--token', 'appcontainer',
+  '--allow', '172.30.112.1:445',
+  '--integrity', $env:DSHNT_INTEGRITY,
+  '--job-memory-mb', '1024', '--job-active-processes', '16', '--job-cpu-percent', '50', '--job-kill-on-close', '1',
+  '--', 'C:\m1\bin\m1-net.exe'
+)
+& $launcherBin @allowArgs2 *> (Join-Path $Share 'm1-net-allowlist-allowed.log')
+$allowAllowedExit = $LASTEXITCODE
+$allowAllowedOut = Tail (Join-Path $Share 'm1-net-allowlist-allowed.log') 10
+Log "allowlist(matching) exit=$allowAllowedExit out=$allowAllowedOut"
+
+#     15c 空 allowlist ⇒ launcher 必须拒绝启动（不得静默当 offline）
+$allowArgs3 = @(
+  '--domain', $policyInfo.domainId, '--view', 'C:\m1\view', '--workspace', 'C:\m1\ws',
+  '--policy-generation', "$($policyInfo.generation)", '--network', 'allowlist', '--token', 'appcontainer',
+  '--integrity', $env:DSHNT_INTEGRITY,
+  '--', 'C:\m1\bin\m1-net.exe'
+)
+& $launcherBin @allowArgs3 *> (Join-Path $Share 'm1-net-allowlist-empty.log')
+$allowEmptyExit = $LASTEXITCODE
+Log "allowlist(empty) launcher exit=$allowEmptyExit (expect non-zero: fail-closed)"
+
+# 16. mitigation / Job 回读（不是 launcher 自述，而是内核视角的事实）
+$mitArgs = @(
+  '--domain', $policyInfo.domainId, '--view', 'C:\m1\view', '--workspace', 'C:\m1\ws',
+  '--policy-generation', "$($policyInfo.generation)", '--network', 'offline', '--token', 'appcontainer',
+  '--integrity', $env:DSHNT_INTEGRITY,
+  '--job-memory-mb', '1024', '--job-active-processes', '16', '--job-cpu-percent', '50', '--job-kill-on-close', '1',
+  '--', 'C:\m1\bin\m1-mitigate.exe'
+)
+& $launcherBin @mitArgs *> (Join-Path $Share 'm1-mitigate.log')
+$mitigateExit = $LASTEXITCODE
+$mitigateOut = Tail (Join-Path $Share 'm1-mitigate.log') 20
+Log "mitigate/job probe exit=$mitigateExit out=$mitigateOut"
+
+# 17. verify lower unchanged + view state
 $lowerAfter = HashTree 'C:\m1\ws'
 $lowerDiff = @()
 foreach ($k in $lowerBefore.Keys) {
@@ -461,8 +518,17 @@ $checks = [ordered]@{
   appContainerOfflineOutput = $acOfflineOut
   appContainerObservedExit = $acObservedExit
   appContainerObservedOutput = $acObservedOut
+  allowlistBlockedExit = $allowBlockedExit
+  allowlistBlockedOutput = $allowBlockedOut
+  allowlistAllowedExit = $allowAllowedExit
+  allowlistAllowedOutput = $allowAllowedOut
+  allowlistEmptyExit = $allowEmptyExit
+  mitigateExit = $mitigateExit
+  mitigateOutput = $mitigateOut
   # m1-net.exe: 0 = 连接被阻断（期望），1 = 连接成功（对照组）。
-  networkGateWorks = ($acOfflineExit -eq 0 -and $acObservedExit -eq 1)
+  # allowlist：错端口被阻断、命中端点放行、空列表 launcher 拒绝启动。
+  networkGateWorks = ($acOfflineExit -eq 0 -and $acObservedExit -eq 1 -and
+                      $allowBlockedExit -eq 0 -and $allowAllowedExit -eq 1 -and $allowEmptyExit -ne 0)
   stats              = $stats
   providerStart      = $startReply
   providerProtect    = $protectReply
@@ -470,9 +536,11 @@ $checks = [ordered]@{
   clientConsole      = $clientConsole
 }
 
-$networkOk = ($acOfflineExit -eq 0 -and $acObservedExit -eq 1)
+$networkOk = ($acOfflineExit -eq 0 -and $acObservedExit -eq 1 -and
+              $allowBlockedExit -eq 0 -and $allowAllowedExit -eq 1 -and $allowEmptyExit -ne 0)
+$mitigationOk = ($mitigateExit -eq 0)
 $ok = ($clientExit -eq 0) -and ($lowerDiff.Count -eq 0) -and ($viewB -eq 'v2') -and ($lowerB -eq 'v1') -and
-      ($null -ne $clientJson -and $clientJson.failures -eq 0) -and (-not $viewA) -and $viewChild -and $networkOk
+      ($null -ne $clientJson -and $clientJson.failures -eq 0) -and (-not $viewA) -and $viewChild -and $networkOk -and $mitigationOk
 $payload = [ordered]@{
   ok = [bool]$ok
   phase = 'm1'

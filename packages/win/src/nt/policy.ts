@@ -24,6 +24,7 @@
 
 import { createHash } from 'node:crypto'
 import {
+  isIpLiteral,
   isPathInside,
   matchPath,
   matchSpecificity,
@@ -514,6 +515,10 @@ function validateNetwork(
     errors.push(`${where}.network.allow 必须是数组`)
     return
   }
+  if (network.mode === 'allowlist' && network.allow.length === 0) {
+    // 空 allowlist 不是 offline 的同义词：静默按 offline 处理会让用户以为“只放行了白名单”。
+    errors.push(`${where}.network.mode='allowlist' 至少需要一个端点（空列表请显式用 offline）`)
+  }
   for (const [index, endpoint] of network.allow.entries()) {
     const at = `${where}.network.allow[${index}]`
     if (endpoint === null || typeof endpoint !== 'object') {
@@ -522,6 +527,8 @@ function validateNetwork(
     }
     if (typeof endpoint.host !== 'string' || endpoint.host.trim().length === 0 || /\s/.test(endpoint.host)) {
       errors.push(`${at}.host 必须是非空且不含空白的字符串`)
+    } else if (!isIpLiteral(endpoint.host)) {
+      errors.push(`${at}.host 必须是 IP 字面量（v1 的 WFP 闸门没有 DNS 解析器）`)
     }
     if (!Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535) {
       errors.push(`${at}.port 必须是 1..65535 的整数`)

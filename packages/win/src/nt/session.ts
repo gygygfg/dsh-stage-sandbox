@@ -149,6 +149,7 @@ export class NtSession {
       workspaceRoot: this.options.domain.workspaceRoot,
       policyGeneration: this.options.policy.generation,
       network: this.options.domain.network.mode,
+      allow: this.options.domain.network.allow,
       job: this.options.domain.job,
       tokenMode: this.options.domain.tokenMode,
       ...(this.options.domain.appContainerSid === undefined

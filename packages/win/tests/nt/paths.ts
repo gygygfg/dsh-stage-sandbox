@@ -8,6 +8,7 @@ import {
   concealViewText,
   hasAlternateDataStream,
   isDriveRoot,
+  isIpLiteral,
   isPathInside,
   joinWin32,
   logicalToView,
@@ -91,4 +92,14 @@ await runSuite('nt-paths', async () => {
   check('普通文件不是 ADS', !hasAlternateDataStream('C:\\ws\\a.txt'))
   check('盘符根判定', isDriveRoot('C:\\'))
   check('非根判定', !isDriveRoot('C:\\ws'))
+
+  section('8. allowlist 地址（IP 字面量判定）')
+  check('IPv4', isIpLiteral('172.30.112.1'))
+  check('IPv4 边界 255', isIpLiteral('255.255.255.255'))
+  check('IPv6', isIpLiteral('2001:db8::1'))
+  check('IPv4 映射 IPv6', isIpLiteral('::ffff:10.0.0.1'))
+  check('拒绝域名', !isIpLiteral('example.com'))
+  check('拒绝越界八位组', !isIpLiteral('256.1.1.1'))
+  check('拒绝空串', !isIpLiteral(''))
+  check('拒绝单个冒号', !isIpLiteral('1:2'))
 })

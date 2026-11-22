@@ -1,36 +1,36 @@
-﻿=== dshnt M1 11/23/2026 03:19:15 ===
-03:19:15 share ok: \\host.lan\Data\m1
-03:19:22 policy generation=1 bytes=1216
-03:19:22 msbuild=C:\BuildTools\MSBuild\Current\Bin\MSBuild.exe
-03:19:22 sdk=10.0.26100.0
-03:19:28 driver build exit=0
-03:19:28 dshnt.sys = C:\m1\src\driver\x64\Release\dshnt.sys
-03:19:34 launcher build exit=0
-03:19:37 ctl build exit=0
-03:19:37 launcher=C:\m1\src\launcher\out\dshnt-launch.exe ctl=C:\m1\src\ctl\out\dshnt-ctl.exe
-03:19:41 client build exit=0
-03:19:42 signtool=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe
-03:19:42 inf2cat=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x86\Inf2Cat.exe
-03:19:42 pfx unreadable: 找不到与参数名称“Password”匹配的参数。
-03:19:43 new signing cert 578BD08069E770FAD283B1E920108A5D28B3E85A valid 11/23/2026 03:09:43..11/23/2028 03:19:42
-03:19:43 cert ready
-03:19:43 inf2cat exit=-2
-03:19:44 sign(sys) exit=0
-03:19:44 sc/registry install: service exists=True
-03:19:44 fltmc load exit=0
-03:19:44  | dshnt 筛选器的实例: |  | 卷名                              高度        实例名称       框架  VlStatus | -------------------------------------  ------------  ----------------------  -----  -------- | C:                                        371100     dshnt                     0    
-03:19:45 lower before: 6 files
-03:19:45 provider pid=2028
-03:19:48 provider start: {"id":1,"ok":true,"pid":2028}
-03:19:48 provider protect: {"id":1,"ok":true,"lowerProtected":true}
-03:19:48 ctl hello exit=0: abi=2 capabilities=0x0000000F version=0.1.0 altitude=371100
-03:19:48 ctl policy exit=0: policy applied: generation=1 domains=1 rules=10
-03:19:48 ctl register-domain exit=0
-03:19:48 ctl stats: generation=1 domains=1 rules=10 processes=0 redirects=0 denies=0 masks=0 lastError=0x00000000
-03:19:49 client launcher exit=0
-03:19:49 client console tail:
+﻿=== dshnt M1 11/23/2026 03:46:12 ===
+03:46:12 share ok: \\host.lan\Data\m1
+03:46:18 policy generation=1 bytes=1216
+03:46:18 msbuild=C:\BuildTools\MSBuild\Current\Bin\MSBuild.exe
+03:46:18 sdk=10.0.26100.0
+03:46:20 driver build exit=0
+03:46:21 dshnt.sys = C:\m1\src\driver\x64\Release\dshnt.sys
+03:46:26 launcher build exit=0
+03:46:30 ctl build exit=0
+03:46:30 launcher=C:\m1\src\launcher\out\dshnt-launch.exe ctl=C:\m1\src\ctl\out\dshnt-ctl.exe
+03:46:34 client build exit=0
+03:46:34 signtool=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe
+03:46:34 inf2cat=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x86\Inf2Cat.exe
+03:46:34 pfx unreadable: 找不到与参数名称“Password”匹配的参数。
+03:46:35 new signing cert 21A411D5ED065D0C0947C83F3479F0C93C3D908D valid 11/23/2026 03:36:35..11/23/2028 03:46:35
+03:46:35 cert ready
+03:46:35 inf2cat exit=-2
+03:46:36 sign(sys) exit=0
+03:46:36 sc/registry install: service exists=True
+03:46:36 fltmc load exit=0
+03:46:36  | dshnt 筛选器的实例: |  | 卷名                              高度        实例名称       框架  VlStatus | -------------------------------------  ------------  ----------------------  -----  -------- | C:                                        371100     dshnt                     0    
+03:46:37 lower before: 6 files
+03:46:37 provider pid=2704
+03:46:40 provider start: {"id":1,"ok":true,"pid":2704}
+03:46:40 provider protect: {"id":1,"ok":true,"lowerProtected":true}
+03:46:40 ctl hello exit=0: abi=2 capabilities=0x0000000F version=0.1.0 altitude=371100
+03:46:40 ctl policy exit=0: policy applied: generation=1 domains=1 rules=10
+03:46:40 ctl register-domain exit=0
+03:46:40 ctl stats: generation=1 domains=1 rules=10 processes=0 redirects=0 denies=0 masks=0 lastError=0x00000000
+03:46:40 client launcher exit=0
+03:46:40 client console tail:
 dshnt-launch.exe : dshnt-launch: integrity=medium (explicitly disabled by --integrity medium)
-所在位置 \\host.lan\Data\m1\m1.ps1:370 字符: 1
+所在位置 \\host.lan\Data\m1\m1.ps1:374 字符: 1
 + & $launcherBin @launchArgs *> (Join-Path $Share 'm1-client-console.lo ...
 + ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (dshnt-launch: i...tegrity medium):String) [], RemoteException
@@ -73,22 +73,49 @@ dshnt-launch: create first=0 final=0 appcontainer=0
 [PASS] create_new_file -- err=0
 [PASS] enum_has_new
 M1-CLIENT checks=24 failures=0
-03:19:49 client result: checks=24 failures=0
-03:19:49 restricted+offline launcher exit=90 (expect non-zero: fail-closed)
-03:19:49 appcontainer+offline exit=0 out=dshnt-launch.exe : dshnt-launch: create first=0 final=0 appcontainer=1
-所在位置 \\host.lan\Data\m1\m1.ps1:404 字符: 1
+03:46:40 client result: checks=24 failures=0
+03:46:41 restricted+offline launcher exit=90 (expect non-zero: fail-closed)
+03:46:41 appcontainer+offline exit=0 out=dshnt-launch.exe : dshnt-launch: create first=0 final=0 appcontainer=1
+所在位置 \\host.lan\Data\m1\m1.ps1:408 字符: 1
 + & $launcherBin @netArgs2 *> (Join-Path $Share 'm1-net-appcontainer-of ...
 + ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (dshnt-launch: c... appcontainer=1:String) [], RemoteException
     + FullyQualifiedErrorId : NativeCommandError
  
 NET-BLOCKED 172.30.112.1:445 wsa=10013
-03:19:49 appcontainer+observed exit=1 out=dshnt-launch.exe : dshnt-launch: create first=0 final=0 appcontainer=1
-所在位置 \\host.lan\Data\m1\m1.ps1:417 字符: 1
+03:46:41 appcontainer+observed exit=1 out=dshnt-launch.exe : dshnt-launch: create first=0 final=0 appcontainer=1
+所在位置 \\host.lan\Data\m1\m1.ps1:421 字符: 1
 + & $launcherBin @netArgs3 *> (Join-Path $Share 'm1-net-appcontainer-ob ...
 + ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (dshnt-launch: c... appcontainer=1:String) [], RemoteException
     + FullyQualifiedErrorId : NativeCommandError
  
 NET-CONNECTED 172.30.112.1:445
-03:19:49 RESULT ok=True -> \\host.lan\Data\RESULT_M1.json
+03:46:41 allowlist(wrong port) exit=0 out=dshnt-launch.exe : dshnt-launch: create first=0 final=0 appcontainer=1
+所在位置 \\host.lan\Data\m1\m1.ps1:436 字符: 1
++ & $launcherBin @allowArgs *> (Join-Path $Share 'm1-net-allowlist-bloc ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (dshnt-launch: c... appcontainer=1:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+NET-BLOCKED 172.30.112.1:445 wsa=10013
+03:46:41 allowlist(matching) exit=1 out=dshnt-launch.exe : dshnt-launch: create first=0 final=0 appcontainer=1
+所在位置 \\host.lan\Data\m1\m1.ps1:450 字符: 1
++ & $launcherBin @allowArgs2 *> (Join-Path $Share 'm1-net-allowlist-all ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (dshnt-launch: c... appcontainer=1:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+NET-CONNECTED 172.30.112.1:445
+03:46:41 allowlist(empty) launcher exit=2 (expect non-zero: fail-closed)
+03:46:41 mitigate/job probe exit=0 out=dshnt-launch.exe : dshnt-launch: create first=0 final=0 appcontainer=1
+所在位置 \\host.lan\Data\m1\m1.ps1:474 字符: 1
++ & $launcherBin @mitArgs *> (Join-Path $Share 'm1-mitigate.log')
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (dshnt-launch: c... appcontainer=1:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+MITIGATION dep=1 aslr=1 buaslr=1 win32k=1 ext=1 acg=1 cfg=1 msft=1
+JOB injob=1 active=16 memmb=1024 kill=1 cpu=5000
+MITIGATE-JOB-OK
+03:46:41 RESULT ok=True -> \\host.lan\Data\RESULT_M1.json

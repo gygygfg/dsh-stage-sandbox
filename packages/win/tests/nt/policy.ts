@@ -196,6 +196,9 @@ await runSuite('nt-policy', async () => {
       'allowlist + restricted 不支持',
       makePolicy([makeDomain({ tokenMode: 'restricted', network: { mode: 'allowlist', allow: [{ host: 'example.com', port: 443 }] } })]),
     ],
+    ['allowlist 空列表（不得静默当 offline）', makePolicy([makeDomain({ network: { mode: 'allowlist', allow: [] } })])],
+    ['allowlist 域名（闸门没有 DNS）', makePolicy([makeDomain({ network: { mode: 'allowlist', allow: [{ host: 'example.com', port: 443 }] } })])],
+    ['allowlist 端口越界', makePolicy([makeDomain({ network: { mode: 'allowlist', allow: [{ host: '10.0.0.1', port: 70000 }] } })])],
     [
       '重复 AppContainer SID',
       makePolicy([
@@ -209,6 +212,11 @@ await runSuite('nt-policy', async () => {
     check(`拒绝：${label}`, !result.ok, result.errors.join('; ') || '（未报错）')
   }
   throwsCode('compilePolicy 对非法策略抛 NT_POLICY_INVALID', () => compilePolicy(invalidCases[0][1]), 'NT_POLICY_INVALID')
+
+  const allowOk = validatePolicy(
+    makePolicy([makeDomain({ network: { mode: 'allowlist', allow: [{ host: '10.0.0.1', port: 443 }, { host: '2001:db8::1', port: 53 }] } })]),
+  )
+  check('IP 字面量 allowlist 合法', allowOk.ok, allowOk.errors.join('; '))
 
   section('9. 重复域 id / 跨域根重叠')
   const duplicateId = validatePolicy(makePolicy([makeDomain(), makeDomain({ viewRoot: 'D:\\dshnt\\view\\s2', storeRoot: 'D:\\dshnt\\store\\s2', appContainerSid: 'S-1-15-2-9-9-9' })]))

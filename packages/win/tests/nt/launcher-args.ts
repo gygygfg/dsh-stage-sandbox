@@ -91,4 +91,49 @@ await runSuite('nt-launcher-args', async () => {
     () => buildLauncherArgv(baseInput({ job: { ...defaultJobLimits(), memoryMb: 0 } })),
     'NT_CAPABILITY_MISSING',
   )
+
+  section('4. allowlist 端点（v1：IP 字面量，无 DNS）')
+  const allowV4 = buildLauncherArgv(
+    baseInput({ network: 'allowlist', allow: [{ host: '172.30.112.1', port: 445 }] }),
+  )
+  eq('v4 端点写成 host:port', allowV4[allowV4.indexOf('--allow') + 1], '172.30.112.1:445')
+  const allowV6 = buildLauncherArgv(
+    baseInput({ network: 'allowlist', allow: [{ host: '2001:db8::1', port: 443 }] }),
+  )
+  eq('v6 端点加方括号', allowV6[allowV6.indexOf('--allow') + 1], '[2001:db8::1]:443')
+  const multi = buildLauncherArgv(
+    baseInput({
+      network: 'allowlist',
+      allow: [
+        { host: '10.0.0.2', port: 53 },
+        { host: '10.0.0.1', port: 443 },
+      ],
+    }),
+  )
+  eq(
+    '多个端点按输入顺序',
+    multi.filter((item, index) => index > 0 && multi[index - 1] === '--allow'),
+    ['10.0.0.2:53', '10.0.0.1:443'],
+  )
+  throwsCode(
+    'allowlist 空列表拒绝（不得静默当 offline）',
+    () => buildLauncherArgv(baseInput({ network: 'allowlist', allow: [] })),
+    'NT_NETWORK_UNSUPPORTED',
+  )
+  throwsCode(
+    '域名拒绝（闸门没有 DNS）',
+    () => buildLauncherArgv(baseInput({ network: 'allowlist', allow: [{ host: 'example.com', port: 443 }] })),
+    'NT_NETWORK_UNSUPPORTED',
+  )
+  throwsCode(
+    '非法端口拒绝',
+    () => buildLauncherArgv(baseInput({ network: 'allowlist', allow: [{ host: '10.0.0.1', port: 0 }] })),
+    'NT_NETWORK_UNSUPPORTED',
+  )
+  throwsCode(
+    '非 allowlist 模式带端点拒绝',
+    () => buildLauncherArgv(baseInput({ network: 'offline', allow: [{ host: '10.0.0.1', port: 443 }] })),
+    'NT_NETWORK_UNSUPPORTED',
+  )
+  check('offline 不产生 --allow', !buildLauncherArgv(baseInput()).includes('--allow'))
 })

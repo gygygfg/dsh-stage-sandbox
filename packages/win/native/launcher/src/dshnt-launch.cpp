@@ -52,6 +52,7 @@ struct Options {
     int jobActiveProcesses = 0;
     int jobCpuPercent = 0;
     bool jobKillOnClose = false;
+    std::vector<WfpEndpoint> allow;
     std::vector<std::pair<std::wstring, std::wstring>> env;
     std::vector<std::wstring> argv;
 };
@@ -59,6 +60,46 @@ struct Options {
 int Fail(const char* code, const std::wstring& detail, int exitCode = 90) {
     std::fwprintf(stderr, L"dshnt-launch: FAIL %hs: %ls\n", code, detail.c_str());
     return exitCode;
+}
+
+/*
+ * `--allow host:port`，IPv6 写作 `[::1]:443`。
+ * 这里只做形状校验；地址是否为 IP 字面量由 WFP 安装时（InetPtonW）判定，
+ * 失败即 fail-closed（不会退化成“放行全部”）。
+ */
+bool ParseEndpoint(const std::wstring& spec, WfpEndpoint& out, std::wstring& error) {
+    std::wstring host;
+    std::wstring portText;
+    if (!spec.empty() && spec[0] == L'[') {
+        size_t close = spec.find(L']');
+        if (close == std::wstring::npos || close + 2 > spec.size() || spec[close + 1] != L':') {
+            error = L"--allow needs [ipv6]:port: " + spec;
+            return false;
+        }
+        host = spec.substr(1, close - 1);
+        portText = spec.substr(close + 2);
+    } else {
+        size_t colon = spec.rfind(L':');
+        if (colon == std::wstring::npos || colon == 0 || colon + 1 >= spec.size()) {
+            error = L"--allow needs host:port: " + spec;
+            return false;
+        }
+        host = spec.substr(0, colon);
+        portText = spec.substr(colon + 1);
+    }
+    if (host.empty() || host.find_first_of(L" \t\r\n") != std::wstring::npos) {
+        error = L"--allow host is empty or contains whitespace: " + spec;
+        return false;
+    }
+    wchar_t* end = nullptr;
+    unsigned long port = wcstoul(portText.c_str(), &end, 10);
+    if (end == nullptr || *end != 0 || port == 0 || port > 65535) {
+        error = L"--allow port must be 1..65535: " + spec;
+        return false;
+    }
+    out.host = host;
+    out.port = (unsigned short)port;
+    return true;
 }
 
 bool ParseArgs(int argc, wchar_t** argv, Options& o, std::wstring& error) {
@@ -88,6 +129,12 @@ bool ParseArgs(int argc, wchar_t** argv, Options& o, std::wstring& error) {
         else if (a == L"--job-active-processes") { if (!need(L"--job-active-processes")) return false; o.jobActiveProcesses = _wtoi(argv[i]); }
         else if (a == L"--job-cpu-percent") { if (!need(L"--job-cpu-percent")) return false; o.jobCpuPercent = _wtoi(argv[i]); }
         else if (a == L"--job-kill-on-close") { if (!need(L"--job-kill-on-close")) return false; o.jobKillOnClose = std::wstring(argv[i]) == L"1"; }
+        else if (a == L"--allow") {
+            if (!need(L"--allow")) return false;
+            WfpEndpoint endpoint;
+            if (!ParseEndpoint(argv[i], endpoint, error)) return false;
+            o.allow.push_back(endpoint);
+        }
         else if (a == L"--env-allow") {
             if (!need(L"--env-allow")) return false;
             std::wstring kv = argv[i];
@@ -104,6 +151,14 @@ bool ParseArgs(int argc, wchar_t** argv, Options& o, std::wstring& error) {
     if (o.argv.empty()) { error = L"target argv missing after --"; return false; }
     if (o.token != L"appcontainer" && o.token != L"restricted") { error = L"--token must be appcontainer|restricted"; return false; }
     if (o.integrity != L"low" && o.integrity != L"medium") { error = L"--integrity must be low|medium"; return false; }
+    if (o.network == L"allowlist" && o.allow.empty()) {
+        error = L"--network allowlist requires at least one --allow host:port";
+        return false;
+    }
+    if (o.network != L"allowlist" && !o.allow.empty()) {
+        error = L"--allow is only valid with --network allowlist";
+        return false;
+    }
     return true;
 }
 
@@ -609,7 +664,7 @@ int wmain(int argc, wchar_t** argv) {
             return Fail("NT_NETWORK_UNSUPPORTED", L"unknown --network mode");
         }
         std::wstring wfpError;
-        if (!WfpInstall(sidText, o.network == L"allowlist", {}, &wfpGate, &wfpError)) {
+        if (!WfpInstall(sidText, o.network == L"allowlist", o.allow, &wfpGate, &wfpError)) {
             if (childToken != nullptr) CloseHandle(childToken);
             return Fail("NT_NETWORK_UNENFORCED", wfpError);
         }
@@ -663,13 +718,26 @@ int wmain(int argc, wchar_t** argv) {
         return Fail("NT_CAPABILITY_MISSING", L"InitializeProcThreadAttributeList failed");
     }
 
+    /*
+     * mitigation 位序（winnt.h 的 PROCESS_CREATION_MITIGATION_POLICY_*）：
+     *   0 DEP_ENABLE | 8 FORCE_RELOCATE_IMAGES | 16 BOTTOM_UP_ASLR |
+     *   28 WIN32K_SYSTEM_CALL_DISABLE | 32 EXTENSION_POINT_DISABLE |
+     *   36 PROHIBIT_DYNAMIC_CODE (ACG) | 40 CONTROL_FLOW_GUARD |
+     *   44 BLOCK_NON_MICROSOFT_BINARIES
+     *
+     * ⚠ 之前这里把 28 当成 CFG、36 当成扩展点、40 当成签名策略 —— 三处都错位了一档，
+     * 实际只设置了“Win32k 禁用=RERSERVED 值 2 / ACG / CFG”。`m1-mitigate.exe`
+     * 用 GetProcessMitigationPolicy 回读后修正（见 M1-REPORT §4.5）。
+     */
     DWORD64 mitigation = 0;
-    mitigation |= PROCESS_CREATION_MITIGATION_POLICY_DEP_ENABLE;
-    mitigation |= (1ull << 8);   /* DEP_ALWAYS_ON */
-    mitigation |= (1ull << 16);  /* ASLR force relocate images: ALWAYS_ON */
-    mitigation |= (2ull << 28);  /* Control flow guard: ALWAYS_ON */
-    mitigation |= (1ull << 36);  /* Disable extension points */
-    mitigation |= (1ull << 40);  /* Block non-Microsoft binaries */
+    mitigation |= (1ull << 0);   /* DEP */
+    mitigation |= (1ull << 8);   /* Force relocate images (ASLR) */
+    mitigation |= (1ull << 16);  /* Bottom-up ASLR */
+    mitigation |= (1ull << 28);  /* Disable Win32k system calls */
+    mitigation |= (1ull << 32);  /* Disable extension points */
+    mitigation |= (1ull << 36);  /* Prohibit dynamic code (ACG) */
+    mitigation |= (1ull << 40);  /* Control flow guard */
+    mitigation |= (1ull << 44);  /* Block non-Microsoft binaries */
     UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
                               &mitigation, sizeof(mitigation), nullptr, nullptr);
 
