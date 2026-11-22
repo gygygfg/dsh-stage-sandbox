@@ -43,6 +43,7 @@ import { WindowsStageExecutor, resolveDshModuleRoot } from '../src/executor.ts'
 import { canonical, compareKey, maskSessionId } from '../src/paths.ts'
 import { renderCandidateDiff } from '../src/tools.ts'
 import { verifyStageRootAlive } from '../src/stage-guard.ts'
+import { createNtRuntime, defaultNtLayout } from '../src/nt/runtime.ts'
 import { REVIEW_BASENAME, getReviewService, isRegistryCandidate, resolveReviewStoreDir, disposeReviewServices } from './review-service.ts'
 import { installBaselineWatch } from './baseline-watch.ts'
 import { createAuditMirror } from './audit-mirror.ts'
@@ -52,6 +53,7 @@ import { createApprovalQueue } from './approval-queue.ts'
 import { executeApprovalIntent } from './approval-execute.ts'
 import { installProfileFormattingGuard } from './profile-format.ts'
 import { configPendingRestart, resolveProfilePatchPath, winStageEnabledFromProfile } from './assembly-toggle.ts'
+import { runNtCommand } from './nt-command.ts'
 // ★ BUG-B：档位（lane）判定的**同一份**分类与结论口径。只 import 纯函数/常量，
 //   不 import 执行器类；`shell-executor.ts` 反过来**不**依赖本模块（无环）。
 // ★ WP3：在同一份产物上补"历史"（首次掉档 / 是否曾掉档 / 失根次数）——
@@ -1706,13 +1708,27 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
       queue.decide(id, 'rejected', { by: 'user' })
       return { kind: 'success', text: `已拒绝审批项 ${id}（未执行）。` }
     },
+    /**
+     * `/winstage nt status|doctor` —— NT 内核后端（ProjFS + minifilter）的只读诊断。
+     *
+     * 为什么放在命令面而不是设置页：状态是“机器事实”（驱动是否加载、provider 是否在跑），
+     * 必须能随时重测；缓存在配置里就会变成谎报。`/winstage nt` 不做任何初始化。
+     */
+    async nt({ args }) {
+      const ntRuntime = options.ntRuntime
+      if (typeof ntRuntime !== 'function') {
+        return { kind: 'error', text: 'NT 后端未接线：宿主没有提供运行时装配（仅开发构建会出现）。' }
+      }
+      const sub = splitArgs(String(args ?? '').trim())[0]
+      return await runNtCommand(sub, { runtime: ntRuntime, log: { warn: (message) => log.warn(message) } })
+    },
   }
 
   const registered = []
   // 命令规格：`sub === null` 表示伞形命令（第一个词是子命令），
   // 其余命令把整个 rawInput 当作参数列表。
   const SPECS = [
-    { name: 'winstage', sub: null, description: '查看 WinStage 暂存待审文件（/winstage list|diff|approve|reject|rebase|refresh|undo|approvals）' },
+    { name: 'winstage', sub: null, description: '查看 WinStage 暂存待审文件（/winstage list|diff|approve|reject|rebase|refresh|undo|approvals|nt）' },
     { name: 'winstage-status', sub: 'status', description: 'WinStage 暂存：查看待审清单' },
     { name: 'winstage-refresh', sub: 'refresh', description: 'WinStage 暂存：重新发布审阅快照' },
     { name: 'winstage-rebase', sub: 'rebase', description: 'WinStage 暂存：以真实文件为基线重新暂存（基线过期时）' },
@@ -1722,6 +1738,7 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
     { name: 'winstage-approvals', sub: 'approvals', hint: '（无参数）', description: 'WinStage：列出待处理的异步审批' },
     { name: 'winstage-approval-approve', sub: 'approval-approve', hint: '审批项 id', description: 'WinStage：批准并尝试执行异步审批' },
     { name: 'winstage-approval-reject', sub: 'approval-reject', hint: '审批项 id', description: 'WinStage：拒绝异步审批' },
+    { name: 'winstage-nt', sub: 'nt', hint: 'status|doctor', description: 'WinStage NT 内核后端：查看/诊断 ProjFS + minifilter 路径' },
   ]
 
   for (const spec of SPECS) {
@@ -1767,7 +1784,7 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
             if (!handler) {
               return {
                 kind: 'error',
-                text: `未知子命令 "${sub}"；可用：list、status、diff、approve、reject、rebase、refresh、undo、approvals、approval-approve、approval-reject`,
+                text: `未知子命令 "${sub}"；可用：list、status、diff、approve、reject、rebase、refresh、undo、approvals、approval-approve、approval-reject、nt`,
               }
             }
             return handler({ args, invocation, raw, service })
@@ -2266,6 +2283,39 @@ export function apply(ctx, config = {}) {
   const runtimeStatus = () => ({ ...runtimeConfig, effective: isEnabled() })
 
   /**
+   * NT 内核后端的**惰性**装配：只有真的执行 `/winstage nt status|doctor` 才去
+   * 碰驱动端口/命名管道。装配失败不缓存失败（下次命令重试），却也绝不在加载期
+   * 拉起任何内核交互——默认路径保持 legacy，行为与之前逐字节一致。
+   */
+  let ntRuntimePromise = null
+  const ntRuntimeFor = () => {
+    if (ntRuntimePromise === null) {
+      const layout = defaultNtLayout(workspaceRoot, process.env)
+      const pending = createNtRuntime({
+        workspaceRoot,
+        viewRoot: layout.viewRoot,
+        storeRoot: layout.storeRoot,
+        launcherPath: layout.launcherPath,
+      })
+      ntRuntimePromise = pending.catch((error) => {
+        ntRuntimePromise = null
+        throw error
+      })
+    }
+    return ntRuntimePromise
+  }
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => {
+      return () => {
+        const pending = ntRuntimePromise
+        ntRuntimePromise = null
+        if (pending === null) return
+        pending.then((runtime) => runtime.dispose()).catch(() => {})
+      }
+    }, 'winstage-sandbox: nt runtime dispose')
+  }
+
+  /**
    * A1a（2026-11-19）：只读 `plugin_manager` 审批自动放行。
    *
    * DSH 0.2.2-rc.5 的 `plugin_manager` 对**所有** action（含 `list_plugins`）都调
@@ -2426,6 +2476,7 @@ export function apply(ctx, config = {}) {
         ...(approvalQueue ? { approvals: approvalQueue } : {}),
         executeApproval: executeApprovalForCommand,
         runtimeStatus,
+        ntRuntime: ntRuntimeFor,
       })
       log.info(`已注册 ${registered.length} 个 /winstage* 命令（暂存与快照按会话隔离）`)
     } catch (error) {

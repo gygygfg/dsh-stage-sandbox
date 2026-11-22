@@ -106,7 +106,10 @@ const policy: NtPolicySet = {
 
 - 工作区读/执行 `allow`；
 - 工作区写/删/改名/属性 `stage`；
-- view/store 直接访问全 `deny`；
+- store 直接访问 `deny`（驱动更早的硬拒绝也会命中）；
+- 视图路径**不再单独写 deny 规则**：M1 实测重定向续开会用视图新名字重发 create，
+  驱动把视图路径映射回逻辑工作区路径后按同一套规则判定（见 `M1-REPORT.md` §3.1）。
+  因此按视图路径写的 deny/mask 规则永远不会命中，策略里不要依赖它们；
 - `C:\Windows`、`C:\Program Files`、`C:\Program Files (x86)` 读/执行 `allow`、写 `deny`。
 
 ## 4. 网络

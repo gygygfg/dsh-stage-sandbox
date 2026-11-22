@@ -265,6 +265,12 @@ export const OFFLINE_SUITES = [
   //   显示"本次开关未写入/设置值未生效"。修复：同进程上一代守护**收养**（keeperPid 不变）
   //   + 引用计数（还有使用者时不拆守护）+ keeper 轮询校验父进程启动时间（防 pid 复用钉根）。
   { id: 'stage-guard-adoption', script: 'tests/stage-guard-adoption.ts', title: 'R50 守护收养/引用计数（设置开关写后回滚根因：同进程收养、不覆盖哨兵、pid 复用不钉根）' },
+  // NT 内核后端（ProjFS + minifilter）的控制面套件。`run-all` 是子目录聚合器：
+  //   nt 套件放在 tests/nt/，由它逐个 spawn（每个套件独立进程，避免 harness 计数串味）。
+  //   全部是离线确定性断言（假驱动端口/注入命令输出/临时 Unix socket），
+  //   不需要 Windows、不加载驱动、不碰真实工作区 ⇒ 归 OFFLINE_SUITES。
+  //   与 verify.cmd 的清单必须逐字一致（两处同时改）。
+  { id: 'run-all', script: 'tests/nt/run-all.ts', title: 'NT 内核后端控制面（14 个套件聚合：策略/路径/视图/驱动/状态/执行器/apply/runtime）' },
 ]
 
 /** 需要未受限会话的套件 */

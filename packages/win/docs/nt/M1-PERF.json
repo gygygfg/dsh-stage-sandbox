@@ -1,0 +1,74 @@
+{
+  "ok": false,
+  "at": "2026-11-23T03:26:40.1578380+08:00",
+  "gate": {
+    "totalMs": 5000,
+    "perFileMs": 0.2
+  },
+  "results": {
+    "cold5k": {
+      "label": "cold-5k",
+      "files": 5000,
+      "enumMs": 62.7,
+      "statMs": 2931.5,
+      "totalMs": 2994.1,
+      "perFileMs": 0.599,
+      "bytes": 5120000
+    },
+    "cold20k": {
+      "label": "cold-20k",
+      "files": 20000,
+      "enumMs": 104.7,
+      "statMs": 12676.6,
+      "totalMs": 12781.3,
+      "perFileMs": 0.639,
+      "bytes": 20480000
+    },
+    "warm5k": {
+      "label": "warm-5k",
+      "files": 5000,
+      "enumMs": 17.3,
+      "statMs": 1448,
+      "totalMs": 1465.2,
+      "perFileMs": 0.293,
+      "bytes": 5120000
+    },
+    "warm20k": {
+      "label": "warm-20k",
+      "files": 20000,
+      "enumMs": 65.9,
+      "statMs": 5882.3,
+      "totalMs": 5948.2,
+      "perFileMs": 0.297,
+      "bytes": 20480000
+    },
+    "tree": {
+      "label": "warm-tree",
+      "files": 1000,
+      "enumMs": 29.3,
+      "statMs": 595.2,
+      "totalMs": 624.5,
+      "perFileMs": 0.625,
+      "bytes": 1024000
+    },
+    "restart5k": {
+      "label": "restart-5k",
+      "files": 5000,
+      "enumMs": 31.6,
+      "statMs": 1468.9,
+      "totalMs": 1500.5,
+      "perFileMs": 0.3,
+      "bytes": 5120000
+    },
+    "restart20k": {
+      "label": "restart-20k",
+      "files": 20000,
+      "enumMs": 107.2,
+      "statMs": 5901.4,
+      "totalMs": 6008.5,
+      "perFileMs": 0.3,
+      "bytes": 20480000
+    }
+  },
+  "providerLog": "03:26:07.678 control reply: {\"id\":1,\"ok\":true,\"lowerProtected\":true}\n03:26:32.487 control connected\n03:26:32.501 control request: {\"id\":1,\"op\":\"ping\"}\n03:26:32.560 control reply: {\"id\":1,\"ok\":true,\"pid\":228,\"pipe\":\"dshnt-provider-perf\",\"lowerProtected\":false}\n03:26:32.567 control connected\n03:26:32.571 control request: {\"workspace\":\"C:\\\\m1p\\\\ws\",\"op\":\"start\",\"domain\":\"perf\",\"id\":1,\"view\":\"C:\\\\m1p\\\\view\"}\n03:26:32.588 view started domain=perf lower=C:\\m1p\\ws view=C:\\m1p\\view\n03:26:32.593 domain registered perf\n03:26:32.599 control reply: {\"id\":1,\"ok\":true,\"pid\":228}\n03:26:32.604 control connected\n03:26:32.608 control request: {\"op\":\"protect\",\"id\":1,\"value\":true}\n03:26:32.616 control reply: {\"id\":1,\"ok\":true,\"lowerProtected\":true}"
+}

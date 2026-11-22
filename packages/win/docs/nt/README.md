@@ -1,7 +1,10 @@
 # NT 内核视图隔离沙箱（ProjFS + minifilter）
 
-> 状态：**M0/M1 之间**。控制面契约与单测已落地；驱动/ProjFS helper/launcher 尚未接线。
-> 诚实状态见 [`STATUS.md`](./STATUS.md)；威胁模型见 [`THREAT-MODEL.md`](./THREAT-MODEL.md)；
+> 状态：**M1 已完成（功能 GO；性能门禁未达标）**。产品驱动/provider/launcher 在
+> Windows 10 19041 上跑通端到端；DSH 侧目前只接入了只读诊断命令
+> `/winstage nt status|doctor`，默认 `enforcement` 仍是 legacy（M2 才切换路径）。
+> 诚实状态见 [`STATUS.md`](./STATUS.md)；M1 证据见 [`M1-REPORT.md`](./M1-REPORT.md)
+> 与 [`M1-PERF.md`](./M1-PERF.md)；威胁模型见 [`THREAT-MODEL.md`](./THREAT-MODEL.md)；
 > 策略格式见 [`POLICY.md`](./POLICY.md)；Windows spike 步骤见 [`M0-SPIKE.md`](./M0-SPIKE.md)。
 
 ## 1. 目标
@@ -23,8 +26,9 @@ DSH / Cordis
         src/nt/view.ts          ProjFS 视图 diff（placeholder/full/tombstone）
         src/nt/driver.ts        驱动通信端口契约（真实 FFI 在 M1）
         src/nt/status.ts        fail-closed / 写屏障 / 失败分类
-        src/nt/executor.ts      K0 档执行链（下一步）
-        src/nt/apply.ts         apply helper 客户端（下一步）
+        src/nt/executor.ts      K0 档执行链
+        src/nt/apply.ts         apply helper 客户端（控制面 journal/undo）
+        src/nt/runtime.ts       诊断装配（驱动/状态/provider/策略校验）
                 │
                 ▼
         NT kernel data plane
@@ -99,15 +103,22 @@ DSH / Cordis
 | `src/nt/launcher-args.ts` | ✅ 启动契约/环境白名单/路径校验 + 单测 |
 | `src/nt/apply-manifest.ts` | ✅ CAS manifest/冲突零写/排序 + 单测 |
 | `src/nt/session.ts` | ✅ 策略下发/域注册/launcher 包装/清理 + 单测 |
-| `src/nt/executor.ts` | ⏳ M1 |
-| `src/nt/apply.ts` | ⏳ M1 |
-| `src/nt/provider.ts` | ⏳ M2 |
+| `src/nt/policy-binary.ts` | ✅ 驱动线格式 + 单测 |
+| `src/nt/driver-wire.ts` / `driver-client.ts` | ✅ ABI v2 编解码 / Windows FFI + 单测 |
+| `src/nt/executor.ts` | ✅ K0 执行链 + 单测 |
+| `src/nt/apply.ts` | ✅ 控制面 apply（journal/undo）+ 单测 |
+| `src/nt/status-probe.ts` | ✅ 机器事实 → `NtStatus` + 单测 |
+| `src/nt/provider.ts` | ✅ `ctx.sandbox` NT provider（M2 才装配） |
+| `src/nt/runtime.ts` | ✅ 诊断装配 + 单测 |
 | M0 Windows spike | ✅ 已通过（ProjFS + SimRep；23/23 探针；见 `M0-REPORT.md`） |
-| `native/driver/` | ⏳ M1（产品实现；M0 仅验证 sample） |
-| `native/projfs/` | ⏳ M1（产品 helper；M0 用微软 sample） |
-| `native/launcher/` | ⏳ M1 |
-| `native/apply/` | ⏳ M1 |
-| dsh 接线 | ⏳ M2（默认仍 legacy） |
+| M1 端到端 | ✅ 已通过（24/24 探针、暂存写、lower 不变、网络闸门；见 `M1-REPORT.md`） |
+| M1 性能 | ⚠ 0.55–0.64 ms/文件、20k 11.4–12.8 s（门禁未过；见 `M1-PERF.md`） |
+| `native/driver/` | ✅ 产品实现，已加载并挂 C: |
+| `native/provider/` | ✅ 产品 ProjFS provider（C#），已运行 |
+| `native/launcher/` | ✅ token/Job/环境/WFP，已运行 |
+| `native/apply/` | ⏳ M2（v1 在可信控制面 apply） |
+| `/winstage nt` | ✅ status/doctor（只读诊断） |
+| dsh 路径切换 | ⏳ M2（默认仍 legacy） |
 
 ## 7. 常用命令（当前）
 
@@ -122,7 +133,11 @@ node tests/nt/paths.ts
 node tests/nt/view.ts
 node tests/nt/status.ts
 node tests/nt/driver.ts
+node tests/nt/runtime.ts
 ```
+
+Windows guest 内（管理员）：`\\host.lan\Data\m1\go.bat` 跑 M1 全流程，
+`goperf.bat` 跑性能；结果写 `RESULT_M1.json` / `PERF_M1.json`。
 
 TypeScript 类型检查（本机 vendor 缺 `@deepseek-ai/*` 时，先只检查 `src/nt` 与 `tests/nt`；
 完整 `tsc` 需要先备齐 `.dsh-vendor`）：
@@ -138,8 +153,11 @@ Windows 驱动/ProjFS 的 spike 见 [`M0-SPIKE.md`](./M0-SPIKE.md)。
 
 - 旧 T0/T1/T1S/TS/shim 路径**暂不删除**，作为 legacy/回退；
 - `enforcement: 'kernel'` 未就绪时默认 fail-closed；诊断可显式切 legacy；
-- 新套件在 `tests/nt/` 先以“开发期未封印”目录存在，M1 收口时提升到 `tests/*.ts`、
-  登记 `OFFLINE_SUITES` 与 `verify.cmd`，并刷新 `docs/源码基线.sha256`。
+- `tests/nt/*.ts` 已通过 `tests/nt/run-all.ts` 登记进 `OFFLINE_SUITES` 与
+  `verify.cmd`（`tests/suite-wiring.ts` 机器检查两处逐字一致）；
+- 但**封印收录面**仍是深度 1，`src/nt/`、`tests/nt/`、`native/` 不在
+  `docs/源码基线.sha256` 里。扩展收录面需要同时改 `tools/baseline-sha256.ts` 的 glob
+  与 `tests/baseline-integrity.ts` 的形状断言，是一次独立契约变更（M2 治理项）。
 
 ## 9. 参考
 

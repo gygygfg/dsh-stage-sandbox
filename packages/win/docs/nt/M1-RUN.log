@@ -1,0 +1,94 @@
+﻿=== dshnt M1 11/23/2026 03:19:15 ===
+03:19:15 share ok: \\host.lan\Data\m1
+03:19:22 policy generation=1 bytes=1216
+03:19:22 msbuild=C:\BuildTools\MSBuild\Current\Bin\MSBuild.exe
+03:19:22 sdk=10.0.26100.0
+03:19:28 driver build exit=0
+03:19:28 dshnt.sys = C:\m1\src\driver\x64\Release\dshnt.sys
+03:19:34 launcher build exit=0
+03:19:37 ctl build exit=0
+03:19:37 launcher=C:\m1\src\launcher\out\dshnt-launch.exe ctl=C:\m1\src\ctl\out\dshnt-ctl.exe
+03:19:41 client build exit=0
+03:19:42 signtool=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe
+03:19:42 inf2cat=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x86\Inf2Cat.exe
+03:19:42 pfx unreadable: 找不到与参数名称“Password”匹配的参数。
+03:19:43 new signing cert 578BD08069E770FAD283B1E920108A5D28B3E85A valid 11/23/2026 03:09:43..11/23/2028 03:19:42
+03:19:43 cert ready
+03:19:43 inf2cat exit=-2
+03:19:44 sign(sys) exit=0
+03:19:44 sc/registry install: service exists=True
+03:19:44 fltmc load exit=0
+03:19:44  | dshnt 筛选器的实例: |  | 卷名                              高度        实例名称       框架  VlStatus | -------------------------------------  ------------  ----------------------  -----  -------- | C:                                        371100     dshnt                     0    
+03:19:45 lower before: 6 files
+03:19:45 provider pid=2028
+03:19:48 provider start: {"id":1,"ok":true,"pid":2028}
+03:19:48 provider protect: {"id":1,"ok":true,"lowerProtected":true}
+03:19:48 ctl hello exit=0: abi=2 capabilities=0x0000000F version=0.1.0 altitude=371100
+03:19:48 ctl policy exit=0: policy applied: generation=1 domains=1 rules=10
+03:19:48 ctl register-domain exit=0
+03:19:48 ctl stats: generation=1 domains=1 rules=10 processes=0 redirects=0 denies=0 masks=0 lastError=0x00000000
+03:19:49 client launcher exit=0
+03:19:49 client console tail:
+dshnt-launch.exe : dshnt-launch: integrity=medium (explicitly disabled by --integrity medium)
+所在位置 \\host.lan\Data\m1\m1.ps1:370 字符: 1
++ & $launcherBin @launchArgs *> (Join-Path $Share 'm1-client-console.lo ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (dshnt-launch: i...tegrity medium):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+dshnt-launch: create first=0 final=0 appcontainer=0
+[PASS] ntcreatefile_available
+[PASS] read_workspace_a -- hello
+
+
+[PASS] write_workspace_b
+[PASS] read_b_after_write -- v2
+[PASS] enum_has_a
+[PASS] enum_has_b
+[PASS] enum_has_dir
+[PASS] relative_cwd_read -- c
+
+
+[PASS] handle_relative_read -- c
+
+
+[PASS] raw_nt_write
+[PASS] raw_nt_read_back -- raw
+[PASS] delete_a -- err=0
+[PASS] deleted_a_gone
+[PASS] rename_c_to_d -- err=0
+[PASS] read_renamed_d -- c
+
+
+[PASS] child_write_via_redirect -- child 
+
+
+[INFO] child_exit=0
+[PASS] view_read_mapped_to_logical
+[PASS] view_list_mapped_to_logical
+[PASS] deny_store_read
+[PASS] deny_rule_read
+[PASS] deny_global_mask
+[PASS] allow_ws_normal_read
+[PASS] create_new_file -- err=0
+[PASS] enum_has_new
+M1-CLIENT checks=24 failures=0
+03:19:49 client result: checks=24 failures=0
+03:19:49 restricted+offline launcher exit=90 (expect non-zero: fail-closed)
+03:19:49 appcontainer+offline exit=0 out=dshnt-launch.exe : dshnt-launch: create first=0 final=0 appcontainer=1
+所在位置 \\host.lan\Data\m1\m1.ps1:404 字符: 1
++ & $launcherBin @netArgs2 *> (Join-Path $Share 'm1-net-appcontainer-of ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (dshnt-launch: c... appcontainer=1:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+NET-BLOCKED 172.30.112.1:445 wsa=10013
+03:19:49 appcontainer+observed exit=1 out=dshnt-launch.exe : dshnt-launch: create first=0 final=0 appcontainer=1
+所在位置 \\host.lan\Data\m1\m1.ps1:417 字符: 1
++ & $launcherBin @netArgs3 *> (Join-Path $Share 'm1-net-appcontainer-ob ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (dshnt-launch: c... appcontainer=1:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+NET-CONNECTED 172.30.112.1:445
+03:19:49 RESULT ok=True -> \\host.lan\Data\RESULT_M1.json

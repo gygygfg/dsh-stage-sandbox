@@ -1,0 +1,12 @@
+﻿=== dshnt M1 perf 11/23/2026 03:25:17 ===
+03:25:33 fixture C:\m1p\ws\flat5k: 5000 files in 8.1s
+03:26:05 fixture C:\m1p\ws\flat20k: 20000 files in 31.5s
+03:26:06 fixture ready
+03:26:10 PERF cold-5k: files=5000 enum=62.7ms stat=2931.5ms total=2994.1ms per-file=0.599ms
+03:26:23 PERF cold-20k: files=20000 enum=104.7ms stat=12676.6ms total=12781.3ms per-file=0.639ms
+03:26:25 PERF warm-5k: files=5000 enum=17.3ms stat=1448ms total=1465.2ms per-file=0.293ms
+03:26:30 PERF warm-20k: files=20000 enum=65.9ms stat=5882.3ms total=5948.2ms per-file=0.297ms
+03:26:31 PERF warm-tree: files=1000 enum=29.3ms stat=595.2ms total=624.5ms per-file=0.625ms
+03:26:34 PERF restart-5k: files=5000 enum=31.6ms stat=1468.9ms total=1500.5ms per-file=0.3ms
+03:26:40 PERF restart-20k: files=20000 enum=107.2ms stat=5901.4ms total=6008.5ms per-file=0.3ms
+03:26:40 GATE ok=False cold20k=12781.3ms/0.639ms-per-file restart20k=0.3ms-per-file

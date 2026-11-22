@@ -366,9 +366,15 @@ export function policyHash(policy: NtPolicySet): string {
 /**
  * 构造一个保守的默认域规则集：
  *   · 工作区读/执行允许，写/删/改名/属性 stage；
- *   · view/store 直接访问一律拒绝（重定向路径由驱动标记，不靠规则放行）；
+ *   · store 直接访问拒绝（驱动另有更早的硬拒绝；这里供控制面判定/纵深防御）；
+ *   · **不生成 view 规则**：M1 实测重定向续开会用视图新名字重发 create，驱动把
+ *     视图路径映射回逻辑工作区路径后按同一套规则判定（见 docs/nt/M1-REPORT.md §3.1）。
+ *     按视图路径写的 deny/mask 永远不会命中，留着只会误导策略作者。
  *   · Windows / Program Files 读/执行允许，写拒绝；
  *   · 其余默认拒绝。
+ *
+ * `viewRoot` 仍保留在入参里：调用方（provider/CLI）共用同一形状，且未来若改用
+ * “file-object context 标记重定向续开”，这里会重新需要它。
  */
 export function defaultRulesForDomain(input: {
   workspaceRoot: string
@@ -392,14 +398,6 @@ export function defaultRulesForDomain(input: {
       access: ['write', 'delete', 'rename', 'attribute'],
       action: 'stage',
       note: '工作区写/删除/改名/属性只进 ProjFS 视图',
-    },
-    {
-      id: 'view-deny',
-      type: 'store',
-      match: { kind: 'prefix', path: input.viewRoot },
-      access: ['read', 'write', 'execute', 'delete', 'rename', 'attribute'],
-      action: 'deny',
-      note: '禁止绕过重定向直接访问视图根',
     },
     {
       id: 'store-deny',
