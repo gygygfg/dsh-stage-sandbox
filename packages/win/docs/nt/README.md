@@ -114,7 +114,7 @@ DSH / Cordis
 | `src/nt/provider-protocol.ts` / `provider-client.ts` | ✅ 管道协议/客户端 + 单测 |
 | `src/nt/supervisor.ts` | ✅ 数据面生命周期（up/down、回滚、generation 单调）+ 单测 |
 | M0 Windows spike | ✅ 已通过（ProjFS + SimRep；23/23 探针；见 `M0-REPORT.md`） |
-| M1 端到端 | ✅ 已通过（24/24 探针、暂存写、lower 不变、offline/allowlist、缓解/Job 回读；见 `M1-REPORT.md`） |
+| M1 端到端 | ✅ 已通过（24/24 探针、暂存写、lower 不变、offline/allowlist、缓解/Job 回读、注销/重下发；见 `M1-REPORT.md`） |
 | M1 性能 | ⚠ 0.55–0.64 ms/文件、20k 11.4–12.8 s（门禁未过；见 `M1-PERF.md`） |
 | `native/driver/` | ✅ 产品实现，已加载并挂 C: |
 | `native/provider/` | ✅ 产品 ProjFS provider（C#），已运行 |

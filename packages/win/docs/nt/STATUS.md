@@ -25,7 +25,7 @@
 | `src/nt/status.ts` | fail-closed；写屏障；逐项缺失机读码；失败分类 | `status`（32） |
 | `src/nt/status-probe.ts` | `fltmc`/`sc`/ProjFS/provider 事实 → `NtStatus` | `status-probe`（36） |
 | `src/nt/driver.ts` | 端口契约；Fake/Unavailable；默认 fail-closed | `driver`（27） |
-| `src/nt/driver-wire.ts` | ABI v2 消息编解码（hello/policy/domain/stats/events） | `driver-wire`（50） |
+| `src/nt/driver-wire.ts` | ABI v2 消息编解码（hello/policy/domain/unregister/stats/events） | `driver-wire`（53） |
 | `src/nt/driver-client.ts` | koffi → fltlib 真实端口（仅 Windows） | 由 `driver-wire` 覆盖格式 |
 | `src/nt/launcher-args.ts` | launcher argv；环境白名单/凭据拒绝；路径/Job/网络校验 | `launcher-args`（26） |
 | `src/nt/session.ts` | 策略下发（二进制）/域注册/launcher 包装/幂等清理 | `session`（23） |
@@ -47,8 +47,8 @@ nt 控制面套件：15 个，失败 0 个
 RESULT: ALL PASS
 ```
 
-共 **546** 条断言（paths=47、policy=45、policy-binary=43、view=15、status=32、
-status-probe=36、driver=27、driver-wire=50、launcher-args=34、session=23、executor=36、
+共 **549** 条断言（paths=47、policy=45、policy-binary=43、view=15、status=32、
+status-probe=36、driver=27、driver-wire=53、launcher-args=34、session=23、executor=36、
 apply=24、apply-manifest=23、runtime=54、supervisor=57）。
 
 ### 与 DSH 的接线（v1）
@@ -94,6 +94,9 @@ apply=24、apply-manifest=23、runtime=54、supervisor=57）。
 - 进程缓解/Job 由 `m1-mitigate.exe` 回读验证：DEP/ASLR/ACG/CFG/扩展点/签名 8/8，
   Job（in-job、ActiveProcessLimit=16、1024 MB、kill-on-close、CPU 50%）全部命中。
   修掉了 mitigation 位序一档错位（28/32/36/40/44）。
+- 生命周期实测：`unregister-domain` 后（未下发新策略）再注册必须失败；
+  下发 generation=2 后注册成功，`stats` 显示 `generation=2 domains=1`。
+  为此修掉了驱动 `UnregisterDomain` 的空实现（tombstone + 清 PID 映射）。
 
 ## 3. 本机限制（如实）
 

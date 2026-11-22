@@ -37,6 +37,8 @@ public:
     /** 注册域（驱动会与策略里的根核对）。 */
     bool RegisterDomain(const std::wstring& id, const std::wstring& workspace,
                         const std::wstring& view, const std::wstring& store, std::wstring* error);
+    /** 注销域：移除域与它的 PID→域映射（驱动侧真实删除，不是 no-op）。 */
+    bool UnregisterDomain(const std::wstring& id, std::wstring* error);
     bool QueryStats(DshntStats* out, std::wstring* error);
     bool RegisterProcess(unsigned long pid, unsigned long flags, const std::wstring& domain, std::wstring* error);
     bool UnregisterProcess(unsigned long pid);

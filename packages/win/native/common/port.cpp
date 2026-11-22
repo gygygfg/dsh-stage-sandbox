@@ -126,6 +126,17 @@ bool DshntPort::RegisterDomain(const std::wstring& id, const std::wstring& works
     return Send(DshntMsgRegisterDomain, payload, nullptr, error);
 }
 
+bool DshntPort::UnregisterDomain(const std::wstring& id, std::wstring* error) {
+    DSHNT_UNREGISTER_DOMAIN req{};
+    std::vector<unsigned char> strings;
+    PutRef(strings, id, &req.Id);
+
+    std::vector<unsigned char> payload(sizeof(req) + strings.size());
+    std::memcpy(payload.data(), &req, sizeof(req));
+    if (!strings.empty()) std::memcpy(payload.data() + sizeof(req), strings.data(), strings.size());
+    return Send(DshntMsgUnregisterDomain, payload, nullptr, error);
+}
+
 bool DshntPort::QueryStats(DshntStats* out, std::wstring* error) {
     std::vector<unsigned char> reply;
     if (!Send(DshntMsgQueryStats, {}, &reply, error)) return false;

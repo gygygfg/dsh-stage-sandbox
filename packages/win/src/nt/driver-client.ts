@@ -24,6 +24,7 @@ import {
   encodeRegisterDomain,
   encodeRegisterProcess,
   encodeRevokeApply,
+  encodeUnregisterDomain,
   encodeSetPolicy,
   encodeUnregisterProcess,
   type StatsReply,
@@ -173,8 +174,11 @@ export class WindowsDriverPort implements NtDriverPort {
     )
   }
 
-  async unregisterDomain(_id: string): Promise<void> {
-    // 域的生命周期由 PID 映射决定；显式注销在 v1 是 no-op（驱动侧同样）。
+  async unregisterDomain(id: string): Promise<void> {
+    if (typeof id !== 'string' || id.length === 0) {
+      throw new NtError('NT_DOMAIN_NOT_REGISTERED', { reason: 'domain id is required' })
+    }
+    this.request(encodeUnregisterDomain(id))
   }
 
   async grantApply(input: { pid: number; imageHash: string; paths: string[] }): Promise<void> {

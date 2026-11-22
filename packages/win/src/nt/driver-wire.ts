@@ -178,6 +178,16 @@ export function encodeRegisterDomain(input: RegisterDomainInput): Buffer {
   return encodeMessage(Msg.registerDomain, Buffer.concat([fields, table.toBuffer()]))
 }
 
+export function encodeUnregisterDomain(id: string): Buffer {
+  const table = new StringTable()
+  const ref = table.add(id)
+  // DSHNT_UNREGISTER_DOMAIN = { STRING_REF Id }，字符串表紧随其后。
+  const fields = Buffer.alloc(8)
+  fields.writeUInt32LE(ref.offset, 0)
+  fields.writeUInt32LE(ref.bytes, 4)
+  return encodeMessage(Msg.unregisterDomain, Buffer.concat([fields, table.toBuffer()]))
+}
+
 export function encodeRegisterProcess(input: {
   pid: number
   domainId?: string

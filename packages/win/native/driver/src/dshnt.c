@@ -730,6 +730,7 @@ static DSHNT_DOMAIN *DshntFindDomainLocked(_In_opt_ PCUNICODE_STRING domainId)
     }
     for (i = 0; i < g_Dshnt.Policy->DomainCount; i++) {
         DSHNT_DOMAIN *d = &g_Dshnt.Policy->Domains[i];
+        if (d->Id.Length == 0) continue; /* 已注销（tombstone） */
         if (DshntPathEquals(&d->Id, domainId)) {
             return d;
         }
@@ -1527,6 +1528,59 @@ cleanup:
     return ok ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
 }
 
+/*
+ * 注销域：真实删除，不是 no-op。
+ *
+ * 为什么不能只返回成功：`NtSupervisor.down()` 依赖这里把域与 PID→域映射一起清掉；
+ * 若域留在策略表里，下一次 up 之前的下属进程仍可能命中旧规则（重定向到已停的视图）。
+ * 释放策略内存不安全（域数组是 policy 的一部分、规则按起始下标引用），因此用
+ * `Id.Length=0` 让它不再被 `DshntFindDomainLocked` 命中；字符串仍由 policy 的
+ * Allocs 统一释放。
+ */
+static NTSTATUS DshntHandleUnregisterDomain(_In_ const DSHNT_UNREGISTER_DOMAIN *req,
+                                            _In_ const UCHAR *strings, _In_ ULONG stringBytes)
+{
+    UNICODE_STRING id;
+    NTSTATUS status;
+    DSHNT_DOMAIN *domain;
+    ULONG bucket;
+
+    status = DshntRefString(strings, stringBytes, req->Id, &id);
+    if (!NT_SUCCESS(status)) return status;
+    if (id.Length == 0) return STATUS_INVALID_PARAMETER;
+
+    ExAcquireResourceExclusiveLite(&g_Dshnt.Lock, TRUE);
+
+    domain = DshntFindDomainLocked(&id);
+    if (domain == NULL) {
+        ExReleaseResourceLite(&g_Dshnt.Lock);
+        return STATUS_NOT_FOUND;
+    }
+    domain->Id.Length = 0;
+    domain->Id.MaximumLength = 0;
+
+    /* 同时移除这个域的 PID→域映射（ROOT 进程退出前 down 也是常见路径）。 */
+    for (bucket = 0; bucket < DSHNT_PROC_BUCKETS; bucket++) {
+        LIST_ENTRY *head = &g_Dshnt.ProcBuckets[bucket];
+        LIST_ENTRY *link = head->Flink;
+        while (link != head) {
+            DSHNT_PROC_ENTRY *entry = CONTAINING_RECORD(link, DSHNT_PROC_ENTRY, Link);
+            LIST_ENTRY *next = link->Flink;
+            UNICODE_STRING entryId;
+            RtlInitUnicodeString(&entryId, entry->DomainId);
+            if (DshntPathEquals(&entryId, &id)) {
+                RemoveEntryList(&entry->Link);
+                ExFreePoolWithTag(entry, DSHNT_TAG);
+                InterlockedDecrement(&g_Dshnt.ProcessCount);
+            }
+            link = next;
+        }
+    }
+
+    ExReleaseResourceLite(&g_Dshnt.Lock);
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS DshntHandleRegisterProcess(_In_ const DSHNT_REGISTER_PROCESS *req,
                                            _In_ const UCHAR *strings, _In_ ULONG stringBytes)
 {
@@ -1682,7 +1736,14 @@ DshntMessage(_In_opt_ PVOID PortCookie,
         return DshntFillReply(hdr, type, status, NULL, 0, OutputBuffer, OutputBufferLength, ReturnOutputBufferLength);
 
     case DshntMsgUnregisterDomain:
-        return DshntFillReply(hdr, type, STATUS_SUCCESS, NULL, 0, OutputBuffer, OutputBufferLength, ReturnOutputBufferLength);
+        if (payloadLength < sizeof(DSHNT_UNREGISTER_DOMAIN)) {
+            status = STATUS_INVALID_PARAMETER;
+        } else {
+            status = DshntHandleUnregisterDomain((const DSHNT_UNREGISTER_DOMAIN *)payload,
+                                                 payload + sizeof(DSHNT_UNREGISTER_DOMAIN),
+                                                 payloadLength - sizeof(DSHNT_UNREGISTER_DOMAIN));
+        }
+        return DshntFillReply(hdr, type, status, NULL, 0, OutputBuffer, OutputBufferLength, ReturnOutputBufferLength);
 
     case DshntMsgRegisterProcess:
         if (payloadLength < sizeof(DSHNT_REGISTER_PROCESS)) {
@@ -1724,12 +1785,17 @@ DshntMessage(_In_opt_ PVOID PortCookie,
         return DshntFillReply(hdr, type, STATUS_SUCCESS, NULL, 0, OutputBuffer, OutputBufferLength, ReturnOutputBufferLength);
     }
 
-    case DshntMsgQueryStats:
+    case DshntMsgQueryStats: {
+        ULONG i;
         RtlZeroMemory(&stats, sizeof(stats));
         ExAcquireResourceSharedLite(&g_Dshnt.Lock, TRUE);
-        stats.Domains = g_Dshnt.Policy != NULL ? g_Dshnt.Policy->DomainCount : 0;
-        stats.Rules = g_Dshnt.Policy != NULL ? g_Dshnt.Policy->RuleCount : 0;
-        stats.PolicyGeneration = g_Dshnt.Policy != NULL ? g_Dshnt.Policy->Generation : 0;
+        if (g_Dshnt.Policy != NULL) {
+            for (i = 0; i < g_Dshnt.Policy->DomainCount; i++) {
+                if (g_Dshnt.Policy->Domains[i].Id.Length > 0) stats.Domains++;
+            }
+            stats.Rules = g_Dshnt.Policy->RuleCount;
+            stats.PolicyGeneration = g_Dshnt.Policy->Generation;
+        }
         stats.ProcessCount = (UINT32)g_Dshnt.ProcessCount;
         ExReleaseResourceLite(&g_Dshnt.Lock);
         stats.Redirects = (UINT64)g_Dshnt.Redirects;
@@ -1738,6 +1804,7 @@ DshntMessage(_In_opt_ PVOID PortCookie,
         stats.LastError = g_Dshnt.LastError;
         return DshntFillReply(hdr, type, STATUS_SUCCESS, &stats, sizeof(stats),
                               OutputBuffer, OutputBufferLength, ReturnOutputBufferLength);
+    }
 
     case DshntMsgQueryEvents: {
         PDSHNT_EVENTS_REPLY events;

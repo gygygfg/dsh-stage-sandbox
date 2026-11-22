@@ -19,6 +19,7 @@ import {
   encodeQueryStats,
   encodeRegisterProcess,
   encodeSetPolicy,
+  encodeUnregisterDomain,
 } from '../../src/nt/driver-wire.ts'
 import { NT_DRIVER_ABI_VERSION } from '../../src/nt/types.ts'
 import { check, eq, runSuite, section } from './harness.ts'
@@ -140,6 +141,15 @@ await runSuite('nt-driver-wire', async () => {
   const trustedBody = trusted.subarray(MSG_HEADER_BYTES)
   eq('flags trusted', trustedBody.readUInt32LE(4), 0x2)
   eq('无域时 ref 为空', trustedBody.readUInt32LE(12), 0)
+
+  section('5b. UNREGISTER_DOMAIN 布局')
+  const unregister = encodeUnregisterDomain('sess-1')
+  eq('type', headerOf(unregister).type, Msg.unregisterDomain)
+  const unregisterBody = unregister.subarray(MSG_HEADER_BYTES)
+  const unregisterOffset = unregisterBody.readUInt32LE(0)
+  const unregisterBytes = unregisterBody.readUInt32LE(4)
+  eq('id 字节数', unregisterBytes, 'sess-1'.length * 2)
+  eq('id 内容', unregisterBody.subarray(8 + unregisterOffset, 8 + unregisterOffset + unregisterBytes).toString('utf16le'), 'sess-1')
 
   section('6. GRANT_APPLY 布局')
   const grant = encodeGrantApply({

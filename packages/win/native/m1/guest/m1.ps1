@@ -108,6 +108,7 @@ if (Test-Path (Join-Path $Root 'provider')) { Remove-Item (Join-Path $Root 'prov
 Copy-Item -Path (Join-Path $Src 'provider') -Destination (Join-Path $Root 'provider') -Recurse -Force
 if (-not (Test-Path (Join-Path $Root 'provider\dshnt-provider.exe'))) { Fail 'provider exe missing' }
 Copy-Item -Force (Join-Path $Src 'policy.bin') (Join-Path $Root 'policy.bin')
+Copy-Item -Force (Join-Path $Src 'policy2.bin') (Join-Path $Root 'policy2.bin') -ErrorAction SilentlyContinue
 Copy-Item -Force (Join-Path $Src 'policy.json') (Join-Path $Root 'policy.json')
 $policyInfo = Get-Content (Join-Path $Root 'policy.json') -Raw | ConvertFrom-Json
 Log "policy generation=$($policyInfo.generation) bytes=$($policyInfo.bytes)"
@@ -476,7 +477,24 @@ $mitigateExit = $LASTEXITCODE
 $mitigateOut = Tail (Join-Path $Share 'm1-mitigate.log') 20
 Log "mitigate/job probe exit=$mitigateExit out=$mitigateOut"
 
-# 17. verify lower unchanged + view state
+# 17. 生命周期（supervisor 的关键路径）：注销 → 重新下发 generation+1 → 再注册
+#     supervisor.down() 依赖 unregister 真的清域；up() 依赖 generation 单调递增。
+& $ctlBin unregister-domain $policyInfo.domainId *> (Join-Path $Share 'm1-ctl-unregister.log')
+$lcUnregisterExit = $LASTEXITCODE
+& $ctlBin register-domain $policyInfo.domainId 'C:\m1\ws' 'C:\m1\view' 'C:\m1\store' *> (Join-Path $Share 'm1-ctl-reregister.log')
+$lcRegisterWithoutPolicyExit = $LASTEXITCODE
+& $ctlBin policy (Join-Path $Root 'policy2.bin') *> (Join-Path $Share 'm1-ctl-policy2.log')
+$lcPolicy2Exit = $LASTEXITCODE
+& $ctlBin register-domain $policyInfo.domainId 'C:\m1\ws' 'C:\m1\view' 'C:\m1\store' *> (Join-Path $Share 'm1-ctl-reregister2.log')
+$lcRegister2Exit = $LASTEXITCODE
+$lcStats = ((& $ctlBin stats) -join ' ').Trim()
+$lcGeneration = 0
+if ($lcStats -match 'generation=(\d+)') { $lcGeneration = [int]$Matches[1] }
+$lcDomains = -1
+if ($lcStats -match 'domains=(\d+)') { $lcDomains = [int]$Matches[1] }
+Log "lifecycle unregister=$lcUnregisterExit registerWithoutPolicy=$lcRegisterWithoutPolicyExit policy2=$lcPolicy2Exit register2=$lcRegister2Exit stats=$lcStats"
+
+# 18. verify lower unchanged + view state
 $lowerAfter = HashTree 'C:\m1\ws'
 $lowerDiff = @()
 foreach ($k in $lowerBefore.Keys) {
@@ -525,6 +543,13 @@ $checks = [ordered]@{
   allowlistEmptyExit = $allowEmptyExit
   mitigateExit = $mitigateExit
   mitigateOutput = $mitigateOut
+  lifecycleUnregisterExit = $lcUnregisterExit
+  lifecycleRegisterWithoutPolicyExit = $lcRegisterWithoutPolicyExit
+  lifecyclePolicy2Exit = $lcPolicy2Exit
+  lifecycleRegister2Exit = $lcRegister2Exit
+  lifecycleGeneration = $lcGeneration
+  lifecycleDomains = $lcDomains
+  lifecycleStats = $lcStats
   # m1-net.exe: 0 = 连接被阻断（期望），1 = 连接成功（对照组）。
   # allowlist：错端口被阻断、命中端点放行、空列表 launcher 拒绝启动。
   networkGateWorks = ($acOfflineExit -eq 0 -and $acObservedExit -eq 1 -and
@@ -539,8 +564,12 @@ $checks = [ordered]@{
 $networkOk = ($acOfflineExit -eq 0 -and $acObservedExit -eq 1 -and
               $allowBlockedExit -eq 0 -and $allowAllowedExit -eq 1 -and $allowEmptyExit -ne 0)
 $mitigationOk = ($mitigateExit -eq 0)
+# 注销后未下发新策略时 register 必须失败；下发 generation=2 后必须成功且 domains=1。
+$lifecycleOk = ($lcUnregisterExit -eq 0) -and ($lcRegisterWithoutPolicyExit -ne 0) -and
+               ($lcPolicy2Exit -eq 0) -and ($lcRegister2Exit -eq 0) -and
+               ($lcGeneration -eq 2) -and ($lcDomains -eq 1)
 $ok = ($clientExit -eq 0) -and ($lowerDiff.Count -eq 0) -and ($viewB -eq 'v2') -and ($lowerB -eq 'v1') -and
-      ($null -ne $clientJson -and $clientJson.failures -eq 0) -and (-not $viewA) -and $viewChild -and $networkOk -and $mitigationOk
+      ($null -ne $clientJson -and $clientJson.failures -eq 0) -and (-not $viewA) -and $viewChild -and $networkOk -and $mitigationOk -and $lifecycleOk
 $payload = [ordered]@{
   ok = [bool]$ok
   phase = 'm1'

@@ -3,6 +3,7 @@
 //   dshnt-ctl hello
 //   dshnt-ctl policy <policy.bin>
 //   dshnt-ctl register-domain <id> <workspace> <view> <store>
+//   dshnt-ctl unregister-domain <id>
 //   dshnt-ctl stats
 //   dshnt-ctl events
 //
@@ -29,6 +30,7 @@ int Usage() {
         L"  dshnt-ctl hello\n"
         L"  dshnt-ctl policy <policy.bin>\n"
         L"  dshnt-ctl register-domain <id> <workspace> <view> <store>\n"
+        L"  dshnt-ctl unregister-domain <id>\n"
         L"  dshnt-ctl stats\n"
         L"  dshnt-ctl events\n");
     return 2;
@@ -93,6 +95,15 @@ int wmain(int argc, wchar_t** argv) {
             return Fail(L"register-domain: " + error);
         }
         std::wprintf(L"domain %ls registered\n", argv[2]);
+        return 0;
+    }
+
+    if (command == L"unregister-domain") {
+        if (argc < 3) return Usage();
+        if (!port.UnregisterDomain(argv[2], &error)) {
+            return Fail(L"unregister-domain: " + error);
+        }
+        std::wprintf(L"domain %ls unregistered\n", argv[2]);
         return 0;
     }
 

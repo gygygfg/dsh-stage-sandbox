@@ -35,11 +35,13 @@
 | 网络：`appcontainer + allowlist` 但空列表 → launcher 拒绝启动（exit 2） | ✅ |
 | 网络：`restricted + offline` → launcher 拒绝启动（fail-closed） | ✅ |
 | 进程缓解（DEP/ASLR/ACG/CFG/扩展点/签名）+ Job 限制回读 | ✅ 8/8 + Job 4 项 |
+| 域注销 → 未下发策略时再注册必须失败 → 下发 generation+1 → 再注册成功 | ✅ |
 
 `RESULT_M1.json` 的机读字段：`clientChecks=24 / clientFailures=0`、`stagedWrite=true`、
 `lowerUnchanged=true`、`lowerDiff=[]`、`networkGateWorks=true`、
 `allowlistBlockedExit=0`、`allowlistAllowedExit=1`、`allowlistEmptyExit=2`、
-`mitigateExit=0`（`MITIGATION dep=1 aslr=1 buaslr=1 win32k=1 ext=1 acg=1 cfg=1 msft=1`）。
+`mitigateExit=0`（`MITIGATION dep=1 aslr=1 buaslr=1 win32k=1 ext=1 acg=1 cfg=1 msft=1`）、
+`lifecycleGeneration=2`、`lifecycleDomains=1`。
 
 ## 2. 生产布局（与 M0 的差别）
 
@@ -159,6 +161,28 @@ kill-on-close、CPU 硬上限 50%（`CpuRate=5000`）。这些是内核回读值
 自述。注意 `Block non-Microsoft binaries` 不会阻止本进程启动（主映像在策略生效前
 已映射）；它约束的是之后加载的模块。
 
+### 4.6 生命周期：注销是真实删除，策略 generation 必须单调
+
+M2 的 `NtSupervisor.down()` 依赖 `UnregisterDomain` 真的把域清掉；`up()` 依赖
+`setPolicy` 接受 `generation+1`。M1 只跑过 gen=1 且从未注销，两个假设都没被验证。
+
+实测发现驱动里 `DshntMsgUnregisterDomain` 是**空实现**（直接回 `STATUS_SUCCESS`），
+域会一直留在策略表里。修复：
+
+- 注销把域的 `Id.Length` 置 0（tombstone；策略内存仍由 `Allocs` 统一释放），
+  并删除该域的所有 PID→域映射；
+- `DshntFindDomainLocked` 跳过 tombstone；`QueryStats.domains` 只数活跃域。
+
+guest 实测（`m1.ps1` 第 17 节）：
+
+```text
+unregister=0  registerWithoutPolicy=3  policy2=0  register2=0
+stats=generation=2 domains=1 rules=10 ... lastError=0x00000000
+```
+
+即“注销后未下发新策略时再注册”必须失败（3），下发 gen=2 后再注册成功。
+这正是 supervisor 的 down→up 路径。
+
 ## 5. 完整性标签：本 VM 上写不进去（已定位，未绕过）
 
 `SetNamedSecurityInfoW(..., LABEL_SECURITY_INFORMATION, ...)` 返回 0，但回读的 SACL
@@ -186,6 +210,7 @@ kill-on-close、CPU 硬上限 50%（`CpuRate=5000`）。这些是内核回读值
 | `CreateAppContainerToken` | userenv | kernelbase + `SECURITY_CAPABILITIES` | 无行为差异 |
 | 完整性标签 low | 默认 | 本 VM 不可用；显式 medium | 需在正常机器复验 |
 | mitigation 位序 | 28/36/40 | 28/32/36/40/44（回读验证） | 修正了错位；行为已实测 |
+| `UnregisterDomain` | ABI 有、实现删除 | M1 发现是 no-op；M2 已实现 tombstone + 清 PID 映射 | 已实测注销/再注册 |
 | 性能门禁 | 0.2 ms/文件、20k ≤ 5 s | 0.55–0.64 / 11.4–12.8 s | 未达标，见 `M1-PERF.md` |
 | apply helper | 内核授权写 | v1 在可信控制面执行（journal/undo） | `grantApply` 留给 M2 |
 
