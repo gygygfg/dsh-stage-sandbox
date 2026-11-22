@@ -205,9 +205,11 @@ export function cgroupAvailable(base: string = '/sys/fs/cgroup', io: CgroupIo = 
   return io.exists(`${base}/cgroup.controllers`)
 }
 
-/** Sanitize an id for use as one cgroup directory name. */
-function sanitizeId(id: string): string {
-  return id.replace(/[^A-Za-z0-9_.-]/gu, '_')
+/** Sanitize an id for use as one cgroup directory name; `undefined` when unusable. */
+function sanitizeId(id: string): string | undefined {
+  const sanitized = id.replace(/[^A-Za-z0-9_.-]/gu, '_')
+  if (sanitized === '' || sanitized === '.' || sanitized === '..') return undefined
+  return sanitized
 }
 
 /**
@@ -268,7 +270,9 @@ export class CgroupDomain {
     // in the PARENT's subtree_control, so delegate down the chain first.
     enableControllers(base, io)
     enableControllers(parent, io)
-    const path = `${parent}/${sanitizeId(id)}`
+    const safeId = sanitizeId(id)
+    if (safeId === undefined) return undefined
+    const path = `${parent}/${safeId}`
     if (!io.mkdir(path)) return undefined
     const limits = resolveLimits(options, hostMemoryBytes)
     if (limits.memoryMax !== undefined) {

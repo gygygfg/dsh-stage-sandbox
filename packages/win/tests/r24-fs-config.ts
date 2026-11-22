@@ -438,7 +438,7 @@ try {
         applyError = error
       }
       check('装配：合法 masks ⇒ apply 不抛错', applyError === undefined, String(applyError?.message ?? 'ok'))
-      check('装配：命令面仍注册 7 条（与 R21 一致）', harness.commands.length === 7, String(harness.commands.length))
+      check('装配：命令面注册 10 条（7 条暂存命令 + A5 的 approvals/approve/reject）', harness.commands.length === 10, String(harness.commands.length))
       const handler = findBySub(harness.commands)
       const invitation = { rawInput: 'list', agent: { session: { id: 'r24-apply-session' } } }
       let result

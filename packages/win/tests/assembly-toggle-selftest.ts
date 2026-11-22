@@ -35,7 +35,7 @@
  *   A. 文本形态：两行都存在；表达式以 `(` 开头；不含 `!!js !`、不含 `: `；
  *      两条表达式**逐字共享**同一段 profile 读取代码（`PROFILE_SWITCH_READER_SOURCE`）。
  *   B. **宿主真实形态**（ctx.baseUrl 有、DSH env 无）× profile {true, false, 缺失}：
- *      开关关 ⇒ 平台接管；开 ⇒ WinStage 接管；读不出 ⇒ fail-safe 接管。
+ *      开关关 ⇒ 平台接管；开 ⇒ WinStage 接管；读不出 ⇒ fail-closed 交还平台。
  *   C. 优先级：ctx.baseUrl 与 env 指向**不同** profile 时，以 ctx.baseUrl 为准。
  *   D. 逐格对拍：YAML 两条表达式 vs `assembly-toggle.ts` 的 `shellProviderPlan()` /
  *      `winStageEnabledFromProfile()`，在 env {未设,1,0} × 来源 {baseUrl, env, 两无}
@@ -52,6 +52,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
 import {
   PROFILE_SWITCH_READER_SOURCE,
+  configPendingRestart,
   profilePatchPath,
   profilePatchPathFromBaseUrl,
   resolveProfilePatchPath,
@@ -173,9 +174,9 @@ writeFileSync(join(SCRATCH_HOME, 'profiles', 'on', 'cordis.patch.yml'), '- id: w
 const hostCases = [
   ['host: baseUrl + enabled:false ⇒ 交还平台', offProfile.baseUrl, hostEnv, false],
   ['host: baseUrl + enabled:true ⇒ WinStage 接管', onProfile.baseUrl, hostEnv, true],
-  ['host: baseUrl + profile 缺失 ⇒ fail-safe 接管', missingProfile.baseUrl, hostEnv, true],
+  ['host: baseUrl + profile 缺失 ⇒ fail-closed 交还平台', missingProfile.baseUrl, hostEnv, false],
   ['host: baseUrl 缺失 + env 有 + enabled:false ⇒ env 回退交还', undefined, { DSH_HOME: SCRATCH_HOME, DSH_PROFILE: 'off' }, false],
-  ['host: baseUrl 与 env 都缺失 ⇒ fail-safe 接管', undefined, {}, true],
+  ['host: baseUrl 与 env 都缺失 ⇒ fail-closed 交还平台', undefined, {}, false],
 ]
 for (const [label, baseUrl, env, expectWinstage] of hostCases) {
   const pwshDisabled = evaluate(pwshExpr, { env, ctx: baseUrl === undefined ? {} : { baseUrl } })
@@ -208,11 +209,16 @@ process.stdout.write('\n[C] 来源优先级\n')
   ok(typeof resolved?.path === 'string' && resolved.path.endsWith('cordis.patch.yml'), 'C4 解出的路径指向 `cordis.patch.yml`', resolved?.path)
   ok(profilePatchPathFromBaseUrl(offProfile.baseUrl) === resolved?.path, 'C5 `profilePatchPathFromBaseUrl` 与解析器同源')
   ok(profilePatchPath({ DSH_HOME: 'C:\\dsh', DSH_PROFILE: 'p' }) === join('C:\\dsh', 'profiles', 'p', 'cordis.patch.yml'), 'C6 `profilePatchPath(env)` 保持原契约（env 回退路径不变）')
-  ok(resolveProfilePatchPath({ env: {} }) === undefined, 'C7 两源都不可用 ⇒ undefined（调用方按 fail-safe 接管）')
+  ok(resolveProfilePatchPath({ env: {} }) === undefined, 'C7 两源都不可用 ⇒ undefined（调用方按 fail-closed 交还平台）')
 }
 
 // ── D. 逐格对拍：YAML 表达式 vs assembly-toggle 纯函数 ────────────────────────
 process.stdout.write('\n[D] YAML 内联 × 模块纯函数逐格对拍\n')
+
+ok(configPendingRestart(true, false) === true, 'K1 profile 开 / 生效关 ⇒ pending-restart')
+ok(configPendingRestart(false, true) === true, 'K2 profile 关 / 生效开 ⇒ pending-restart')
+ok(configPendingRestart(true, true) === false && configPendingRestart(false, false) === false, 'K3 一致 ⇒ 不报 pending')
+ok(configPendingRestart(null, true) === false && configPendingRestart(undefined, false) === false, 'K4 未知 profile ⇒ 不误报 pending')
 const envStates = [
   ['env=unset', {}],
   ['env=1', { WINSTAGE_SHELL: '1' }],

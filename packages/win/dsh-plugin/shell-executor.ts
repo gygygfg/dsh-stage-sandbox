@@ -272,6 +272,31 @@ export function classifyLaneFallback(reason) {
  * 开关为**关**时同样要如实记录（关态不是"没有事实"，只是"不是告警"），
  * 但结论里标明"属预期，仅作记录"。
  */
+/**
+ * 把模型可见输出里的**暂存树根**替换成真实工作区根。
+ *
+ * 命令的真实 cwd 是 `<store>/staged`（为了读写暂存副本），但 `Get-Location`/
+ * `os.getcwd()`/错误信息会把它原样打印出来，构成稳定的沙箱指纹。这里只改
+ * stdout/stderr 的展示文本，不改变进程 cwd、相对路径解析或捕获结果。
+ *
+ * @param {string} text
+ * @param {string} stagedRoot
+ * @param {string} realRoot
+ * @returns {string}
+ */
+export function redactStagedRoot(text, stagedRoot, realRoot) {
+  if (typeof text !== 'string' || text.length === 0) return text
+  if (typeof stagedRoot !== 'string' || stagedRoot.length === 0) return text
+  if (typeof realRoot !== 'string' || realRoot.length === 0) return text
+  const root = stagedRoot.replace(/[\\/]+$/, '')
+  const escaped = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  try {
+    return text.replace(new RegExp(escaped, 'gi'), realRoot.replace(/[\\/]+$/, ''))
+  } catch {
+    return text
+  }
+}
+
 export function summarizeLane(lane) {
   const record = lane && typeof lane === 'object' ? lane : {}
   const reported = typeof record.launchMode === 'string' && record.launchMode.length > 0 ? record.launchMode : null
@@ -1331,6 +1356,8 @@ export function createWinStageShellExecutor(options = {}) {
   const workspaceFor = typeof options.workspaceFor === 'function' ? options.workspaceFor : undefined
 
   return class WinStageShellExecutor extends Base {
+    /** 供 host 行识别“当前 `ctx.shell` 仍是 WinStage 提供方”（C2 pending-restart 判定）。 */
+    static winstageProvider = true
     /**
      * ★ **刻意不声明 `static Config`** —— 这是一个实测出来的**激活阻断**，不是遗漏。
      *
@@ -2400,8 +2427,8 @@ export function createWinStageShellExecutor(options = {}) {
           notes,
           execution: {
             exitCode: execution?.exitCode ?? null,
-            stdout: execution?.stdout,
-            stderr: execution?.stderr,
+            stdout: redactStagedRoot(execution?.stdout, stagedDir, workspace?.root),
+            stderr: redactStagedRoot(execution?.stderr, stagedDir, workspace?.root),
             timedOut,
             envRejected,
           },

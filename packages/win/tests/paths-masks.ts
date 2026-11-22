@@ -280,7 +280,9 @@ W('=== 5. 作用域与豁免（#16.8：豁免要限定作用域）===')
   // N8 的私钥扩展名规则**必须**限定在 \users\ 与 \programdata\ 之下，
   // 否则会把工作区里的源码/夹具（例如测试用的 *.pem）一起封死。
   check('源码路径下的 *.pem 不被 N8 误伤', !isMasked(join('C:\\repo\\src', 'fixture.pem')), 'C:\\repo\\src\\fixture.pem')
-  check('用户目录下的 *.pem 命中 N8', isMasked(join('C:\\Users\\Administrator', 'certs', 'a.pem')), 'C:\\Users\\Administrator\\certs\\a.pem')
+  check('用户目录下的私钥形状 *.pem 命中 N8', isMasked(join('C:\\Users\\Administrator', 'certs', 'id_rsa.pem')), 'C:\\Users\\Administrator\\certs\\id_rsa.pem')
+  check('公开 CA 包 cacert.pem 不被 N8 误伤（pip/npm 读 CA）', !isMasked(join('C:\\Users\\Administrator', 'AppData', 'Local', 'Programs', 'Python', 'cacert.pem')), 'cacert.pem')
+  check('普通证书形状 a.pem 不被 N8 误伤', !isMasked(join('C:\\Users\\Administrator', 'certs', 'a.pem')), 'a.pem')
   check('不存在的普通文件不命中任何规则', !isMasked('C:\\repo\\src\\index.ts'), 'C:\\repo\\src\\index.ts')
   // 误报防线：不带路径分隔符上下文的名字（如 notes.key）在源码目录下不得命中
   check('源码目录下的 notes.key 不被误伤', !isMasked(join('C:\\repo\\docs', 'notes.key')), 'C:\\repo\\docs\\notes.key')

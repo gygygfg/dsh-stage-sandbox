@@ -87,7 +87,7 @@ const { buffer: ext, flags } = buildExtendedLimitInformation({ activeProcessLimi
 check('KILL_ON_JOB_CLOSE 已置位', (flags & 0x2000) !== 0, `flags=0x${flags.toString(16)}`)
 check('ACTIVE_PROCESS 已置位', (flags & 0x8) !== 0, `flags=0x${flags.toString(16)}`)
 check('LimitFlags 写在偏移 16', ext.readUInt32LE(16) === (flags >>> 0), `read=${ext.readUInt32LE(16)}`)
-check('ActiveProcessLimit 写在偏移 36 且值为 16', ext.readUInt32LE(36) === 16, String(ext.readUInt32LE(36)))
+check('ActiveProcessLimit 写在偏移 40 且值为 16', ext.readUInt32LE(40) === 16, String(ext.readUInt32LE(40)))
 check('结构大小 144', ext.length === 144, String(ext.length))
 
 W('')

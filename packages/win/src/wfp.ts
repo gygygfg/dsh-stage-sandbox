@@ -892,13 +892,15 @@ export function describeWfpStatus(status) {
       '与"WFP 需要管理员"无关，与 BFE 是否运行也无关 —— BFE 实测 RUNNING)',
     0x00000057: 'ERROR_INVALID_PARAMETER',
     0x000006b5: 'EPT_S_NOT_REGISTERED (RPC 端点不可用；常见于 BFE 服务未运行)',
-    0x80320003: 'FWP_E_ALREADY_EXISTS',
-    0x80320007: 'FWP_E_FILTER_NOT_FOUND',
-    0x80320008: 'FWP_E_LAYER_NOT_FOUND (常见根因：layer GUID 字节序写错或该层不存在)',
-    0x80320009: 'FWP_E_ALREADY_EXISTS (sessionKey 重复)',
-    0x8032000a: 'FWP_E_SUBLAYER_NOT_FOUND',
-    0x8032000b: 'FWP_E_NOT_FOUND',
-    0x80320010: 'FWP_E_INCOMPATIBLE_TXN (只读事务中不可调用)',
+    0x80320003: 'FWP_E_FILTER_NOT_FOUND',
+    0x80320004: 'FWP_E_LAYER_NOT_FOUND (常见根因：layer GUID 字节序写错或该层不存在)',
+    0x80320007: 'FWP_E_SUBLAYER_NOT_FOUND',
+    0x80320008: 'FWP_E_NOT_FOUND',
+    0x80320009: 'FWP_E_ALREADY_EXISTS',
+    0x8032000a: 'FWP_E_IN_USE',
+    0x8032000b: 'FWP_E_DYNAMIC_SESSION_IN_PROGRESS',
+    0x80320010: 'FWP_E_SESSION_ABORTED',
+    0x80320011: 'FWP_E_INCOMPATIBLE_TXN (只读事务中不可调用)',
   }
   return table[value] ?? `unknown/undocumented WFP status 0x${value.toString(16)}`
 }
@@ -1003,13 +1005,13 @@ export function openEngine(api) {
   }
 }
 
-/** 安装 sublayer；`FWP_E_ALREADY_EXISTS`(0x80320003) 视为幂等成功 */
+/** 安装 sublayer；`FWP_E_ALREADY_EXISTS`(0x80320009) 视为幂等成功 */
 export function installSubLayer(api, engineHandle, subLayerBuffer) {
   if (!Buffer.isBuffer(subLayerBuffer) || subLayerBuffer.length !== FWPM_SUBLAYER0_SIZE) {
     throw wfpError('WFP_SUBLAYER_INVALID', `subLayer must be a ${FWPM_SUBLAYER0_SIZE}-byte Buffer from buildSubLayer0()`)
   }
   const status = (api.fwpmSubLayerAdd0(engineHandle, subLayerBuffer, null) ?? 0) >>> 0
-  if (status === 0 || status === 0x80320003) return { status, idempotent: status === 0x80320003 }
+  if (status === 0 || status === 0x80320009) return { status, idempotent: status === 0x80320009 }
   throw wfpError('WFP_SUBLAYER_ADD_FAILED', `FwpmSubLayerAdd0 -> 0x${status.toString(16)}: ${describeWfpStatus(status)}`, {
     wfpStatus: status,
   })
@@ -1044,7 +1046,7 @@ export function addFilter(api, engineHandle, filterBuffer) {
 /** 删除 filter（幂等：`FWP_E_FILTER_NOT_FOUND` 视为成功；其它错误码一律上抛） */
 export function deleteFilterById(api, engineHandle, filterId) {
   const status = (api.fwpmFilterDeleteById0(engineHandle, BigInt(filterId)) ?? 0) >>> 0
-  if (status === 0 || status === 0x80320007) return { status, idempotent: status !== 0 }
+  if (status === 0 || status === 0x80320003) return { status, idempotent: status !== 0 }
   throw wfpError('WFP_FILTER_DELETE_FAILED', `FwpmFilterDeleteById0 -> 0x${status.toString(16)}: ${describeWfpStatus(status)}`, {
     wfpStatus: status,
   })
@@ -1053,7 +1055,7 @@ export function deleteFilterById(api, engineHandle, filterId) {
 /** 删除 sublayer（幂等：`FWP_E_SUBLAYER_NOT_FOUND` 视为成功） */
 export function deleteSubLayerByKey(api, engineHandle, subLayerKey) {
   const status = (api.fwpmSubLayerDeleteByKey0(engineHandle, coerceGuid(subLayerKey, 'subLayerKey')) ?? 0) >>> 0
-  if (status === 0 || status === 0x8032000a) return { status, idempotent: status !== 0 }
+  if (status === 0 || status === 0x80320007) return { status, idempotent: status !== 0 }
   throw wfpError('WFP_SUBLAYER_DELETE_FAILED', `FwpmSubLayerDeleteByKey0 -> 0x${status.toString(16)}: ${describeWfpStatus(status)}`, {
     wfpStatus: status,
   })

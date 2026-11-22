@@ -688,6 +688,28 @@ static void env_to_w(const wchar_t *name, wchar_t *out, DWORD cch)
     }
 }
 
+/**
+ * 初始化完成后清掉内部契约环境变量。
+ *
+ * 这些变量只用于父进程→shim 的 bootstrap；子进程注入时 `ws_env_with_contract`
+ * 会用 `g_ws` 里的值重新加回。留在当前进程环境里会让 `Get-ChildItem Env:` /
+ * `$env:DSH_SHIM_*` 直接暴露“我在 WinStage 里”。
+ */
+void ws_env_scrub_contract(void)
+{
+    static const wchar_t *names[] = {
+        L"DSH_STAGE_ROOT", L"DSH_SHIM_CONFIG", L"DSH_SHIM_LOG", L"DSH_AUDIT_LOG",
+        L"WINSTAGE_STAGE_ROOT", L"WINSTAGE_SHIM_CONFIG", L"WINSTAGE_SHIM_LOG", L"WINSTAGE_AUDIT_LOG",
+        L"WINSTAGE_READ_DENY_FILE", L"WINSTAGE_SHIM_VERBOSE", L"WINSTAGE_UNSTAGED_WRITES",
+        L"WINSTAGE_STAGE_OUTSIDE", L"WINSTAGE_SHELL",
+        L"WINSTAGE_REGSTAGE_SESSION_DIR", L"WINSTAGE_REGSTAGE_ROOT",
+        L"DSH_REGSTAGE_SESSION_DIR", L"DSH_REGSTAGE_ROOT",
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        SetEnvironmentVariableW(names[i], NULL);
+    }
+}
+
 void ws_config_from_env(void)
 {
     WS_PATH_BUF(buf);

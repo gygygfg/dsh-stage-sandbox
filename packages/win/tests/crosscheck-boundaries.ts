@@ -216,7 +216,7 @@ assert(
 )
 assert(
   /command \$\{spec\.name\}/.test(hostSrc),
-  '7 条 `/winstage*` 命令的 disposer 必须交给 cordis（旧实现只取 .length 后丢弃）',
+  '每条 `/winstage*` 命令的 disposer 必须交给 cordis（旧实现只取 .length 后丢弃）',
   'scope.effect(...) per command',
 )
 assert(

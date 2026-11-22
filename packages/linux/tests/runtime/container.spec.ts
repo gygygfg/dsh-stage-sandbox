@@ -21,6 +21,28 @@ describe('container runtime control', () => {
     expect(exec?.confined).toBe(true)
   })
 
+  it('finds run/create after global options that take a value', () => {
+    const byLogLevel = planContainerCommand(['podman', '--log-level', 'debug', 'run', '-it', 'alpine'])
+    expect(byLogLevel?.argv).toEqual(['podman', '--log-level', 'debug', 'run', '--net=host', '--pid=host', '--ipc=host', '--uts=host', '-it', 'alpine'])
+    const byRoot = planContainerCommand(['podman', '--root', '/tmp/x', 'run', 'alpine'])
+    expect(byRoot?.argv).toEqual(['podman', '--root', '/tmp/x', 'run', '--net=host', '--pid=host', '--ipc=host', '--uts=host', 'alpine'])
+  })
+
+  it('handles the grouped `container run` form', () => {
+    const plan = planContainerCommand(['podman', 'container', 'run', 'alpine'])
+    expect(plan?.argv).toEqual(['podman', 'container', 'run', '--net=host', '--pid=host', '--ipc=host', '--uts=host', 'alpine'])
+  })
+
+  it('recognizes the space-separated namespace flag form', () => {
+    const argv = ['podman', 'run', '--net', 'host', '--pid', 'host', '--ipc', 'host', '--uts', 'host', 'alpine']
+    expect(planContainerCommand(argv)?.argv).toEqual(argv)
+  })
+
+  it('does not treat an exec container named "run" as a run subcommand', () => {
+    const argv = ['podman', 'exec', 'run', 'ls']
+    expect(planContainerCommand(argv)?.argv).toEqual(argv)
+  })
+
   it('ignores non-container commands', () => {
     expect(planContainerCommand(['ls', '-la'])).toBeUndefined()
   })

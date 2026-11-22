@@ -155,6 +155,9 @@ export const OFFLINE_SUITES = [
   //   `plugin/approval-hub.ts`、`plugin/review-state.ts`），零子进程/零 Win32 ⇒ 离线档。
   //   与 verify.cmd 清单必须逐字一致（tests/suite-wiring.ts 机器检查）。
   { id: 'plugin-approval-align', script: 'tests/plugin-approval-align.ts', title: '审批/策略对齐（DENY>NEEDS_CONFIRMATION>ALLOW / 约束交集 / L0–L3 硬拒绝 / 多页分流 / 双状态线）' },
+  { id: 'plugin-manager-approval', script: 'tests/plugin-manager-approval.ts', title: '只读 plugin_manager 审批自动放行（A1a：list_* => allowed-once；写动作/未知 => next）' },
+  { id: 'approval-queue', script: 'tests/approval-queue.ts', title: '异步审批队列（A2：JSONL 入队/折叠/决策/幂等/坏行）' },
+  { id: 'approval-execute', script: 'tests/approval-execute.ts', title: 'A3 意图重放（set/remove 透传、install 明确不自动执行、失败不伪装）' },
   // ★ 独立交叉验证轮追加：本套件**不复用**被测模块自己的判别入口 —— 每条断言都是
   //   "给出攻击/故障形状 → 断言结局 → 反向对照"。覆盖四个重点面（危险命令拦截 /
   //   敏感文件遮蔽读入口 / 注册表应用后的状态同步与"报成功其实没写" / Cordis 卸载协议
@@ -177,6 +180,11 @@ export const OFFLINE_SUITES = [
   //   注入都必须归 `ctx.effect` 所有。零子进程、零注册表写、零系统状态 ⇒ 离线档。
   //   与 verify.cmd 的清单必须逐字一致（两处同时改；tests/suite-wiring.ts 机器检查）。
   { id: 'crosscheck-r17', script: 'tests/crosscheck-r17.ts', title: '交叉验证 R17（暂存应用 mkdir/原子替换/敏感遮蔽/危险命令拦截 + 卸载可恢复 + Cordis 卸载协议）' },
+  { id: 'client-residue', script: 'tests/client-residue.ts', title: '客户端残留静态探针（CSS/composer/chip/permission 条件注册 + 同步 disposer）' },
+  { id: 'profile-format', script: 'tests/profile-format.ts', title: 'B1 profile BOM/CRLF 保真（纯函数 + 假 configEditor 失败回滚）' },
+  { id: 'toolchain-acl', script: 'tests/toolchain-acl.ts', title: 'R34-P1 工具链只读根（Python/npm/pip/uv 过滤与去重）' },
+  { id: 'shell-cwd-redact', script: 'tests/shell-cwd-redact.ts', title: 'D0 模型可见暂存根改写（精确/子路径/大小写/空值）' },
+  { id: 'shell-error-matrix', script: 'tests/shell-error-matrix.ts', title: 'D0 失败分类矩阵 + 改写性能预算' },
   // ★ round16 缺陷修复轮追加：CLI 对外契约（U16-5/6/7/8/9）。
   //   全部是把命令/输入**真喂给 CLI 子进程**再断言退出码与文本：--help 是成功路径、
   //   子命令 help 覆盖真实参数、未知候选 id 走 `CODE: message` 而不是未捕获堆栈、
@@ -251,6 +259,12 @@ export const OFFLINE_SUITES = [
   { id: 'r45-kernel-lane', script: 'tests/r45-kernel-lane.ts', title: 'R45 显式内核边界档（tier=T1S 探测/装配 fail-closed、TS 边界文案、T1S 不误报降级；34 断言）' },
   // R46：已保存撤销（对标 NeoAI review undo；文件面 + 冲突整批零写 + 记录 checksum）。
   { id: 'r46-undo', script: 'tests/r46-undo.ts', title: 'R46 已保存撤销（apply 后 undo/冲突零写/新建删除/删除恢复/幂等/损坏 fail-closed；31 断言）' },
+  // R50：设置开关"写入被回滚"的根因回归。插件行在设置事务里重建时，新一代 Store 走
+  //   acquireStageGuard()，旧守护仍以 FILE_SHARE_READ 持有哨兵 ⇒ sentinel-held-by-live-guard
+  //   ⇒ fs 行激活失败 ⇒ reconcile 抛错 ⇒ 设置层写后回滚（mtime 变、内容不变）⇒ 界面
+  //   显示"本次开关未写入/设置值未生效"。修复：同进程上一代守护**收养**（keeperPid 不变）
+  //   + 引用计数（还有使用者时不拆守护）+ keeper 轮询校验父进程启动时间（防 pid 复用钉根）。
+  { id: 'stage-guard-adoption', script: 'tests/stage-guard-adoption.ts', title: 'R50 守护收养/引用计数（设置开关写后回滚根因：同进程收养、不覆盖哨兵、pid 复用不钉根）' },
 ]
 
 /** 需要未受限会话的套件 */

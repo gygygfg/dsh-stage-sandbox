@@ -49,11 +49,11 @@ describe('durable pending approvals', () => {
     const store = new FilePendingStore(stateDir)
     const source = mkdtempSync(join(tmpdir(), 'dsh-cand-'))
     writeFileSync(join(source, 'x.txt'), 'x')
-    const path = store.snapshotCandidate('sha256:abc', source)
+    const path = store.snapshotCandidate(`sha256:${'a'.repeat(64)}`, source)
     expect(existsSync(join(path, 'x.txt'))).toBe(true)
     const record = {
       workspaceRoot: '/ws', branchId: 'main',
-      candidate: { digest: 'sha256:abc', baseVersion: 'b', manifestDigest: 'm', path, scope: { categories: ['filesystem'] as const, writableRoots: ['/ws'] }, createdAt: 1 },
+      candidate: { digest: `sha256:${'a'.repeat(64)}`, baseVersion: 'b', manifestDigest: 'm', path, scope: { categories: ['filesystem'] as const, writableRoots: ['/ws'] }, createdAt: 1 },
       level: 'L2' as const, marker: 'yellow' as const, confirmationsRequired: 1, confirmationsReceived: 0,
       consequences: ['c'], reasons: [], frozenAt: 1,
     }
@@ -61,7 +61,7 @@ describe('durable pending approvals', () => {
     expect(store.load()).toHaveLength(1)
     store.remove('/ws', 'main')
     expect(store.load()).toHaveLength(0)
-    store.dropCandidate('sha256:abc')
+    store.dropCandidate(`sha256:${'a'.repeat(64)}`)
     rmSync(source, { recursive: true, force: true })
   })
 

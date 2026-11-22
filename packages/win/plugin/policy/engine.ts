@@ -159,7 +159,10 @@ export function evaluate(facts: Facts, config: PolicyConfig = {}): PolicyResult 
     if (typeof rule !== 'function') continue
     try {
       // 见模块头：JS 无等价受限环境，规则作者须为可信代码；抛错一律 fail-closed 为 DENY。
-      results.push(normalizeResult(rule(facts)))
+      const raw = rule(facts)
+      // `undefined` 是规则类型里的“不表态”，不是非法结果；非法值仍由 normalizeResult 判 DENY。
+      if (raw === undefined) continue
+      results.push(normalizeResult(raw))
     } catch {
       results.push({ decision: 'DENY', reasonCodes: [REASON.POLICY_EVALUATION_FAILED], constraints: {}, requiredGrants: [] })
     }

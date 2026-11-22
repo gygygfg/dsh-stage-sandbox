@@ -114,7 +114,8 @@ window.__ModuleLoader__.load({
           '启用 Windows 暂存—候选—选择性提交沙箱。关闭后：文件工具（写文件）立即退回平台自带的沙箱/审批模式；命令（pwsh）需要重启宿主后才交还平台 shell（命令面的提供方在加载期选定，不能热切换）。不确定当前生效哪一侧时，跑 /winstage status 看权威结论。',
         on: '已启用',
         off: '已关闭',
-        unavailable: 'Host 未提供该设置项',
+        unavailable:
+          '设置项未就绪：宿主没有提供 WinStage 设置命名空间（本行只读）。最常见的原因是插件 bundle 在「插件」页被禁用、或宿主未装载 dsh-winstage-sandbox —— 到「插件」页确认它已启用后刷新本页；若启用失败，插件页会给出失败阶段与诊断。',
         // ── R12 修复 · D7-c/d：状态词与**实际生效档**对齐（配置值 / 生效值分列）────────
         // R11 实测：行内写 `已关闭`，而同一宿主里 pwsh 的写入确实进了暂存（TS 在跑）；
         // 进程级 `WINSTAGE_SHELL=1` 这个覆盖在界面上完全不可见。
@@ -137,18 +138,25 @@ window.__ModuleLoader__.load({
         faceShellEnvOff: '命令面（pwsh）：由 WINSTAGE_SHELL=0 强制交还平台 shell',
         faceShellFollow: '命令面（pwsh）：跟随开关（换提供方需重启宿主）',
         toggleAccepted: '本次开关已写入（生效时机见上面的说明）。',
-        toggleRejected: '本次开关未写入：设置通道拒绝了这次修改（本行 config 可能被 profile 覆盖层固定）。可核对 %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml。',
+        toggleRejected: '本次开关未写入：设置通道拒绝了这次修改（目标行可能被更高优先级的 home patch / 命令覆盖层固定）。DSH 设置层在写前拒绝，不会改动文件；请核对 %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml 与启动参数 --patch。',
         toggleThrew: '本次开关出错：',
         /**
-         * R11-C 修复③（D1b）：旧文案是 `写入失败，已保留原值` —— 它只说了**值**的结局，
-         * 却让用户以为"磁盘什么都没发生"。实测：同一个交互把
-         * `%DSH_HOME%\profiles\web\cordis.patch.yml` 重写了（1236→1234 B、mtime 变化、
-         * `name` 的引号风格被打平；`enabled`/`workspaceRoot` 语义未漂移）。
-         * ⇒ 新文案把两件事**分开说清**：值没生效 + 文件可能已被重新序列化（附查看方式），
-         * 并提示该 profile 可能被多个宿主共享（并发写风险）。
+         * R50 修复 ②：宿主拒绝的**逐字原因**（`code` 是宿主分类，`message` 是它自己的话）。
+         * 上面 `toggleRejected` 只给"出路"，这句给"事实"——两者分开才不会让用户照着
+         * 猜出来的原因去改错地方。
+         */
+        toggleDiagnostic: '宿主回答（{code}）：{message}',
+        layerBase: '下层默认',
+        layerUser: 'profile 覆盖',
+        /**
+         * 2026-11-19 复核更正：DSH 0.2.2-rc.5 的 `dsh-config-editor` 已实现
+         * `withFileLock`、`writeFileAtomic`、写前 `before` 快照与 reconcile 失败回滚、
+         * `parseDocument`（保留注释/`!!js`）与 effective 校验；effective 不一致时在
+         * **写前**拒绝，不会重序列化。旧文案（“可能已重序列化 / 本插件无法回滚字节”）
+         * 与现行宿主行为不符，会误导用户，故改为“被更高层覆盖/未写入”。
          */
         error:
-          '设置值未生效：已保留原值（本行 config 被覆盖层/环境变量固定）。注意：此次交互可能已把 profile 文件重新序列化写入（仅格式规范化，键值语义不变）——可核对 %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml 的修改时间与 sha256；同一 profile 若被多个宿主共用，请避免并发改动。本插件无法回滚文件字节：设置通道只送键值，客户端拿不到写前的文件内容，因此"写入前快照 + 失败回滚"必须由宿主侧设置层实现。',
+          '设置值未生效：已保留原值。可能原因：本行被更高优先级层（home patch / 命令覆盖层 / 环境变量）固定，或写入后宿主的热重载激活失败。DSH 设置层在写前校验、失败时回滚，不会留下半写文件 —— 逐字原因见下一个「宿主回答」行；若仍观察到 mtime/sha256 变化，请附上 %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml 的修改时间与 sha256 反馈。',
         loading: '读取中…',
         reviewTitle: 'WinStage 暂存待审',
         reviewWaiting: '等待你批准后才写入真实工作区',
@@ -280,9 +288,10 @@ window.__ModuleLoader__.load({
           'Enable the Windows staging–candidate–selective-commit sandbox. Turning it off: the file tools switch back immediately to the platform sandbox/approval mode; the command side (pwsh) only hands back the platform shell after a host restart (the shell provider is chosen at load time and cannot be hot-swapped). Run /winstage status to see which side is currently in effect.',
         on: 'Enabled',
         off: 'Disabled',
-        unavailable: 'This setting is not exposed by the Host',
+        unavailable:
+          'This setting is not ready: the Host does not expose the WinStage settings namespace (this row is read-only). The usual cause is that the plugin bundle is disabled on the Plugins page, or the Host did not load dsh-winstage-sandbox — enable it there and reload this page; if enabling fails, the Plugins page reports the failing stage and its diagnostic.',
         error:
-          'The setting value did NOT take effect; the previous value was kept (this row\'s config is pinned by a profile overlay or an environment variable). Note: this interaction may still have re-serialized the profile file (formatting normalization only, no key/value change) — check the mtime and sha256 of %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml; if several hosts share that profile, avoid concurrent edits. This plugin cannot roll file bytes back: the settings transport only carries key/values, so a "pre-write snapshot + rollback on failure" must be implemented by the host-side settings layer.',
+          'The setting value did NOT take effect; the previous value was kept. Possible causes: the row is pinned by a higher-priority layer (home patch / command-line overlay / environment variable), or the host hot-reload activation failed after the write. The DSH settings layer validates before writing and rolls back on failure, so no half-written file is left — the verbatim reason is on the "Host answer" line below. If you still observe an mtime/sha256 change, report the mtime and sha256 of %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml.',
         loading: 'Loading…',
         // R12 fix · D7-c/d: status words follow the EFFECTIVE tier (config vs effective split)
         effectivePrefix: 'Currently effective: ',
@@ -293,8 +302,12 @@ window.__ModuleLoader__.load({
           'The process-level WINSTAGE_SHELL variable outranks this row, so toggling this row does not change the effective tier right now. Run /winstage status for the authoritative answer; to really hand control back to the platform, restart the host with WINSTAGE_SHELL=0.',
         toggleAccepted: 'The toggle was written (see the timing note above).',
         toggleRejected:
-          'The toggle was NOT written: the settings channel rejected this change (this row may be pinned by a profile overlay). Check %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml.',
+          'The toggle was NOT written: the settings channel rejected this change (the target row may be pinned by a higher-priority home patch or command-line overlay). The DSH settings layer rejects before writing; the file is not modified. Check %DSH_HOME%\\profiles\\<profile>\\cordis.patch.yml and the --patch arguments.',
         toggleThrew: 'The toggle failed: ',
+        /** R50: the host's verbatim rejection reason (see the Chinese twin above). */
+        toggleDiagnostic: 'Host answer ({code}): {message}',
+        layerBase: 'base default',
+        layerUser: 'profile override',
         reviewTitle: 'WinStage staged changes',
         reviewWaiting: 'Nothing is written to the real workspace until you approve',
         reviewFiles: '{files} files',
@@ -497,6 +510,15 @@ window.__ModuleLoader__.load({
       const left = norm(a)
       return left.length > 0 && left === norm(b)
     }
+
+    /**
+     * R50 修复 ②：**这一次开关动作，宿主逐字回答了什么**。
+     *
+     * 放在 factory 作用域（不是 apply 里），因为设置行组件 `WinStageRow` 定义在这一层：
+     * 组件渲染时直接读它，于是"拒绝原因"与"这次点击"永远同源，不会各说各话。
+     * `null` = 还没点过 / 上一次成功。
+     */
+    let lastToggleDiagnostic = null
 
     /**
      * 开关真值（**三态**）—— 唯一来源：`configForms` 的表单快照。
@@ -3038,6 +3060,20 @@ window.__ModuleLoader__.load({
       const enabled = value && typeof value.enabled === 'boolean' ? value.enabled : true
       const unavailable = Boolean(snapshot && (snapshot.status === 'unavailable' || snapshot.writable === false))
       /**
+       * B0：把 base / user 两层的原始值直接显示出来。更高优先级层把开关钉住时，
+       * 用户至少能看到“哪一层是什么”，而不是只有一句“被覆盖”。
+       */
+      const layerBool = (layer) => (layer && typeof layer.enabled === 'boolean' ? layer.enabled : undefined)
+      const baseEnabled = layerBool(snapshot?.base)
+      const userEnabled = layerBool(snapshot?.user)
+      const layerAny = baseEnabled !== undefined || userEnabled !== undefined
+      const layerAttr = layerAny
+        ? `base=${baseEnabled === undefined ? '?' : String(baseEnabled)};user=${userEnabled === undefined ? '?' : String(userEnabled)};effective=${String(enabled)}`
+        : null
+      const layerText = layerAny
+        ? `${t('layerBase')}=${baseEnabled === undefined ? '—' : baseEnabled ? t('on') : t('off')} · ${t('layerUser')}=${userEnabled === undefined ? '—' : userEnabled ? t('on') : t('off')}`
+        : null
+      /**
        * R12 修复 · D7-c/d：**状态词必须反映"实际生效档"**，并显式标注"被环境变量强制"。
        *
        * R11 实测两条：
@@ -3187,6 +3223,15 @@ window.__ModuleLoader__.load({
            *   · profile 覆盖层固定 —— 改 `%DSH_HOME%\profiles\<profile>\cordis.patch.yml`；
            *   · 设置面不可写（`writable === false`）—— 命中上面 `unavailable` 的既有分支。
            */
+          h(
+            'div',
+            {
+              ...DR,
+              style: { marginTop: '2px', fontSize: '12px', lineHeight: '18px', opacity: 0.65 },
+              'data-winstage-setting-layers': layerAttr,
+            },
+            layerText,
+          ),
           liveOverride ? h('div', { ...DR, style: { marginTop: '4px', fontSize: '12px', opacity: 0.75 }, 'data-winstage-staging-forced-note': '1' }, t('forcedHint')) : null,
           // S3e 第 2 条退路：默认展开/默认收起。纯客户端偏好（localStorage），
           // 不改 host 的 Config schema（那不在本任务写范围），因此不需要重启就能生效。
@@ -3227,6 +3272,27 @@ window.__ModuleLoader__.load({
                   : lastAttempt === 'rejected'
                     ? t('toggleRejected')
                     : `${t('toggleThrew')} ${lastAttempt.replace(/^threw:/, '')}`,
+              )
+            : null,
+          /**
+           * R50 修复 ②：**宿主逐字说的那句**。
+           *
+           * 上面那句是**出路**（去哪里核对、找谁），这句是**事实**（宿主到底为什么拒绝）。
+           * 两者必须分开：旧实现把"猜的原因"当事实写进唯一那句话，用户照着改错地方。
+           * 稳定锚点 `data-winstage-toggle-diagnostic`：GUI 验收可以逐字读出。
+           */
+          lastAttempt === 'rejected' && lastToggleDiagnostic
+            ? h(
+                'div',
+                {
+                  ...DR,
+                  style: { marginTop: '2px', fontSize: '12px', lineHeight: '18px', opacity: 0.75, wordBreak: 'break-word' },
+                  'data-winstage-toggle-diagnostic': `${lastToggleDiagnostic.code}:${lastToggleDiagnostic.message}`,
+                },
+                t('toggleDiagnostic', {
+                  code: lastToggleDiagnostic.code,
+                  message: String(lastToggleDiagnostic.message).slice(0, 400),
+                }),
               )
             : null,
         ),
@@ -3283,7 +3349,14 @@ window.__ModuleLoader__.load({
 
     return {
       /** settings 通道（configForms）+ 槽位 + 本地化 + 只读文件/命令 Remote */
-      inject: ['slots', 'locale', 'configForms', 'remote', 'remote.workspaceFiles', 'remote.commands'],
+      /**
+       * `remote.settings` 是 R50 新增的**显式注入**：cordis 的 remote 是按命名空间
+       * 逐个 inject 的，没 inject 的命名空间在 `ctx.remote.settings` 上会直接抛
+       * `cannot get property "remote.settings" without inject`（实测：不注入时开关
+       * 变成"本次开关出错"，比原来的"未生效"更糟）。加上它，`setEnabledViaHost`
+       * 才能拿到宿主的逐字拒绝原因。
+       */
+      inject: ['slots', 'locale', 'configForms', 'remote', 'remote.settings', 'remote.workspaceFiles', 'remote.commands'],
 
       /**
        * ★ WP3-B：**离线断言的接缝**（不是新契约、不参与 DSH 装配）。
@@ -3309,23 +3382,87 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(LOCALE_NS, dicts), 'winstage-sandbox: dictionaries')
 
-        /**
-         * R11-C 修复①：把平台隐藏起来的「兜底输入条」放回来（详见
-         * `COMPOSER_FALLBACK_UNHIDE_CSS` 处的长注释）。资源由 `ctx.effect` 拥有 ⇒ 插件卸载即撤。
-         */
-        ctx.effect(() => {
-          const style = document.createElement('style')
-          style.setAttribute('data-winstage-composer-unhide', '1')
-          style.textContent = COMPOSER_FALLBACK_UNHIDE_CSS
-          document.head.appendChild(style)
-          return () => {
-            try { style.remove() } catch { /* 卸载期异常不得影响其它 effect */ }
-          }
-        }, 'winstage-sandbox: keep the composer bar visible while the panel is up')
-
         const form = ctx.configForms.get(NAMESPACE)
         const poller = createPoller(ctx, form)
         ctx.effect(() => () => poller.dispose(), 'winstage-sandbox: review poller')
+
+        /**
+         * ── R50 修复 ②：开关写入必须能说出**宿主的逐字拒绝原因** ───────────────────
+         *
+         * `ConfigFormController.set()` 把宿主的 `RemoteError` 折成 `false`，于是行内只能
+         * 猜"被更高优先级层覆盖"——而真实原因可能是：
+         *   · `settings/rejected`：`Configuration for "winstage-sandbox" is overridden by a home patch…`
+         *   · `settings/rejected`：`winstage-fs … sentinel-held-by-live-guard …`（行激活失败）
+         *   · `settings/conflict`：revision 领先/落后（镜像过期）
+         *   · `settings/rejected`：`Config field "enabled" is not volatile`（schema 漂移）
+         * 猜错的代价是用户照着错误提示改错地方（这正是 2026-11-22 报障的形态）。
+         *
+         * 因此这里**直接走同一条 remote 通道**（与 `form.set` 同一条协议、同一个 namespace），
+         * 拿回 `{ ok, error.code, error.message }`，并把原因挂到设置行上逐字显示。
+         * 写用 `expectedRevision: undefined`（无条件写）：设置页是单布尔开关，冲突没有意义，
+         * 而带一个过期 revision 只会把一次本来能成功的写入变成假失败。
+         */
+        async function setEnabledViaHost(next) {
+          lastToggleDiagnostic = null
+          const value = next === true
+          let remote
+          try {
+            // 命名空间未装配时 cordis 会抛；那时退回 configForms（旧行为），绝不把开关弄哑。
+            remote = ctx.remote && ctx.remote.settings
+          } catch {
+            remote = undefined
+          }
+          if (!remote || typeof remote.mutate !== 'function') {
+            return Promise.resolve(form.set('enabled', value))
+          }
+          try {
+            const response = await remote.mutate(NAMESPACE, [{ op: 'set', path: ['enabled'], value }], undefined)
+            if (response && response.ok === true) return true
+            const error = response && response.error
+            lastToggleDiagnostic = {
+              code: String((error && error.code) || 'unknown'),
+              message: String((error && error.message) || 'host returned no diagnostic'),
+            }
+            return false
+          } catch (error) {
+            lastToggleDiagnostic = { code: 'client-threw', message: String((error && error.message) || error) }
+            return false
+          }
+        }
+
+        /**
+         * R11-C 修复①：把平台隐藏起来的「兜底输入条」放回来（详见
+         * `COMPOSER_FALLBACK_UNHIDE_CSS` 处的长注释）。
+         *
+         * 2026-11-19 · C1：只在开关**确定开着**（`readSwitch(form) === 'on'`）时注入；
+         * OFF / UNKNOWN 立即移除。旧实现无条件注入，即使沙箱关闭也改写平台 composer
+         * 的 `display` —— 属于「关闭后未复原」的客户端残留。
+         */
+        ctx.effect(() => {
+          let style = null
+          const sync = () => {
+            let on = false
+            try { on = readSwitch(form) === 'on' } catch { on = false }
+            if (on) {
+              if (!style) {
+                style = document.createElement('style')
+                style.setAttribute('data-winstage-composer-unhide', '1')
+                style.textContent = COMPOSER_FALLBACK_UNHIDE_CSS
+              }
+              if (!style.isConnected) document.head.appendChild(style)
+            } else if (style && style.isConnected) {
+              try { style.remove() } catch { /* 卸载/切换期异常不得影响其它 effect */ }
+            }
+          }
+          sync()
+          const offForm = form && typeof form.subscribe === 'function' ? form.subscribe(sync) : () => {}
+          const offStore = store.subscribe(sync)
+          return () => {
+            try { offForm() } catch { /* best effort */ }
+            try { offStore() } catch { /* best effort */ }
+            try { style?.remove() } catch { /* 卸载期异常不得影响其它 effect */ }
+          }
+        }, 'winstage-sandbox: keep the composer bar visible while the panel is up')
 
         // ── 按需诊断（在页面 URL 加 ?winstageDebug=1 才会输出）──────────────────
         // 存在理由：客户端的失败面只有"命名空间/槽位没出现"，看不到原因；
@@ -3374,7 +3511,7 @@ window.__ModuleLoader__.load({
               locale: LOCALE_NS,
               inject: () => ({
                 hooks: { value: form },
-                setEnabled: (next) => form.set('enabled', next),
+                setEnabled: setEnabledViaHost,
                 /**
                  * R12 修复 · D7-d：给设置行一个**与会话无关**的读法，读它自己的根。
                  *
@@ -3469,16 +3606,48 @@ window.__ModuleLoader__.load({
             if (dispose) dispose()
             dispose = ctx.slots.register(composerEntry, WinStageReview)
           }
-          remount()
-          // 乐观置位：新注册的 select 会在下一次渲染给出真值并覆盖它
-          lastElected = poller.shouldElect()
-          const off = store.subscribe(() => {
+          /**
+           * 2026-11-19 · C1 剩余：只在开关确定开着时注册 composer 条目；OFF/UNKNOWN
+           * 立即 dispose。旧实现无条件注册（`select` 返回 null），slot 表里仍留着
+           * WinStage 条目，属于「关闭后未复原」的客户端残留。
+           */
+          const sync = () => {
+            const on = readSwitch(form) === 'on'
+            if (!on) {
+              if (dispose) {
+                dispose()
+                dispose = null
+                lastElected = false
+              }
+              return
+            }
+            if (!dispose) {
+              // 乐观置位：新注册的 select 会在下一次渲染给出真值并覆盖它
+              lastElected = poller.shouldElect()
+              dispose = ctx.slots.register(composerEntry, WinStageReview)
+            }
+          }
+          sync()
+          const offForm = form && typeof form.subscribe === 'function' ? form.subscribe(sync) : () => {}
+          const offStore = store.subscribe(() => {
+            if (readSwitch(form) !== 'on') {
+              sync()
+              return
+            }
+            if (!dispose) {
+              sync()
+              return
+            }
             const should = poller.shouldElect()
             if (should === lastElected) return
             lastElected = should
             remount()
           })
           // `slots.inject` 的契约就是"回调返回同步 disposer"（runbook `:1385`）
+          const off = () => {
+            offForm()
+            offStore()
+          }
           return () => {
             off()
             if (dispose) dispose()
@@ -3491,33 +3660,51 @@ window.__ModuleLoader__.load({
         // 因此它**不依赖** composer 的 chain 选举 —— 收起后 composer 上是空的，只有这里能点回来。
         // 防御：槽位形状变化/占用冲突绝不能让插件加载失败。
         try {
-          ctx.slots.inject('conversation.input.dock', () =>
-            ctx.slots.register(
-              {
-                name: 'conversation.input.dock',
-                id: 'winstage-sandbox-chip',
-                // T3b（用户诉求）：chip 必须渲染在**发送按钮那一行**与**任务元素**之上。
-                //
-                // 为什么是"把 order 变成 dock 里最小的"：
-                //   · 平台在这条 list 槽位上已有的条目及其 order 是
-                //       todo = 0、goal = 10、queue = 20（`dsh-client-ui-conversation` / `dsh-client-ui-goal`）；
-                //     list 槽位按 `(priority ?? 0)` 再按 `(order ?? 0)` **升序**排
-                //     （`dsh-client-ui-slots/lib/index.js:221`）。
-                //     旧值 30 ⇒ chip 排在最后，正好**压在任务元素下面**（但在发送行上面）。
-                //   · dock 整块本身排在发送行之前：宿主 `composerStack` 的子节点顺序是
-                //       [HeroShell?, heroWorkspaceRow?, renderSlot('conversation.input.dock'),
-                //        inputBar = renderSlot('conversation.composer.bar')]
-                //     （`dsh-client-ui-conversation/lib/client.js:16224-16235`），
-                //     且该容器是 `flex-direction: column`（`wSkVaW_composerStack`，同文件 :15721）
-                //     ⇒ **DOM 顺序 = 视觉顺序**，dock 恒在发送行上方。
-                //   ⇒ 取 −10（< todo 的 0）即同时满足"在任务元素之上"与"在发送行之上"。
-                // 只改排序值：不换槽位、不改 priority、不碰选举逻辑。
-                order: -10,
-                locale: LOCALE_NS,
-              },
-              WinStageChip,
-            ),
-          )
+          const chipEntry = {
+            name: 'conversation.input.dock',
+            id: 'winstage-sandbox-chip',
+            // T3b（用户诉求）：chip 必须渲染在**发送按钮那一行**与**任务元素**之上。
+            //
+            // 为什么是"把 order 变成 dock 里最小的"：
+            //   · 平台在这条 list 槽位上已有的条目及其 order 是
+            //       todo = 0、goal = 10、queue = 20（`dsh-client-ui-conversation` / `dsh-client-ui-goal`）；
+            //     list 槽位按 `(priority ?? 0)` 再按 `(order ?? 0)` **升序**排
+            //     （`dsh-client-ui-slots/lib/index.js:221`）。
+            //     旧值 30 ⇒ chip 排在最后，正好**压在任务元素下面**（但在发送行上面）。
+            //   · dock 整块本身排在发送行之前：宿主 `composerStack` 的子节点顺序是
+            //       [HeroShell?, heroWorkspaceRow?, renderSlot('conversation.input.dock'),
+            //        inputBar = renderSlot('conversation.composer.bar')]
+            //     （`dsh-client-ui-conversation/lib/client.js:16224-16235`），
+            //     且该容器是 `flex-direction: column`（`wSkVaW_composerStack`，同文件 :15721）
+            //     ⇒ **DOM 顺序 = 视觉顺序**，dock 恒在发送行上方。
+            //   ⇒ 取 −10（< todo 的 0）即同时满足"在任务元素之上"与"在发送行之上"。
+            // 只改排序值：不换槽位、不改 priority、不碰选举逻辑。
+            order: -10,
+            locale: LOCALE_NS,
+          }
+          ctx.slots.inject('conversation.input.dock', () => {
+            let dispose = null
+            const sync = () => {
+              const on = readSwitch(form) === 'on'
+              if (on && !dispose) dispose = ctx.slots.register(chipEntry, WinStageChip)
+              else if (!on && dispose) {
+                dispose()
+                dispose = null
+              }
+            }
+            sync()
+            const offForm = form && typeof form.subscribe === 'function' ? form.subscribe(sync) : () => {}
+            const offStore = store.subscribe(sync)
+            const off = () => {
+              offForm()
+              offStore()
+            }
+            return () => {
+              off()
+              if (dispose) dispose()
+              dispose = null
+            }
+          })
         } catch (error) {
           console.log('[winstage] reopen-chip slot registration failed:', error)
         }
@@ -3536,7 +3723,7 @@ window.__ModuleLoader__.load({
           inject: () => ({
             openPanel: restorePanel,
             executeCommand: (targetSessionId, line) => runCommand(ctx, targetSessionId, line),
-            setEnabled: (next) => form.set('enabled', next),
+            setEnabled: setEnabledViaHost,
           }),
         }
         try {
@@ -3565,9 +3752,12 @@ window.__ModuleLoader__.load({
             sync() // 初始：Config 还是 loading ⇒ 'unknown' ⇒ **不接管**（平台控件在场；ready 后按真值接管）
             const offForm = form && typeof form.subscribe === 'function' ? form.subscribe(sync) : () => {}
             const offStore = store.subscribe(sync)
-            return () => {
+            const off = () => {
               offForm()
               offStore()
+            }
+            return () => {
+              off()
               if (dispose) dispose()
               dispose = null
             }

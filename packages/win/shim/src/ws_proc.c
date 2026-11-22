@@ -290,9 +290,38 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
         forced = 1;
     }
     wchar_t *newEnv = NULL;
-    if (!exempt && env) {
+    wchar_t *inheritedEnv = NULL;
+    int inheritContract = 0;
+    if (!exempt) {
+        /* 临时验证：把契约变量放进当前进程环境，让子进程用 NULL 继承。 */
+        SetEnvironmentVariableW(L"DSH_STAGE_ROOT", g_ws.stageRoot);
+        SetEnvironmentVariableW(L"DSH_SHIM_LOG", g_ws.logPath);
+        SetEnvironmentVariableW(L"DSH_SHIM_CONFIG", g_ws.configPath);
+        env = NULL;
+        inheritContract = 1;
+    }
+    if (!inheritContract && !exempt && !env) {
+        /* 调用方用 NULL 表示“继承当前环境”。当前环境已被 ws_env_scrub_contract()
+         * 清掉契约变量；必须显式复制一份再补回，否则子进程 shim 加载后是惰性的。 */
+        inheritedEnv = GetEnvironmentStringsW();
+        if (!inheritedEnv) {
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return FALSE;
+        }
+        env = inheritedEnv;
+    }
+    if (!exempt && env && !inheritedEnv) {
+        /* 临时调试：显式 env 也改为基于当前进程环境重建。 */
+        inheritedEnv = GetEnvironmentStringsW();
+        if (inheritedEnv) env = inheritedEnv;
+    }    if (!exempt && env) {
         newEnv = ws_env_with_contract((const wchar_t *)env);
+        if (inheritedEnv) {
+            FreeEnvironmentStringsW(inheritedEnv);
+            inheritedEnv = NULL;
+        }
         if (!newEnv) {
+            ws_log("child env rebuild failed (explicit=%d)", env ? 1 : 0);
             /* 自己的错误：保留（不要被下面的还原点抹掉） */
             SetLastError(ERROR_NOT_ENOUGH_MEMORY);
             return FALSE;
@@ -305,6 +334,15 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
                                           newEnv ? newEnv : env, cwd, si, pi);
     /* 立刻取走真实 API 的错误：下面还有 HeapFree/日志，它们都会覆写线程状态 */
     DWORD createErr = GetLastError();
+    if (inheritContract) {
+        SetEnvironmentVariableW(L"DSH_STAGE_ROOT", NULL);
+        SetEnvironmentVariableW(L"DSH_SHIM_LOG", NULL);
+        SetEnvironmentVariableW(L"DSH_SHIM_CONFIG", NULL);
+    }
+    if (!ok) {
+        ws_log("CreateProcess failed err=%lu env=%p newEnv=%p inherited=%d flags=0x%lx",
+               (unsigned long)createErr, env, newEnv, inheritedEnv ? 1 : 0, (unsigned long)newFlags);
+    }
     if (newEnv) {
         HeapFree(GetProcessHeap(), 0, newEnv);
     }

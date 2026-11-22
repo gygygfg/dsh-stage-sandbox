@@ -773,8 +773,8 @@ section('9. 调用层的 fail-closed 与错误码翻译（用替身，不碰真�
   )
 
   // 幂等语义
-  check('installSubLayer 把 FWP_E_ALREADY_EXISTS 视为幂等成功', installSubLayer({ fwpmSubLayerAdd0: () => 0x80320003 }, 1n, buildSubLayer0({ displayData: buildDisplayData0({ name: 1n }) })).idempotent === true, 'idempotent')
-  check('deleteFilterById 把 FWP_E_FILTER_NOT_FOUND 视为幂等成功', deleteFilterById({ fwpmFilterDeleteById0: () => 0x80320007 }, 1n, 5n).idempotent === true, 'idempotent')
+  check('installSubLayer 把 FWP_E_ALREADY_EXISTS 视为幂等成功', installSubLayer({ fwpmSubLayerAdd0: () => 0x80320009 }, 1n, buildSubLayer0({ displayData: buildDisplayData0({ name: 1n }) })).idempotent === true, 'idempotent')
+  check('deleteFilterById 把 FWP_E_FILTER_NOT_FOUND 视为幂等成功', deleteFilterById({ fwpmFilterDeleteById0: () => 0x80320003 }, 1n, 5n).idempotent === true, 'idempotent')
   checkThrows(
     'addFilter 对其它错误码一律上抛（不吞）',
     () =>

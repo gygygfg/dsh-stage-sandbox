@@ -3382,7 +3382,18 @@ export function createRegistryStage(options = {}) {
       const baselineFrozen = frozenBaselineFor(unit.keyPath)
       if (baselineFrozen !== undefined && opts.force !== true) {
         // 必须**现读**真实 hive（不用缓存），否则这个检查永远通过。
-        const current = serializeSnapshot(readBaselineFresh(unit.keyPath))
+        let current
+        try {
+          current = serializeSnapshot(readBaselineFresh(unit.keyPath))
+        } catch (error) {
+          // An unreadable baseline is not "unchanged": refuse the stale unit.
+          stale.push({
+            path: unit.path,
+            op: unit.op,
+            reason: `cannot re-read the real hive baseline: ${error.message}`,
+          })
+          continue
+        }
         if (current !== baselineFrozen) {
           stale.push({
             path: unit.path,
@@ -3637,6 +3648,11 @@ export function createRegistryWriter(bindings) {
       return { status }
     },
     setValue(path, valueName, type, dataHex, opts = {}) {
+      if (typeof dataHex !== 'string') {
+        // Writing an empty payload because the caller passed a Buffer/number
+        // silently clears the value; refuse instead (F8 family).
+        throw stageError('REG_VALUE_DATA_INVALID', `setValue(${path}) requires a hex string, got ${typeof dataHex}`)
+      }
       const keyHandle = openForWrite(path, REG_ACCESS.KEY_SET_VALUE | (opts.samDesired ?? 0))
       try {
         const typeNumber = REG_TYPES[registryTypeName(type)]

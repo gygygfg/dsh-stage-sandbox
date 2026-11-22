@@ -150,10 +150,11 @@ export function decide(input: DecideInput): boolean {
   if (verdict.hardDeny) return false
   if (verdict.action === 'auto') return true
   if (verdict.action === 'record') return true
-  // review / block：需要显式确认；会话自动审批**不得**跳过密钥与包安装。
+  // review / block：需要显式确认；会话自动审批**不得**跳过密钥与包安装，且只把 review 降为 auto。
   const neverAutoSkip =
     verdict.reasonCodes.includes(RISK_REASON.SECRET_SCOPE) || verdict.reasonCodes.includes(RISK_REASON.PACKAGE_INSTALL)
-  if (sessionAuto && !neverAutoSkip) return true
+  if (verdict.action === 'review' && sessionAuto && !neverAutoSkip) return true
+  // block 是“阻断”语义：即使 confirmed/--force 也不放行（见 plugin/commands.ts 的 L3 断言）。
   if (verdict.action === 'block') return false
   return confirmed === true
 }

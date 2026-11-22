@@ -694,7 +694,7 @@ function applyLiteralEdit(text, edit, displayPath) {
   }
   const next = edit.replaceAll === true
     ? text.split(oldString).join(newString)
-    : text.replace(oldString, newString)
+    : text.replace(oldString, () => newString)
   return next
 }
 
@@ -2694,6 +2694,7 @@ export function createStagingFileSystem(options = {}) {
     }
 
     async streamText(target, signal) {
+      this.guardMaskedRead(target, 'streamText')
       if (!this.stagingEnabled()) return super.streamText(target, signal)
       if (!this.inConfiguredWorkspace()) {
         this.warnForeignWorkspace()

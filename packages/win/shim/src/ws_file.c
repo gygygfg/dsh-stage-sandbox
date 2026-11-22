@@ -1731,6 +1731,7 @@ static int ws_nt_create_write_intent(ACCESS_MASK access, ULONG disposition, ULON
     switch (disposition) {
     case 0: /* FILE_SUPERSEDE */
     case 2: /* FILE_CREATE */
+    case 3: /* FILE_OPEN_IF: creates the file when it does not exist (maybe-create) */
     case 4: /* FILE_OVERWRITE */
     case 5: /* FILE_OVERWRITE_IF */
         return 1;
@@ -3437,7 +3438,7 @@ static BOOL ws_copy_file_locked(LPCWSTR src, LPCWSTR dst, BOOL failIfExists)
         SetLastError(ERROR_FILE_NOT_FOUND);
         return FALSE;
     }
-    if (failIfExists && ws_file_exists(normDst)) {
+    if (failIfExists && (ws_file_exists(normDst) || ws_file_exists(stagedDst))) {
         SetLastError(ERROR_FILE_EXISTS);
         return FALSE;
     }

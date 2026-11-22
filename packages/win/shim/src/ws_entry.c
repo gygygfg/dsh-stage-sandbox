@@ -176,6 +176,9 @@ static int ws_init_full(const wchar_t *configJsonPath)
         ws_log("read mask is declared but could not be honored: reads will be denied (fail-closed)");
     }
     ws_hook_install();
+    /* 初始化完成后清掉内部契约变量：模型可见环境里不得出现 DSH_SHIM_* 等指纹。
+     * 子进程注入由 ws_env_with_contract 用 g_ws 里的值重新加回，不影响嵌套。 */
+    ws_env_scrub_contract();
     g_ws.initialized = 1;
     ws_log("initialized: stageRoot=%ls provider=%ls failClosed=%d readThrough=%d",
            g_ws.stageRoot, g_wsStage.name ? g_wsStage.name : L"(none)", g_ws.failClosed, g_ws.readThrough);
@@ -320,8 +323,12 @@ int __cdecl WinstageShimStatsJson(char *buf, unsigned cch)
     if (n < 0) {
         return 0;
     }
-    if (buf && cch) {
-        unsigned copy = (unsigned)n < cch - 1 ? (unsigned)n : cch - 1;
+    if (buf && cch > 0) {
+        /* snprintf returns the would-be length; when the JSON was truncated
+         * that value can exceed tmp's allocation, so copy what tmp really holds. */
+        size_t produced = strlen(tmp);
+        unsigned limit = (unsigned)(cch - 1);
+        unsigned copy = (unsigned)(produced < limit ? produced : limit);
         memcpy(buf, tmp, copy);
         buf[copy] = 0;
     }

@@ -600,7 +600,7 @@ export async function runAudit(workspace, options = {}) {
       `try { Set-Content -LiteralPath '${q(insideTarget)}' -Value x -ErrorAction Stop; $r.inside='ok' } catch { $r.inside='denied' }`,
       `try { Set-Content -LiteralPath '${q(outsideTarget)}' -Value x -ErrorAction Stop; $r.outside='ok' } catch { $r.outside='denied' }`,
       `try { Set-Content -LiteralPath '${q(systemTarget)}' -Value x -ErrorAction Stop; $r.system='ok' } catch { $r.system='denied' }`,
-      `try { Remove-Item -LiteralPath '${q(join(workspace.root, 'package.json'))}' -ErrorAction Stop; $r.deleteOutside='ok' } catch { $r.deleteOutside='denied' }`,
+      `try { Remove-Item -LiteralPath '${q(outsideTarget)}' -ErrorAction Stop; $r.deleteOutside='ok' } catch { $r.deleteOutside='denied' }`,
       '$r.temp=$env:TEMP',
       '$r.cwd=(Get-Location).Path',
       '$r.secretPresent=($null -ne $env:DSH_AUDIT_SECRET)',

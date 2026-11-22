@@ -351,9 +351,9 @@ const OFF = {
   limitFlags: 16,
   minimumWorkingSetSize: 24,
   maximumWorkingSetSize: 32,
-  activeProcessLimit: 36,
-  affinity: 40,
-  priorityClass: 48,
+  activeProcessLimit: 40,
+  affinity: 48,
+  priorityClass: 56,
   // IO_COUNTERS: 64..112
   processMemoryLimit: 112,
   jobMemoryLimit: 120,
@@ -1314,6 +1314,62 @@ function grantPathToAppContainerSid(target, sidString, rights = 'M') {
 }
 
 /**
+ * R34-P1：T0/AppContainer 需要**只读+执行**访问的工具链根。
+ *
+ * 现象：pip 读自带的 CA 证书（Python 安装目录内）报 `PermissionError [Errno 13]`，
+ * npm 读缓存/CA 也失败；根因不是网络，而是包 SID 对这些目录没有读 ACE。
+ * 这些目录只授 `RX`（读+执行，不写），并过滤不存在的路径；退出时由既有
+ * `_revokeGrantsOnExit` 统一撤销。
+ *
+ * @param {{env?:object, execPath?:string, exists?:(p:string)=>boolean}} [options]
+ * @returns {string[]}
+ */
+export function toolchainReadRoots({ env = process.env, execPath = process.execPath, exists = existsSync } = {}) {
+  const roots = []
+  const push = (candidate) => {
+    if (typeof candidate !== 'string' || candidate.length === 0) return
+    try {
+      if (!exists(candidate)) return
+    } catch {
+      return
+    }
+    if (!roots.includes(candidate)) roots.push(candidate)
+  }
+  try {
+    if (typeof execPath === 'string' && execPath.length > 0) push(dirname(execPath))
+  } catch {
+    /* best effort */
+  }
+  const local = typeof env?.LOCALAPPDATA === 'string' ? env.LOCALAPPDATA : ''
+  const roaming = typeof env?.APPDATA === 'string' ? env.APPDATA : ''
+  const profile = typeof env?.USERPROFILE === 'string' ? env.USERPROFILE : ''
+  if (local) {
+    const pythonParent = join(local, 'Programs', 'Python')
+    push(pythonParent)
+    /* 有些 Python 安装目录关闭了父目录 ACE 继承；把每个 Python* 和它的
+     * site-packages 单独授一遍，否则 pip 读 certifi 的 cacert.pem 仍 EACCES。 */
+    try {
+      for (const name of readdirSync(pythonParent)) {
+        if (!/^Python\d/i.test(name)) continue
+        const pythonRoot = join(pythonParent, name)
+        push(pythonRoot)
+        push(join(pythonRoot, 'Lib', 'site-packages'))
+      }
+    } catch {
+      /* 目录不存在/不可读：父目录那一档仍是 best effort */
+    }
+    push(join(local, 'npm-cache'))
+    push(join(local, 'pnpm'))
+  }
+  if (roaming) push(join(roaming, 'npm'))
+  if (profile) {
+    push(join(profile, '.cache', 'pip'))
+    push(join(profile, '.cache', 'uv'))
+  }
+  return roots
+}
+
+/**
  * `[实测]` 用 `icacls` 而不是自己拼 ACL：包 SID 的字符串形式必须带 `*` 前缀（否则被当账户名解析）。
  *
  * ── 缺陷（T2 报告，2026-09-30）：**不能**用命名管道捕获 ─────────────────────────
@@ -1462,7 +1518,7 @@ export function repairStaleAppContainerAces(dir, options = {}) {
   }
   const after = read(dir)
   const remaining = after.ok ? findStaleAppContainerAces(after.sddl).stale.map((a) => a.sid) : [...failed]
-  const repaired = failed.length === 0 && remaining.length === 0
+  const repaired = after.ok && failed.length === 0 && remaining.length === 0
   return {
     repaired,
     removed,
@@ -3014,8 +3070,9 @@ export class WindowsStageExecutor {
   /** collectChild + 有界超时（超时 ⇒ terminate(124) 回收整棵 Job，fail-closed）。 */
   async collectWithTimeout(child, timeoutMs) {
     let timedOut = false
+    let handle: ReturnType<typeof setTimeout> | undefined
     const timer = new Promise((resolvePromise) => {
-      const handle = setTimeout(() => {
+      handle = setTimeout(() => {
         timedOut = true
         try {
           this.terminate(124)
@@ -3028,9 +3085,10 @@ export class WindowsStageExecutor {
           exitCode: 124,
         })
       }, timeoutMs)
-      if (typeof handle.unref === 'function') handle.unref()
+      if (handle && typeof handle.unref === 'function') handle.unref()
     })
     const settled = await Promise.race([this.collectChild(child), timer])
+    if (handle !== undefined) clearTimeout(handle)
     return { ...settled, timedOut }
   }
 
@@ -3442,7 +3500,11 @@ export class WindowsStageExecutor {
       try {
         appContainer = await createAppContainerLauncher({
           api: this.api,
-          grantPaths: [this.stagingRoot, this.tempDir].filter(Boolean),
+          grantPaths: [
+            this.stagingRoot,
+            this.tempDir,
+            ...toolchainReadRoots().map((path) => ({ path, rights: 'RX' })),
+          ].filter(Boolean),
           capabilities: this.options.capabilities ?? [],
           profileName: this.options.profileName,
           // 三轮接线：把进程缓解策略传进 T0 启动路径。默认 `none` ⇒ 构造出的策略
@@ -4155,6 +4217,9 @@ export class WindowsStageExecutor {
         // 而不是假定返回对象带 wait()（真实缺陷 15）。
         settled = await Promise.race([this.collectChild(child), timeoutPromise])
       } catch (error) {
+        // fail closed: a broken pipe / collector is not a reason to leave the
+        // child (and its Job) running after the result says 127.
+        this.terminate(124)
         settled = { stdout: Buffer.alloc(0), stderr: Buffer.from(`dsh-stage: ${error.message}`), exitCode: 127 }
       }
     }
@@ -4999,7 +5064,38 @@ export function classifyCommandRisk(command, args = [], options = {}) {
     if (PS_CONTROL_KEYWORDS.has(token)) continue
     if (!/^[a-z0-9_][a-z0-9_.\-]*$/.test(token)) continue
     if (READ_ONLY_VERBS.includes(token) || READ_ONLY_EXES.includes(token)) continue
-    if (WRITE_VERBS.includes(token) || INTERPRETER_COMMANDS.includes(token)) continue
+    if (WRITE_VERBS.includes(token)) continue
+    if (INTERPRETER_COMMANDS.includes(token)) {
+      /**
+       * `cmd /c <payload>` hands the rest of the line to a second parser. The
+       * command-position loop only sees the `cmd` token, so a payload program
+       * that is in neither the read-only nor the write table (certutil, wmic,
+       * mshta, …) would otherwise leave the whole command classified READ_ONLY.
+       * Treat the first non-flag token after /c or /k as a command position.
+       */
+      if (token === 'cmd' || token === 'cmd.exe') {
+        let payloadIndex = -1
+        for (let j = i + 1; j < scannedTokens.length; j += 1) {
+          if (scannedTokens[j] === '/c' || scannedTokens[j] === '/k') { payloadIndex = j + 1; break }
+        }
+        while (payloadIndex !== -1 && payloadIndex < scannedTokens.length &&
+               (scannedTokens[payloadIndex].startsWith('-') || scannedTokens[payloadIndex].startsWith('/'))) {
+          payloadIndex += 1
+        }
+        const payload = payloadIndex === -1 ? undefined : scannedTokens[payloadIndex]
+        if (payload !== undefined && !isCommandSeparator(payload)) {
+          const payloadToken = baseNameLower(payload)
+          if (INTERPRETER_COMMANDS.includes(payloadToken) ||
+              (!PS_CONTROL_KEYWORDS.has(payloadToken) &&
+               !READ_ONLY_VERBS.includes(payloadToken) &&
+               !READ_ONLY_EXES.includes(payloadToken) &&
+               !WRITE_VERBS.includes(payloadToken))) {
+            unknownCommandTokens.push(payloadToken)
+          }
+        }
+      }
+      continue
+    }
     unknownCommandTokens.push(token)
   }
   if (unknownCommandTokens.length > 0) {
@@ -6285,11 +6381,12 @@ export function probeShimDll(dllPath) {
  * 清单文件同时进 `passthrough`：shim 自己的策略文件不允许被它自己再暂存一次。
  *
  * ── R18-KNOWN-08c：日志有界轮转 ───────────────────────────────────────────────
- * 每次写配置（= 每次起 shim 之前）先做一次有界轮转：`logPath` 超过 32 MiB 就
- * 改名成 `<logPath>.old`（只保留 1 份）。现场实测 `shim.log` 本会话涨到 533 MB
+ * 每次写配置（= 每次起 shim 之前）先做一次有界轮转：`logPath` 超过 8 MiB 就
+ * 改名成 `<logPath>.old`（只保留 1 份）。现场实测 `shim.log` 单会话涨到 533 MB
  * 且永不回收 —— shim 是用户态 hook，日志行数随进程树操作线性增长，没有上限。
+ * 2026-11-19：上限从 32 MiB 收紧到 8 MiB（R34 实测 13→20 MB 仍会拖慢命令）。
  */
-export const SHIM_LOG_MAX_BYTES = 32 * 1024 * 1024
+export const SHIM_LOG_MAX_BYTES = 8 * 1024 * 1024
 export const SHIM_LOG_KEEP_OLD = 1
 
 /**

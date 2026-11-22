@@ -865,6 +865,10 @@ LSTATUS ws_mask_init(void)
         g_mask.caseSensitive = 1; /* mutation self-proof only */
     }
     for (int i = 0; i < g_ws.readAllowCount; i++) {
+        if (g_mask.allowCount >= WS_RE_MAX_RULES) {
+            ws_log("readAllow capacity exhausted; remaining entries ignored");
+            break;
+        }
         WsReRule r;
         if (ws_mask_compile(&r, g_ws.readAllow[i], L"readAllow")) {
             g_mask.allow[g_mask.allowCount++] = r;
@@ -883,6 +887,13 @@ LSTATUS ws_mask_init(void)
     }
     for (int i = 0; i < g_ws.readDenyCount; i++) {
         g_mask.declared = 1;
+        if (g_mask.ruleCount >= WS_RE_MAX_RULES) {
+            /* The file rules can already fill the fixed array; never write past it.
+             * Refuse the mask (loaded=0) rather than silently dropping deny rules. */
+            ws_log("readDeny capacity exhausted; refusing the mask (fail-closed)");
+            hardFailure = 1;
+            break;
+        }
         WsReRule r;
         if (ws_mask_compile(&r, g_ws.readDeny[i], L"readDeny")) {
             g_mask.rules[g_mask.ruleCount++] = r;

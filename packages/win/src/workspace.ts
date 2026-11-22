@@ -2443,20 +2443,14 @@ export class Workspace {
           return { ok: false, path, code: error.code || 'APPLY_LOCK_UNAVAILABLE', message: error.message }
         }
         // 陈旧锁（持锁进程被强杀等）：先看锁里的 pid 是否还活着（崩溃后立即可恢复），
-        // 再退回 mtime 超时清理。
-        try {
-          const st = statSync(path)
-          if (Date.now() - st.mtimeMs > 120000) {
-            rmSync(path, { force: true })
-            continue
-          }
-        } catch {
-          continue
-        }
+        // 再退回 mtime 超时清理。顺序不能反：一个仍在 apply、耗时超过 120s 的持锁者
+        // 会被 mtime 分支误删，导致两个进程同时持锁。
+        let holderChecked = false
         try {
           const holder = JSON.parse(readFileSync(path, 'utf8'))
           const pid = Number(holder?.pid)
           if (Number.isInteger(pid) && pid > 0) {
+            holderChecked = true
             let alive = true
             try {
               process.kill(pid, 0)
@@ -2470,6 +2464,15 @@ export class Workspace {
           }
         } catch {
           /* unreadable lock: fall through to timeout handling */
+        }
+        try {
+          const st = statSync(path)
+          if (!holderChecked && Date.now() - st.mtimeMs > 120000) {
+            rmSync(path, { force: true })
+            continue
+          }
+        } catch {
+          continue
         }
         if (Date.now() >= deadline) {
           return { ok: false, path, code: 'APPLY_LOCK_TIMEOUT', message: `another process is applying (lock ${path})` }
@@ -4198,10 +4201,11 @@ export class Workspace {
    */
   freezeIfNeeded(opts = {}) {
     const changes = this.diffEntries()
-    if (changes.length === 0) return { frozen: false, reason: 'no-net-change', changes: 0 }
+    const pendingHostOps = this.manifest.hostOperations.filter((op) => op.status === 'pending')
+    if (changes.length === 0 && pendingHostOps.length === 0) return { frozen: false, reason: 'no-net-change', changes: 0 }
     const pending = this.listReviews()
     const latest = pending[pending.length - 1]
-    if (latest && candidateRepresents(latest.changes, changes)) {
+    if (pendingHostOps.length === 0 && latest && candidateRepresents(latest.changes, changes)) {
       return { frozen: false, reason: 'already-represented', candidate: latest, changes: changes.length }
     }
     const frozen = this.freezeCandidate(opts)

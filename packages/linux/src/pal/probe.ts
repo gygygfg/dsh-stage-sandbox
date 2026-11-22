@@ -152,7 +152,11 @@ export function validateExecution(input: { readonly probe?: ExecutionProbe; read
     if (file === '') throw new Error('create did not produce a file')
     probe.remove(file)
   })
-  run('cleanup', () => probe.cleanup(baseDir))
+  run('cleanup', () => {
+    // Only a probe-created temp dir is ours to delete. A caller-supplied baseDir
+    // belongs to the caller; the default cleanup is rm -rf.
+    if (input.baseDir === undefined) probe.cleanup(baseDir)
+  })
   return {
     fingerprint: fingerprintKey(environment),
     operations,

@@ -363,8 +363,11 @@ export const MASK_CLASSES = [
   {
     id: 'private-key-files',
     category: '私钥/证书导出文件（扩展名约定类，限定作用域）',
-    pattern: /\\(users|programdata)\\.*\.(pfx|p12|pvk|pem|key)$/i,
-    reason: '私钥/证书导出文件（作用域限定在用户与程序数据目录，避免误伤源码夹具）',
+    // 只封**私钥形状**的 .pem（id_rsa/private/key 等）；公开 CA 包（cacert.pem、
+    // cert.pem、chain.pem）不能封：否则 pip/npm 读自带 CA 会直接 PermissionError。
+    pattern:
+      /\\(users|programdata)\\.*\.(pfx|p12|pvk|key)$|\\(users|programdata)\\.*(?:id_rsa|id_dsa|id_ecdsa|id_ed25519|private|privkey|key)[^\\]*\.pem$/i,
+    reason: '私钥/证书导出文件（作用域限定在用户与程序数据目录；公开 CA 包 .pem 除外）',
   },
   // ── N9：凭据缓存 / SSO cookie（T2：`inetcookies\\` → `inetcookies(\\|$)`，目录自身）──
   {

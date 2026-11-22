@@ -118,6 +118,10 @@ process.stdout.write('\n[3] risk 分级与硬拒绝\n')
   // 普通 review 可被会话自动审批放行
   const plain = assess({ pathScope: 'system' })
   ok(plain.hardDeny === false, '系统路径不是硬拒绝（只是 L3/block）')
+  ok(plain.action === 'block', '系统路径的建议动作是 block')
+  ok(decide({ verdict: plain, sessionAuto: true }) === false, 'L3 block 不得被会话自动审批放行')
+  ok(decide({ verdict: plain, confirmed: true }) === false, 'L3 block 即使 --force 也不放行（block 语义）')
+  ok(decide({ verdict: plain }) === false, '未确认的 block 不放行')
   ok(decide({ verdict: assess({ effect: 'network' }), sessionAuto: true }) === true, '普通 record 项：会话自动审批放行')
 }
 

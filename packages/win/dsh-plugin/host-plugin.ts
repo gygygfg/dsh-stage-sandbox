@@ -47,6 +47,11 @@ import { REVIEW_BASENAME, getReviewService, isRegistryCandidate, resolveReviewSt
 import { installBaselineWatch } from './baseline-watch.ts'
 import { createAuditMirror } from './audit-mirror.ts'
 import { createRunCapture } from './run-capture.ts'
+import { installPluginManagerReadOnlyApproval } from './plugin-manager-approval.ts'
+import { createApprovalQueue } from './approval-queue.ts'
+import { executeApprovalIntent } from './approval-execute.ts'
+import { installProfileFormattingGuard } from './profile-format.ts'
+import { configPendingRestart, resolveProfilePatchPath, winStageEnabledFromProfile } from './assembly-toggle.ts'
 // ★ BUG-B：档位（lane）判定的**同一份**分类与结论口径。只 import 纯函数/常量，
 //   不 import 执行器类；`shell-executor.ts` 反过来**不**依赖本模块（无环）。
 // ★ WP3：在同一份产物上补"历史"（首次掉档 / 是否曾掉档 / 失根次数）——
@@ -1418,9 +1423,13 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
       })
       // 最危险的档位（掉档/失根）必须显眼：命令面用 error 级
       const alarming = card.trust.level === 'lost' || card.trust.level === 'degraded'
+      const runtime = typeof options.runtimeStatus === 'function' ? options.runtimeStatus() : null
+      const pendingLine = runtime?.pendingRestart
+        ? `\n\n⚠ 配置漂移：profile 开关=${String(runtime.profileEnabled)}，当前 shell 提供方=${runtime.shellProvider === true ? 'winstage' : runtime.shellProvider === false ? 'platform' : '未知'}（host 生效值=${String(runtime.effective)}）。命令面提供方需要重启宿主后才切换（文件面/面板已按新快照刷新）；这不影响已生效面的安全语义。`
+        : ''
       return {
         kind: alarming ? 'error' : listed.kind,
-        text: `${listed.text}\n\n${formatTrustCard(card)}`,
+        text: `${listed.text}\n\n${formatTrustCard(card)}${pendingLine}`,
       }
     },
     refresh({ service }) {
@@ -1628,19 +1637,91 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
       }
       return { kind: 'success', text: lines.join('\n') }
     },
+    /** `/winstage approvals`：列出 A2 异步审批队列的待处理项。 */
+    approvals() {
+      const queue = options.approvals
+      if (!queue || typeof queue.listPending !== 'function') {
+        return { kind: 'error', text: '异步审批队列不可用：宿主未接线（或队列初始化失败）。' }
+      }
+      let items
+      try {
+        items = queue.listPending()
+      } catch (error) {
+        return { kind: 'error', text: `读取审批队列失败：${error?.message ?? error}` }
+      }
+      if (items.length === 0) return { kind: 'success', text: '没有待处理的异步审批。' }
+      const lines = [`待处理异步审批 ${items.length} 项（新→旧）：`]
+      for (const item of items.slice().reverse()) {
+        lines.push(`  · ${item.id}  ${item.createdAt ?? '?'}  ${item.toolName}.${item.action}  ${JSON.stringify(item.args ?? {})}`)
+      }
+      lines.push('用法：/winstage approval-approve <id> 或 /winstage approval-reject <id>')
+      return { kind: 'success', text: lines.join('\n') }
+    },
+    /**
+     * `/winstage approval-approve <id>`：批准并尝试重放 A3 意图。
+     * 不可自动重放的 action 会明确返回 error，并保留“需人工重试”的事实。
+     */
+    async 'approval-approve'({ args }) {
+      const queue = options.approvals
+      if (!queue || typeof queue.get !== 'function' || typeof queue.decide !== 'function') {
+        return { kind: 'error', text: '异步审批队列不可用：宿主未接线。' }
+      }
+      const id = splitArgs(String(args ?? '').trim())[0]
+      if (!id) return { kind: 'error', text: '用法：/winstage approval-approve <id>（先跑 /winstage approvals）' }
+      const item = queue.get(id)
+      if (!item) return { kind: 'error', text: `找不到审批项 ${id}；用 /winstage approvals 查看。` }
+      if (item.decision) {
+        return { kind: 'success', text: `审批项 ${id} 已处理（${item.decision.outcome}，幂等）。` }
+      }
+      let outcome
+      try {
+        outcome = typeof options.executeApproval === 'function'
+          ? await options.executeApproval(item)
+          : { ok: false, reason: '宿主没有提供意图执行器' }
+      } catch (error) {
+        outcome = { ok: false, reason: String(error?.message ?? error) }
+      }
+      queue.decide(id, outcome.ok ? 'approved' : 'failed', { by: 'user', result: outcome })
+      if (!outcome.ok) {
+        return {
+          kind: 'error',
+          text: `审批项 ${id} 已记录为 failed：${outcome.reason ?? '执行失败'}。请按上面的原因人工重试；不会伪装成已执行。`,
+        }
+      }
+      return { kind: 'success', text: `审批项 ${id} 已批准并执行（${outcome.action ?? item.action}）。` }
+    },
+    /** `/winstage approval-reject <id>`：拒绝一个待处理异步审批。 */
+    'approval-reject'({ args }) {
+      const queue = options.approvals
+      if (!queue || typeof queue.decide !== 'function') {
+        return { kind: 'error', text: '异步审批队列不可用：宿主未接线。' }
+      }
+      const id = splitArgs(String(args ?? '').trim())[0]
+      if (!id) return { kind: 'error', text: '用法：/winstage approval-reject <id>（先跑 /winstage approvals）' }
+      const item = queue.get(id)
+      if (!item) return { kind: 'error', text: `找不到审批项 ${id}；用 /winstage approvals 查看。` }
+      if (item.decision) {
+        return { kind: 'success', text: `审批项 ${id} 已处理（${item.decision.outcome}，幂等）。` }
+      }
+      queue.decide(id, 'rejected', { by: 'user' })
+      return { kind: 'success', text: `已拒绝审批项 ${id}（未执行）。` }
+    },
   }
 
   const registered = []
   // 命令规格：`sub === null` 表示伞形命令（第一个词是子命令），
   // 其余命令把整个 rawInput 当作参数列表。
   const SPECS = [
-    { name: 'winstage', sub: null, description: '查看 WinStage 暂存待审文件（/winstage list|diff|approve|reject|rebase|refresh|undo）' },
+    { name: 'winstage', sub: null, description: '查看 WinStage 暂存待审文件（/winstage list|diff|approve|reject|rebase|refresh|undo|approvals）' },
     { name: 'winstage-status', sub: 'status', description: 'WinStage 暂存：查看待审清单' },
     { name: 'winstage-refresh', sub: 'refresh', description: 'WinStage 暂存：重新发布审阅快照' },
     { name: 'winstage-rebase', sub: 'rebase', description: 'WinStage 暂存：以真实文件为基线重新暂存（基线过期时）' },
     { name: 'winstage-diff', sub: 'diff', description: 'WinStage 暂存：显示改动（可给路径，空格用引号包住）' },
     { name: 'winstage-approve', sub: 'approve', description: 'WinStage 暂存：把改动写入真实工作区（可给路径）' },
     { name: 'winstage-reject', sub: 'reject', description: 'WinStage 暂存：把改动退回真实磁盘（可给路径）' },
+    { name: 'winstage-approvals', sub: 'approvals', hint: '（无参数）', description: 'WinStage：列出待处理的异步审批' },
+    { name: 'winstage-approval-approve', sub: 'approval-approve', hint: '审批项 id', description: 'WinStage：批准并尝试执行异步审批' },
+    { name: 'winstage-approval-reject', sub: 'approval-reject', hint: '审批项 id', description: 'WinStage：拒绝异步审批' },
   ]
 
   for (const spec of SPECS) {
@@ -1659,10 +1740,16 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
         // `TypeError: command "<name>" input hint must be a string`。
         // 该异常会让整个 `ctx.inject(['commands'], …)` 回调失败 ⇒ **线上 0 条命令注册**，
         // 而进程内直接调 `registerCommands()`（绕过该校验）会「看起来注册了 6 条」。
-        input: { hint: '文件路径（可省略；含空格时用双引号）' },
+        input: { hint: spec.hint ?? '文件路径（可省略；含空格时用双引号）' },
         handler: (invocation) => {
           try {
-            if (!isEnabled()) return { kind: 'error', text: DISABLED_TEXT }
+            if (!isEnabled()) {
+              const runtime = typeof options.runtimeStatus === 'function' ? options.runtimeStatus() : null
+              const pending = runtime?.pendingRestart
+                ? `\n\n⚠ 配置漂移：profile 开关=${String(runtime.profileEnabled)}，当前 shell 提供方=${runtime.shellProvider === true ? 'winstage' : runtime.shellProvider === false ? 'platform' : '未知'}。命令面提供方需要重启宿主后才切换。`
+                : ''
+              return { kind: 'error', text: `${DISABLED_TEXT}${pending}` }
+            }
             // **按会话解析**：命令在哪条会话里点的，就只动那条会话的暂存
             const service = serviceOf(invocation)
             const raw = String(invocation?.rawInput ?? '')
@@ -1680,7 +1767,7 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
             if (!handler) {
               return {
                 kind: 'error',
-                text: `未知子命令 "${sub}"；可用：list、status、diff、approve、reject、rebase、refresh、undo`,
+                text: `未知子命令 "${sub}"；可用：list、status、diff、approve、reject、rebase、refresh、undo、approvals、approval-approve、approval-reject`,
               }
             }
             return handler({ args, invocation, raw, service })
@@ -1922,6 +2009,18 @@ export function switchEnabledFromRows(rows) {
 }
 
 /**
+ * C2：从 loader 行表判断**当前加载的** shell 提供方。
+ * `winstage-shell` 行的 `disabled` 是加载期求值结果；为 false ⇒ 当前 provider 是 WinStage。
+ * 找不到行/非数组 ⇒ `undefined`，调用方回退 `ctx.get('shell')` 或 host 生效值。
+ */
+export function shellProviderFromRows(rows) {
+  if (!Array.isArray(rows)) return undefined
+  const row = rows.find((item) => item && item.id === 'winstage-shell')
+  if (!row) return undefined
+  return row.disabled !== true
+}
+
+/**
  * host 行 config `masks: string[]` → `Workspace.masks`（`extraMasks`）规则对象（R24-A2）。
  *
  * ── 语义 ────────────────────────────────────────────────────────────────────
@@ -2086,6 +2185,105 @@ export function apply(ctx, config = {}) {
    * 占位路径，绝不建 store、绝不写盘。
    */
   const workspaceRoot = canonical(configuredWorkspaceRoot || process.cwd())
+  /**
+   * A2：异步审批队列（event-sourced JSONL，落在 `.dshstage` 元数据目录）。
+   * 关闭态不创建文件；只有真正入队时才 append。
+   */
+  let approvalQueue = null
+  try {
+    approvalQueue = createApprovalQueue(workspaceRoot)
+  } catch (error) {
+    logError(`WinStage 审批队列初始化失败：${error?.message ?? error}`)
+  }
+
+  /**
+   * A3：用户批准后重放 `plugin_manager` 的写意图（实现见 approval-execute.ts）。
+   * @param {object} item queue request record
+   */
+  const executeApprovalForCommand = (item) =>
+    executeApprovalIntent(typeof ctx?.get === 'function' ? ctx.get('pluginManager') : undefined, item)
+
+  /**
+   * B1：profile 覆盖层的 BOM/CRLF 保真。只在 configEditor 存在时挂壳；失败/无服务时无操作。
+   */
+  if (typeof ctx.effect === 'function' && typeof ctx.get === 'function' && ctx.get('configEditor')) {
+    ctx.effect(
+      () => installProfileFormattingGuard(ctx, (message) => log.warn(message)),
+      'winstage-sandbox: profile BOM/CRLF formatting guard',
+    )
+  }
+
+  /**
+   * B3：运行中宿主感知 profile 开关漂移。
+   * 命令面 provider 在加载期选定；其他宿主/手工改 profile 后，本宿主不可能热切 shell。
+   * 这里每 2s 只读一次 profile patch，若与 loader 行表生效值不一致 ⇒ 在
+   * `/winstage status` 明确报告 pending-restart，不谎报“已经切了”。
+   */
+  const runtimeConfig = { pendingRestart: false, profileEnabled: null, effective: null, shellProvider: null, checkedAt: 0 }
+  const readProfileSwitch = () => {
+    try {
+      const resolved = resolveProfilePatchPath({ env: process.env, baseUrl: ctx?.baseUrl })
+      const path = resolved?.path
+      if (!path || !existsSync(path)) return null
+      return winStageEnabledFromProfile(process.env, ctx?.baseUrl)
+    } catch {
+      return null
+    }
+  }
+  const readShellProvider = () => {
+    try {
+      const fromRows = shellProviderFromRows(ctx?.fiber?.entry?.parent?.data)
+      if (typeof fromRows === 'boolean') return fromRows
+      const shell = typeof ctx?.get === 'function' ? ctx.get('shell') : undefined
+      if (!shell) return null
+      return shell?.constructor?.winstageProvider === true
+    } catch {
+      return null
+    }
+  }
+  const checkRuntimeConfig = () => {
+    const effective = isEnabled()
+    const profile = readProfileSwitch()
+    const provider = readShellProvider()
+    runtimeConfig.profileEnabled = profile
+    runtimeConfig.effective = effective
+    runtimeConfig.shellProvider = provider
+    // C2：真正决定“命令面是否已切换”的是 provider，不是 host 行 config；
+    // profile 关但 shell 仍是 WinStage（或反之）⇒ 必须重启宿主。
+    runtimeConfig.pendingRestart = provider === null
+      ? configPendingRestart(profile, effective)
+      : configPendingRestart(profile, provider)
+    runtimeConfig.checkedAt = Date.now()
+  }
+  if (typeof ctx.effect === 'function' && typeof setInterval === 'function') {
+    ctx.effect(() => {
+      checkRuntimeConfig()
+      const timer = setInterval(checkRuntimeConfig, 2000)
+      if (typeof timer?.unref === 'function') timer.unref()
+      return () => clearInterval(timer)
+    }, 'winstage-sandbox: runtime profile-switch watchdog')
+  }
+  const runtimeStatus = () => ({ ...runtimeConfig, effective: isEnabled() })
+
+  /**
+   * A1a（2026-11-19）：只读 `plugin_manager` 审批自动放行。
+   *
+   * DSH 0.2.2-rc.5 的 `plugin_manager` 对**所有** action（含 `list_plugins`）都调
+   * `approveEscalation`，导致无人值守会话一列插件就弹旧审批框（截图为证）。
+   * 在 `approval/request` 瀑布最前 claim 只读白名单，返回 `allowed-once`：
+   * 客户端 answerer 不再收到该请求 ⇒ 不弹窗；其余 action 仍 `next()` 交回平台，
+   * 不扩大权限。`isActive()` 现读开关：关闭时完全不介入，保持 OFF 语义。
+   */
+  if (typeof ctx.on === 'function' && typeof ctx.effect === 'function') {
+    ctx.effect(
+      () => installPluginManagerReadOnlyApproval(ctx, {
+        log: (message) => log.info(message),
+        isActive: () => isEnabled(),
+        ...(approvalQueue ? { queue: approvalQueue } : {}),
+      }),
+      'winstage-sandbox: plugin_manager read-only approval',
+    )
+  }
 
   /**
    * 开关的**唯一读法**：每次现读，绝不在这里冻结成常量。
@@ -2223,7 +2421,12 @@ export function apply(ctx, config = {}) {
     // （T5-B 实测就是这样静默失效的）。这里把失败降级为 error 日志 + 不抛出，
     // 让"命令面不可用"这件事在日志里可见，同时不影响插件其余部分加载。
     try {
-      const registered = registerCommands(scope, serviceFor, log, { isEnabled })
+      const registered = registerCommands(scope, serviceFor, log, {
+        isEnabled,
+        ...(approvalQueue ? { approvals: approvalQueue } : {}),
+        executeApproval: executeApprovalForCommand,
+        runtimeStatus,
+      })
       log.info(`已注册 ${registered.length} 个 /winstage* 命令（暂存与快照按会话隔离）`)
     } catch (error) {
       const logger = ctx?.logger

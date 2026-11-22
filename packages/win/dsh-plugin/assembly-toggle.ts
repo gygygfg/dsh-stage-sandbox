@@ -38,10 +38,10 @@
  * 读取顺序（`PROFILE_SWITCH_READER_SOURCE`，YAML 内联与本模块**逐字共享**）：
  *   1. `ctx.baseUrl` ⇒ `<profile>/cordis.patch.yml`（宿主真实路径，**首选**）；
  *   2. `process.env.DSH_HOME` + `DSH_PROFILE`（CLI / 自测 / 工具子进程的兼容回退）；
- *   3. 都拿不到 / 文件不存在 / 正则不匹配 ⇒ **fail-safe 返回 `true`**（= 接管）。
- *      fail-safe 方向**刻意保持不变**：把"读不懂"解释成"关闭"会让用户静默失去沙箱。
- *      推论：`ctx.baseUrl` 与 env 都没有时仍会接管 —— 这是本轮**保留**的行为，回归测试
- *      `tests/assembly-toggle-selftest.ts` 的 B 段把它钉成"刻意 fail-safe"，不要改反。
+ *   3. 都拿不到 / 文件不存在 / 读失败 ⇒ **fail-closed 返回 `false`（交还平台）**。
+ *      2026-11-19 起改为「未知不接管」：与需求规格 §5.1 一致；旧 fail-safe(true) 会在
+ *      profile 不可读时静默接管 shell，用户失去平台 shell 且界面只说“配置关”。
+ *      回归测试 `tests/assembly-toggle-selftest.ts` 的 B 段钉住 fail-closed 方向。
  *
  * ── 本模块做什么 ───────────────────────────────────────────────────────────────
  * 用**纯文本 + 正则**从 profile 覆盖层读出 `enabled` 的布尔值：
@@ -76,7 +76,7 @@ import { fileURLToPath } from 'node:url'
  *   · 只用 `process` / `ctx` / 全局 `URL`，**不用 `require`**（loader 求值作用域里没有）。
  */
 export const PROFILE_SWITCH_READER_SOURCE =
-  "(() => { try { const fs = process.getBuiltinModule('node:fs'); let p = null; if (process.env.DSH_HOME && process.env.DSH_PROFILE) p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; try { if (ctx && typeof ctx.baseUrl === 'string' && ctx.baseUrl.length > 0) p = new URL('cordis.patch.yml', ctx.baseUrl) } catch {} if (!p) return true; if (!fs.existsSync(p)) return true; const m = /id:\\s*winstage-sandbox\\b([\\s\\S]*?)(?=\\s*-\\s*id:|\\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return true; const e = /enabled:\\s*(true|false)\\b/.exec(m[1]); return !e || e[1] !== 'false' } catch { return true } })()"
+  "(() => { try { const fs = process.getBuiltinModule('node:fs'); let p = null; if (process.env.DSH_HOME && process.env.DSH_PROFILE) p = process.env.DSH_HOME + '/profiles/' + process.env.DSH_PROFILE + '/cordis.patch.yml'; try { if (ctx && typeof ctx.baseUrl === 'string' && ctx.baseUrl.length > 0) p = new URL('cordis.patch.yml', ctx.baseUrl) } catch {} if (!p) return false; if (!fs.existsSync(p)) return false; const m = /id:\\s*winstage-sandbox\\b([\\s\\S]*?)(?=\\s*-\\s*id:|\\s*$)/.exec(fs.readFileSync(p, 'utf8')); if (!m) return true; const e = /enabled:\\s*(true|false)\\b/.exec(m[1]); return !e || e[1] !== 'false' } catch { return false } })()"
 
 /** profile 覆盖层的路径（env 回退来源；DSH 的层序：bundle → profile → home → overlays） */
 export function profilePatchPath(env = process.env) {
@@ -122,10 +122,10 @@ export function resolveProfilePatchPath({ baseUrl, env = process.env } = {}) {
 /**
  * 从一份 entry-list YAML **文本**里判定 `id: winstage-sandbox` 行的 `config.enabled`。
  * @param {string} source
- * @returns {boolean} `true` = WinStage 接管；判不出也返回 `true`（fail-safe 见文件头）
+ * @returns {boolean} `true` = WinStage 接管；空文本（profile 不可读）返回 `false`（fail-closed）
  */
 export function winStageEnabledInProfileText(source) {
-  if (typeof source !== 'string' || source.length === 0) return true
+  if (typeof source !== 'string' || source.length === 0) return false
   // 只取 `id: winstage-sandbox` 之后、下一个 `- id:` 之前的那一段
   const section = /id:\s*winstage-sandbox\b([\s\S]*?)(?=\n\s*-\s*id:|\s*$)/.exec(source)
   if (!section) return true
@@ -135,7 +135,8 @@ export function winStageEnabledInProfileText(source) {
 }
 
 /**
- * 读 profile 覆盖层并判定。**读不到文件/两源都不可用/读失败也返回 `true`**（fail-safe）。
+ * 读 profile 覆盖层并判定。**文件不可读/两源都不可用/读失败返回 `false`**（fail-closed：
+ * 未知不接管，交还平台 shell）；文件存在但没有该行/没有 enabled 键时沿用 bundle 默认 true。
  *
  * @param {NodeJS.ProcessEnv} [env]
  * @param {string} [baseUrl] loader `ctx.baseUrl`（首选；`undefined` 时只看 env）
@@ -144,11 +145,18 @@ export function winStageEnabledInProfileText(source) {
 export function winStageEnabledFromProfile(env = process.env, baseUrl) {
   try {
     const resolved = resolveProfilePatchPath({ baseUrl, env })
-    if (!resolved || !existsSync(resolved.path)) return true
+    if (!resolved || !existsSync(resolved.path)) return false
     return winStageEnabledInProfileText(readFileSync(resolved.path, 'utf8'))
   } catch {
-    return true
+    return false
   }
+}
+
+/** profile 开关与当前生效值不一致 ⇒ 需要重启宿主才能换命令面提供方。 */
+export function configPendingRestart(profileEnabled, effectiveEnabled) {
+  return typeof profileEnabled === 'boolean'
+    && typeof effectiveEnabled === 'boolean'
+    && profileEnabled !== effectiveEnabled
 }
 
 /**

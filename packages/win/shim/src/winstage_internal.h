@@ -359,6 +359,8 @@ int ws_appendf_w(wchar_t *dst, size_t cch, size_t *pos, const wchar_t *fmt, ...)
 void ws_config_defaults(void);
 int ws_config_load_file(const wchar_t *path);
 void ws_config_from_env(void);
+/* 初始化完成后从本进程环境块移除内部契约变量（模型可见面零指纹）。 */
+void ws_env_scrub_contract(void);
 int ws_config_get_string(const char *json, const char *key, wchar_t *out, DWORD cch);
 int ws_config_get_bool(const char *json, const char *key, int *out);
 int ws_read_text_file(const wchar_t *path, char **out, DWORD *outLen); /* HeapAlloc; NUL-terminated */

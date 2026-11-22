@@ -390,6 +390,18 @@ public static extern uint WaitForSingleObject(System.IntPtr hHandle, uint dwMill
   # ③ 等父进程死（拿不到句柄就退化成轮询，绝不因此提前清理）
   $hProc = [WinStageGuard.Native]::OpenProcess($SYNCHRONIZE, $false, $ParentPid)
 
+  # ★ R50：轮询退化路径必须校验**父进程身份**，不能只看 pid。
+  #   pid 会被复用：宿主退出后同号进程出现，会让守护认为"父还活着"从而**永久钉住根**
+  #   （实测：18:02 起的守护到 18:22 仍活着，持有哨兵 ⇒ 后续任何一处都建不出沙箱）。
+  #   启动时间不同 ⇒ 这是一个新进程 ⇒ 当作父已死，退出并清理。
+  $ParentStart = $null
+  if ($hProc -eq [System.IntPtr]::Zero) {
+    try {
+      $p0 = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+      if ($null -ne $p0) { $ParentStart = $p0.StartTime }
+    } catch { $ParentStart = $null }
+  }
+
   # ⚠ PowerShell 变量名**不区分大小写**：$Marker 与 $marker 是同一个变量。
   # 这里因此把"路径"和"JSON 文本"取成两个不会互相踩的名字（$MarkerPath / $markerJson）——
   # 曾经写成 $Marker + $marker，于是路径被 JSON 文本覆盖，
@@ -408,6 +420,10 @@ public static extern uint WaitForSingleObject(System.IntPtr hHandle, uint dwMill
       Start-Sleep -Milliseconds 250
       $p = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
       if ($null -eq $p) { break }
+      # 同号不同启动时间 = pid 复用 ⇒ 父进程已经没了，绝不因此永久持有根。
+      if ($null -ne $ParentStart) {
+        try { if ($p.StartTime -ne $ParentStart) { break } } catch { break }
+      }
     }
     if (Test-Path -LiteralPath $ReleaseFile) { break }
   }
@@ -484,6 +500,16 @@ function acquireInProcessGuard(root) {
 
 function makeGuard({ root, sentinelPath, keeperPid, token, inProcess }) {
   const state = { released: false }
+  /**
+   * ★ R50：**引用计数**。
+   *
+   * 同一个根在一个宿主进程里可能被**多个** Store 同时持有（热重载时新旧两代重叠、
+   * 或设置事务里 fs 行被重建）。只要还有一个使用者，释放就**不得**真的拆守护：
+   * 拆了之后新一轮 `acquireStageGuard()` 会去覆写仍被旧守护以 `FILE_SHARE_READ`
+   * 持有的哨兵 ⇒ `sentinel-held-by-live-guard` ⇒ fs 行激活失败 ⇒ 设置写入回滚。
+   * 最后一个使用者释放（或显式 `force`）才真正收尾。
+   */
+  let refs = 1
   const guard = {
     root,
     sentinelPath,
@@ -491,6 +517,15 @@ function makeGuard({ root, sentinelPath, keeperPid, token, inProcess }) {
     markerPath: stageMarkerPath(root),
     token,
     inProcess: Boolean(inProcess),
+    /** 再加一个使用者；返回同一个 guard（跨"模块实例"也安全：以磁盘标记为准）。 */
+    retain() {
+      if (!state.released) refs += 1
+      return guard
+    },
+    /** 当前使用者数量（诊断/断言用）。 */
+    get refCount() {
+      return refs
+    },
     status() {
       return verifyStageRootAlive(root)
     },
@@ -505,6 +540,9 @@ function makeGuard({ root, sentinelPath, keeperPid, token, inProcess }) {
       return status
     },
     release(options = {}) {
+      // ★ R50：引用计数 —— 还有别的使用者时"释放"只是让出名额，**不拆守护**（见 retain 的长注释）。
+      refs = Math.max(0, refs - 1)
+      if (refs > 0 && options.force !== true) return { root, refs, removed: false, pending: true }
       if (state.released) return { root, removed: !existsSync(root), alreadyReleased: true }
       state.released = true
       LIVE_GUARDS.delete(root)
@@ -533,6 +571,41 @@ function makeGuard({ root, sentinelPath, keeperPid, token, inProcess }) {
 }
 
 /**
+ * 收养**本进程**上一代守护（若仍在位）。
+ *
+ * 触发场景（实测，2026-11-22 用户报障链路）：
+ *   1. 插件行在设置事务里被重建（`configEditor.edit` → `reconcileProfilePatches`）；
+ *   2. 新的模块实例 `LIVE_GUARDS` 是空的 ⇒ 想再起一个守护；
+ *   3. 旧守护仍以 `FILE_SHARE_READ` 持有哨兵 ⇒ 覆写失败 ⇒
+ *      `sentinel-held-by-live-guard` ⇒ fs 行激活失败 ⇒ 设置层**写后回滚**
+ *      （profile patch mtime 变了、内容没变）⇒ 用户看到
+ *      "本次开关未写入 / 设置值未生效"。
+ *
+ * 判据只认**磁盘事实**：标记里的 `parentPid` 必须等于本进程，哨兵 token 必须仍然匹配，
+ * 守护进程必须仍然存活（`verifyStageRootAlive`）。别的宿主、pid 复用、未知所有者
+ * **一律不收养**（fail-closed，绝不静默接管别人的根）。
+ * @param {string} abs 规范化后的根
+ * @returns {object|undefined} 收养到的 guard
+ */
+function adoptSameProcessGuard(abs) {
+  const status = verifyStageRootAlive(abs)
+  if (!status.alive) return undefined
+  const marker = readJsonFile(stageMarkerPath(abs))
+  if (!marker || typeof marker !== 'object') return undefined
+  if (Number(marker.parentPid) !== process.pid) return undefined
+  if (marker.inProcess === true) return undefined
+  const token = typeof marker.token === 'string' ? marker.token : undefined
+  const keeperPid = Number(status.keeperPid ?? marker.keeperPid)
+  if (!token || !Number.isFinite(keeperPid) || keeperPid <= 0) return undefined
+  return makeGuard({
+    root: abs,
+    sentinelPath: status.sentinelPath ?? stageSentinelPath(abs),
+    keeperPid,
+    token,
+  })
+}
+
+/**
  * 见文件头契约。同步建立守护（实测本机 ~0.6 s，会话内只做一次）。
  *
  * `options`：
@@ -545,7 +618,14 @@ export function acquireStageGuard(root, options = {}) {
   const existing = LIVE_GUARDS.get(abs)
   if (existing) {
     existing.assertAlive()
-    return existing
+    return existing.retain()
+  }
+
+  // ★ R50：同一宿主进程上一代守护仍在位 ⇒ **收养**，绝不另起一个（见 adoptSameProcessGuard）。
+  const adopted = adoptSameProcessGuard(abs)
+  if (adopted !== undefined) {
+    LIVE_GUARDS.set(abs, adopted)
+    return adopted
   }
 
   const allowInProcess = options.allowInProcess === true
@@ -767,4 +847,25 @@ export function assertTransparentMessages() {
   return { ok: true, checked: samples.length }
 }
 
-export const __internal = { sanitizeKey, removeTreeRetry, keeperScript, POWERSHELL, KEEPER_VERSION }
+export const __internal = {
+  sanitizeKey,
+  removeTreeRetry,
+  keeperScript,
+  POWERSHELL,
+  KEEPER_VERSION,
+  /** R50：存活守卫表（测试用来模拟"新模块实例"）。 */
+  liveGuards: LIVE_GUARDS,
+  /** R50：收养判定（测试用来验证"只收养本进程的守护"）。 */
+  adoptSameProcessGuard,
+  /** R50：不写盘的收养判定（伪造标记验证 fail-closed，不会起守护）。 */
+  adoptDecision(root) {
+    const abs = normalize(String(root))
+    const status = verifyStageRootAlive(abs)
+    if (!status.alive) return { adopt: false, reason: status.reason }
+    const marker = readJsonFile(stageMarkerPath(abs))
+    if (!marker || typeof marker !== 'object') return { adopt: false, reason: 'marker-invalid' }
+    if (Number(marker.parentPid) !== process.pid) return { adopt: false, reason: 'foreign-parent' }
+    if (marker.inProcess === true) return { adopt: false, reason: 'in-process' }
+    return { adopt: adoptSameProcessGuard(abs) !== undefined, reason: 'same-process' }
+  },
+}

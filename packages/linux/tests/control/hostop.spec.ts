@@ -27,4 +27,28 @@ describe('host-operation proposals', () => {
     expect((await registry.replay('hostop_missing', run)).kind).toBe('not-found')
     expect(ran).toBe(0)
   })
+
+  it('deduplicates concurrent replays and lets a concurrent reject win', async () => {
+    const registry = new HostOperationRegistry()
+    const proposal = registry.propose({ command: 'systemctl restart nginx', summary: 'restart nginx' })
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let ran = 0
+    const first = registry.replay(proposal.id, async () => {
+      ran += 1
+      await gate
+      return { exitCode: 0, stdout: '', stderr: '' }
+    })
+    // The first call is still awaiting run(); a second call must not execute it again.
+    const second = await registry.replay(proposal.id, async () => {
+      ran += 1
+      return { exitCode: 0, stdout: '', stderr: '' }
+    })
+    expect(second.kind).toBe('busy')
+    expect(registry.reject(proposal.id)).toBe(true)
+    release()
+    expect((await first).kind).toBe('rejected')
+    expect(ran).toBe(1)
+    expect(registry.list()[0]?.state).toBe('rejected')
+  })
 })

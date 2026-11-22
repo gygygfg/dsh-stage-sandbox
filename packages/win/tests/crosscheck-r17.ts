@@ -273,7 +273,7 @@ assertThat(
 assertThat(
   (clientSrc.match(/ctx\.slots\.inject\(/g) ?? []).length >= 2 &&
     /return \(\) => \{\s*\n\s*off\(\)/.test(clientSrc),
-  '`ctx.slots.inject` 的两处都返回同步 disposer（槽位占用会随卸载释放）',
+  '`ctx.slots.inject` 的注入都返回同步 disposer（至少覆盖 composer/chip/permission）',
   `${(clientSrc.match(/ctx\.slots\.inject\(/g) ?? []).length} 处`,
 )
 assertThat(

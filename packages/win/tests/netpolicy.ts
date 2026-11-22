@@ -276,7 +276,7 @@ function makeFakeWfp(options = {}) {
       subLayerDeleteArgs.push(key)
       if (!Buffer.isBuffer(key) || key.length !== 16) violations.push('FwpmSubLayerDeleteByKey0: key 不是 16 字节 Buffer')
       const existed = host.subLayers.delete(formatGuid(key))
-      return existed ? 0 : 0x8032000a // 幂等：FWP_E_SUBLAYER_NOT_FOUND
+      return existed ? 0 : 0x80320007 // 幂等：FWP_E_SUBLAYER_NOT_FOUND
     },
   }
 

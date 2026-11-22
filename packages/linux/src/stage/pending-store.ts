@@ -14,6 +14,17 @@ import { join } from 'node:path'
 import type { CandidateRef } from '../control/records.ts'
 import type { DangerLevel, DangerMarker, DangerReason } from '../candidate/danger.ts'
 
+/**
+ * The directory name for a candidate digest. Digests are `sha256:<64 hex>`;
+ * anything else is rejected instead of being sanitized, so `.`/`..` cannot
+ * escape `<stateDir>/candidates`.
+ */
+function candidateDirName(digest: string): string {
+  const match = /^sha256:([0-9a-f]{64})$/u.exec(digest)
+  if (match === null) throw new Error(`Invalid candidate digest: ${digest}`)
+  return `sha256_${match[1]}`
+}
+
 /** One serializable pending confirmation. */
 export interface PersistedPending {
   /** The workspace root the candidate targets. */
@@ -152,7 +163,7 @@ export class FilePendingStore implements PendingStore {
    * @returns the durable candidate path.
    */
   snapshotCandidate(digest: string, sourcePath: string): string {
-    const safe = digest.replace(/[^A-Za-z0-9._-]/gu, '_')
+    const safe = candidateDirName(digest)
     const destination = join(this.candidateDir, safe)
     if (!existsSync(destination)) cpSync(sourcePath, destination, { recursive: true, force: true, errorOnExist: false })
     return destination
@@ -163,8 +174,7 @@ export class FilePendingStore implements PendingStore {
    * @param digest - the candidate digest.
    */
   dropCandidate(digest: string): void {
-    const safe = digest.replace(/[^A-Za-z0-9._-]/gu, '_')
-    rmSync(join(this.candidateDir, safe), { recursive: true, force: true })
+    rmSync(join(this.candidateDir, candidateDirName(digest)), { recursive: true, force: true })
   }
 
   /** The state directory this store owns. */

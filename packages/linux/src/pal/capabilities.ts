@@ -22,7 +22,13 @@ const STATUS_RANK = {
  * @returns the unmet requirements.
  */
 export function capabilityGaps(report: CapabilityReport, requirements: readonly CapabilityRequirement[]): CapabilityRequirement[] {
-  return requirements.filter(requirement => STATUS_RANK[report.capabilities[requirement.capability]] < STATUS_RANK[requirement.minimum])
+  return requirements.filter(requirement => {
+    const actual = (STATUS_RANK as Record<string, number | undefined>)[report.capabilities[requirement.capability]]
+    const required = STATUS_RANK[requirement.minimum]
+    // Missing/unknown is a gap, not a pass: a deserialized or partial report
+    // must never be read as "the host enforces this".
+    return actual === undefined || required === undefined || actual < required
+  })
 }
 
 /**

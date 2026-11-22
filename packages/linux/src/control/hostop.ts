@@ -28,6 +28,7 @@ export interface HostOperation {
 export type HostReplayResult =
   | { readonly kind: 'applied'; readonly exitCode: number | null; readonly stdout: string; readonly stderr: string }
   | { readonly kind: 'rejected' }
+  | { readonly kind: 'busy' }
   | { readonly kind: 'not-found' }
 
 /** Runs an approved host command. */
@@ -36,6 +37,7 @@ export type HostReplayRunner = (command: string) => Promise<{ exitCode: number |
 /** The in-memory host-operation registry. */
 export class HostOperationRegistry {
   private readonly operations = new Map<string, HostOperation>()
+  private readonly replaysInFlight = new Set<string>()
   private sequence = 0
   private readonly clock: Clock
 
@@ -91,8 +93,18 @@ export class HostOperationRegistry {
     const operation = this.operations.get(id)
     if (operation === undefined) return { kind: 'not-found' }
     if (operation.state !== 'proposed') return { kind: 'rejected' }
-    const result = await run(operation.command)
-    this.operations.set(id, { ...operation, state: 'applied' })
-    return { kind: 'applied', ...result }
+    if (this.replaysInFlight.has(id)) return { kind: 'busy' }
+    this.replaysInFlight.add(id)
+    try {
+      const result = await run(operation.command)
+      // A concurrent reject() must win: never overwrite a terminal state written
+      // while the host command was in flight.
+      const current = this.operations.get(id)
+      if (current === undefined || current.state !== 'proposed') return { kind: 'rejected' }
+      this.operations.set(id, { ...operation, state: 'applied' })
+      return { kind: 'applied', ...result }
+    } finally {
+      this.replaysInFlight.delete(id)
+    }
   }
 }

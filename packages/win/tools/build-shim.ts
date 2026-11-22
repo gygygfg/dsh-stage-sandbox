@@ -606,7 +606,8 @@ function buildOne(zig, { label, out: finalOut, sources, extra = [], shared = fal
     log(`  temp output locked, retrying in ${1.5 * attempt}s (${attempt}/3) -- if this keeps failing run: node tools/stop-shim-holders.ts`);
     /* A failed/partial temp is disposable: it is not the published artifact. */
     try { fs.rmSync(attemptTmp, { force: true }); } catch { /* keep retrying */ }
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500 * attempt);
+    const until = Date.now() + 1500 * attempt;
+    while (Date.now() < until) { /* Atomics.wait is illegal on the main thread; busy-wait the retry backoff */ }
     attemptTmp = `${finalOut}.tmp-${Date.now()}-r${attempt}`;
     argv[argv.indexOf('-o') + 1] = attemptTmp;
     r = run(zig, argv, `${label}-retry${attempt}`);
