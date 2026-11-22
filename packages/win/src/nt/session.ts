@@ -10,7 +10,8 @@
  */
 
 import { buildLauncherArgv, type LauncherArgvInput } from './launcher-args.ts'
-import { canonicalPolicyJson, compilePolicy, type CompiledPolicy } from './policy.ts'
+import { compilePolicy, type CompiledPolicy } from './policy.ts'
+import { encodePolicy } from './policy-binary.ts'
 import { assertKernelReady } from './status.ts'
 import {
   NT_DRIVER_ABI_VERSION,
@@ -87,8 +88,15 @@ export class NtSession {
   async init(): Promise<NtSessionInitReport> {
     if (this.initialized && this.initReport !== undefined) return this.initReport
 
+    /*
+     * 网络闸门是**按子进程**安装的（WFP DYNAMIC 会话由 launcher 持有到子进程退出），
+     * 不存在“初始化时就已经装好”的全局状态；这里不把 network.enforced 当成前置条件。
+     * 放开的不是强制：launcher 在 offline/allowlist 下安装失败即拒绝启动（fail-closed），
+     * 且每次 confine 前仍会重新核对驱动/ProjFS/策略。
+     */
     assertKernelReady(this.currentStatus(), {
       requireApplyHelper: this.options.requireApplyHelper === true,
+      requireNetwork: false,
     })
     const compiled = compilePolicy(this.options.policy)
     if (!compiled.domains.has(this.options.domain.id)) {
@@ -103,8 +111,13 @@ export class NtSession {
       })
     }
 
-    const payload = new TextEncoder().encode(canonicalPolicyJson(this.options.policy))
-    const applied = await this.options.driver.setPolicy(payload, compiled.hash, compiled.generation)
+    /*
+     * 驱动只认二进制线格式（`DSHNT_POLICY_MAGIC`）；JSON 只出现在控制面/CLI 参数里。
+     * M1 之前这里发的是 canonical JSON，只有 FakeDriverPort 会接受 —— 真实驱动返回
+     * STATUS_INVALID_PARAMETER。现在统一用 policy-binary.encodePolicy（与 ctl 同一份编码）。
+     */
+    const encoded = encodePolicy(this.options.policy)
+    const applied = await this.options.driver.setPolicy(encoded.payload, encoded.hash, encoded.generation)
     await this.options.driver.registerDomain({
       id: this.options.domain.id,
       viewRoot: this.options.domain.viewRoot,

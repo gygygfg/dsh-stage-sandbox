@@ -29,6 +29,7 @@ DSH / Cordis
         src/nt/executor.ts      K0 档执行链
         src/nt/apply.ts         apply helper 客户端（控制面 journal/undo）
         src/nt/runtime.ts       诊断装配（驱动/状态/provider/策略校验）
+        src/nt/supervisor.ts    数据面生命周期（provider/策略/域；失败回滚）
                 │
                 ▼
         NT kernel data plane
@@ -110,6 +111,8 @@ DSH / Cordis
 | `src/nt/status-probe.ts` | ✅ 机器事实 → `NtStatus` + 单测 |
 | `src/nt/provider.ts` | ✅ `ctx.sandbox` NT provider（M2 才装配） |
 | `src/nt/runtime.ts` | ✅ 诊断装配 + 单测 |
+| `src/nt/provider-protocol.ts` / `provider-client.ts` | ✅ 管道协议/客户端 + 单测 |
+| `src/nt/supervisor.ts` | ✅ 数据面生命周期（up/down、回滚、generation 单调）+ 单测 |
 | M0 Windows spike | ✅ 已通过（ProjFS + SimRep；23/23 探针；见 `M0-REPORT.md`） |
 | M1 端到端 | ✅ 已通过（24/24 探针、暂存写、lower 不变、offline/allowlist、缓解/Job 回读；见 `M1-REPORT.md`） |
 | M1 性能 | ⚠ 0.55–0.64 ms/文件、20k 11.4–12.8 s（门禁未过；见 `M1-PERF.md`） |
@@ -117,7 +120,7 @@ DSH / Cordis
 | `native/provider/` | ✅ 产品 ProjFS provider（C#），已运行 |
 | `native/launcher/` | ✅ token/Job/环境/WFP，已运行 |
 | `native/apply/` | ⏳ M2（v1 在可信控制面 apply） |
-| `/winstage nt` | ✅ status/doctor（只读诊断） |
+| `/winstage nt` | ✅ status/doctor/up/down（诊断 + 数据面生命周期） |
 | dsh 路径切换 | ⏳ M2（默认仍 legacy） |
 
 ## 7. 常用命令（当前）
@@ -134,6 +137,7 @@ node tests/nt/view.ts
 node tests/nt/status.ts
 node tests/nt/driver.ts
 node tests/nt/runtime.ts
+node tests/nt/supervisor.ts
 ```
 
 Windows guest 内（管理员）：`\\host.lan\Data\m1\go.bat` 跑 M1 全流程，

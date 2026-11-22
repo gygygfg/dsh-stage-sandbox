@@ -28,33 +28,41 @@
 | `src/nt/driver-wire.ts` | ABI v2 消息编解码（hello/policy/domain/stats/events） | `driver-wire`（50） |
 | `src/nt/driver-client.ts` | koffi → fltlib 真实端口（仅 Windows） | 由 `driver-wire` 覆盖格式 |
 | `src/nt/launcher-args.ts` | launcher argv；环境白名单/凭据拒绝；路径/Job/网络校验 | `launcher-args`（26） |
-| `src/nt/session.ts` | 策略下发/域注册/launcher 包装/幂等清理 | `session`（21） |
+| `src/nt/session.ts` | 策略下发（二进制）/域注册/launcher 包装/幂等清理 | `session`（23） |
 | `src/nt/executor.ts` | K0 执行链：confine→spawn→超时/输出上限/失败分类 | `executor`（36） |
 | `src/nt/provider.ts` | `ctx.sandbox` 的 NT provider（构造即校验，init 才下发） | 由 `executor`/`session` 覆盖 |
 | `src/nt/apply.ts` + `apply-manifest.ts` | 控制面 apply：CAS/journal/undo/冲突零写 | `apply`（24）、`apply-manifest`（23） |
 | `src/nt/runtime.ts` | 诊断装配：驱动端口 + 状态探测 + provider 管道 + 域策略校验 | `runtime`（54） |
-| `dsh-plugin/nt-command.ts` | `/winstage nt status` / `doctor`（只读，不做初始化） | `runtime`（同上） |
-| `tests/nt/run-all.ts` | 14 个套件独立子进程运行 | `node tests/nt/run-all.ts` |
+| `src/nt/provider-protocol.ts` | provider 管道常量 / 回复解析 | `supervisor`（57） |
+| `src/nt/provider-client.ts` | provider 控制客户端（一请求一连接、超时、id 校验） | `supervisor`（57） |
+| `src/nt/supervisor.ts` | M2 数据面生命周期：校验→探测→spawn provider→start/protect→二进制策略→注册域→复核；失败回滚 | `supervisor`（57） |
+| `dsh-plugin/nt-command.ts` | `/winstage nt status` / `doctor` / `up` / `down` | `runtime` + `supervisor` |
+| `tests/nt/run-all.ts` | 15 个套件独立子进程运行 | `node tests/nt/run-all.ts` |
 
 ### 本机实测结果
 
 ```text
 node tests/nt/run-all.ts
-nt 控制面套件：14 个，失败 0 个
+nt 控制面套件：15 个，失败 0 个
 RESULT: ALL PASS
 ```
 
-共 **467** 条断言（paths=39、policy=41、policy-binary=43、view=15、status=32、
-status-probe=36、driver=27、driver-wire=50、launcher-args=26、session=21、executor=36、
-apply=24、apply-manifest=23、runtime=54）。
+共 **546** 条断言（paths=47、policy=45、policy-binary=43、view=15、status=32、
+status-probe=36、driver=27、driver-wire=50、launcher-args=34、session=23、executor=36、
+apply=24、apply-manifest=23、runtime=54、supervisor=57）。
 
 ### 与 DSH 的接线（v1）
 
 - `/winstage nt status` —— 与 `ctx.sandbox` 同一判据的只读状态卡；
 - `/winstage nt doctor` —— 逐项检查驱动/ABI/ProjFS/provider/策略/网络，并给修复动作；
-- 装配是**惰性**的：只有执行该命令才碰驱动端口/命名管道；加载期零内核交互；
+- `/winstage nt up` —— **M2 数据面生命周期**：校验策略 → 探测驱动/ProjFS → spawn
+  provider → `start`/`protect` → 用 `generation+1` 编码二进制策略并下发 → 注册域 →
+  重新探测必须到 `kernel-projfs-minifilter`；任一步失败**先回滚再报错**；
+- `/winstage nt down` —— 注销域 → provider `stop`/`shutdown` → kill（幂等，清理不抛）；
+- 装配是**惰性**的：只有执行命令才碰驱动端口/命名管道；加载期零内核交互；
 - 命令在 WinStage 关闭时与其他 `/winstage*` 一样被开关挡住（行为未变）；
-- `enforcement` 仍未切到 kernel：`NtSandboxProvider` 只在 M2 装配。
+- `ctx.fs`/`ctx.shell` 的路径切换**仍未接管**：当前只到“数据面可拉起/可诊断”，
+  默认执行链仍是 legacy；`NtSandboxProvider` 尚未注册成 `ctx.sandbox`。
 
 ## 2. 原生实现：M1 已实测
 
@@ -116,9 +124,10 @@ apply=24、apply-manifest=23、runtime=54）。
 
 ## 5. 下一步（M2）
 
-1. 插件接管：`enforcement='kernel'` 时装配 `NtSandboxProvider`，启动 provider、
-   `start`/`protect`、下发策略、注册域；任一步失败 fail-closed。
-2. 路径切换：`ctx.fs`/`ctx.shell` 走视图/launcher；legacy 保留为显式回退。
+1. ~~数据面拉起~~ ✅ 已完成（`NtSupervisor` + `/winstage nt up|down`，单测覆盖；
+   失败回滚、generation 单调、二进制策略）。
+2. 插件接管：`enforcement='kernel'` 时装配 `NtSandboxProvider`，由 supervisor 提供
+   已就绪的会话；`ctx.fs`/`ctx.shell` 走视图/launcher；legacy 保留为显式回退。
 3. apply helper：`grantApply` + CAS/journal/undo 接线。
 4. 性能：批量元数据 / placeholder 预创建 / 排除面（`M1-PERF.md` §5）。
 5. 治理：扩展封印收录面；CI 机器上复验 Low IL；24 h soak。

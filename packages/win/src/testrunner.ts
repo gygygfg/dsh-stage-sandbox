@@ -270,7 +270,7 @@ export const OFFLINE_SUITES = [
   //   全部是离线确定性断言（假驱动端口/注入命令输出/临时 Unix socket），
   //   不需要 Windows、不加载驱动、不碰真实工作区 ⇒ 归 OFFLINE_SUITES。
   //   与 verify.cmd 的清单必须逐字一致（两处同时改）。
-  { id: 'run-all', script: 'tests/nt/run-all.ts', title: 'NT 内核后端控制面（14 个套件聚合：策略/路径/视图/驱动/状态/执行器/apply/runtime）' },
+  { id: 'run-all', script: 'tests/nt/run-all.ts', title: 'NT 内核后端控制面（15 个套件聚合：策略/路径/视图/驱动/状态/执行器/apply/runtime/supervisor）' },
 ]
 
 /** 需要未受限会话的套件 */

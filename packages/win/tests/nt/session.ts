@@ -6,6 +6,7 @@
 
 import { FakeDriverPort } from '../../src/nt/driver.ts'
 import { defaultRulesForDomain } from '../../src/nt/policy.ts'
+import { encodePolicy } from '../../src/nt/policy-binary.ts'
 import { NtSession } from '../../src/nt/session.ts'
 import { createNtStatus } from '../../src/nt/status.ts'
 import { NT_DRIVER_ABI_VERSION, defaultJobLimits, type NtDomain, type NtPolicySet } from '../../src/nt/types.ts'
@@ -69,6 +70,9 @@ await runSuite('nt-session', async () => {
   eq('policy generation', report.policyGeneration, 5)
   eq('driver generation', report.driverGeneration, 5)
   eq('policy hash 长度', report.policyHash.length, 64)
+  const encoded = encodePolicy(policy())
+  eq('下发给驱动的是二进制 payload（含 magic）', Array.from(driver.policyPayload ?? []).slice(0, 4), Array.from(encoded.payload.slice(0, 4)))
+  eq('payload 与 encodePolicy 完全一致', driver.policyPayload?.length, encoded.payload.length)
   eq('域已注册', (await driver.queryStats()).domains, 1)
   const report2 = await session.init()
   eq('init 幂等', report2.driverGeneration, 5)

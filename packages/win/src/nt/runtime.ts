@@ -23,6 +23,7 @@ import { dirname, join, win32 } from 'node:path'
 import { connect } from 'node:net'
 import { fileURLToPath } from 'node:url'
 import { createDriverPortAsync } from './driver.ts'
+import { DEFAULT_PROVIDER_PIPE, providerSocketPath } from './provider-protocol.ts'
 import { buildDomainPolicy } from './provider.ts'
 import { validatePolicy } from './policy.ts'
 import { assessNtStatus, collectNtFacts, parseProviderStats, type NtRawFacts } from './status-probe.ts'
@@ -39,8 +40,9 @@ import {
   type NtTokenMode,
 } from './types.ts'
 
-/** 默认 provider 管道名（与 `native/provider` 的 `--pipe` 默认值一致）。 */
-export const DEFAULT_PROVIDER_PIPE = 'dshnt-provider'
+// 协议常量在 provider-protocol（provider-client/supervisor 共用）；这里保留 re-export
+// 以免既有调用方/测试的 import 路径变化。
+export { DEFAULT_PROVIDER_PIPE, providerSocketPath }
 
 /**
  * 包根目录；用于默认 launcher 路径。
@@ -74,6 +76,10 @@ export interface NtLayout {
   viewRoot: string
   storeRoot: string
   launcherPath: string
+  /** ProjFS provider 可执行文件（`--pipe` 由 supervisor 传）。 */
+  providerPath: string
+  /** provider 日志文件（默认在 store 下，便于与证据一起归档）。 */
+  providerLog: string
 }
 
 /**
@@ -85,6 +91,8 @@ export interface NtLayout {
  *   · `WINSTAGE_NT_VIEW_ROOT`     —— 视图根
  *   · `WINSTAGE_NT_STORE_ROOT`    —— 候选/证据根
  *   · `WINSTAGE_NT_LAUNCHER`      —— launcher 可执行文件
+ *   · `WINSTAGE_NT_PROVIDER`      —— ProjFS provider 可执行文件
+ *   · `WINSTAGE_NT_PROVIDER_LOG`  —— provider 日志路径
  */
 export function defaultNtLayout(
   workspaceRoot: string,
@@ -98,12 +106,10 @@ export function defaultNtLayout(
     storeRoot: env.WINSTAGE_NT_STORE_ROOT?.trim() || win32.join(root, 'store'),
     launcherPath:
       env.WINSTAGE_NT_LAUNCHER?.trim() || win32.join(PACKAGE_ROOT, 'native', 'launcher', 'out', 'dshnt-launch.exe'),
+    providerPath:
+      env.WINSTAGE_NT_PROVIDER?.trim() || win32.join(PACKAGE_ROOT, 'native', 'provider', 'out', 'dshnt-provider.exe'),
+    providerLog: env.WINSTAGE_NT_PROVIDER_LOG?.trim() || win32.join(root, 'store', 'provider.log'),
   }
-}
-
-/** Windows 命名管道路径（其它平台不适用；测试可直接给 `providerSocket`）。 */
-export function providerSocketPath(pipeName: string = DEFAULT_PROVIDER_PIPE, platform: NodeJS.Platform = process.platform): string | undefined {
-  return platform === 'win32' ? `\\\\.\\pipe\\${pipeName}` : undefined
 }
 
 /**
@@ -179,6 +185,8 @@ export interface NtRuntimeOptions {
   storeRoot: string
   /** launcher 绝对路径。 */
   launcherPath: string
+  /** ProjFS provider 可执行文件（supervisor 用）。 */
+  providerPath?: string
   /** 驱动端口；默认按平台装配（不可用即 fail-closed 端口）。 */
   driver?: NtDriverPort
   /** 命令执行器（诊断用）；默认 Windows 走 cmd.exe。 */
@@ -231,6 +239,11 @@ export interface NtDoctorReport {
  */
 export class NtRuntime {
   readonly driver: NtDriverPort
+  readonly workspaceRoot: string
+  readonly viewRoot: string
+  readonly storeRoot: string
+  readonly launcherPath: string
+  readonly providerPath?: string
   private readonly options: NtRuntimeOptions
   private readonly run: (command: string) => Promise<string>
   private readonly platform: NodeJS.Platform
@@ -238,6 +251,11 @@ export class NtRuntime {
   constructor(options: NtRuntimeOptions, driver: NtDriverPort) {
     this.options = options
     this.driver = driver
+    this.workspaceRoot = options.workspaceRoot
+    this.viewRoot = options.viewRoot
+    this.storeRoot = options.storeRoot
+    this.launcherPath = options.launcherPath
+    if (options.providerPath !== undefined) this.providerPath = options.providerPath
     this.platform = options.platform ?? process.platform
     this.run = options.run ?? createWindowsCommandRunner(this.platform)
   }

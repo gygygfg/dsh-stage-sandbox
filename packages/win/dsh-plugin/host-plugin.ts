@@ -44,6 +44,7 @@ import { canonical, compareKey, maskSessionId } from '../src/paths.ts'
 import { renderCandidateDiff } from '../src/tools.ts'
 import { verifyStageRootAlive } from '../src/stage-guard.ts'
 import { createNtRuntime, defaultNtLayout } from '../src/nt/runtime.ts'
+import { NtSupervisor } from '../src/nt/supervisor.ts'
 import { REVIEW_BASENAME, getReviewService, isRegistryCandidate, resolveReviewStoreDir, disposeReviewServices } from './review-service.ts'
 import { installBaselineWatch } from './baseline-watch.ts'
 import { createAuditMirror } from './audit-mirror.ts'
@@ -1720,7 +1721,11 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
         return { kind: 'error', text: 'NT 后端未接线：宿主没有提供运行时装配（仅开发构建会出现）。' }
       }
       const sub = splitArgs(String(args ?? '').trim())[0]
-      return await runNtCommand(sub, { runtime: ntRuntime, log: { warn: (message) => log.warn(message) } })
+      return await runNtCommand(sub, {
+        runtime: ntRuntime,
+        ...(typeof options.ntSupervisor === 'function' ? { supervisor: options.ntSupervisor } : {}),
+        log: { warn: (message) => log.warn(message) },
+      })
     },
   }
 
@@ -1738,7 +1743,7 @@ export function registerCommands(scope, serviceOrResolver, log, options = {}) {
     { name: 'winstage-approvals', sub: 'approvals', hint: '（无参数）', description: 'WinStage：列出待处理的异步审批' },
     { name: 'winstage-approval-approve', sub: 'approval-approve', hint: '审批项 id', description: 'WinStage：批准并尝试执行异步审批' },
     { name: 'winstage-approval-reject', sub: 'approval-reject', hint: '审批项 id', description: 'WinStage：拒绝异步审批' },
-    { name: 'winstage-nt', sub: 'nt', hint: 'status|doctor', description: 'WinStage NT 内核后端：查看/诊断 ProjFS + minifilter 路径' },
+    { name: 'winstage-nt', sub: 'nt', hint: 'status|doctor|up|down', description: 'WinStage NT 内核后端：查看/诊断/拉起/收起 ProjFS + minifilter 路径' },
   ]
 
   for (const spec of SPECS) {
@@ -2296,6 +2301,7 @@ export function apply(ctx, config = {}) {
         viewRoot: layout.viewRoot,
         storeRoot: layout.storeRoot,
         launcherPath: layout.launcherPath,
+        providerPath: layout.providerPath,
       })
       ntRuntimePromise = pending.catch((error) => {
         ntRuntimePromise = null
@@ -2304,13 +2310,45 @@ export function apply(ctx, config = {}) {
     }
     return ntRuntimePromise
   }
+  /**
+   * 数据面生命周期（`/winstage nt up|down`）：与 runtime 共用同一份布局/驱动端口。
+   * 只有一个 supervisor（一个工作区一个域）；`up` 幂等，`down` 幂等。
+   */
+  let ntSupervisorPromise = null
+  const ntSupervisorFor = () => {
+    if (ntSupervisorPromise === null) {
+      ntSupervisorPromise = (async () => {
+        const runtime = await ntRuntimeFor()
+        const layout = defaultNtLayout(workspaceRoot, process.env)
+        return new NtSupervisor({
+          runtime,
+          providerPath: layout.providerPath,
+          providerLog: layout.providerLog,
+        })
+      })().catch((error) => {
+        ntSupervisorPromise = null
+        throw error
+      })
+    }
+    return ntSupervisorPromise
+  }
   if (typeof ctx.effect === 'function') {
     ctx.effect(() => {
       return () => {
-        const pending = ntRuntimePromise
+        const pendingSupervisor = ntSupervisorPromise
+        const pendingRuntime = ntRuntimePromise
+        ntSupervisorPromise = null
         ntRuntimePromise = null
-        if (pending === null) return
-        pending.then((runtime) => runtime.dispose()).catch(() => {})
+        if (pendingSupervisor !== null) {
+          pendingSupervisor
+            .then((supervisor) => supervisor.down())
+            .catch(() => {})
+            .finally(() => {
+              if (pendingRuntime !== null) pendingRuntime.then((runtime) => runtime.dispose()).catch(() => {})
+            })
+          return
+        }
+        if (pendingRuntime !== null) pendingRuntime.then((runtime) => runtime.dispose()).catch(() => {})
       }
     }, 'winstage-sandbox: nt runtime dispose')
   }
@@ -2477,6 +2515,7 @@ export function apply(ctx, config = {}) {
         executeApproval: executeApprovalForCommand,
         runtimeStatus,
         ntRuntime: ntRuntimeFor,
+        ntSupervisor: ntSupervisorFor,
       })
       log.info(`已注册 ${registered.length} 个 /winstage* 命令（暂存与快照按会话隔离）`)
     } catch (error) {
