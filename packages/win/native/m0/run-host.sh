@@ -57,11 +57,12 @@ if [ ! -e /dev/kvm ]; then
 fi
 
 log "work=$WORK iso=$ISO run=$RUN_ID web=$WEB_PORT"
-cp -f "$HERE/guest/m0-phase1.ps1" "$SHARED/m0-phase1.ps1"
-cp -f "$HERE/guest/m0-phase2.ps1" "$SHARED/m0-phase2.ps1"
+# cmd.exe/PowerShell 5.1 are happiest with CRLF; normalize the guest scripts.
+copy_crlf() { sed 's/\r$//' "$1" | sed 's/$/\r/' > "$2"; }
+copy_crlf "$HERE/guest/m0-phase1.ps1" "$SHARED/m0-phase1.ps1"
+copy_crlf "$HERE/guest/m0-phase2.ps1" "$SHARED/m0-phase2.ps1"
 cp -f "$HERE/guest/m0-client.c" "$SHARED/m0-client.c"
-cp -f "$HERE/guest/install.bat" "$OEM/install.bat"
-# install.bat is the OEM first-logon hook; keep it ASCII.
+copy_crlf "$HERE/guest/install.bat" "$OEM/install.bat"
 chmod -R a+rX "$SHARED" "$OEM"
 
 if [ ! -f "$COMPOSE" ]; then
