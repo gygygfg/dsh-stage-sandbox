@@ -1,0 +1,30 @@
+{
+    "ok":  true,
+    "phase":  2,
+    "at":  "2026-11-22T23:24:36.3176911+08:00",
+    "checks":  {
+                   "projfsEnabled":  true,
+                   "testSigning":  true,
+                   "providerRunning":  true,
+                   "driverLoaded":  true,
+                   "redirectOk":  true,
+                   "lowerUnchanged":  true,
+                   "lowerDiff":  [
+
+                                 ],
+                   "clientExit":  0,
+                   "viewB":  "v2",
+                   "lowerB":  "v1",
+                   "viewGoneAbsent":  true,
+                   "lowerGonePresent":  true,
+                   "viewChild":  "child",
+                   "lowerChildAbsent":  true,
+                   "viewRaw":  "raw",
+                   "lowerRawAbsent":  true,
+                   "viewDirD":  true,
+                   "lowerDirC":  true
+               },
+    "filters":  "\n筛选器名称                      数字实例       高度          框架\n------------------------------  -------------  ------------  -----\nbindflt                                 1       409800         0\nSimRep                                  1       371100         0\nWdFilter                                4       328010         0\nstorqosflt                              0       244000         0\nwcifs                                   0       189900         0\nPrjFlt                                  1       189800         0\nCldFlt                                  0       180451         0\nFileCrypt                               0       141100         0\nnpsvctrig                               1        46000         0\nWof                                     1        40700         0\nFileInfo                                4        40500         0",
+    "clientLog":  "[PASS] ntcreatefile_available\n[PASS] read_a -- hello \n\n\n[PASS] write_b\n[PASS] read_b_after_write -- v2\n[PASS] dir_has_a\n[PASS] dir_has_b\n[PASS] dir_has_dir\n[PASS] relative_cwd_read_c -- c \n\n\n[PASS] handle_relative_read_c -- c \n\n\n[PASS] raw_nt_write\n[PASS] raw_nt_read_back -- raw\n[PASS] delete_a\n[PASS] deleted_a_gone_from_view\n[PASS] deleted_a_lower_still_there\n[PASS] delete_gone\n[PASS] deleted_gone_from_view\n[PASS] deleted_gone_lower_still_there\n[PASS] rename_c -- err=0\n[PASS] read_renamed_d -- c \n\n\n[PASS] renamed_lower_c_still_there\n[PASS] renamed_lower_d_absent\n[PASS] child_write_view -- child \n\n\n[PASS] child_lower_absent\n[INFO] child_exit=0\nM0-CLIENT checks=23 failures=0",
+    "providerLog":  ""
+}

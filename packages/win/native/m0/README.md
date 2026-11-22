@@ -1,10 +1,18 @@
 # M0 spike：Windows VM（ProjFS + SimRep）
 
-> 目的：在**专用 Windows 10 VM** 里证明“同路径透明 + ProjFS COW + 内核重定向”可行，
-> 并拿到性能/边界结果。产物写到 `docs/nt/M0-REPORT.md`（模板已存在）。
+> **结果：GO（2026-11-22）**。详见 [`../../docs/nt/M0-REPORT.md`](../../docs/nt/M0-REPORT.md)
+> 与 [`../../docs/nt/M0-RESULT.json`](../../docs/nt/M0-RESULT.json)：同路径读/写/枚举/相对打开/
+> 目录句柄/raw NT/删除 tombstone/rename/子进程全部通过，lower SHA-256 不变。
 >
-> 这不是产品代码：脚本会安装 VS Build Tools/WDK/.NET、构建微软 sample、设置测试签名、
-> 重启一次，然后跑探针。**只应在一次性 VM 里运行。**
+> ⚠ **当前脚本是第一轮尝试的记录，不要直接用于新 VM**：`m0-phase1.ps1` 会在
+> guest 内 `dotnet-install` 处挂起（.NET CDN 连接超时）。成功路径是：
+> 宿主用 `build-provider.sh` 交叉构建 self-contained ProjFS provider →
+> VS Build Tools 加 `Component.Microsoft.Windows.DriverKit.BuildTools` →
+> SimRep 用 `/p:SpectreMitigation=false` 构建 → 签名 `simrep.cat` →
+> `pnputil /add-driver ... /install` → `fltmc load` + `fltmc attach SimRep C:` →
+> `RemapRenamesAndLinks=1`。逐条踩坑与修复见 M0 报告 §3。
+>
+> 这不是产品代码：**只应在一次性 VM 里运行。**
 
 ## 组成
 

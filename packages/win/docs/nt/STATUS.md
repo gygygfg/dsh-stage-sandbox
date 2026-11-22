@@ -1,6 +1,10 @@
 # NT 沙箱实现状态（诚实口径）
 
 > 更新：2026-11-22。只记录**代码事实**；未运行/未实测的项明确写“未开始/未实测”。
+>
+> **M0 已完成（GO）**：Windows 10 VM 上实测 ProjFS + SimRep 同路径重定向；C 探针 23/23 通过，
+> 真实 lower SHA-256 不变。证据：[`M0-RESULT.json`](./M0-RESULT.json)、
+> [`M0-REPORT.md`](./M0-REPORT.md)。性能尚未采集（见 M0 报告 §4）。
 
 ## 1. 已完成（控制面契约 + 单测）
 
@@ -30,12 +34,13 @@ RESULT: ALL PASS
 单套件断言数：paths=39、policy=41、view=15、status=32、driver=27、launcher-args=26、
 apply-manifest=23、session=21。
 
-## 2. 未开始（M0/M1）
+## 2. M0 已验证 / M1 未开始
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| `native/driver/` | 未开始 | minifilter 源码/INF/构建脚本；需 Windows + WDK |
-| `native/projfs/` | 未开始 | ProjFS provider helper；需 Windows + ProjFS |
+| M0 sample spike | ✅ 已验证 | SimRep + SimpleProviderManaged；23/23 探针通过；见 `M0-REPORT.md` |
+| `native/driver/` | 未开始（产品） | 产品 minifilter（按域/PID 重定向 + 策略 + 端口）；M0 只验证了 sample |
+| `native/projfs/` | 未开始（产品） | M0 用微软 managed sample；产品 helper/协议未实现 |
 | `native/launcher/` | 未开始 | token/Job/mitigation/域注册 |
 | `native/apply/` | 未开始 | CAS + journal + undo |
 | `src/nt/executor.ts` | 未开始 | K0 执行链；依赖 launcher/driver |
@@ -69,9 +74,14 @@ apply-manifest=23、session=21。
 
 ## 5. 下一步（M1）
 
-1. Windows VM：按 `M0-SPIKE.md` 跑 SimRep + ProjFS，出 `M0-REPORT.md`。
-2. 驱动：域注册 + `PreCreate` 重定向 + store/view 拒绝 + 审计计数。
-3. Launcher：AppContainer/受限令牌 + Job + mitigation + 环境白名单 + 域注册。
-4. ProjFS helper：投影/水合/通知 + 命名管道状态。
-5. `src/nt/executor.ts`：`K0` 档在 `enforcement='kernel'` 下可用；默认 legacy。
-6. 测试：raw `NtCreateFile`、子进程、目录枚举、删除/改名、长路径、跨卷、性能。
+1. **性能补测（M0 缺口）**：5k/10k/50k 文件 ProjFS 首次/二次枚举、copy-up、`git status`、
+   `pnpm install`、`tsc`；决定是否维持 hybrid 或改“完整复制 + 重定向”。
+2. 产品驱动（从 SimRep 演进）：按域/PID 映射（非全局）、allow/deny/mask、store/view 直接访问拒绝、
+   `PsSetCreateProcessNotifyRoutineEx` 域继承、通信端口、审计计数。
+3. 安装器：`simrep.cat` 签名 + `pnputil` + `fltmc load` + `fltmc attach`；**不要**只 `sc create`
+   （M0 实测 `0x80070002` / `0xC0000034`）。
+4. Launcher：AppContainer/受限令牌 + Job + mitigation + 环境白名单 + 域注册。
+5. ProjFS helper：投影/水合/通知 + 命名管道状态；保留 M0 的 self-contained 方案作为兜底。
+6. `src/nt/executor.ts`：`K0` 档在 `enforcement='kernel'` 下可用；默认 legacy。
+7. 测试：raw `NtCreateFile`、子进程、目录枚举、删除/改名（`RemapRenamesAndLinks=1` +
+   `MoveFileEx`）、长路径、跨卷、性能。

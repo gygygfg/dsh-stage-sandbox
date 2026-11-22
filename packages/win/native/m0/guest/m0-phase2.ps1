@@ -10,7 +10,7 @@ $Share = '\\host.lan\Data'
 if (-not (Test-Path $Share)) { $Share = 'Z:' }
 if (-not (Test-Path $Share)) { $Share = '\\host.lan\shared' }
 $Log = Join-Path $Share 'm0-phase2.log'
-$Result = Join-Path $Share 'RESULT_M0.json'
+$ResultPath = Join-Path $Share 'RESULT_M0.json'
 
 function Log([string]$m) {
   $line = '{0} {1}' -f (Get-Date -Format 'HH:mm:ss'), $m
@@ -40,7 +40,7 @@ function Fail([string]$m, [hashtable]$extra = @{}) {
     clientLog = Tail 'C:\m0\client.log' 120
   }
   foreach ($k in $extra.Keys) { $obj[$k] = $extra[$k] }
-  SaveJson $obj $Result
+  SaveJson $obj $ResultPath
   exit 1
 }
 function HashTree([string]$root) {
@@ -77,37 +77,42 @@ $bcd = (bcdedit /enum '{current}' 2>&1) -join "`n"
 $testSigning = $bcd -match 'testsigning\s+Yes'
 Log "projfs=$projfs testsigning=$testSigning"
 
-# 4. Seed lower (the real workspace) and a real empty ws directory (logical path).
-if (Test-Path C:\m0\lower) { cmd.exe /c 'rmdir /s /q C:\m0\lower' | Out-Null }
-New-Item -ItemType Directory -Force C:\m0\lower\dir | Out-Null
-Set-Content -Path C:\m0\lower\a.txt -Value 'hello' -Encoding ASCII
-Set-Content -Path C:\m0\lower\b.txt -Value 'v1' -Encoding ASCII
-Set-Content -Path C:\m0\lower\dir\c.txt -Value 'c' -Encoding ASCII
-Set-Content -Path C:\m0\lower\gone.txt -Value 'gone' -Encoding ASCII
-New-Item -ItemType Directory -Force C:\m0\ws | Out-Null
-$lowerBefore = HashTree 'C:\m0\lower'
-Log "lower before: $($lowerBefore.Count) files"
-
-# 5. Start ProjFS provider (backing=lower, view=view).
+# 4/5. Seed lower + start provider, unless a provider is already running with a
+#      ready view (manual recovery path: runprovider.bat).
 $providerDir = 'C:\m0\projfs-provider'
 $providerExe = Join-Path $providerDir 'SimpleProviderManaged.exe'
 if (-not (Test-Path $providerExe)) { Fail "provider missing: $providerExe" }
-Get-Process SimpleProviderManaged -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-if (Test-Path C:\m0\view) { cmd.exe /c 'rmdir /s /q C:\m0\view' | Out-Null }
-New-Item -ItemType Directory -Force C:\m0\view | Out-Null
-Remove-Item C:\m0\provider.log -Force -ErrorAction SilentlyContinue
-$providerCmd = "`"$providerExe`" --SourceRoot=C:\m0\lower --VirtRoot=C:\m0\view > `"C:\m0\provider.log`" 2>&1"
-$provider = Start-Process -FilePath 'cmd.exe' -ArgumentList '/k', $providerCmd -WindowStyle Hidden -PassThru
-$deadline = (Get-Date).AddMinutes(2)
-while ((Get-Date) -lt $deadline) {
-  if (Test-Path C:\m0\view\a.txt) { break }
-  Start-Sleep -Seconds 2
+$reuseProvider = ([bool](Get-Process SimpleProviderManaged -ErrorAction SilentlyContinue)) -and
+  (Test-Path C:\m0\view\a.txt) -and (Test-Path C:\m0\lower\a.txt)
+if ($reuseProvider) {
+  Log 'reusing already-running ProjFS provider'
+} else {
+  if (Test-Path C:\m0\lower) { cmd.exe /c 'rmdir /s /q C:\m0\lower' | Out-Null }
+  New-Item -ItemType Directory -Force C:\m0\lower\dir | Out-Null
+  Set-Content -Path C:\m0\lower\a.txt -Value 'hello' -Encoding ASCII
+  Set-Content -Path C:\m0\lower\b.txt -Value 'v1' -Encoding ASCII
+  Set-Content -Path C:\m0\lower\dir\c.txt -Value 'c' -Encoding ASCII
+  Set-Content -Path C:\m0\lower\gone.txt -Value 'gone' -Encoding ASCII
+  New-Item -ItemType Directory -Force C:\m0\ws | Out-Null
+  Get-Process SimpleProviderManaged -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  if (Test-Path C:\m0\view) { cmd.exe /c 'rmdir /s /q C:\m0\view' | Out-Null }
+  New-Item -ItemType Directory -Force C:\m0\view | Out-Null
+  Remove-Item C:\m0\provider.log -Force -ErrorAction SilentlyContinue
+  $providerCmd = "`"$providerExe`" --SourceRoot=C:\m0\lower --VirtRoot=C:\m0\view > `"C:\m0\provider.log`" 2>&1"
+  $provider = Start-Process -FilePath 'cmd.exe' -ArgumentList '/k', $providerCmd -WindowStyle Hidden -PassThru
+  $deadline = (Get-Date).AddMinutes(2)
+  while ((Get-Date) -lt $deadline) {
+    if (Test-Path C:\m0\view\a.txt) { break }
+    Start-Sleep -Seconds 2
+  }
 }
 $providerRunning = [bool](Get-Process SimpleProviderManaged -ErrorAction SilentlyContinue)
 Log "provider running=$providerRunning viewA=$(Test-Path C:\m0\view\a.txt)"
 if (-not (Test-Path C:\m0\view\a.txt)) {
   Fail 'ProjFS view did not become available' @{ providerRunning = $providerRunning }
 }
+$lowerBefore = HashTree 'C:\m0\lower'
+Log "lower before: $($lowerBefore.Count) files"
 
 # 6. Build the C probe.
 $clientSrc = 'C:\m0\m0-client.c'
@@ -126,28 +131,44 @@ if (-not (Test-Path C:\m0\bin\m0-client.exe)) {
   Fail 'm0-client.exe not built' @{ buildLog = Tail 'C:\m0\client-build.log' 120 }
 }
 
-# 7. Load SimRep with the \m0\ws -> \m0\view mapping.
-sc.exe stop SimRep 2>$null | Out-Null
-sc.exe delete SimRep 2>$null | Out-Null
-Start-Sleep -Seconds 2
-sc.exe create SimRep type= filesys start= demand error= normal binPath= C:\m0\bin\simrep.sys depend= FltMgr 2>&1 | Out-Null
-$params = 'HKLM\SYSTEM\CurrentControlSet\Services\SimRep\Parameters'
-$instances = "$params\Instances"
-reg.exe add $params /v SupportedFeatures /t REG_DWORD /d 3 /f 2>&1 | Out-Null
-reg.exe add $params /v OldMapping /t REG_SZ /d '\m0\ws' /f 2>&1 | Out-Null
-reg.exe add $params /v NewMapping /t REG_SZ /d '\m0\view' /f 2>&1 | Out-Null
-reg.exe add $params /v DebugLevel /t REG_DWORD /d 0x1F /f 2>&1 | Out-Null
-reg.exe add $instances /v DefaultInstance /t REG_SZ /d SimRep /f 2>&1 | Out-Null
-reg.exe add "$instances\SimRep" /v Altitude /t REG_SZ /d 371100 /f 2>&1 | Out-Null
-reg.exe add "$instances\SimRep" /v Flags /t REG_DWORD /d 0 /f 2>&1 | Out-Null
-Remove-Item C:\m0\fltmc-load.log -Force -ErrorAction SilentlyContinue
-fltmc load SimRep *> C:\m0\fltmc-load.log
-$loadExit = $LASTEXITCODE
+# 7. Ensure SimRep is loaded with the \m0\ws -> \m0\view mapping.
+# The INF-installed service (pnputil) is the reliable path; if it is already
+# loaded, reuse it. The mapping values must be set before load.
+$filtersBefore = (fltmc filters 2>&1) -join "`n"
+$driverLoaded = $filtersBefore -match 'SimRep'
+if ($driverLoaded) {
+  Log 'reusing already-loaded SimRep (mapping must already be correct)'
+} else {
+  sc.exe stop SimRep 2>$null | Out-Null
+  sc.exe delete SimRep 2>$null | Out-Null
+  Start-Sleep -Seconds 2
+  sc.exe create SimRep type= filesys start= demand error= normal binPath= C:\m0\bin\simrep.sys depend= FltMgr 2>&1 | Out-Null
+  $params = 'HKLM\SYSTEM\CurrentControlSet\Services\SimRep\Parameters'
+  $instances = "$params\Instances"
+  reg.exe add $params /v SupportedFeatures /t REG_DWORD /d 3 /f 2>&1 | Out-Null
+  reg.exe add $params /v OldMapping /t REG_SZ /d '\m0\ws' /f 2>&1 | Out-Null
+  reg.exe add $params /v NewMapping /t REG_SZ /d '\m0\view' /f 2>&1 | Out-Null
+  reg.exe add $params /v DebugLevel /t REG_DWORD /d 0x1F /f 2>&1 | Out-Null
+  reg.exe add $params /v RemapRenamesAndLinks /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+  reg.exe add $instances /v DefaultInstance /t REG_SZ /d SimRep /f 2>&1 | Out-Null
+  reg.exe add "$instances\SimRep" /v Altitude /t REG_SZ /d 371100 /f 2>&1 | Out-Null
+  reg.exe add "$instances\SimRep" /v Flags /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+  Remove-Item C:\m0\fltmc-load.log -Force -ErrorAction SilentlyContinue
+  fltmc load SimRep *> C:\m0\fltmc-load.log
+  $loadExit = $LASTEXITCODE
+  Log "fltmc load exit=$loadExit"
+}
 $filters = (fltmc filters 2>&1) -join "`n"
 $driverLoaded = $filters -match 'SimRep'
-Log "fltmc load exit=$loadExit driverLoaded=$driverLoaded"
+Log "driverLoaded=$driverLoaded"
 if (-not $driverLoaded) {
-  Fail 'SimRep did not load' @{ loadExit = $loadExit; loadLog = Tail 'C:\m0\fltmc-load.log' 120; filters = $filters }
+  Fail 'SimRep did not load' @{ loadLog = Tail 'C:\m0\fltmc-load.log' 120; filters = $filters }
+}
+# SimRep deliberately does not auto-attach; attach C: if no instance exists.
+$instances = (fltmc instances -f SimRep 2>&1) -join "`n"
+if ($instances -notmatch 'C:') {
+  fltmc attach SimRep C: *> C:\m0\fltmc-attach.log
+  Log "fltmc attach exit=$LASTEXITCODE"
 }
 
 # 8. Wait for \m0\ws -> \m0\view redirection.
@@ -218,7 +239,7 @@ $ok = $checks.projfsEnabled -and $checks.testSigning -and $checks.providerRunnin
   ($viewChild -eq 'child') -and $checks.lowerChildAbsent -and ($viewRaw -eq 'raw') -and $checks.lowerRawAbsent -and
   $checks.viewDirD -and $checks.lowerDirC
 
-$result = [ordered]@{
+$payload = [ordered]@{
   ok = $ok
   phase = 2
   at = (Get-Date).ToString('o')
@@ -227,6 +248,6 @@ $result = [ordered]@{
   clientLog = $clientLog
   providerLog = Tail 'C:\m0\provider.log' 80
 }
-SaveJson $result $Result
-Log "RESULT ok=$ok file=$Result"
+SaveJson $payload $ResultPath
+Log "RESULT ok=$ok file=$ResultPath"
 if ($ok) { exit 0 } else { exit 1 }

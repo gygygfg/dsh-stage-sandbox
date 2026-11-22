@@ -102,8 +102,9 @@ DSH / Cordis
 | `src/nt/executor.ts` | ⏳ M1 |
 | `src/nt/apply.ts` | ⏳ M1 |
 | `src/nt/provider.ts` | ⏳ M2 |
-| `native/driver/` | ⏳ M0/M1 |
-| `native/projfs/` | ⏳ M1 |
+| M0 Windows spike | ✅ 已通过（ProjFS + SimRep；23/23 探针；见 `M0-REPORT.md`） |
+| `native/driver/` | ⏳ M1（产品实现；M0 仅验证 sample） |
+| `native/projfs/` | ⏳ M1（产品 helper；M0 用微软 sample） |
 | `native/launcher/` | ⏳ M1 |
 | `native/apply/` | ⏳ M1 |
 | dsh 接线 | ⏳ M2（默认仍 legacy） |

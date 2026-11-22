@@ -2,6 +2,12 @@
 # dshnt M0 host runner: create a disposable Windows 10 VM, inject the OEM
 # first-logon script, wait for RESULT_M0.json, and keep the VM for inspection.
 #
+# ⚠ M0 RESULT (2026-11-22): the first-attempt m0-phase1.ps1 hangs in
+# dotnet-install inside the guest. The successful path (cross-built provider +
+# VS DriverKit component + pnputil + fltmc attach) is documented in
+# ../../docs/nt/M0-REPORT.md §3. Treat this runner as a record, not a
+# one-command reproducible path, until phase1-v2 lands.
+#
 # Usage:
 #   ./run-host.sh [--iso PATH] [--run-id m0] [--web-port 8077] [--timeout-min 180] [--cleanup]
 #

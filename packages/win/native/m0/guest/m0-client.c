@@ -208,7 +208,13 @@ int wmain(void) {
   check("deleted_gone_from_view", GetFileAttributesW(L"C:\\m0\\ws\\gone.txt") == INVALID_FILE_ATTRIBUTES, "");
   check("deleted_gone_lower_still_there", GetFileAttributesW(L"C:\\m0\\lower\\gone.txt") != INVALID_FILE_ATTRIBUTES, "");
 
-  check("rename_c", MoveFileW(L"C:\\m0\\ws\\dir\\c.txt", L"C:\\m0\\ws\\dir\\d.txt") != 0, "");
+  {
+    BOOL moved = MoveFileExW(L"C:\\m0\\ws\\dir\\c.txt", L"C:\\m0\\ws\\dir\\d.txt", MOVEFILE_REPLACE_EXISTING);
+    DWORD moveErr = moved ? 0 : GetLastError();
+    char moveDetail[64];
+    _snprintf_s(moveDetail, sizeof(moveDetail), _TRUNCATE, "err=%lu", (unsigned long)moveErr);
+    check("rename_c", moved != 0, moveDetail);
+  }
   ZeroMemory(buf, sizeof(buf));
   n = read_all(L"C:\\m0\\ws\\dir\\d.txt", buf, sizeof(buf));
   check("read_renamed_d", n > 0 && starts_with(buf, "c"), buf);
