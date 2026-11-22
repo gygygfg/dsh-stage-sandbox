@@ -126,3 +126,7 @@ native/driver/obj/
 native/driver/pkg/
 native/launcher/obj/
 native/launcher/out/
+
+# vendored project build outputs
+native/provider/vendor/**/bin/
+native/provider/vendor/**/obj/
