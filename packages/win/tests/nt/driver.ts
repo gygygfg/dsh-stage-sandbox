@@ -36,9 +36,15 @@ await runSuite('nt-driver', async () => {
   await rejectsCode('非法 generation 拒绝', () => fake.setPolicy(payload, hash, 0), 'NT_POLICY_INVALID')
 
   section('3. 域注册')
-  await fake.registerDomain({ id: 'd1', viewRoot: 'D:\\dshnt\\view\\s1' })
+  await fake.registerDomain({ id: 'd1', viewRoot: 'D:\\dshnt\\view\\s1', workspaceRoot: 'C:\\ws', storeRoot: 'D:\\store' })
   eq('域计数', (await fake.queryStats()).domains, 1)
-  await rejectsCode('重复域拒绝', () => fake.registerDomain({ id: 'd1', viewRoot: 'D:\\dshnt\\view\\s1' }), 'NT_DOMAIN_DUPLICATE')
+  await fake.registerDomain({ id: 'd1', viewRoot: 'D:\\dshnt\\view\\s1', workspaceRoot: 'C:\\ws', storeRoot: 'D:\\store' })
+  eq('同 id + 同根幂等（adopt 会重复注册）', (await fake.queryStats()).domains, 1)
+  await rejectsCode(
+    '同 id + 不同根拒绝',
+    () => fake.registerDomain({ id: 'd1', viewRoot: 'D:\\dshnt\\view\\s2', workspaceRoot: 'C:\\ws', storeRoot: 'D:\\store' }),
+    'NT_DOMAIN_DUPLICATE',
+  )
   await rejectsCode('空 viewRoot 拒绝', () => fake.registerDomain({ id: 'd2', viewRoot: '' }), 'NT_VIEW_ROOT_INVALID')
   await fake.unregisterDomain('d1')
   eq('注销后域计数', (await fake.queryStats()).domains, 0)

@@ -36,7 +36,10 @@ export class FakeDriverPort implements NtDriverPort {
   private readonly failHello: boolean
   private readonly failSetPolicy: boolean
   private readonly failRegisterDomain: boolean
-  private readonly domains = new Map<string, { id: string; viewRoot: string; appContainerSid?: string }>()
+  private readonly domains = new Map<
+    string,
+    { id: string; viewRoot: string; workspaceRoot?: string; storeRoot?: string; appContainerSid?: string }
+  >()
   private readonly applies = new Map<number, { pid: number; imageHash: string; paths: string[] }>()
   private readonly listeners = new Set<(event: NtDriverEvent) => void>()
   private currentPolicyHash: string | undefined
@@ -96,7 +99,13 @@ export class FakeDriverPort implements NtDriverPort {
     return { generation }
   }
 
-  async registerDomain(input: { id: string; viewRoot: string; appContainerSid?: string }): Promise<void> {
+  async registerDomain(input: {
+    id: string
+    viewRoot: string
+    workspaceRoot?: string
+    storeRoot?: string
+    appContainerSid?: string
+  }): Promise<void> {
     if (this.failRegisterDomain) {
       throw new NtError('NT_DOMAIN_NOT_REGISTERED', { reason: 'fake registerDomain failure' })
     }
@@ -106,7 +115,17 @@ export class FakeDriverPort implements NtDriverPort {
     if (typeof input.viewRoot !== 'string' || input.viewRoot.length === 0) {
       throw new NtError('NT_VIEW_ROOT_INVALID', { reason: 'empty viewRoot' })
     }
-    if (this.domains.has(input.id)) {
+    const existing = this.domains.get(input.id)
+    if (existing !== undefined) {
+      // 与真实驱动一致：同 id + 同根是幂等的（supervisor 的 adopt 路径会重复注册）；
+      // 同 id + 不同根才是重复域。
+      if (
+        existing.viewRoot === input.viewRoot &&
+        existing.workspaceRoot === input.workspaceRoot &&
+        existing.storeRoot === input.storeRoot
+      ) {
+        return
+      }
       throw new NtError('NT_DOMAIN_DUPLICATE', { id: input.id })
     }
     this.domains.set(input.id, { ...input })

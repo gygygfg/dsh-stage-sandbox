@@ -44,6 +44,14 @@ export interface NtSessionOptions {
   launcherPath: string
   /** init 时是否要求 apply helper 就绪（默认 false；apply 是发布阶段才需要）。 */
   requireApplyHelper?: boolean
+  /**
+   * 采用“已由 supervisor 下发并注册”的域：
+   *   · 不再 setPolicy（generation 可能已被 supervisor 推进，重发会倒退/幂等失败）；
+   *   · 只查询驱动当前 generation 并 `registerDomain` 校验域仍在；
+   *   · 用当前 generation 重新编译本地策略（规则不变，hash 与驱动一致）。
+   * 缺省 false：会话自己下发策略。
+   */
+  adoptAppliedPolicy?: boolean
 }
 
 /** 驱动返回的 policy generation 与控制面不一致时抛错的细节。 */
@@ -111,28 +119,61 @@ export class NtSession {
       })
     }
 
-    /*
-     * 驱动只认二进制线格式（`DSHNT_POLICY_MAGIC`）；JSON 只出现在控制面/CLI 参数里。
-     * M1 之前这里发的是 canonical JSON，只有 FakeDriverPort 会接受 —— 真实驱动返回
-     * STATUS_INVALID_PARAMETER。现在统一用 policy-binary.encodePolicy（与 ctl 同一份编码）。
-     */
-    const encoded = encodePolicy(this.options.policy)
-    const applied = await this.options.driver.setPolicy(encoded.payload, encoded.hash, encoded.generation)
-    await this.options.driver.registerDomain({
-      id: this.options.domain.id,
-      viewRoot: this.options.domain.viewRoot,
-      ...(this.options.domain.appContainerSid === undefined
-        ? {}
-        : { appContainerSid: this.options.domain.appContainerSid }),
-    })
+    let effective = compiled
+    let driverGeneration: number
+    if (this.options.adoptAppliedPolicy === true) {
+      /*
+       * supervisor 已经下发过策略并注册了域：这里**不能**再 setPolicy。
+       * 它的 generation 是 `当前驱动 generation + 1`，用会话自带的 generation 重发会
+       * 触发 NT_POLICY_GENERATION_MISMATCH（或同 generation 幂等而内容不一致）。
+       * 只核对“驱动确实有策略”，再用当前 generation 重新编译本地副本；registerDomain
+       * 会与驱动里的根核对（域被 down 掉时这里就失败，正是我们要的 fail-closed）。
+       */
+      const stats = await this.options.driver.queryStats()
+      if (!Number.isInteger(stats.policyGeneration) || stats.policyGeneration <= 0) {
+        throw new NtError('NT_POLICY_GENERATION_MISMATCH', {
+          reason: 'adoptAppliedPolicy requires a policy already applied to the driver',
+          driverGeneration: stats.policyGeneration,
+        })
+      }
+      effective = compilePolicy({ ...this.options.policy, generation: stats.policyGeneration })
+      await this.options.driver.registerDomain({
+        id: this.options.domain.id,
+        viewRoot: this.options.domain.viewRoot,
+        workspaceRoot: this.options.domain.workspaceRoot,
+        storeRoot: this.options.domain.storeRoot,
+        ...(this.options.domain.appContainerSid === undefined
+          ? {}
+          : { appContainerSid: this.options.domain.appContainerSid }),
+      })
+      driverGeneration = stats.policyGeneration
+    } else {
+      /*
+       * 驱动只认二进制线格式（`DSHNT_POLICY_MAGIC`）；JSON 只出现在控制面/CLI 参数里。
+       * M1 之前这里发的是 canonical JSON，只有 FakeDriverPort 会接受 —— 真实驱动返回
+       * STATUS_INVALID_PARAMETER。现在统一用 policy-binary.encodePolicy（与 ctl 同一份编码）。
+       */
+      const encoded = encodePolicy(this.options.policy)
+      const applied = await this.options.driver.setPolicy(encoded.payload, encoded.hash, encoded.generation)
+      await this.options.driver.registerDomain({
+        id: this.options.domain.id,
+        viewRoot: this.options.domain.viewRoot,
+        workspaceRoot: this.options.domain.workspaceRoot,
+        storeRoot: this.options.domain.storeRoot,
+        ...(this.options.domain.appContainerSid === undefined
+          ? {}
+          : { appContainerSid: this.options.domain.appContainerSid }),
+      })
+      driverGeneration = applied.generation
+    }
 
-    this.compiled = compiled
+    this.compiled = effective
     this.initialized = true
     this.initReport = {
       domainId: this.options.domain.id,
-      policyGeneration: compiled.generation,
-      policyHash: compiled.hash,
-      driverGeneration: applied.generation,
+      policyGeneration: effective.generation,
+      policyHash: effective.hash,
+      driverGeneration,
       viewRoot: this.options.domain.viewRoot,
     }
     return this.initReport

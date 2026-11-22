@@ -30,8 +30,9 @@ import { encodePolicy } from './policy-binary.ts'
 import { validatePolicy } from './policy.ts'
 import { PipeProviderControl, type ProviderControl } from './provider-client.ts'
 import { DEFAULT_PROVIDER_PIPE, providerSocketPath } from './provider-protocol.ts'
-import { isKernelReady } from './status.ts'
-import { isNtError, NtError, NT_DRIVER_ABI_VERSION, type NtPolicySet, type NtStatus } from './types.ts'
+import { isKernelReady, createNtStatus } from './status.ts'
+import { NtSandboxProvider } from './provider.ts'
+import { isNtError, NtError, NT_DRIVER_ABI_VERSION, type NtDomain, type NtPolicySet, type NtStatus } from './types.ts'
 import type { NtRuntime } from './runtime.ts'
 
 export type NtSupervisorPhase = 'down' | 'starting' | 'up' | 'failed'
@@ -118,6 +119,8 @@ export class NtSupervisor {
   private provider: NtProviderHandle | undefined
   private domainId: string | undefined
   private registered = false
+  private domain: NtDomain | undefined
+  private basePolicy: NtPolicySet | undefined
   private policyGeneration: number | undefined
   private lastError: string | undefined
   private lastStatus: NtStatus | undefined
@@ -155,6 +158,8 @@ export class NtSupervisor {
     try {
       // 1) 纯校验先做：非法策略不产生任何副作用（不 spawn、不下发）。
       const base = this.runtime.policy()
+      this.domain = base.domain
+      this.basePolicy = base.policy
       this.domainId = base.domain.id
       const validation = validatePolicy(base.policy, {
         requireAppContainerSid: base.domain.tokenMode === 'appcontainer',
@@ -335,7 +340,49 @@ export class NtSupervisor {
     }
     this.policyGeneration = undefined
     this.domainId = undefined
+    this.domain = undefined
+    this.basePolicy = undefined
     this.phase = 'down'
+  }
+
+  /**
+   * 构造一个**已就绪**的 `ctx.sandbox` provider（adopt 模式）。
+   *
+   * 它与会话共享 supervisor 已下发的域/策略/generation，`init()` 不会再 setPolicy；
+   * 这让“先 up、再 confine”不会因为 generation 倒退而失败。
+   * 未 up 时调用即 fail-closed（不返回“看起来能用”的 provider）。
+   */
+  sandboxProvider(): NtSandboxProvider {
+    if (
+      this.phase !== 'up' ||
+      this.domain === undefined ||
+      this.basePolicy === undefined ||
+      this.lastStatus === undefined ||
+      this.policyGeneration === undefined
+    ) {
+      throw new NtError('NT_DOMAIN_NOT_REGISTERED', { reason: 'nt supervisor is not up' })
+    }
+    const domain = this.domain
+    const policy: NtPolicySet = { ...this.basePolicy, generation: this.policyGeneration }
+    return new NtSandboxProvider({
+      workspaceRoot: this.runtime.workspaceRoot,
+      viewRoot: this.runtime.viewRoot,
+      storeRoot: this.runtime.storeRoot,
+      launcherPath: this.runtime.launcherPath,
+      driver: this.runtime.driver,
+      status: () =>
+        this.phase === 'up' && this.lastStatus !== undefined
+          ? this.lastStatus
+          : createNtStatus({ enforcement: 'unavailable', notes: ['nt supervisor is not up'] }),
+      domainId: domain.id,
+      policy,
+      adoptAppliedPolicy: true,
+      tokenMode: domain.tokenMode,
+      network: domain.network.mode,
+      networkAllow: domain.network.allow,
+      job: domain.job,
+      ...(domain.appContainerSid === undefined ? {} : { appContainerSid: domain.appContainerSid }),
+    })
   }
 
   private async waitForPing(): Promise<void> {

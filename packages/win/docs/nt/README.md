@@ -109,10 +109,10 @@ DSH / Cordis
 | `src/nt/executor.ts` | ✅ K0 执行链 + 单测 |
 | `src/nt/apply.ts` | ✅ 控制面 apply（journal/undo）+ 单测 |
 | `src/nt/status-probe.ts` | ✅ 机器事实 → `NtStatus` + 单测 |
-| `src/nt/provider.ts` | ✅ `ctx.sandbox` NT provider（M2 才装配） |
+| `src/nt/provider.ts` | ✅ `ctx.sandbox` NT provider（支持 adopt 已下发策略；尚未注册服务） |
 | `src/nt/runtime.ts` | ✅ 诊断装配 + 单测 |
 | `src/nt/provider-protocol.ts` / `provider-client.ts` | ✅ 管道协议/客户端 + 单测 |
-| `src/nt/supervisor.ts` | ✅ 数据面生命周期（up/down、回滚、generation 单调）+ 单测 |
+| `src/nt/supervisor.ts` | ✅ 数据面生命周期（up/down、回滚、generation 单调、adopt provider）+ 单测 |
 | M0 Windows spike | ✅ 已通过（ProjFS + SimRep；23/23 探针；见 `M0-REPORT.md`） |
 | M1 端到端 | ✅ 已通过（24/24 探针、暂存写、lower 不变、offline/allowlist、缓解/Job 回读、注销/重下发；见 `M1-REPORT.md`） |
 | M1 性能 | ⚠ 0.55–0.64 ms/文件、20k 11.4–12.8 s（门禁未过；见 `M1-PERF.md`） |

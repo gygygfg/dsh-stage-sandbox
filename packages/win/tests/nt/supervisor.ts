@@ -240,7 +240,14 @@ await runSuite('nt-supervisor', async () => {
   const s5 = socketPath('up')
   removeSocket(s5)
   const provider = await startFakeProvider(s5)
-  const driver = new FakeDriverPort()
+  class CountingDriver extends FakeDriverPort {
+    setPolicyCalls = 0
+    override async setPolicy(payload: Uint8Array, hash: string, generation: number) {
+      this.setPolicyCalls += 1
+      return await super.setPolicy(payload, hash, generation)
+    }
+  }
+  const driver = new CountingDriver()
   const runtime = makeRuntime(driver, { providerSocket: s5 })
   const control = new PipeProviderControl(s5, { timeoutMs: 1000 })
   const supervisor = makeSupervisor(runtime, control)
@@ -263,6 +270,16 @@ await runSuite('nt-supervisor', async () => {
     const again = await supervisor.up()
     eq('up 幂等', again.policyGeneration, 1)
     eq('未重复 start', provider.ops.filter((op) => op === 'start').length, 1)
+    eq('supervisor 只下发一次策略', driver.setPolicyCalls, 1)
+
+    const sandbox = supervisor.sandboxProvider()
+    await sandbox.init()
+    eq('adopt 后不重复 setPolicy', driver.setPolicyCalls, 1)
+    eq('adopt 报告驱动 generation', sandbox.session.report?.driverGeneration, 1)
+    const confined = sandbox.confine(['C:\\Windows\\System32\\cmd.exe'])
+    check('confine 使用 supervisor 的域', confined[confined.indexOf('--domain') + 1] === state.domainId, confined.join(' '))
+    eq('confine 保留网络档位', confined[confined.indexOf('--network') + 1], 'offline')
+    eq('provider 看到按子进程网络', sandbox.status().network.perChild, true)
 
     await supervisor.down()
     eq('down 后 phase=down', supervisor.state().phase, 'down')

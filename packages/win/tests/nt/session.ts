@@ -77,6 +77,31 @@ await runSuite('nt-session', async () => {
   const report2 = await session.init()
   eq('init 幂等', report2.driverGeneration, 5)
 
+  section('1b. adopt：采用 supervisor 已下发的策略')
+  const adoptedDriver = new FakeDriverPort()
+  await adoptedDriver.setPolicy(encodePolicy(policy()).payload, encodePolicy(policy()).hash, 7)
+  const adopted = new NtSession({
+    domain: domain(),
+    policy: policy(),
+    driver: adoptedDriver,
+    status: status(),
+    launcherPath: 'C:\\dshnt\\bin\\dshnt-launch.exe',
+    adoptAppliedPolicy: true,
+  })
+  const adoptedReport = await adopted.init()
+  eq('adopt 使用驱动当前 generation', adoptedReport.driverGeneration, 7)
+  eq('adopt 报告 generation 同步', adoptedReport.policyGeneration, 7)
+  check('adopt 后可以 confine', adopted.confine(['C:\\Windows\\System32\\cmd.exe']).argv.length > 0)
+  const noPolicy = new NtSession({
+    domain: domain(),
+    policy: policy(),
+    driver: new FakeDriverPort(),
+    status: status(),
+    launcherPath: 'C:\\dshnt\\bin\\dshnt-launch.exe',
+    adoptAppliedPolicy: true,
+  })
+  await rejectsCode('adopt 但驱动无策略 → generation mismatch', () => noPolicy.init(), 'NT_POLICY_GENERATION_MISMATCH')
+
   section('2. confine')
   const confined = session.confine(['C:\\Windows\\System32\\cmd.exe', '/c', 'echo hi'], { env: { PATH: 'C:\\Windows' } })
   eq('enforcement', confined.enforcement, 'full')

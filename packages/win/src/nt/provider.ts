@@ -55,6 +55,13 @@ export interface NtProviderOptions {
   appContainerSid?: string
   /** 域 id（默认 `dsh-<pid>-<counter>`）。 */
   domainId?: string
+  /**
+   * 直接使用这份策略（由 supervisor 构造/下发），而不是按选项重建。
+   * `domainId` 用于在其中选中域；缺省时取第一个域。
+   */
+  policy?: NtPolicySet
+  /** 采用 supervisor 已下发/注册的域：`init()` 不再 setPolicy。 */
+  adoptAppliedPolicy?: boolean
 }
 
 export interface NtProviderDomain {
@@ -131,18 +138,33 @@ export class NtSandboxProvider {
 
   constructor(options: NtProviderOptions) {
     this.options = options
-    const built = buildDomainPolicy({
-      workspaceRoot: options.workspaceRoot,
-      viewRoot: options.viewRoot,
-      storeRoot: options.storeRoot,
-      ...(options.domainId === undefined ? {} : { domainId: options.domainId }),
-      ...(options.tokenMode === undefined ? {} : { tokenMode: options.tokenMode }),
-      ...(options.network === undefined ? {} : { network: options.network }),
-      ...(options.networkAllow === undefined ? {} : { networkAllow: options.networkAllow }),
-      ...(options.job === undefined ? {} : { job: options.job }),
-      ...(options.extraRules === undefined ? {} : { extraRules: options.extraRules }),
-      ...(options.appContainerSid === undefined ? {} : { appContainerSid: options.appContainerSid }),
-    })
+    const built =
+      options.policy === undefined
+        ? buildDomainPolicy({
+            workspaceRoot: options.workspaceRoot,
+            viewRoot: options.viewRoot,
+            storeRoot: options.storeRoot,
+            ...(options.domainId === undefined ? {} : { domainId: options.domainId }),
+            ...(options.tokenMode === undefined ? {} : { tokenMode: options.tokenMode }),
+            ...(options.network === undefined ? {} : { network: options.network }),
+            ...(options.networkAllow === undefined ? {} : { networkAllow: options.networkAllow }),
+            ...(options.job === undefined ? {} : { job: options.job }),
+            ...(options.extraRules === undefined ? {} : { extraRules: options.extraRules }),
+            ...(options.appContainerSid === undefined ? {} : { appContainerSid: options.appContainerSid }),
+          })
+        : (() => {
+            const domain =
+              options.domainId === undefined
+                ? options.policy.domains[0]
+                : options.policy.domains.find((candidate) => candidate.id === options.domainId)
+            if (domain === undefined) {
+              throw new NtError('NT_POLICY_INVALID', {
+                reason: 'provided policy does not contain the requested domain',
+                domainId: options.domainId,
+              })
+            }
+            return { domain, policy: options.policy }
+          })()
     this.domain = built.domain
     this.policy = built.policy
     this.compiled = compilePolicy(this.policy)
@@ -152,6 +174,7 @@ export class NtSandboxProvider {
       driver: options.driver,
       status: options.status,
       launcherPath: options.launcherPath,
+      ...(options.adoptAppliedPolicy === true ? { adoptAppliedPolicy: true } : {}),
     })
   }
 
