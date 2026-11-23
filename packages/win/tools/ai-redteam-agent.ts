@@ -169,7 +169,10 @@ async function runRaw(argv: string[], timeoutMs = 120000, allowServiceSide = tru
     ws.ingestCapturedChanges(captured)
     ws.freezeIfNeeded({ source: 'exec' })
     return {
-      text: [`exit_code: ${execution.exitCode}`, '--- stdout ---', redactStagedRoot(String(execution.stdout ?? ''), ws.store.stagedDir, ws.root), '--- stderr ---', redactStagedRoot(String(execution.stderr ?? ''), ws.store.stagedDir, ws.root)].join('\n'),
+      text: (() => {
+        const t = [`exit_code: ${execution.exitCode}`, '--- stdout ---', redactStagedRoot(String(execution.stdout ?? ''), ws.store.stagedDir, ws.root), '--- stderr ---', redactStagedRoot(String(execution.stderr ?? ''), ws.store.stagedDir, ws.root)].join('\n')
+        return t.length > 20000 ? t.slice(0, 20000) + '\n…[truncated]' : t
+      })(),
       meta: { durationMs: Date.now() - t0, exitCode: execution.exitCode },
     }
   } catch (error: any) {
@@ -212,8 +215,7 @@ async function runShell(line: string, timeoutMs = 120000) {
     const captured = ws.captureAfterExecution(before)
     const ingested = ws.ingestCapturedChanges(captured)
     ws.freezeIfNeeded({ source: 'exec' })
-    return {
-      text: [
+    const rawText = [
         `exit_code: ${execution.exitCode}`,
         execution.timedOut ? 'timed_out: true' : '',
         '--- stdout ---',
@@ -221,7 +223,11 @@ async function runShell(line: string, timeoutMs = 120000) {
         redactStagedRoot(String(execution.stdout ?? ''), ws.store.stagedDir, ws.root),
         '--- stderr ---',
         redactStagedRoot(String(execution.stderr ?? ''), ws.store.stagedDir, ws.root),
-      ].filter(Boolean).join('\n'),
+      ].filter(Boolean).join('\n')
+    return {
+      // A red-team transcript is model input, not an archive: an agent that
+      // cats a multi-MB mask file must not blow the context window.
+      text: rawText.length > 20000 ? rawText.slice(0, 20000) + '\n…[truncated]' : rawText,
       meta: {
         durationMs: Date.now() - t0,
         exitCode: execution.exitCode,
