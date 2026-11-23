@@ -268,6 +268,7 @@ section('E. R41-SEC04：?session= 必须绑定到宿主真实会话（存在 + c
         }
         if (mode === 'throw') throw new Error('session backend down')
         if (mode === 'foreign') return { header: { id, cwd: join(REPO, 'some-other-workspace') } }
+        if (mode === 'child') return { header: { id, cwd: join(WS_ROOT, 'nested-session') } }
         if (mode === 'no-cwd') return { header: { id } }
         return { header: { id, cwd: WS_ROOT } }
       },
@@ -311,6 +312,20 @@ section('E. R41-SEC04：?session= 必须绑定到宿主真实会话（存在 + c
     check('E3 会话存在且 cwd==workspaceRoot ⇒ 放行到既有业务路径（200/404 均可，且不是 session-*）', (res.status === 200 || res.status === 404) && String(body?.code ?? '').startsWith('session-') === false, `status=${res.status} code=${body?.code}`)
   }
   {
+    /**
+     * 2026-11-23（真实桌面端实测）：桌面默认会话工作区
+     * `%USERPROFILE%\Documents\deepseek-harness\default-workspace` 位于配置根
+     * `%USERPROFILE%` 之下。旧判据只认"完全相等" ⇒ 面板整族 403；这里钉住"根之内"合法。
+     */
+    const { handler } = makeHandler({ mode: 'child' })
+    const { res, body } = await snap(handler, 'session-under-root')
+    check(
+      'E2b 会话 cwd 位于配置根**之内** ⇒ 放行（桌面默认工作区形态）',
+      (res.status === 200 || res.status === 404) && String(body?.code ?? '') !== 'session-not-authorized',
+      `status=${res.status} code=${body?.code}`,
+    )
+  }
+  {
     const { handler } = makeHandler({ mode: 'throw' })
     const { res, body } = await snap(handler, 'own-session')
     check('E4 sessionQuery 后端异常 ⇒ 503 session-check-unavailable（fail-closed）', res.status === 503 && body?.code === 'session-check-unavailable' && body?.snapshot === undefined, `status=${res.status} code=${body?.code}`)
@@ -350,7 +365,14 @@ section('E. R41-SEC04：?session= 必须绑定到宿主真实会话（存在 + c
     const payloadAt = block.indexOf('buildPanelPayload(')
     check('E10 静态守卫：createPanelHandler 里会话校验出现在 buildPanelPayload 之前（未校验零构建）', sessionAt >= 0 && payloadAt > 0 && sessionAt < payloadAt, `sessionAt=${sessionAt} payloadAt=${payloadAt}`)
     check('E11 静态守卫：apply() 把 sessionQueryOf/sessionsOf 交给面板 handler（生产接线，非仅单测）', /sessionQueryOf:\s*\(\)\s*=>/.test(src) && /sessionsOf:\s*\(\)\s*=>/.test(src), 'sessionQueryOf/sessionsOf in apply()')
-    check('E12 静态守卫：会话校验用宿主 sessionQuery.observeSession 与 canonical(header.cwd) 对比，而不是信任 query', /observeSession\(/.test(src) && /compareKey\(canonical\(cwd\)\)\s*===\s*compareKey\(canonical\(workspaceRoot\)\)/.test(src), 'observeSession + canonical compare')
+    check(
+      'E12 静态守卫：会话校验用宿主 sessionQuery.observeSession 与 canonical(header.cwd) 对比，而不是信任 query',
+      /observeSession\(/.test(src) &&
+        /const rootKey = canonical\(workspaceRoot\)/.test(src) &&
+        /const cwdKey = canonical\(cwd\)/.test(src) &&
+        /compareKey\(cwdKey\)\s*===\s*compareKey\(rootKey\)/.test(src),
+      'observeSession + canonical compare',
+    )
   }
 }
 

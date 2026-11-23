@@ -1272,7 +1272,7 @@ export class Workspace {
     this._captureBaseWin32(rel, this.absolute(rel), opts)
 
     const buffer = Buffer.isBuffer(content) ? content : Buffer.from(String(content), 'utf8')
-    const hash = this.store.putBlob(buffer)
+    const hash = this.store.putBlob(buffer, { skipQuota: opts.skipQuota === true })
     const stagedPath = this.staged(rel)
     mkdirSync(dirname(stagedPath), { recursive: true })
     writeFileSync(stagedPath, buffer)
@@ -1286,7 +1286,13 @@ export class Workspace {
     // 外部条目**不做**父目录合成：它的父目录是真实 NTFS 目录，且键不是相对路径，
     // 合成会产生 `C:` 这类畸形键（那也是 listDir 根枚举污染的来源）。
     if (!external) this.synthesizeParents(rel)
-    this.store.touch(this.manifest)
+    /**
+     * 2026-11-23（真实机 1000 文件实测）：`store.touch()` 每次都重写**整份**
+     * `manifest.json`。`ingestCapturedChanges()` 逐条调用本方法 ⇒ 1000 个文件要写
+     * 1000 次不断变大的 JSON（实测 100.6 s；同一批在真实盘上只要 2.25 s）。
+     * `deferTouch` 让批处理只落一次盘；非批处理调用方（工具层 write/edit）行为不变。
+     */
+    if (opts.deferTouch !== true) this.store.touch(this.manifest)
     return { path: rel, hash, bytes: buffer.length, changed: entry.changed }
   }
 
@@ -1350,7 +1356,7 @@ export class Workspace {
       }
     }
     if (!external) this.synthesizeParents(rel)
-    this.store.touch(this.manifest)
+    if (opts.deferTouch !== true) this.store.touch(this.manifest)
     return { path: rel, deleted: true, wasKind: state.kind }
   }
 
@@ -4150,43 +4156,75 @@ export class Workspace {
    */
   ingestCapturedChanges(captured = []) {
     const result = { ingested: 0, deletions: 0, skipped: [] }
+    /**
+     * 一次 capture 通常是一整批文件；逐条 `touch()` 的代价是 O(n²) 字节写
+     * （见 `writeFile` 里的实测）。这里延迟到批末落一次盘；中途抛错时
+     * `finally` 仍会把已并入的部分持久化，语义与逐条写一致（只是少写 n-1 次）。
+     */
+    let dirty = false
+    /**
+     * 配额：先按**上界**做一次判定（批内 blob 去重只会更少，绝不多算），
+     * 之后批内写入跳过逐条 `measureTree()`（见 `Store.putBlob` 的实测注释）。
+     * 统计不完整/超配额仍在这一步 fail-closed，不会等到写完才发现。
+     */
+    let incomingBytes = 0
     for (const change of captured) {
-      // 一律经 absolute() 映射（而不是裸 join(root, path)）：
-      // 万一 captured 里出现绝对路径（外部条目键就是绝对路径），
-      // `join('C:\\ws', 'C:\\out\\a.txt')` 会得到 `C:\ws\C:\out\a.txt` 这种畸形路径。
-      const abs = this.absolute(change.path)
-      if (change.deleted) {
-        try {
-          this.remove(abs, { missingOk: true, origin: 'exec' })
-          result.deletions += 1
-        } catch (error) {
-          result.skipped.push({ path: change.path, reason: error.message })
-        }
-        continue
+      if (!change || change.deleted) continue
+      try {
+        const probe =
+          typeof change.stagedPhysical === 'string' && existsSync(change.stagedPhysical)
+            ? change.stagedPhysical
+            : this.store.stagedPath(change.path)
+        if (existsSync(probe)) incomingBytes += statSync(probe).size
+      } catch {
+        /* 读不到大小的条目会在下面按 skipped 处理，不阻断整批 */
       }
-      // ── 取内容的口径必须与捕获口径一致：以**暂存树当前内容**为准 ──────────────
-      // 曾经写成"优先复用条目里的 stagedHash"，那是**执行前**的内容戳，
-      // 会直接把沙箱内进程刚写下的内容覆盖回去（实测：x=3 被还原成 x=2，
-      // 于是 apply 落盘的是旧内容，e2e 阶段 9 红）。
-      // 正确顺序：先按捕获到的 hash 找 blob（内容寻址，天然幂等），找不到再读暂存树物化对象。
-      const hash = change.hash && change.hash !== hashAbsent() ? change.hash : undefined
-      if (hash && this.store.hasBlob(hash)) {
-        this.writeFile(abs, this.store.readBlob(hash), { origin: 'exec' })
-        result.ingested += 1
-        continue
-      }
-      const stagedPath =
-        typeof change.stagedPhysical === 'string' && existsSync(change.stagedPhysical)
-          ? change.stagedPhysical
-          : this.store.stagedPath(change.path)
-      if (!existsSync(stagedPath)) {
-        result.skipped.push({ path: change.path, reason: 'staged object missing; not ingesting' })
-        continue
-      }
-      this.writeFile(abs, readFileSync(stagedPath), { origin: 'exec' })
-      result.ingested += 1
     }
-    return result
+    if (incomingBytes > 0) this.store.assertStagingQuota(incomingBytes)
+    try {
+      for (const change of captured) {
+        // 一律经 absolute() 映射（而不是裸 join(root, path)）：
+        // 万一 captured 里出现绝对路径（外部条目键就是绝对路径），
+        // `join('C:\\ws', 'C:\\out\\a.txt')` 会得到 `C:\ws\C:\out\a.txt` 这种畸形路径。
+        const abs = this.absolute(change.path)
+        if (change.deleted) {
+          try {
+            this.remove(abs, { missingOk: true, origin: 'exec', deferTouch: true })
+            result.deletions += 1
+            dirty = true
+          } catch (error) {
+            result.skipped.push({ path: change.path, reason: error.message })
+          }
+          continue
+        }
+        // ── 取内容的口径必须与捕获口径一致：以**暂存树当前内容**为准 ──────────────
+        // 曾经写成"优先复用条目里的 stagedHash"，那是**执行前**的内容戳，
+        // 会直接把沙箱内进程刚写下的内容覆盖回去（实测：x=3 被还原成 x=2，
+        // 于是 apply 落盘的是旧内容，e2e 阶段 9 红）。
+        // 正确顺序：先按捕获到的 hash 找 blob（内容寻址，天然幂等），找不到再读暂存树物化对象。
+        const hash = change.hash && change.hash !== hashAbsent() ? change.hash : undefined
+        if (hash && this.store.hasBlob(hash)) {
+          this.writeFile(abs, this.store.readBlob(hash), { origin: 'exec', deferTouch: true, skipQuota: true })
+          result.ingested += 1
+          dirty = true
+          continue
+        }
+        const stagedPath =
+          typeof change.stagedPhysical === 'string' && existsSync(change.stagedPhysical)
+            ? change.stagedPhysical
+            : this.store.stagedPath(change.path)
+        if (!existsSync(stagedPath)) {
+          result.skipped.push({ path: change.path, reason: 'staged object missing; not ingesting' })
+          continue
+        }
+        this.writeFile(abs, readFileSync(stagedPath), { origin: 'exec', deferTouch: true, skipQuota: true })
+        result.ingested += 1
+        dirty = true
+      }
+      return result
+    } finally {
+      if (dirty) this.store.touch(this.manifest)
+    }
   }
 
   /**

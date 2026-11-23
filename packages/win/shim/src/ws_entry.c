@@ -149,19 +149,24 @@ static int ws_init_full(const wchar_t *configJsonPath)
      * either WINSTAGE_REGSTAGE_SESSION_DIR, DSH_REGSTAGE_ROOT (T3's name), or the
      * file staging root. Failure is not fatal for the file layer but makes every
      * registry write fail closed (never a real-hive write). */
+    {
+        WS_PATH_BUF(sessionDir0);
+        sessionDir0[0] = 0;
+        ws_env_get(L"DSH_REGSTAGE_SESSION_DIR", sessionDir0, WS_PATH_MAX);
+        if (!sessionDir0[0]) {
+            ws_env_get(L"WINSTAGE_REGSTAGE_SESSION_DIR", sessionDir0, WS_PATH_MAX);
+        }
+        if (!sessionDir0[0]) {
+            ws_env_get(L"DSH_REGSTAGE_ROOT", sessionDir0, WS_PATH_MAX);
+        }
+        if (!sessionDir0[0]) {
+            ws_strlcpy_w(sessionDir0, g_ws.stageRoot, WS_PATH_MAX);
+        }
+        ws_strlcpy_w(g_ws.regStageDir, sessionDir0, WS_PATH_MAX);
+    }
     if (!ws_t3_is_attached()) {
         WS_PATH_BUF(sessionDir);
-        sessionDir[0] = 0;
-        ws_env_get(L"DSH_REGSTAGE_SESSION_DIR", sessionDir, WS_PATH_MAX);
-        if (!sessionDir[0]) {
-            ws_env_get(L"WINSTAGE_REGSTAGE_SESSION_DIR", sessionDir, WS_PATH_MAX);
-        }
-        if (!sessionDir[0]) {
-            ws_env_get(L"DSH_REGSTAGE_ROOT", sessionDir, WS_PATH_MAX);
-        }
-        if (!sessionDir[0]) {
-            ws_strlcpy_w(sessionDir, g_ws.stageRoot, WS_PATH_MAX);
-        }
+        ws_strlcpy_w(sessionDir, g_ws.regStageDir, WS_PATH_MAX);
         LSTATUS rc = DshRegStageAttach(sessionDir, L"winstage-shim");
         if (rc != ERROR_SUCCESS) {
             ws_log("DshRegStageAttach failed: %lu (sessionDir=%ls); registry writes will fail closed",

@@ -26,6 +26,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
+#include <tlhelp32.h>
 
 #define INJECT_FAILED 111
 #define USAGE_FAILED  112
@@ -281,6 +283,56 @@ static BOOL append_quoted_arg(wchar_t *buf, size_t cap, size_t *pos, const wchar
  * ⇒ 进程没有可用钩子，同样 fail closed。初始化返回普通 Win32 错误码时保持旧语义
  * （注入成功、子进程继续；rc 写进报告），因为 DISABLE=1（rc=1058）与"配置不全导致
  * DllMain 初始化失败但进程照跑"在 R20 之前就是这个行为。 */
+/**
+ * Find the module base of the DLL we just loaded in the target process.
+ *
+ * WHY THIS EXISTS (2026-11-23, real Windows 10 / x64):
+ *   `LoadLibraryW` runs in a remote thread, and the only value we can read back
+ *   through `GetExitCodeThread` is a **DWORD**. On x64 the module handle is a
+ *   64-bit pointer (normally 0x7ff8...), so that read-back truncates it. Adding
+ *   the export RVA to the truncated value made the "call WinstageShimInit"
+ *   thread start at an unmapped / CFG-invalid address; the target died with
+ *   `0xC0000409` and every injection ended in exit 111 ("remote
+ *   WinstageShimInit failed"), which silently kept the whole lane on T1.
+ *
+ *   Enumerating the target's modules is the authoritative way to recover the
+ *   real base: the loader already knows it, and the path match also rejects a
+ *   stale copy that happens to be mapped into the target.
+ *
+ * @returns module base, or NULL when the snapshot cannot be taken (caller
+ *          falls back to the legacy truncated handle).
+ */
+static HMODULE find_remote_module(DWORD pid, const wchar_t *dllPath)
+{
+    if (!dllPath) {
+        return NULL;
+    }
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+    MODULEENTRY32W me;
+    memset(&me, 0, sizeof(me));
+    me.dwSize = sizeof(me);
+    HMODULE found = NULL;
+    if (Module32FirstW(snap, &me)) {
+        do {
+            if (me.szExePath[0] && _wcsicmp(me.szExePath, dllPath) == 0) {
+                found = (HMODULE)(void *)me.modBaseAddr;
+                break;
+            }
+            const wchar_t *a = wcsrchr(me.szExePath, L'\\');
+            const wchar_t *b = wcsrchr(dllPath, L'\\');
+            if (a && b && _wcsicmp(a + 1, b + 1) == 0) {
+                found = (HMODULE)(void *)me.modBaseAddr;
+                break;
+            }
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
 static FARPROC resolve_remote_export(HMODULE remoteModule, const wchar_t *dllPath)
 {
     if (!remoteModule || !dllPath) {
@@ -510,7 +562,12 @@ int wmain(int argc, wchar_t **argv)
                              * inventing ERROR_MOD_NOT_FOUND. */
                             injectErr = ERROR_DLL_INIT_FAILED;
                         } else {
-                            remoteModule = (HMODULE)(ULONG_PTR)moduleResult;
+                            /* Prefer the module table: the DWORD exit code above
+                             * truncates a 64-bit HMODULE (see find_remote_module). */
+                            remoteModule = find_remote_module(pi.dwProcessId, o.dll);
+                            if (!remoteModule) {
+                                remoteModule = (HMODULE)(ULONG_PTR)moduleResult;
+                            }
                             injected = TRUE;
                         }
                     }

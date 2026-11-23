@@ -24,6 +24,7 @@
  * write straight through to the real system (see the measurement above).
  */
 #include "winstage_internal.h"
+#include <tlhelp32.h>
 
 static wchar_t g_selfDll[WS_PATH_MAX];
 static int g_selfDllOk;
@@ -90,12 +91,12 @@ void ws_proc_set_self_module(HMODULE self)
  * on failure (the caller then fails the CreateProcess* fail-closed). */
 static wchar_t *ws_env_with_contract(const wchar_t *env)
 {
-    static const wchar_t *names[3] = { L"DSH_STAGE_ROOT", L"DSH_SHIM_LOG", L"DSH_SHIM_CONFIG" };
-    const wchar_t *values[3] = { g_ws.stageRoot, g_ws.logPath, g_ws.configPath };
+    static const wchar_t *names[4] = { L"DSH_STAGE_ROOT", L"DSH_SHIM_LOG", L"DSH_SHIM_CONFIG", L"DSH_REGSTAGE_SESSION_DIR" };
+    const wchar_t *values[4] = { g_ws.stageRoot, g_ws.logPath, g_ws.configPath, g_ws.regStageDir };
     size_t total = 1;
     for (const wchar_t *p = env; p && *p; p += wcslen(p) + 1) {
         int skip = 0;
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             size_t nl = wcslen(names[i]);
             if (_wcsnicmp(p, names[i], nl) == 0 && p[nl] == L'=') {
                 skip = 1;
@@ -106,7 +107,7 @@ static wchar_t *ws_env_with_contract(const wchar_t *env)
             total += wcslen(p) + 1;
         }
     }
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         if (values[i] && values[i][0]) {
             total += wcslen(names[i]) + 1 + wcslen(values[i]) + 1;
         }
@@ -201,6 +202,55 @@ static int ws_remote_init(HANDLE hProcess, HMODULE remoteModule)
     return 1;
 }
 
+/**
+ * Recover the real module base of our DLL in the child process.
+ *
+ * WHY THIS EXISTS (2026-11-23, real Windows 10 / x64): the remote
+ * `LoadLibraryW` thread's exit code is a **DWORD**, so on x64 the module handle
+ * (0x7ff8...) is truncated. `ws_remote_init()` added the export RVA to that
+ * truncated value and started a thread at an unmapped / CFG-invalid address;
+ * the child died with 0xC0000409, `ws_inject_into()` returned 0, and every
+ * CreateProcess inside the sandbox failed closed with ERROR_ACCESS_DENIED
+ * (observed as `whoami.exe: access denied` in the transparent-shim canary).
+ *
+ * The module table is authoritative, and the path comparison also rejects a
+ * stale copy that happens to be mapped in the target.
+ */
+static HMODULE ws_find_remote_module(HANDLE hProcess)
+{
+    if (!g_selfDllOk) {
+        return NULL;
+    }
+    DWORD pid = GetProcessId(hProcess);
+    if (!pid) {
+        return NULL;
+    }
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+    MODULEENTRY32W me;
+    memset(&me, 0, sizeof(me));
+    me.dwSize = sizeof(me);
+    HMODULE found = NULL;
+    if (Module32FirstW(snap, &me)) {
+        do {
+            if (me.szExePath[0] && _wcsicmp(me.szExePath, g_selfDll) == 0) {
+                found = (HMODULE)(void *)me.modBaseAddr;
+                break;
+            }
+            const wchar_t *a = wcsrchr(me.szExePath, L'\\');
+            const wchar_t *b = wcsrchr(g_selfDll, L'\\');
+            if (a && b && _wcsicmp(a + 1, b + 1) == 0) {
+                found = (HMODULE)(void *)me.modBaseAddr;
+                break;
+            }
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
 static int ws_inject_into(HANDLE hProcess)
 {
     if (!g_selfDllOk) {
@@ -245,7 +295,13 @@ static int ws_inject_into(HANDLE hProcess)
                     SetLastError(ERROR_DLL_INIT_FAILED);
                 }
                 /* R20①：模块映射成功还不够 —— 在子进程里跑显式初始化并等它就绪。 */
-                if (ok && !ws_remote_init(hProcess, (HMODULE)(ULONG_PTR)moduleResult)) {
+                /* moduleResult is a truncated x64 HMODULE; the module table is
+                 * the authoritative base (see ws_find_remote_module). */
+                HMODULE remoteBase = ok ? ws_find_remote_module(hProcess) : NULL;
+                if (ok && !remoteBase) {
+                    remoteBase = (HMODULE)(ULONG_PTR)moduleResult;
+                }
+                if (ok && !ws_remote_init(hProcess, remoteBase)) {
                     if (GetLastError() == ERROR_SUCCESS) {
                         SetLastError(ERROR_DLL_INIT_FAILED);
                     }
@@ -297,6 +353,9 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
         SetEnvironmentVariableW(L"DSH_STAGE_ROOT", g_ws.stageRoot);
         SetEnvironmentVariableW(L"DSH_SHIM_LOG", g_ws.logPath);
         SetEnvironmentVariableW(L"DSH_SHIM_CONFIG", g_ws.configPath);
+        if (g_ws.regStageDir[0]) {
+            SetEnvironmentVariableW(L"DSH_REGSTAGE_SESSION_DIR", g_ws.regStageDir);
+        }
         env = NULL;
         inheritContract = 1;
     }

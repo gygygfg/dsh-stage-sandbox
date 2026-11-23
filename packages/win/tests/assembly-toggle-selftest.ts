@@ -285,6 +285,52 @@ function worldEnv(env) {
   return out
 }
 
+// ── L. 启动期缓存：运行中的设置写入不得重挂两个 shell 提供方 ────────────────
+process.stdout.write('\n[L] boot 缓存（运行中开关不得翻转行）\n')
+{
+  ok(pwshExpr.includes('__winstageShellProviderCache') && shellExpr.includes('__winstageShellProviderCache'),
+    'L1 两条表达式都使用进程级 boot 缓存（globalThis 在 loader 的求值上下文里不共享）')
+  ok(!pwshExpr.includes('globalThis') && !shellExpr.includes('globalThis'),
+    'L2 不再依赖 globalThis（每个 !!js 可能在不同上下文求值）')
+  const bootProcess = { env: { DSH_HOME: join(SCRATCH, 'home'), DSH_PROFILE: 'on' }, getBuiltinModule: (n) => require_(n) }
+  const bootCtx = { baseUrl: onProfile.baseUrl }
+  const pwshFn = new Function('process', 'ctx', `with (ctx) { return (${pwshExpr}); }`)
+  const shellFn = new Function('process', 'ctx', `with (ctx) { return (${shellExpr}); }`)
+  const firstPwsh = pwshFn(bootProcess, bootCtx)
+  const firstShell = shellFn(bootProcess, bootCtx)
+  ok(firstPwsh === true && firstShell === false,
+    'L3 开态启动：平台 shell 让位、winstage-shell 启用', `pwsh=${firstPwsh} shell=${firstShell}`)
+  // 模拟"用户在设置页把开关关掉"：profile 变了，但同一个宿主进程里行不得翻转。
+  writeFileSync(onProfile.file, '- id: winstage-sandbox\n  config:\n    enabled: false\n', 'utf8')
+  const secondPwsh = pwshFn(bootProcess, bootCtx)
+  const secondShell = shellFn(bootProcess, bootCtx)
+  ok(secondPwsh === firstPwsh && secondShell === firstShell,
+    'L4 设置写入后同一进程内行选择不变（避免 pwsh/winstage 并发重挂）',
+    `before=(${firstPwsh},${firstShell}) after=(${secondPwsh},${secondShell})`)
+  // 恢复该 profile，避免污染后续用例（本段之后没有依赖它的用例，仍保持整洁）。
+  writeFileSync(onProfile.file, '- id: winstage-sandbox\n  config:\n    enabled: true\n    workspaceRoot: ' + ROOT_PATH + '\n', 'utf8')
+}
+
+// ── M. 本轮修复的静态接线（缺一条就会在真实桌面端复现）──────────────────────
+process.stdout.write('\n[M] 静态接线\n')
+{
+  const fsEntry = readFileSync(join(REPO, 'dsh-plugin', 'fs-entry.ts'), 'utf8')
+  const shellEntry = readFileSync(join(REPO, 'dsh-plugin', 'shell-entry.ts'), 'utf8')
+  const executorSrc = readFileSync(join(REPO, 'src', 'executor.ts'), 'utf8')
+  const workspaceSrc = readFileSync(join(REPO, 'src', 'workspace.ts'), 'utf8')
+  const storeSrc = readFileSync(join(REPO, 'src', 'store.ts'), 'utf8')
+  ok(/export const inject = Array\.isArray\(SandboxedFileSystem/.test(fsEntry),
+    'M1 fs-entry 导出 Cordis 依赖声明（关态 super.writeText 需要 ctx.sandboxPolicy）')
+  ok(/export const inject = Array\.isArray\(WinStageShellExecutor/.test(shellEntry),
+    'M2 shell-entry 导出 Cordis 依赖声明')
+  ok(executorSrc.includes('haveNode') && executorSrc.includes('v1.2.3-canary'),
+    'M3 金丝雀不硬依赖 PATH 上的 node（桌面端自带运行时但无 node.exe）')
+  ok(workspaceSrc.includes('deferTouch') && workspaceSrc.includes('skipQuota'),
+    'M4 ingest 批处理：清单与配额各只落一次（1000 文件 93.8s→23.3s）')
+  ok(storeSrc.includes('skipQuota'),
+    'M5 Store.putBlob 支持批内跳过逐 blob 的 measureTree')
+}
+
 // ── E. 变异自证（负面对照）─────────────────────────────────────────────────
 process.stdout.write('\n[E] 变异自证（负面对照）\n')
 {

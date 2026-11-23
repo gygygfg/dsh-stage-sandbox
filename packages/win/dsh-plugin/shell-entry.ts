@@ -174,5 +174,11 @@ const WinStageShellExecutor = createWinStageShellExecutor({
   },
 })
 
+/**
+ * 同 `fs-entry.ts`：依赖声明必须是**模块命名导出**。基类 `ShellExecutor` 的
+ * `static inject`（sandboxPolicy / subprocess / settings …）不会自动成为本插件的声明。
+ */
+export const inject = Array.isArray(WinStageShellExecutor?.inject) ? WinStageShellExecutor.inject : []
+
 export default WinStageShellExecutor
 export { WinStageShellExecutor, SHELL_MODULE, workspaceFor, workspaceRootsOfLoaderRows }

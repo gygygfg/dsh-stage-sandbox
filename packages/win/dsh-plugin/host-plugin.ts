@@ -40,7 +40,7 @@ import { Config } from './schema.ts'
 import { evaluateEnvironment, environmentFailureMessage } from './environment-gate.ts'
 import { probeWin32Abi } from '../src/capability.ts'
 import { WindowsStageExecutor, resolveDshModuleRoot } from '../src/executor.ts'
-import { canonical, compareKey, maskSessionId } from '../src/paths.ts'
+import { canonical, compareKey, isInside, maskSessionId } from '../src/paths.ts'
 import { renderCandidateDiff } from '../src/tools.ts'
 import { verifyStageRootAlive } from '../src/stage-guard.ts'
 import { createNtRuntime, defaultNtLayout } from '../src/nt/runtime.ts'
@@ -1153,8 +1153,19 @@ export async function authorizePanelSession(options = {}) {
     return { ok: false, checked: true, code: 'session-not-authorized', reason: 'panel-workspace-unknown', source }
   }
   let same
+  let inside = false
   try {
-    same = compareKey(canonical(cwd)) === compareKey(canonical(workspaceRoot))
+    const rootKey = canonical(workspaceRoot)
+    const cwdKey = canonical(cwd)
+    same = compareKey(cwdKey) === compareKey(rootKey)
+    /**
+     * 2026-11-23（真实桌面端实测）：桌面版的默认会话工作区是
+     * `C:\Users\<user>\Documents\deepseek-harness\default-workspace`，通常在配置根
+     * `C:\Users\<user>` **之下**。旧判据只认"完全相等"，于是面板路由整族 403
+     * （`session-workspace-mismatch`），设置页那一行也在同一批 403 里加载失败。
+     * 配置根是**沙箱边界**，会话工作区落在其内是合法形态；仍拒绝根之外的工作区。
+     */
+    inside = same ? true : isInside(rootKey, cwdKey)
   } catch (error) {
     return {
       ok: false,
@@ -1164,7 +1175,7 @@ export async function authorizePanelSession(options = {}) {
       source,
     }
   }
-  if (!same) {
+  if (!same && !inside) {
     return { ok: false, checked: true, code: 'session-not-authorized', reason: 'session-workspace-mismatch', cwd, source }
   }
   return { ok: true, checked: true, cwd, source }

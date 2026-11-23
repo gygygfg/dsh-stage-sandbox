@@ -1161,3 +1161,90 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
   "热切换失败假装成功"。
 - 桌面端与 `dsh web` 共用同一个 exe；用 `ELECTRON_RUN_AS_NODE=1` 启动会**没有窗口**（只跑
   CLI）。GUI 验证前必须清掉该变量。
+
+---
+
+## 22. 2026-11-23 · 全功能实测（Win10 guest / 真实 DSH 桌面端 / 透明垫片 lane）
+
+本节是 §21 之后**在同一台 ebk Win10 虚拟机**里做的一轮功能矩阵验证：核心机制用 guest 内的
+真实 Windows API 跑（`src/` + `dsh-plugin/` 的真实代码，经 Electron-as-Node 驱动），
+宿主层用桌面端 UI + `/winstage` 命令验证。所有结论都是本轮实测，失败项/未闭环项单列。
+
+### 22.1 先修掉的三处环境/产物缺陷（否则整条 TS lane 不可用）
+
+| # | 现象（实测） | 根因 | 修复 |
+|---|---|---|---|
+| 1 | shim 金丝雀：`initReturn=1610`、`initialized=false` | `shim/out` 里的 DLL/exe 是 2026-10-06 的旧产物，与 `shim/src` 已漂移 | 用 mingw-w64 按当前源码重建三件套（`winstage-shim.dll` 241KB→448KB） |
+| 2 | 注入失败：`injector exit=111`、`shimInitRc=0xC0000409` | 注入器把远程 `LoadLibraryW` 的 **64 位 HMODULE 经 `GetExitCodeThread` 截成 DWORD**，再加导出 RVA ⇒ 线程起点错误（CFG 报 0xC0000409） | `winstage-inject.exe` 改为按 Toolhelp32 枚举目标模块取真实基址；`ws_proc.c`（子进程自注入）同一处同样修复 |
+| 3 | 金丝雀 `pipeOk/redirectOk=false`，shim 永远判不可用 | 金丝雀硬依赖 PATH 上的 `node --version`；桌面端自带 Electron 运行时但**不提供 node.exe** | 金丝雀检测 node 是否存在：有 node 逐字保留旧语义；没有则用 `cmd /c echo v1.2.3-canary`，结果里新增 `probe` 字段如实标注 |
+
+修复后：`probeTransparentShim()` → `available=true`，
+`launchMode=shim / tierEffective=TS / fallbackReason=(无)`。
+
+### 22.2 修复后的功能矩阵（全部 PASS）
+
+| 用例 | 实测结果 |
+|---|---|
+| 工作区暂存 | `Set-Content base.txt` 后真实盘仍 `v1`，暂存树 `v2-staged`；`new.txt` 真实盘不存在；`del.txt` 真实盘仍在、视图已消失 |
+| **全机暂存** | 沙箱内写 `C:\Users\Docker\Desktop\winstage-outside.txt`：真实盘不存在，暂存树 `fs\C\Users\Docker\Desktop\...` 存在；批准后真实盘出现且内容逐字一致 |
+| 视图一致性 | 第二条沙箱命令 `type base.txt` 读到暂存内容、`del.txt` 已 `DEL-GONE`、`new.txt` 可见；工具层 `readText`/`listDir` 同源 |
+| 敏感文件遮蔽 | `.ssh` / `.dsh\.credentials.yaml` / `.aws` / `.git-credentials` / `.npmrc` / `config\SAM` / `.dshstage` ⇒ `maskId` 命中且 `readText` 抛 `SANDBOX_PATH_MASKED` |
+| 值级脱敏 | `api_key/password/URL 凭据/ghp_…/AWS_SECRET…` ⇒ `<REDACTED len=N>`，明文 0 命中 |
+| 危险命令判定 | `del /f /s /q C:\`、`Remove-Item -Recurse C:\Users`、`reg add HKLM` ⇒ `write-capable`；`format.com` ⇒ `indeterminate`；`dir`/`Get-ChildItem`/`Write-Output` ⇒ `read-only` |
+| 注册表暂存 | `reg add HKCU\Software\WinStageProbe /v Token /d s3cr3t-v1`：真实 hive 前后都不存在；WAL 202 B；overlay 读回 `s3cr3t-v1`；`apply()` 写 2 个单元；真实 hive 出现该值；清理成功 |
+| 安装/使用/应用 | 沙箱内 `copy C:\Windows\System32\curl.exe app\curl.exe`（真实盘不存在）→ 沙箱内 `app\curl.exe --version` 成功 → 批准 → 真实盘 hash 与源文件一致 |
+| 二进制完整性 | 1 MiB 随机文件：源 hash == 暂存 hash == 落盘 hash，字节数一致 |
+| 网络 | `networkTier=OFFLINE`：WFP 绑定表不可用 ⇒ `state=refused` 且 `run()` 抛 `SANDBOX_NETWORK_POLICY_UNENFORCED`（**拒绝执行**，不假装已阻断）；`OBSERVED_ONLINE` 正常执行 |
+| 超多文件 | 1000 个小文件：见 22.3 |
+
+### 22.3 1000 文件性能（guest，同一台机器）
+
+| 阶段 | 修复前 | 修复后 | 说明 |
+|---|---|---|---|
+| 真实盘基线（同循环，不沙箱） | 1.97–2.25 s | — | 宿主 I/O 基线 |
+| 沙箱内创建 1000 文件（`cmd for`） | 8.0–8.3 s | 8.1 s | 垫片拦截 + 日志 |
+| 捕获（快照差分） | 128–131 ms | 130 ms | 与文件数线性 |
+| **并入清单（ingest）** | **93.8 s** | **23.3 s** | ① 每个文件都重写整份 `manifest.json`；② 每个 blob 都 `measureTree()` 整棵暂存树（O(n²)）。改为批末一次 touch + 批前一次配额判定（上界） |
+| 冻结候选 | 18 ms | 18 ms | — |
+| 应用 1000 文件 | 43.3 s | 43.5 s | 每文件一次哈希校验 + 原子写（Defender 扫描占主导，未优化） |
+| 已有 1000 暂存条目时再跑一条命令 | run 227 ms / capture 101 ms | 同量级 | 运行期本身不随条目数退化 |
+
+### 22.4 宿主层（DSH 桌面端 UI）
+
+- 设置页「WinStage 沙箱」行可用：显示 **已启用/已关闭**、下层默认、profile 覆盖、工作区根
+  输入 + 「保存根」、默认收起开关。行在 DOM 中稳定存在（`[data-winstage-setting-layers]`）。
+- **运行中开关**（本轮修复）：旧实现的 `disabled` 表达式读 profile 开关，设置写入时
+  loader 重新求值 ⇒ `pwsh-sandbox` 与 `winstage-shell` 并发重挂，实测硬失败
+  `service "shell" has been registered at <SandboxPwshExecutor>`，设置被回滚。
+  现在两行共用**进程级 boot 缓存**（`process.__winstageShellProviderCache`，键 = profile 路径 +
+  `WINSTAGE_SHELL`）：运行中只写配置、不动行；文件面立即切换，命令面下一次启动生效
+  （与设置行文案一致）。实测：关闭 → 下一条 write 直接落真实盘且工具不报错；开启 →
+  立即回到「WinStage 暂存」，无错误提示。
+- **关态 fs 修复**：`fs-entry.ts` / `shell-entry.ts` 增加 Cordis 约定的**模块命名导出**
+  `export const inject`。旧实现只靠基类 `static inject`，关态 `super.writeText()` 里
+  `this.ctx.sandboxPolicy` 为 undefined ⇒ `Cannot read properties of undefined (reading 'mode')`
+  （实测 write 工具连续失败）。修复后关态写入走平台面成功。
+- 面板路由：`?session=` 的 cwd 校验从「必须相等」放宽为「等于或位于配置根之内」
+  （桌面默认工作区 `%USERPROFILE%\Documents\deepseek-harness\default-workspace` 在
+  `%USERPROFILE%` 之下）。修复前整族 403 `session-workspace-mismatch`；关闭态实测
+  503 `disabled`（符合设计）。
+- 端到端：会话内让 agent 创建 `stage-probe.txt` → `/winstage status` 显示
+  `lane=shim / tierEffective=TS / 开关=开 / 回退分类=none`，候选 `cs_0001_…`、
+  1 个文件 +2/-0；`/winstage diff` 显示 `--- create … + hello`；`/winstage approve`
+  → 「已应用 1 项」；真实盘此前 `找不到文件`，之后 `type` 输出 `hello`。
+
+### 22.5 未闭环 / 边界（如实）
+
+- 本轮最后一次替换 `dist` 后，面板路由在本机返回 **404**（此前同一构建返回 403/503，
+  即路由已注册）。命令面、工具面、lane 均正常；404 的根因尚未定位（怀疑宿主本轮
+  `connection`/`webServer` 注入时序，或旧实例残留），列入下一轮首要排查项。
+- 网络 `OFFLINE` 在本机**无法强制**（缺 WFP 绑定表）⇒ 按设计 fail-closed 拒绝执行；
+  没有"已阻断"的证据，也不声称有。
+- 1000 文件 apply 仍 ~43 s（23 文件/s），瓶颈在逐文件哈希/原子写 + Defender；未做批处理。
+- MSI/服务类安装（`msiexec` 走 `msiserver`）不在本轮矩阵内；历史结论仍是"服务进程写盘绕过
+  IAT 垫片"，不能当作已暂存。
+- `icacls /setintegritylevel Low` 在本机**成功**（与旧记录的"无法设置"不同），但本轮
+  未把 Low IL 作为独立验收项跑完整攻击面。
+- 桌面端默认工作区与配置根的"父子关系"现在是合法形态；但暂存键仍是**绝对路径（外部条目）**，
+  面板/候选里会显示完整路径。若希望键为工作区相对路径，应把 `workspaceRoot` 直接设为
+  该会话工作区。

@@ -59,6 +59,15 @@ const READ_POLICY_RAW = process.env.WINSTAGE_READ_POLICY
 const readPolicyFromEnv =
   typeof READ_POLICY_RAW === 'string' && READ_POLICY_RAW.trim().length > 0 ? READ_POLICY_RAW : undefined
 
+/**
+ * Cordis 的依赖声明走**模块命名导出**（`plugin/index.ts` 的 `export const inject`
+ * 是同一约定）。仅靠基类 `static inject` 不够：loader 不会把它当成插件声明，
+ * 于是关态 `super.writeText()` 里的 `this.ctx.sandboxPolicy` 是 undefined ⇒
+ * `const { mode } = policy` 抛 "Cannot read properties of undefined (reading 'mode')"
+ * （2026-11-23 真实桌面端实测：设置页关掉沙箱后 write 工具连续两次内部错误）。
+ */
+export const inject = Array.isArray(SandboxedFileSystem?.inject) ? SandboxedFileSystem.inject : ['sandboxPolicy']
+
 const StagingFileSystem = createStagingFileSystem({
   stageOutside: stageOutsideFromEnv,
   base: SandboxedFileSystem,

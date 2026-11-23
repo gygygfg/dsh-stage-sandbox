@@ -6561,17 +6561,32 @@ export function buildCapabilityCanaryScript() {
   return [
     "$ErrorActionPreference = 'Continue'",
     '$r = [ordered]@{}',
+    /**
+     * 2026-11-23（真实桌面端实测）：金丝雀原来**硬依赖 PATH 上的 `node`**。
+     * DSH 桌面端自带 Electron 运行时，但**不把 `node.exe` 放进 PATH** ⇒ 这台机器上
+     * `node --version` 永远失败，pipe/redirect 两项恒 false ⇒ TS/T1S 档被永久判成
+     * "shim 不可用"，退回 T1（没有注册表 WAL、没有全机暂存）。
+     * 现在按"有没有 node"选探针命令，并把用了哪一个写进结果（`probe`）：
+     *   · 有 node ⇒ 逐字保留旧语义；
+     *   · 没有 node ⇒ 用 `cmd.exe /c echo v1.2.3-canary`，管道/重定向仍走同一条
+     *     shim 路径（被测的是管道与重定向，不是 node 本身）。
+     */
+    "$haveNode = $false",
+    'try { if (Get-Command node -ErrorAction Stop) { $haveNode = $true } } catch { }',
+    "$r.probe = if ($haveNode) { 'node' } else { 'cmd' }",
     // ① 管道：跑不通时管道内容为空（错误是非终止性的）
     "$pipeText = ''",
-    'try { $pipeText = (& node --version | Out-String) } catch { $pipeText = "" }',
-    "$r.pipeOk = [bool]($pipeText -match '^v\\d+\\.')",
+    "if ($haveNode) { try { $pipeText = (& node --version | Out-String) } catch { $pipeText = '' } }",
+    "else { try { $pipeText = (& cmd.exe /c 'echo v1.2.3-canary' | Out-String) } catch { $pipeText = '' } }",
+    "$r.pipeOk = [bool]($pipeText -match 'v\\d+\\.\\d+')",
     "$r.pipeText = ($pipeText + '').Trim()",
     // ② 重定向：受限令牌下文件会被创建但**内容为空**（静默丢数据）
     "$f = Join-Path $env:TEMP ('winstage-canary-' + [guid]::NewGuid().ToString('n') + '.txt')",
-    'try { & node --version > $f } catch { }',
+    "if ($haveNode) { try { & node --version > $f } catch { } }",
+    "else { try { & cmd.exe /c 'echo v1.2.3-canary' > $f } catch { } }",
     "$redirText = ''",
     'try { if (Test-Path -LiteralPath $f) { $redirText = ((Get-Content -LiteralPath $f -Raw -ErrorAction SilentlyContinue) + "").Trim() } } catch { }',
-    "$r.redirectOk = [bool]($redirText -match '^v\\d+\\.')",
+    "$r.redirectOk = [bool]($redirText -match 'v\\d+\\.\\d+')",
     "$r.redirectText = $redirText",
     'Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue',
     // ③ 系统查询（不重定向：让子进程直接继承脚本自身的标准句柄，靠退出码判定）

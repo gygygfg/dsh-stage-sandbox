@@ -350,7 +350,7 @@ export class Store {
   }
 
   /** 把内存内容落成一个 blob，返回 sha256 */
-  putBlob(buffer) {
+  putBlob(buffer, options = {}) {
     const hash = sha256Buffer(buffer)
     const path = this.blobPath(hash)
     if (!existsSync(path)) {
@@ -360,7 +360,12 @@ export class Store {
       this.assertStageAvailable()
       // ── 三轮接线：配额闸门放在**写入之前**（写完再量只能事后发现超了，磁盘已经占了）──
       // 内容寻址：hash 已存在时直接返回，不重复写、也不消耗配额（去重语义逐字不变）。
-      this.assertStagingQuota(buffer.length)
+      //
+      // 2026-11-23（真实机 1000 文件实测）：`assertStagingQuota()` 会 `measureTree()`
+      // **整棵暂存树**；逐 blob 调用 ⇒ O(n²) 的文件系统遍历（实测 93.8 s，同一批真实盘
+      // 写入只要 1.97 s）。批处理（`ingestCapturedChanges`）先用一个上界总量做一次
+      // 配额判定，再对批内每个 blob 传 `skipQuota:true`。单文件调用方行为不变。
+      if (options.skipQuota !== true) this.assertStagingQuota(buffer.length)
       mkdirSync(dirname(path), { recursive: true })
       writeFileSync(path, buffer)
     }
