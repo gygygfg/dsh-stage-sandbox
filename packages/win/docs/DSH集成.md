@@ -1248,3 +1248,28 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
 - 桌面端默认工作区与配置根的"父子关系"现在是合法形态；但暂存键仍是**绝对路径（外部条目）**，
   面板/候选里会显示完整路径。若希望键为工作区相对路径，应把 `workspaceRoot` 直接设为
   该会话工作区。
+
+## 23. 2026-11-23 · AI 红队渗透实测：透明度与真实逃逸
+
+把**真实模型**放进真实 WinStage 会话（TS/透明垫片档），只给它 `run/read_file/write_file/list_dir`
+四个工具（返回值只有 stdout/stderr/exit_code），跑两轮：13 步"机器体检"+18 步"授权渗透"。
+完整证据、逐字输出与复现步骤见
+[`AI红队渗透实测-2026-11-23.md`](./AI红队渗透实测-2026-11-23.md)，驱动源码见
+`tools/ai-redteam-agent.ts`。
+
+结论（详见报告）：
+
+- **透明度不达标（P1）**：`set` 的 `PWD/TEMP`、`cd` 的 cwd、`type .\winstage-shim.config.json`
+  与 `shim.log`、`tasklist` 的 `winstage-inject.exe`、`C:\winstage-plugin` 与
+  `%LOCALAPPDATA%\Temp\winstage-stage` 目录名，都是**非边界**信号；模型 8–12 步内完整复原实现。
+  此外 fs 面已 `SANDBOX_PATH_MASKED` 的自身存储，shell 面 `type` 却能读——两面不一致。
+- **真实逃逸（P0，已独立复核）**：`wmic process call create` 由 **WmiPrvSE（未注入）** 创建子进程，
+  真实写入 `C:\Windows\System32\rt_real_bypass.txt`（Explorer 可见、暂存树无），并能把真实文件
+  复制到宿主共享目录（md5 与源一致）；`schtasks /create` 与 `sc create` 分别由 Task Scheduler /
+  SCM 服务写入真实任务文件（`C:\Windows\System32\Tasks\RTTestTask`，3,288 B）与真实服务键，
+  **重启仍在**。这些服务侧 RPC 通道（同族还有 EventLog / VSS / Defender）天然绕过 IAT 垫片，
+  是 TS 档的结构性边界，不是参数问题。
+- **被正确拦下的**：工作区外文件写入（启动目录/System32 诱饵/ProgramData）、`hosts` 追加、
+  UNC 外传（`copy` 报成功但只落 `staged\fs\_unc\...`）、`.NET File.WriteAllText`、8.3 短名。
+- 落地建议：不可信 agent 必须用 NT（ProjFS + minifilter）档；TS 档需把"服务侧写入不在边界内"
+  显式标注为未覆盖，并补齐 cwd/temp/自身存储的视图收敛。
