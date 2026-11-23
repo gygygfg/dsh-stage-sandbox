@@ -1271,5 +1271,10 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
   是 TS 档的结构性边界，不是参数问题。
 - **被正确拦下的**：工作区外文件写入（启动目录/System32 诱饵/ProgramData）、`hosts` 追加、
   UNC 外传（`copy` 报成功但只落 `staged\fs\_unc\...`）、`.NET File.WriteAllText`、8.3 短名。
+- 第二轮（同日）：WMI 进程创建已改为**真重定向**——`wmic process call create "<inner>"`
+  的内层命令改走 `winstage-inject.exe`，wmic 输出形态不变，子进程写入回到暂存树
+  （实测 `realExists=false / stagedHit=true`）。其余服务侧通道（SCM/计划任务/日志/卷影/
+  Defender/防火墙/BCD）尚未重定向，仍按文本策略拒绝；SCM/EventLog 的客户端钩子方案与
+  COM 通道的三条路线见报告 §6。
 - 落地建议：不可信 agent 必须用 NT（ProjFS + minifilter）档；TS 档需把"服务侧写入不在边界内"
   显式标注为未覆盖，并补齐 cwd/temp/自身存储的视图收敛。

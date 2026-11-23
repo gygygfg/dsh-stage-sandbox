@@ -314,8 +314,210 @@ static int ws_inject_into(HANDLE hProcess)
     return ok;
 }
 
-static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LPWSTR cmd,
-                                     LPSECURITY_ATTRIBUTES pa, LPSECURITY_ATTRIBUTES ta, BOOL inherit,
+/* ---------------------------------------------------------------- wmic RPC  --
+ * 2026-11-23（AI 红队实测后的"重定向优先"修复）：
+ *
+ * `wmic process call create "cmd /c ..."` 由 **WmiPrvSE.exe（未注入的服务进程）**
+ * 创建子进程 —— 垫片的 CreateProcess 钩子看不到它，真实盘会被写穿。
+ * 硬拒绝不是唯一出路：wmic 的语义只是"把后面那串命令行交给 WMI 去起进程"，
+ * 因此我们在**调用方**改写那条内层命令行，让它先经过 `winstage-inject.exe`：
+ *
+ *     wmic process call create "cmd /c echo x > C:\Windows\System32\x.txt"
+ *   → wmic process call create "<injector> --dll <shim.dll> --set-env ... -- cmd /d /c <.wmi-*.cmd>"
+ *
+ * WmiPrvSE 起的仍然是"我们给的命令行"，注入器把真正的命令注入垫片后再放行 ⇒
+ * 子进程的文件/注册表写入回到暂存树。wmic 对调用方的输出保持"Method execution
+ * successful + ProcessId"的形态（PID 是注入器的，语义上仍是"被创建的那个进程"）。
+ *
+ * 失败关闭：改写构造不出来（缺配置/写不出脚本）⇒ CreateProcess 返回
+ * ERROR_ACCESS_DENIED，绝不放行到真实 WMI。远程目标（/node:）不在此列 ——
+ * 注入器路径在远端不存在，因此同样失败关闭。
+ * ------------------------------------------------------------------------- */
+typedef struct WsWmicToken {
+    const wchar_t *start;
+    int len;
+    int quoted;
+} WsWmicToken;
+
+static int ws_wmic_next_token(const wchar_t *s, int *pos, WsWmicToken *out)
+{
+    int i = *pos;
+    while (s[i] == L' ' || s[i] == L'\t') {
+        i++;
+    }
+    if (!s[i]) {
+        return 0;
+    }
+    int quoted = 0;
+    if (s[i] == L'"') {
+        quoted = 1;
+        i++;
+    }
+    int start = i;
+    while (s[i]) {
+        /* 命令行里的 \" 是引号转义（Node/MSVCRT 风格），不是参数的结束 */
+        if (quoted && s[i] == L'\\' && s[i + 1] == L'"') {
+            i += 2;
+            continue;
+        }
+        if (quoted && s[i] == L'"') {
+            break;
+        }
+        if (!quoted && (s[i] == L' ' || s[i] == L'\t')) {
+            break;
+        }
+        i++;
+    }
+    out->start = s + start;
+    out->len = i - start;
+    out->quoted = quoted;
+    if (quoted && s[i] == L'"') {
+        i++;
+    }
+    *pos = i;
+    return 1;
+}
+
+static int ws_wmic_token_eq(const WsWmicToken *t, const wchar_t *literal)
+{
+    int n = (int)wcslen(literal);
+    return t->len == n && _wcsnicmp(t->start, literal, n) == 0;
+}
+
+/** 返回 1 = 命中本地 process call create（inner 指向内层命令行）；2 = 远程目标；0 = 不相关 */
+static int ws_wmic_extract_create(const wchar_t *cmd, const wchar_t **inner, int *innerLen)
+{
+    WsWmicToken tokens[64];
+    int count = 0;
+    int pos = 0;
+    WsWmicToken token;
+    while (count < 64 && ws_wmic_next_token(cmd, &pos, &token)) {
+        tokens[count++] = token;
+    }
+    int remote = 0;
+    for (int i = 0; i < count; i++) {
+        if (tokens[i].len > 6 && _wcsnicmp(tokens[i].start, L"/node:", 6) == 0) {
+            const wchar_t *value = tokens[i].start + 6;
+            int len = tokens[i].len - 6;
+            if (!((len == 1 && value[0] == L'.') || (len == 9 && _wcsnicmp(value, L"localhost", 9) == 0) ||
+                  (len == 9 && _wcsnicmp(value, L"127.0.0.1", 9) == 0))) {
+                remote = 1;
+            }
+        }
+    }
+    for (int i = 1; i + 3 < count; i++) {
+        if (ws_wmic_token_eq(&tokens[i], L"process") && ws_wmic_token_eq(&tokens[i + 1], L"call") &&
+            ws_wmic_token_eq(&tokens[i + 2], L"create")) {
+            *inner = tokens[i + 3].start;
+            *innerLen = tokens[i + 3].len;
+            return remote ? 2 : 1;
+        }
+    }
+    return 0;
+}
+
+static int ws_wmic_write_utf8(HANDLE file, const wchar_t *text, int len)
+{
+    if (len <= 0) {
+        return 1;
+    }
+    int need = WideCharToMultiByte(CP_UTF8, 0, text, len, NULL, 0, NULL, NULL);
+    if (need <= 0) {
+        return 0;
+    }
+    char *buffer = (char *)malloc((size_t)need);
+    if (!buffer) {
+        return 0;
+    }
+    int got = WideCharToMultiByte(CP_UTF8, 0, text, len, buffer, need, NULL, NULL);
+    DWORD wrote = 0;
+    int ok = got == need && WriteFile(file, buffer, (DWORD)need, &wrote, NULL) && wrote == (DWORD)need;
+    free(buffer);
+    return ok;
+}
+
+/** 写内层命令脚本（UTF-8 + chcp 65001）；`\"` 还原成 `"`（wmic 外层引号留下的转义） */
+static int ws_wmic_write_script(const wchar_t *inner, int innerLen, wchar_t *outPath, DWORD cch)
+{
+    const wchar_t *dir = g_ws.regStageDir[0] ? g_ws.regStageDir : g_ws.stageRoot;
+    static volatile LONG seq = 0;
+    _snwprintf(outPath, cch, L"%ls\\.wmi-%lu-%ld.cmd", dir, (unsigned long)GetCurrentProcessId(),
+               (long)InterlockedIncrement(&seq));
+    outPath[cch - 1] = 0;
+    HANDLE file = CreateFileW(outPath, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    wchar_t *unescaped = (wchar_t *)malloc(((size_t)innerLen + 1) * sizeof(wchar_t));
+    if (!unescaped) {
+        CloseHandle(file);
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < innerLen; i++) {
+        if (inner[i] == L'\\' && i + 1 < innerLen && inner[i + 1] == L'"') {
+            unescaped[n++] = L'"';
+            i++;
+        } else {
+            unescaped[n++] = inner[i];
+        }
+    }
+    const wchar_t *head = L"@chcp 65001>nul\r\n@echo off\r\n";
+    int ok = ws_wmic_write_utf8(file, head, (int)wcslen(head)) && ws_wmic_write_utf8(file, unescaped, n) &&
+             ws_wmic_write_utf8(file, L"\r\n", 2);
+    free(unescaped);
+    CloseHandle(file);
+    if (!ok) {
+        DeleteFileW(outPath);
+    }
+    return ok;
+}
+
+/** 构造注入器命令行（作为 wmic 的唯一内层命令） */
+static wchar_t *ws_wmic_build_inject_cmd(const wchar_t *scriptPath)
+{
+    if (!g_selfDll[0] || !g_ws.stageRoot[0] || !g_ws.configPath[0] || !g_ws.logPath[0]) {
+        return NULL;
+    }
+    wchar_t dir[WS_PATH_MAX];
+    ws_strlcpy_w(dir, g_selfDll, WS_PATH_MAX);
+    wchar_t *slash = wcsrchr(dir, L'\\');
+    if (!slash) {
+        return NULL;
+    }
+    slash[1] = 0;
+    wchar_t injector[WS_PATH_MAX];
+    _snwprintf(injector, WS_PATH_MAX, L"%ls%ls", dir, L"winstage-inject.exe");
+    injector[WS_PATH_MAX - 1] = 0;
+
+    wchar_t regPart[WS_PATH_MAX + 64];
+    regPart[0] = 0;
+    if (g_ws.regStageDir[0]) {
+        _snwprintf(regPart, WS_PATH_MAX + 64, L" --set-env \"DSH_REGSTAGE_SESSION_DIR=%ls\"", g_ws.regStageDir);
+        regPart[WS_PATH_MAX + 63] = 0;
+    }
+    wchar_t auditPart[WS_PATH_MAX + 64];
+    auditPart[0] = 0;
+    if (g_ws.auditPath[0]) {
+        _snwprintf(auditPart, WS_PATH_MAX + 64, L" --set-env \"DSH_AUDIT_LOG=%ls\"", g_ws.auditPath);
+        auditPart[WS_PATH_MAX + 63] = 0;
+    }
+    size_t cch = (WS_PATH_MAX * 6) + 1024;
+    wchar_t *out = (wchar_t *)malloc(cch * sizeof(wchar_t));
+    if (!out) {
+        return NULL;
+    }
+    _snwprintf(out, cch,
+               L"\"%ls\" --dll \"%ls\" --set-env \"DSH_STAGE_ROOT=%ls\" --set-env \"DSH_SHIM_CONFIG=%ls\" "
+               L"--set-env \"DSH_SHIM_LOG=%ls\"%ls%ls --cwd \"%ls\" -- cmd.exe /d /c \"%ls\"",
+               injector, g_selfDll, g_ws.stageRoot, g_ws.configPath, g_ws.logPath, regPart, auditPart, g_ws.stageRoot,
+               scriptPath);
+    out[cch - 1] = 0;
+    return out;
+}
+
+static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LPWSTR cmd,                                     LPSECURITY_ATTRIBUTES pa, LPSECURITY_ATTRIBUTES ta, BOOL inherit,
                                      DWORD flags, LPVOID env, LPCWSTR cwd, LPSTARTUPINFOW si,
                                      LPPROCESS_INFORMATION pi)
 {
@@ -339,6 +541,46 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
     /* Debug/protected creations cannot be injected safely (the debugger owns the
      * first event) and must not be broken, so they pass through with a log. */
     int exempt = (flags & (DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS | CREATE_PROTECTED_PROCESS)) != 0;
+    /**
+     * ── wmic process call create：把内层命令改道到注入器（见文件头注释）─────────
+     * 只处理本机目标；`/node:` 指向远端时无法把注入器一起送过去，失败关闭。
+     */
+    wchar_t *wmiRewrite = NULL;
+    if (!exempt && !hasToken && cmd && cmd[0]) {
+        const wchar_t *image = app ? app : cmd;
+        const wchar_t *base = image;
+        for (const wchar_t *p = image; *p; p++) {
+            if (*p == L'\\' || *p == L'/') {
+                base = p + 1;
+            }
+        }
+        int isWmic = (_wcsicmp(base, L"wmic") == 0 || _wcsicmp(base, L"wmic.exe") == 0 ||
+                      _wcsicmp(base, L"wmic\"") == 0);
+        if (isWmic) {
+            const wchar_t *inner = NULL;
+            int innerLen = 0;
+            int hit = ws_wmic_extract_create(cmd, &inner, &innerLen);
+            if (hit == 2) {
+                ws_log("wmic remote process-create (/node:) cannot be redirected; failing closed");
+                SetLastError(ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
+            if (hit == 1) {
+                wchar_t script[WS_PATH_MAX];
+                if (ws_wmic_write_script(inner, innerLen, script, WS_PATH_MAX)) {
+                    wmiRewrite = ws_wmic_build_inject_cmd(script);
+                }
+                if (!wmiRewrite) {
+                    ws_log("wmic process create: could not build the injector command; failing closed");
+                    SetLastError(ERROR_ACCESS_DENIED);
+                    return FALSE;
+                }
+                ws_log("wmic process create redirected through the injector: script=%ls", script);
+                cmd = wmiRewrite;
+                app = NULL;
+            }
+        }
+    }
     int forced = 0;
     DWORD newFlags = flags;
     if (!exempt && !(flags & CREATE_SUSPENDED)) {
@@ -406,6 +648,9 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
         HeapFree(GetProcessHeap(), 0, newEnv);
     }
     if (!ok) {
+        if (wmiRewrite) {
+            HeapFree(GetProcessHeap(), 0, wmiRewrite);
+        }
         SetLastError(createErr);
         return FALSE;
     }
@@ -437,6 +682,9 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
     }
     if (forced) {
         ResumeThread(pi->hThread);
+    }
+    if (wmiRewrite) {
+        HeapFree(GetProcessHeap(), 0, wmiRewrite);
     }
     SetLastError(ws_saved_last_error);
     return TRUE;

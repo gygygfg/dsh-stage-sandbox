@@ -43,6 +43,7 @@ import { WindowsStageExecutor, resolveDshModuleRoot } from '../src/executor.ts'
 import { canonical, compareKey, isInside, maskSessionId } from '../src/paths.ts'
 import { renderCandidateDiff } from '../src/tools.ts'
 import { verifyStageRootAlive } from '../src/stage-guard.ts'
+import { SERVICE_SIDE_UNCOVERED, SERVICE_SIDE_CHANNEL_LABELS } from '../src/service-side.ts'
 import { createNtRuntime, defaultNtLayout } from '../src/nt/runtime.ts'
 import { NtSupervisor } from '../src/nt/supervisor.ts'
 import { REVIEW_BASENAME, getReviewService, isRegistryCandidate, resolveReviewStoreDir, disposeReviewServices } from './review-service.ts'
@@ -698,6 +699,31 @@ export function buildTrustCard(options = {}) {
     approvals,
     writes,
     readVisibility,
+    /**
+     * ── 服务侧写入的覆盖声明（2026-11-23 AI 红队实测后新增）──────────────────────
+     *
+     * TS（透明垫片）档只钩本进程树的 IAT。WMI / SCM / 计划任务 / 事件日志 / VSS /
+     * Defender / 防火墙 / BCD 这些"让服务代写"的通道**不在**暂存边界内；此前它们没有
+     * 任何可见声明，用户会以为写了暂存。现在：① 已知构造按命令文本拒绝
+     * （`SERVICE_SIDE_ESCAPE_BLOCKED`，策略面、非内核边界）；② 卡片如实标出未覆盖面。
+     * 字段名刻意叫 `laneCoverage`，避免被读成"已阻断"。
+     */
+    laneCoverage: {
+      serviceSide: {
+        stated: true,
+        coveredByKernelBoundary: tier.launchMode === 'nt',
+        redirectedChannels: [SERVICE_SIDE_CHANNELS.WMI_PROCESS_CREATE],
+        redirectedLabels: [SERVICE_SIDE_CHANNEL_LABELS[SERVICE_SIDE_CHANNELS.WMI_PROCESS_CREATE]],
+        uncoveredChannels: SERVICE_SIDE_UNCOVERED,
+        uncoveredLabels: SERVICE_SIDE_UNCOVERED.map((channel) => SERVICE_SIDE_CHANNEL_LABELS[channel] ?? channel),
+        knownEscapesBlockedByText: true,
+        boundaryKind: 'redirect-or-policy-text-denial',
+        note:
+          'TS 档只覆盖本进程树的 IAT 文件/注册表调用。WMI 进程创建（wmic process call create）已**重定向**：' +
+          '内层命令改走注入器，子进程写入回到暂存树；其余服务侧通道（SCM/计划任务/日志/卷影/Defender/防火墙/BCD）' +
+          '尚未重定向，已知构造按文本策略拒绝（不是内核边界）。真正的全覆盖需要 NT（ProjFS + minifilter）档。',
+      },
+    },
     trust: { level, ok, blockers },
     conclusion,
   }
@@ -737,6 +763,18 @@ function formatTierLines(card) {
       '  · 处置：① 查 shim 产物是否齐备（DLL / winstage-inject.exe / winstage-probe.exe）；' +
         '② 查探测证据（暂存根下的 shim.log 与能力探测输出）；' +
         '③ 在修好之前，本窗口的写入结果按"可能只剩内核硬拒"对待，**不要**当成沙箱内成功。',
+    )
+  }
+  // ★ 2026-11-23 AI 红队实测：TS 档不覆盖"服务侧写入"，必须在状态卡可见。
+  const coverage = card.laneCoverage?.serviceSide
+  if (coverage) {
+    lines.push(
+      coverage.coveredByKernelBoundary
+        ? '  · 覆盖边界：当前档位是内核边界（NT/ProjFS+minifilter），服务侧写入在边界内。'
+        : '  · 覆盖边界：TS 档只覆盖**本进程树**的 IAT 文件/注册表调用；' +
+            `WMI 进程创建已重定向（${(coverage.redirectedLabels ?? []).join('、') || '无'}，内层命令改走注入器、写入回到暂存）；` +
+            `其余（${coverage.uncoveredLabels.join('、')}）尚未重定向，已知构造按命令文本拒绝` +
+            '（`SERVICE_SIDE_ESCAPE_BLOCKED`，策略面、**不是**内核边界）。',
     )
   }
   return lines

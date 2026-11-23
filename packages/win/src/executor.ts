@@ -47,6 +47,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
+import { classifyServiceSideWrite, SERVICE_SIDE_CHANNELS, serviceSideRedirectFor } from './service-side.ts'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
@@ -4054,6 +4055,69 @@ export class WindowsStageExecutor {
     }
   }
 
+/**
+   * ── WMI 进程创建的真重定向（2026-11-23 第二轮）────────────────────────────────
+   *
+   * `wmic process call create "<inner>"` 由 WmiPrvSE 起子进程，垫片看不到。与其把
+   * 这条高频路径**拒绝**掉，不如改写：把 `<inner>` 写进会话目录下的 .cmd，再让
+   * `winstage-inject.exe` 去启动 `cmd /d /c <脚本>` —— WmiPrvSE 起的仍然是"我们给的
+   * 那条命令行"，注入器把真正命令注入垫片后放行，写入回到暂存树。
+   *
+   * 只处理本机、shim 档、参数形状是 process call create 的调用；其余返回 null。
+   * 构造不出来也返回 null，让上层服务侧闸门按 fail-closed 拒绝（不是静默放行）。
+   */
+  rewriteWmicProcessCreate(command, args) {
+    if (this.launchMode !== 'shim') return null
+    const base = String(command ?? '').split(/[\\/]/).pop()?.toLowerCase() ?? ''
+    if (base !== 'wmic' && base !== 'wmic.exe') return null
+    const list = Array.isArray(args) ? args.map(String) : []
+    let at = -1
+    for (let i = 0; i + 3 < list.length; i++) {
+      if (
+        list[i].toLowerCase() === 'process' &&
+        list[i + 1].toLowerCase() === 'call' &&
+        list[i + 2].toLowerCase() === 'create'
+      ) {
+        at = i
+        break
+      }
+    }
+    if (at < 0) return null
+    for (const token of list) {
+      if (/^\/node:/i.test(token) && !/^\/node:(\.|localhost|127\.0\.0\.1)$/i.test(token)) return null
+    }
+    const inner = list[at + 3]
+    if (!inner || typeof inner !== 'string') return null
+    const artifacts = this.transparent?.artifacts
+    const configPath = this.initReport?.shimConfigPath
+    const regDir = this.options.registryStageDir
+    if (!artifacts?.injectorPath || !artifacts?.dllPath || !configPath || !regDir) return null
+    let scriptPath
+    try {
+      scriptPath = join(regDir, `.wmi-${process.pid}-${randomUUID().slice(0, 6)}.cmd`)
+      writeFileSync(scriptPath, `@chcp 65001>nul\r\n@echo off\r\n${inner}\r\n`, 'utf8')
+    } catch {
+      return null
+    }
+    /**
+     * 只改写**内层命令参数**，保留原来的 wmic 调用：WMI 仍然负责起进程、仍然打印
+     * "Method execution successful / ProcessId"，调用方看到的形态不变；被起的进程是
+     * 注入器，由它把真正的 cmd 注入垫片后放行。
+     */
+    const injectorCmd = [
+      `"${artifacts.injectorPath}"`,
+      `--dll "${artifacts.dllPath}"`,
+      `--set-env "DSH_STAGE_ROOT=${this.stagingRoot}"`,
+      `--set-env "DSH_SHIM_CONFIG=${configPath}"`,
+      `--set-env "DSH_SHIM_LOG=${join(this.stagingRoot, 'shim.log')}"`,
+      `--set-env "DSH_REGSTAGE_SESSION_DIR=${regDir}"`,
+      `--cwd "${this.stagingRoot}"`,
+      `-- cmd.exe /d /c "${scriptPath}"`,
+    ].join(' ')
+    const rewritten = [...list.slice(0, at + 3), injectorCmd, ...list.slice(at + 4)]
+    return { command, args: rewritten, scriptPath }
+  }
+
 /** 在受限令牌下执行一次命令，返回结构化结果（手册第 4 章返回契约） */
   async run(options) {
     // 去令牌化模式没有 AclSandbox（它本来就不是"受限令牌 + ACL"那套），
@@ -4088,6 +4152,84 @@ export class WindowsStageExecutor {
     // CreateProcess 的 lpCurrentDirectory 必须真实存在，否则同样是 Win32 2。
     // 新建工作区在首次执行前可能还没有暂存目录，这里补上受控目录（手册 #3.5）。
     if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true })
+
+    /**
+     * 先尝试把服务侧写入**重定向**成暂存写入（目前覆盖 WMI 进程创建）。
+     * 重定向成功后，后续闸门看到的是注入器命令，不会命中拒绝面。
+     */
+    let serviceSideRedirected = false
+    {
+      const redirected = this.rewriteWmicProcessCreate(options.command, options.args ?? [])
+      if (redirected) {
+        options = { ...options, command: redirected.command, args: redirected.args }
+        serviceSideRedirected = true
+      }
+    }
+
+    /**
+     * ── 服务侧写入闸门（2026-11-23 AI 红队实测后的策略补丁）────────────────────
+     *
+     * 透明垫片只覆盖**本进程树**的 IAT。`wmic process call create` /
+     * `schtasks /create` / `sc create` / `wevtutil cl` / `vssadmin delete shadows` /
+     * `*-MpPreference` / `netsh advfirewall` 等构造让 **Windows 服务**代写真实盘/真实注册表，
+     * 已实测绕过暂存（详见 docs/AI红队渗透实测-2026-11-23.md）。
+     *
+     * 这是**策略拒绝**（文本判定，不完备），不是内核边界：默认 fail-closed 拦下已知构造；
+     * 真边界只有 NT（ProjFS + minifilter）档。`allowServiceSideWrites` 是显式逃生口
+     * （仅用于已经用 NT 档/离线机等**确有边界**的场景）。
+     *
+     * 自检本身不豁免：自检命令（PowerShell 脚本）不会命中这些构造；若将来命中，说明
+     * 判定面过宽，应当修判定而不是绕过闸门。
+     */
+    if (
+      !serviceSideRedirected &&
+      this.options.allowServiceSideWrites !== true &&
+      process.env.WINSTAGE_ALLOW_SERVICE_SIDE !== '1' &&
+      options.skipServiceSidePreflight !== true
+    ) {
+      const serviceSide = classifyServiceSideWrite(options.command, options.args ?? [], {
+        readFile: (path, maxBytes) => {
+          try {
+            if (!existsSync(path)) return null
+            const info = statSync(path)
+            if (!info.isFile() || info.size > maxBytes) return null
+            return readFileSync(path, 'utf8')
+          } catch {
+            return null
+          }
+        },
+      })
+      if (serviceSide.hit) {
+        /**
+         * 重定向优先（2026-11-23 第二轮）：`wmic process call create` 已经能在 shim
+         * 的 CreateProcess 钩子里把内层命令行改道到注入器（见 shim/src/ws_proc.c），
+         * 因此这条路**不再拒绝** —— 子进程会照常创建，但写入回到暂存树。
+         * 其余通道（SCM/计划任务/日志/卷影/Defender/防火墙/BCD）还没有重定向实现，
+         * 仍按 fail-closed 拒绝；这里不是"一刀切拒绝"。
+         */
+        const redirect = serviceSideRedirectFor(serviceSide.channel, this.launchMode)
+        if (!redirect) {
+          const error = fail(
+            'SERVICE_SIDE_ESCAPE_BLOCKED',
+            `refusing to run this command: it asks a Windows service to do the work (${serviceSide.label}: ${serviceSide.reason}), ` +
+              `but this lane only intercepts file/registry calls made **in-process** (IAT shim). ` +
+              `The service would write the REAL disk/registry outside staging. ` +
+              `The command was not executed and nothing changed. ` +
+              `Use the kernel lane (NT / ProjFS + minifilter) when a service-side operation is genuinely required.`,
+          )
+          error.policyDenial = true
+          error.retryable = false
+          error.channel = serviceSide.channel
+          error.evidence = serviceSide.evidence
+          error.remediation = [
+            'this is a text-based policy denial, not a kernel boundary; it covers known one-line service-side escapes',
+            'for real coverage of WMI / SCM / Task Scheduler / EventLog / VSS / Defender, use the NT (ProjFS + minifilter) lane',
+            'if this machine already has a kernel boundary in place, set allowServiceSideWrites (or WINSTAGE_ALLOW_SERVICE_SIDE=1) explicitly',
+          ]
+          throw error
+        }
+      }
+    }
 
     const { env, rejected } = buildChildEnvironment(options.env, {
       tempDir: this.tempDir,
