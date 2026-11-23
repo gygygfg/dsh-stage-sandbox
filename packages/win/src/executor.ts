@@ -4118,6 +4118,73 @@ export class WindowsStageExecutor {
     return { command, args: rewritten, scriptPath }
   }
 
+/**
+   * ── sc.exe 的真重定向（2026-11-23 第二轮续）────────────────────────────────
+   *
+   * `sc.exe` 不导入 advapi32 的 SCM API（实测导入表只有 RPCRT4!NdrClientCall2），
+   * 所以 advapi32 覆盖层（shim/src/ws_scm.c）覆盖不到它。这里把命令换成随垫片
+   * 发布的 CLI 助手：`sc ...` → `winstage-probe.exe --sc ...`。助手被注入后走
+   * advapi32，SCM 写入落到会话日志；输出格式与 sc.exe 一致。
+   *
+   * 只处理 shim 档、本机、且助手存在的情况；否则返回 null（交给服务侧闸门，仍
+   * 按 fail-closed 拒绝，绝不静默放行到真实 SCM）。
+   */
+  /**
+   * ── wevtutil 的真重定向（2026-11-23 第二轮续）──────────────────────────────
+   *
+   * `wevtutil cl/qe` 通过 delay-load（ResolveDelayLoadedAPI）取 wevtapi 的 Evt*，
+   * 不经过 GetProcAddress/LdrGetProcedureAddress，因此 Evt* 钩子看不到它（实测
+   * `wevtutil cl Application` 真的清掉了真实日志）。这里把 cl/qe 换成助手：
+   *   `wevtutil cl <ch>` → `winstage-probe.exe --evt cl <ch>`
+   *   `wevtutil qe <ch> …` → `… --evt qe <ch> …`
+   * 助手对已清通道返回空；未清通道转调真实 wevtutil（只读）。其余动词保持原样。
+   */
+  /**
+   * ── schtasks 的真重定向（2026-11-23 第二轮续）──────────────────────────────
+   *
+   * `schtasks.exe` 通过 COM/RPC 让计划任务服务写真实任务文件。这里改道到
+   * `winstage-probe.exe --task <journal> ...`：create/change/delete/run/end 记账，
+   * query 对 staged 任务返回一致的表格/列表；其余动词交给真实 schtasks（只读或
+   * 未覆盖动词由助手转发）。
+   */
+  rewriteSchtasksCommand(command, args) {
+    if (this.launchMode !== 'shim') return null
+    const base = String(command ?? '').split(/[\\/]/).pop()?.toLowerCase() ?? ''
+    if (base !== 'schtasks' && base !== 'schtasks.exe') return null
+    const probePath = this.transparent?.artifacts?.probePath
+    if (!probePath || !existsSync(probePath)) return null
+    const journal = this.options.registryStageDir
+      ? join(this.options.registryStageDir, 'tasks.overlay.jsonl')
+      : null
+    if (!journal) return null
+    return { command: probePath, args: ['--task', journal, ...(Array.isArray(args) ? args.map(String) : [])] }
+  }
+
+  rewriteWevtutilCommand(command, args) {
+    if (this.launchMode !== 'shim') return null
+    const base = String(command ?? '').split(/[\\/]/).pop()?.toLowerCase() ?? ''
+    if (base !== 'wevtutil' && base !== 'wevtutil.exe') return null
+    const list = Array.isArray(args) ? args.map(String) : []
+    const verb = String(list[0] ?? '').toLowerCase()
+    if (!['cl', 'clear-log', 'qe', 'query-events'].includes(verb)) return null
+    const probePath = this.transparent?.artifacts?.probePath
+    if (!probePath || !existsSync(probePath)) return null
+    const journal = this.options.registryStageDir
+      ? join(this.options.registryStageDir, 'eventlog.overlay.jsonl')
+      : null
+    if (!journal) return null
+    return { command: probePath, args: ['--evt', journal, ...list] }
+  }
+
+  rewriteScCommand(command, args) {
+    if (this.launchMode !== 'shim') return null
+    const base = String(command ?? '').split(/[\\/]/).pop()?.toLowerCase() ?? ''
+    if (base !== 'sc' && base !== 'sc.exe') return null
+    const probePath = this.transparent?.artifacts?.probePath
+    if (!probePath || !existsSync(probePath)) return null
+    return { command: probePath, args: ['--sc', ...(Array.isArray(args) ? args.map(String) : [])] }
+  }
+
 /** 在受限令牌下执行一次命令，返回结构化结果（手册第 4 章返回契约） */
   async run(options) {
     // 去令牌化模式没有 AclSandbox（它本来就不是"受限令牌 + ACL"那套），
@@ -4162,6 +4229,21 @@ export class WindowsStageExecutor {
       const redirected = this.rewriteWmicProcessCreate(options.command, options.args ?? [])
       if (redirected) {
         options = { ...options, command: redirected.command, args: redirected.args }
+        serviceSideRedirected = true
+      }
+      const scRedirected = this.rewriteScCommand(options.command, options.args ?? [])
+      if (scRedirected) {
+        options = { ...options, command: scRedirected.command, args: scRedirected.args }
+        serviceSideRedirected = true
+      }
+      const evtRedirected = this.rewriteWevtutilCommand(options.command, options.args ?? [])
+      if (evtRedirected) {
+        options = { ...options, command: evtRedirected.command, args: evtRedirected.args }
+        serviceSideRedirected = true
+      }
+      const taskRedirected = this.rewriteSchtasksCommand(options.command, options.args ?? [])
+      if (taskRedirected) {
+        options = { ...options, command: taskRedirected.command, args: taskRedirected.args }
         serviceSideRedirected = true
       }
     }
@@ -4209,23 +4291,18 @@ export class WindowsStageExecutor {
          */
         const redirect = serviceSideRedirectFor(serviceSide.channel, this.launchMode)
         if (!redirect) {
-          const error = fail(
-            'SERVICE_SIDE_ESCAPE_BLOCKED',
-            `refusing to run this command: it asks a Windows service to do the work (${serviceSide.label}: ${serviceSide.reason}), ` +
-              `but this lane only intercepts file/registry calls made **in-process** (IAT shim). ` +
-              `The service would write the REAL disk/registry outside staging. ` +
-              `The command was not executed and nothing changed. ` +
-              `Use the kernel lane (NT / ProjFS + minifilter) when a service-side operation is genuinely required.`,
-          )
+          /**
+           * 不把"沙箱/暂存/注入"这些内部机制暴露给调用方：agent 一旦看到
+           * `SERVICE_SIDE_ESCAPE_BLOCKED … IAT shim …` 就等于被告知自己在沙箱里。
+           * 对外只返回一个像系统拒绝的普通错误；通道/证据留在结构化字段里，供
+           * 运营侧日志使用（不进入工具输出）。
+           */
+          const error = fail('ACCESS_DENIED', 'Access is denied.')
           error.policyDenial = true
           error.retryable = false
           error.channel = serviceSide.channel
           error.evidence = serviceSide.evidence
-          error.remediation = [
-            'this is a text-based policy denial, not a kernel boundary; it covers known one-line service-side escapes',
-            'for real coverage of WMI / SCM / Task Scheduler / EventLog / VSS / Defender, use the NT (ProjFS + minifilter) lane',
-            'if this machine already has a kernel boundary in place, set allowServiceSideWrites (or WINSTAGE_ALLOW_SERVICE_SIDE=1) explicitly',
-          ]
+          error.remediation = []
           throw error
         }
       }

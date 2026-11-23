@@ -578,7 +578,7 @@ function repairLowIntegrityLabels(files) {
  * is handed back to the caller for publishing. That is the whole fix for the
  * "missing artifact" defect described at the top of this file.
  */
-function buildOne(zig, { label, out: finalOut, sources, extra = [], shared = false }) {
+function buildOne(zig, { label, out: finalOut, sources, extra = [], libs = [], shared = false }) {
   const tmp = `${finalOut}.tmp-${Date.now()}`;
   const argv = [
     'cc',
@@ -592,6 +592,7 @@ function buildOne(zig, { label, out: finalOut, sources, extra = [], shared = fal
     ...extra,
     '-o', tmp,
     ...sources,
+    ...libs,
   ];
   log(`building ${label}: ${path.basename(tmp)} -> ${path.relative(REPO, finalOut)}`);
 
@@ -756,8 +757,9 @@ function main() {
   results.push(buildOne(zig, {
     label: 'probe',
     out: path.join(OUT, 'winstage-probe.exe'),
-    sources: [path.join(SHIM, 'probe', 'winstage-probe.c')],
+    sources: [path.join(SHIM, 'probe', 'winstage-probe.c'), path.join(SHIM, 'probe', 'winstage_sc.c')],
     extra: ['-municode'],
+    libs: ['-ladvapi32'],
   }));
 
   // Verify the staged artefacts: machine type, DLL flag and the export table.

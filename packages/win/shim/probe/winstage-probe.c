@@ -195,8 +195,22 @@ static const ModeEntry g_modes[] = {
     { L"reg-delete-key", mode_reg_delete_key, 3 },
 };
 
+/* winstage_sc.c -- the staged `sc.exe` CLI (see that file's header). */
+int ws_sc_main(int argc, wchar_t **argv);
+int ws_evt_main(int argc, wchar_t **argv);
+int ws_task_main(int argc, wchar_t **argv);
+
 int wmain(int argc, wchar_t **argv)
 {
+    if (argc >= 2 && _wcsicmp(argv[1], L"--sc") == 0) {
+        return ws_sc_main(argc - 2, argv + 2);
+    }
+    if (argc >= 2 && _wcsicmp(argv[1], L"--evt") == 0) {
+        return ws_evt_main(argc - 2, argv + 2);
+    }
+    if (argc >= 2 && _wcsicmp(argv[1], L"--task") == 0) {
+        return ws_task_main(argc - 2, argv + 2);
+    }
     if (argc < 3) {
         fputs("usage: winstage-probe.exe <mode> ... <out.json>\n", stderr);
         return 2;

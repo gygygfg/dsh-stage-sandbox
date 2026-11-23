@@ -5,11 +5,11 @@
  * 透明垫片只钩**本进程树**的 IAT。任何"让 Windows 服务代跑"的构造都绕过它：
  *
  *   · `wmic process call create "cmd /c …"`  → WmiPrvSE.exe（未注入）创建子进程
- *   · `schtasks /create …`                   → Task Scheduler 服务写真实任务文件
+ *   · `schtasks /create …`                   → Task Scheduler 服务写真实任务文件（现由 CLI 助手重定向）
  *   · `sc create …`                          → services.exe 写真实服务键
  *   · `wevtutil cl` / `vssadmin delete shadows` / `Set-MpPreference` / `netsh advfirewall`
  *
- * 实测：前三条在真实盘/真实共享目录上留下了可复核的文件与注册表（见
+ * 实测：在修复前，前三条在真实盘/真实共享目录上留下了可复核的文件与注册表（见
  * docs/AI红队渗透实测-2026-11-23.md）。因此 TS 档必须把**已知的服务侧写入**按命令文本
  * 拦下（fail-closed），并如实告诉调用方"这一档不覆盖服务侧写入；要覆盖请用 NT 档"。
  *
@@ -242,9 +242,22 @@ export function classifyServiceSideWrite(command, args = [], options = {}) {
   }
 }
 
-/** 已经实现"真重定向"（不是拒绝）的通道 —— 目前只有 WMI 进程创建（shim 改写内层命令行）。 */
+/**
+ * 已经实现"真重定向"（不是拒绝）的通道：
+ *   · WMI 进程创建     —— 改写 wmic 内层命令行，子进程先过注入器（executor + shim 两处）；
+ *   · SCM（服务）      —— 客户端虚拟化：钩 advapi32 SCM API，写进 service.overlay.jsonl，
+ *                        查询时与真实 SCM 合并（shim/src/ws_scm.c）。`sc.exe` 本身是裸 RPC
+ *                        客户端（不导入 advapi32），因此 executor/shim 把它改道到
+ *                        `winstage-probe.exe --sc ...`（probe/winstage_sc.c），助手被注入后
+ *                        同样落到这套覆盖层；
+ *   · EventLog         —— EvtClearLog/ClearEventLog 记账并返回成功，已清通道的查询返回空
+ *                        （shim/src/ws_scm.c）。
+ */
 export const SERVICE_SIDE_REDIRECTED = Object.freeze({
   [SERVICE_SIDE_CHANNELS.WMI_PROCESS_CREATE]: 'injector-rewrite',
+  [SERVICE_SIDE_CHANNELS.SCM_SERVICE]: 'scm-client-overlay',
+  [SERVICE_SIDE_CHANNELS.TASK_SCHEDULER]: 'task-cli-overlay',
+  [SERVICE_SIDE_CHANNELS.EVENT_LOG]: 'eventlog-journal',
 })
 
 /** 某通道在当前 lane 上是否可重定向；返回重定向方式或 null */
@@ -253,11 +266,8 @@ export function serviceSideRedirectFor(channel, lane) {
   return SERVICE_SIDE_REDIRECTED[channel] ?? null
 }
 
-/** 供状态卡/文档引用：TS 档**尚未覆盖**的服务侧通道清单（WMI 已改为重定向，见上） */
+/** 供状态卡/文档引用：TS 档**尚未覆盖**的服务侧通道清单（WMI/SCM/计划任务/EventLog 已重定向） */
 export const SERVICE_SIDE_UNCOVERED = Object.freeze([
-  SERVICE_SIDE_CHANNELS.SCM_SERVICE,
-  SERVICE_SIDE_CHANNELS.TASK_SCHEDULER,
-  SERVICE_SIDE_CHANNELS.EVENT_LOG,
   SERVICE_SIDE_CHANNELS.VOLUME_SHADOW,
   SERVICE_SIDE_CHANNELS.DEFENDER_POLICY,
   SERVICE_SIDE_CHANNELS.FIREWALL,

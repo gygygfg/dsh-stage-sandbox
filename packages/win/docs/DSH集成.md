@@ -1273,8 +1273,15 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
   UNC 外传（`copy` 报成功但只落 `staged\fs\_unc\...`）、`.NET File.WriteAllText`、8.3 短名。
 - 第二轮（同日）：WMI 进程创建已改为**真重定向**——`wmic process call create "<inner>"`
   的内层命令改走 `winstage-inject.exe`，wmic 输出形态不变，子进程写入回到暂存树
-  （实测 `realExists=false / stagedHit=true`）。其余服务侧通道（SCM/计划任务/日志/卷影/
-  Defender/防火墙/BCD）尚未重定向，仍按文本策略拒绝；SCM/EventLog 的客户端钩子方案与
-  COM 通道的三条路线见报告 §6。
+  （实测 `realExists=false / stagedHit=true`）。
+- 第二轮续：**SCM 与 EventLog 也已重定向**。advapi32 覆盖层（`shim/src/ws_scm.c`）把服务
+  创建/改配/删除/启停写进 `service.overlay.jsonl`，查询时与真实 SCM 合并，并把服务键镜像到
+  注册表覆盖层；EventLog 清日志记账、已清通道查询返回空。`sc.exe` 是 svcctl 的**裸 RPC 客户端**
+  （导入表里没有 advapi32 SCM API）、`wevtutil` 走 delay-load，因此两者由 executor/shim 改道到
+  `winstage-probe.exe --sc/--evt` 助手，助手被注入后走同一覆盖层。实测真实系统侧：服务/注册表
+  键不存在、Application 日志标记仍在。`schtasks` 也改道到 `winstage-probe.exe --task`，
+  任务的 create/delete/run 记账、query 与 staged 状态一致，真实任务不存在。
+  卷影/Defender/防火墙/BCD 仍按文本策略拒绝（对外只返回普通 `Access is denied.`）。
+  细节与未覆盖面见报告 §6.4/§6.5。
 - 落地建议：不可信 agent 必须用 NT（ProjFS + minifilter）档；TS 档需把"服务侧写入不在边界内"
   显式标注为未覆盖，并补齐 cwd/temp/自身存储的视图收敛。

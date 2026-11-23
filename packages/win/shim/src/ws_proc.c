@@ -517,6 +517,135 @@ static wchar_t *ws_wmic_build_inject_cmd(const wchar_t *scriptPath)
     return out;
 }
 
+/* The staged CLI helper itself must be able to spawn the REAL wevtutil for a
+ * read of a non-cleared channel. The marker is honoured only when the CURRENT
+ * process image is our helper -- an agent's `set WINSTAGE_CLI_REAL=1 & sc ...`
+ * runs inside cmd.exe and is still rewritten. */
+static int ws_cli_real_bypass(void)
+{
+    wchar_t flag[8];
+    if (GetEnvironmentVariableW(L"WINSTAGE_CLI_REAL", flag, 8) == 0 || flag[0] != L'1') {
+        return 0;
+    }
+    wchar_t self[WS_PATH_MAX];
+    if (!GetModuleFileNameW(NULL, self, WS_PATH_MAX)) {
+        return 0;
+    }
+    const wchar_t *base = wcsrchr(self, L'\\');
+    base = base ? base + 1 : self;
+    return _wcsicmp(base, L"winstage-probe.exe") == 0;
+}
+
+/* --------------------------------------------------------------- sc.exe RPC --
+ * 2026-11-23（第二轮实测）：`sc.exe` **不导入** advapi32 的 SCM API —— 它的导入表里
+ * 只有 RPCRT4!NdrClientCall2，是 svcctl 接口的裸 RPC 客户端。因此 advapi32 覆盖层
+ * （ws_scm.c）只能覆盖 PowerShell New-Service / .NET 这类程序化调用，`sc create`
+ * 仍然直接写真实 SCM（实测真实服务键 + 真实启动）。
+ *
+ * 这里在 CreateProcess 处把 `sc.exe` 换成随垫片发布的 CLI 助手：
+ *     sc.exe <args>  →  winstage-probe.exe --sc <args>
+ * 助手是 advapi32 的薄 CLI（probe/winstage_sc.c），被注入后它的 SCM 调用就落到
+ * ws_scm.c 的会话日志里；真实 services.exe 完全不被触碰。
+ *
+ * 只替换本机 `sc`/`sc.exe`；解析不出命令行就 fail-closed（绝不回落真 sc）。
+ * ------------------------------------------------------------------------- */
+
+static int ws_token_span(const wchar_t *s, int *outStart, int *outEnd)
+{
+    int i = 0;
+    while (s[i] == L' ' || s[i] == L'\t') {
+        i++;
+    }
+    *outStart = i;
+    if (s[i] == L'"') {
+        i++;
+        while (s[i] && s[i] != L'"') {
+            i++;
+        }
+        if (s[i] == L'"') {
+            i++;
+        }
+    } else {
+        while (s[i] && s[i] != L' ' && s[i] != L'\t') {
+            i++;
+        }
+    }
+    *outEnd = i;
+    return i;
+}
+
+static int ws_basename_is_cli(const wchar_t *token, int len, const wchar_t *name)
+{
+    if (len >= 2 && token[0] == L'"' && token[len - 1] == L'"') {
+        token++;
+        len -= 2;
+    }
+    int start = 0;
+    for (int i = 0; i < len; i++) {
+        if (token[i] == L'\\' || token[i] == L'/') {
+            start = i + 1;
+        }
+    }
+    const wchar_t *base = token + start;
+    int n = len - start;
+    int nameLen = (int)wcslen(name);
+    if (n == nameLen && _wcsnicmp(base, name, nameLen) == 0) {
+        return 1;
+    }
+    if (n == nameLen + 4 && _wcsnicmp(base, name, nameLen) == 0 &&
+        _wcsnicmp(base + nameLen, L".exe", 4) == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+/** Build `"<probe>" --sc <original arguments>`; NULL = could not build. */
+static wchar_t *ws_cli_rewrite_cmd(LPCWSTR app, LPCWSTR cmd, const wchar_t *baseName,
+                                   const wchar_t *mode, wchar_t *probeOut, DWORD probeCch)
+{
+    if (!g_selfDll[0]) {
+        return NULL;
+    }
+    wchar_t dir[WS_PATH_MAX];
+    ws_strlcpy_w(dir, g_selfDll, WS_PATH_MAX);
+    wchar_t *slash = wcsrchr(dir, L'\\');
+    if (!slash) {
+        return NULL;
+    }
+    slash[1] = 0;
+    _snwprintf(probeOut, probeCch, L"%lswinstage-probe.exe", dir);
+    probeOut[probeCch - 1] = 0;
+
+    const wchar_t *remainder = L"";
+    if (cmd && cmd[0]) {
+        int start = 0, end = 0;
+        ws_token_span(cmd, &start, &end);
+        if (ws_basename_is_cli(cmd + start, end - start, baseName)) {
+            remainder = cmd + end;
+        } else {
+            remainder = cmd;
+        }
+    }
+    size_t cch = wcslen(probeOut) + wcslen(remainder) + 64;
+    wchar_t *out = (wchar_t *)malloc(cch * sizeof(wchar_t));
+    if (!out) {
+        return NULL;
+    }
+    if (wcscmp(mode, L"--evt") == 0 || wcscmp(mode, L"--task") == 0) {
+        wchar_t journal[WS_PATH_MAX];
+        const wchar_t *dir = g_ws.regStageDir[0] ? g_ws.regStageDir : g_ws.stageRoot;
+        const wchar_t *leaf = (wcscmp(mode, L"--evt") == 0) ? L"eventlog.overlay.jsonl"
+                                                           : L"tasks.overlay.jsonl";
+        _snwprintf(journal, WS_PATH_MAX, L"%ls\\%ls", dir, leaf);
+        journal[WS_PATH_MAX - 1] = 0;
+        _snwprintf(out, cch, L"\"%ls\" %ls \"%ls\" %ls", probeOut, mode, journal, remainder);
+    } else {
+        _snwprintf(out, cch, L"\"%ls\" %ls %ls", probeOut, mode, remainder);
+    }
+    out[cch - 1] = 0;
+    return out;
+}
+
 static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LPWSTR cmd,                                     LPSECURITY_ATTRIBUTES pa, LPSECURITY_ATTRIBUTES ta, BOOL inherit,
                                      DWORD flags, LPVOID env, LPCWSTR cwd, LPSTARTUPINFOW si,
                                      LPPROCESS_INFORMATION pi)
@@ -545,6 +674,36 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
      * ── wmic process call create：把内层命令改道到注入器（见文件头注释）─────────
      * 只处理本机目标；`/node:` 指向远端时无法把注入器一起送过去，失败关闭。
      */
+    wchar_t scProbe[WS_PATH_MAX];
+    wchar_t *scRewrite = NULL;
+    if (!exempt && !hasToken && !ws_cli_real_bypass()) {
+        int isSc = 0, isEvt = 0, isTask = 0;
+        if (app && app[0]) {
+            isSc = ws_basename_is_cli(app, (int)wcslen(app), L"sc");
+            isEvt = ws_basename_is_cli(app, (int)wcslen(app), L"wevtutil");
+            isTask = ws_basename_is_cli(app, (int)wcslen(app), L"schtasks");
+        } else if (cmd && cmd[0]) {
+            int start = 0, end = 0;
+            ws_token_span(cmd, &start, &end);
+            isSc = ws_basename_is_cli(cmd + start, end - start, L"sc");
+            isEvt = ws_basename_is_cli(cmd + start, end - start, L"wevtutil");
+            isTask = ws_basename_is_cli(cmd + start, end - start, L"schtasks");
+        }
+        if (isSc || isEvt || isTask) {
+            const wchar_t *mode = isSc ? L"--sc" : (isEvt ? L"--evt" : L"--task");
+            const wchar_t *baseName = isSc ? L"sc" : (isEvt ? L"wevtutil" : L"schtasks");
+            scRewrite = ws_cli_rewrite_cmd(app, cmd, baseName, mode, scProbe, WS_PATH_MAX);
+            if (!scRewrite) {
+                ws_log("staged CLI: could not build the helper command; failing closed");
+                SetLastError(ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
+            ws_log("%ls redirected to the staged CLI helper",
+                   isSc ? L"sc.exe" : (isEvt ? L"wevtutil.exe" : L"schtasks.exe"));
+            cmd = scRewrite;
+            app = scProbe;
+        }
+    }
     wchar_t *wmiRewrite = NULL;
     if (!exempt && !hasToken && cmd && cmd[0]) {
         const wchar_t *image = app ? app : cmd;
@@ -649,7 +808,10 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
     }
     if (!ok) {
         if (wmiRewrite) {
-            HeapFree(GetProcessHeap(), 0, wmiRewrite);
+            free(wmiRewrite);
+        }
+        if (scRewrite) {
+            free(scRewrite);
         }
         SetLastError(createErr);
         return FALSE;
@@ -676,6 +838,9 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
     ws_lock_enter(&g_procLock);
     g_injectCount++;
     ws_lock_leave(&g_procLock);
+    if (scRewrite) {
+        ws_log("sc.exe child injected pid=%lu", (unsigned long)pi->dwProcessId);
+    }
     if (g_ws.verbose) {
         ws_log("child injected (pid=%lu) app=%ls", (unsigned long)pi->dwProcessId,
                app ? app : (cmd ? cmd : L"(null)"));
@@ -684,7 +849,10 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
         ResumeThread(pi->hThread);
     }
     if (wmiRewrite) {
-        HeapFree(GetProcessHeap(), 0, wmiRewrite);
+        free(wmiRewrite);
+    }
+    if (scRewrite) {
+        free(scRewrite);
     }
     SetLastError(ws_saved_last_error);
     return TRUE;

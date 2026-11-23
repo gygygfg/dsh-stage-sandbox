@@ -218,6 +218,46 @@ static const WsHookTarget g_targets[] = {
     WS_TARGET(NtQueryAttributesFile), /* R11-D-13d-nqaf */
     WS_TARGET(NtQueryFullAttributesFile), /* R11-D-13d-nqfaf */
     WS_TARGET(NtQueryInformationByName), /* R11-D-13d-nqifbn */
+    /* 2026-11-23 (second round): service-side client virtualization. The write
+     * does not originate in this process (services.exe / eventlog do it), so the
+     * only place to intercept it is the RPC client API. See ws_scm.c. */
+    WS_TARGET(OpenSCManagerW),
+    WS_TARGET(OpenSCManagerA),
+    WS_TARGET(OpenServiceW),
+    WS_TARGET(OpenServiceA),
+    WS_TARGET(CreateServiceW),
+    WS_TARGET(CreateServiceA),
+    WS_TARGET(ChangeServiceConfigW),
+    WS_TARGET(ChangeServiceConfigA),
+    WS_TARGET(DeleteService),
+    WS_TARGET(StartServiceW),
+    WS_TARGET(StartServiceA),
+    WS_TARGET(ControlService),
+    WS_TARGET(QueryServiceStatus),
+    WS_TARGET(QueryServiceStatusEx),
+    WS_TARGET(QueryServiceConfigW),
+    WS_TARGET(QueryServiceConfigA),
+    WS_TARGET(QueryServiceConfig2W),
+    WS_TARGET(QueryServiceConfig2A),
+    WS_TARGET(EnumServicesStatusExW),
+    WS_TARGET(EnumServicesStatusExA),
+    WS_TARGET(EnumServicesStatusW),
+    WS_TARGET(EnumServicesStatusA),
+    WS_TARGET(CloseServiceHandle),
+    WS_TARGET(GetServiceDisplayNameW),
+    WS_TARGET(GetServiceDisplayNameA),
+    WS_TARGET(EvtClearLog),
+    WS_TARGET(EvtQuery),
+    WS_TARGET(EvtNext),
+    WS_TARGET(EvtClose),
+    WS_TARGET(OpenEventLogW),
+    WS_TARGET(OpenEventLogA),
+    WS_TARGET(ClearEventLogW),
+    WS_TARGET(ClearEventLogA),
+    WS_TARGET(ReadEventLogW),
+    WS_TARGET(ReadEventLogA),
+    WS_TARGET(GetNumberOfEventLogRecords),
+    WS_TARGET(CloseEventLog),
 };
 #define WS_TARGET_COUNT (sizeof(g_targets) / sizeof(g_targets[0]))
 
@@ -281,6 +321,17 @@ static const char *const g_targetNames[] = {
     "NtQueryAttributesFile", /* R11-D-13d-nqaf */
     "NtQueryFullAttributesFile", /* R11-D-13d-nqfaf */
     "NtQueryInformationByName", /* R11-D-13d-nqifbn */
+    /* 2026-11-23 service-side virtualization (must mirror g_targets exactly) */
+    "OpenSCManagerW", "OpenSCManagerA", "OpenServiceW", "OpenServiceA",
+    "CreateServiceW", "CreateServiceA", "ChangeServiceConfigW", "ChangeServiceConfigA",
+    "DeleteService", "StartServiceW", "StartServiceA", "ControlService",
+    "QueryServiceStatus", "QueryServiceStatusEx", "QueryServiceConfigW", "QueryServiceConfigA",
+    "QueryServiceConfig2W", "QueryServiceConfig2A",
+    "EnumServicesStatusExW", "EnumServicesStatusExA", "EnumServicesStatusW", "EnumServicesStatusA",
+    "CloseServiceHandle", "GetServiceDisplayNameW", "GetServiceDisplayNameA",
+    "EvtClearLog", "EvtQuery", "EvtNext", "EvtClose",
+    "OpenEventLogW", "OpenEventLogA", "ClearEventLogW", "ClearEventLogA",
+    "ReadEventLogW", "ReadEventLogA", "GetNumberOfEventLogRecords", "CloseEventLog",
 };
 /* R11-D-13d (v2)：调用期命中计数（与 g_targetHits 的"安装期 IAT 站点数"无关）。
  * v2 **不新增任何挂钩目标**：只统计既已挂钩入口被调用的次数。
@@ -703,6 +754,41 @@ int ws_hook_init(void)
         { (void **)&g_orig.NtQueryValueKey, "NtQueryValueKey" },
         { (void **)&g_orig.NtEnumerateValueKey, "NtEnumerateValueKey" },
         { (void **)&g_orig.NtQueryKey, "NtQueryKey" },
+        /* 2026-11-23 service-side client virtualization (SCM + legacy EventLog
+         * are advapi32 exports; wevtapi's Evt* are resolved lazily in ws_scm.c). */
+        { (void **)&g_orig.OpenSCManagerW, "OpenSCManagerW" },
+        { (void **)&g_orig.OpenSCManagerA, "OpenSCManagerA" },
+        { (void **)&g_orig.OpenServiceW, "OpenServiceW" },
+        { (void **)&g_orig.OpenServiceA, "OpenServiceA" },
+        { (void **)&g_orig.CreateServiceW, "CreateServiceW" },
+        { (void **)&g_orig.CreateServiceA, "CreateServiceA" },
+        { (void **)&g_orig.ChangeServiceConfigW, "ChangeServiceConfigW" },
+        { (void **)&g_orig.ChangeServiceConfigA, "ChangeServiceConfigA" },
+        { (void **)&g_orig.DeleteService, "DeleteService" },
+        { (void **)&g_orig.StartServiceW, "StartServiceW" },
+        { (void **)&g_orig.StartServiceA, "StartServiceA" },
+        { (void **)&g_orig.ControlService, "ControlService" },
+        { (void **)&g_orig.QueryServiceStatus, "QueryServiceStatus" },
+        { (void **)&g_orig.QueryServiceStatusEx, "QueryServiceStatusEx" },
+        { (void **)&g_orig.QueryServiceConfigW, "QueryServiceConfigW" },
+        { (void **)&g_orig.QueryServiceConfigA, "QueryServiceConfigA" },
+        { (void **)&g_orig.QueryServiceConfig2W, "QueryServiceConfig2W" },
+        { (void **)&g_orig.QueryServiceConfig2A, "QueryServiceConfig2A" },
+        { (void **)&g_orig.EnumServicesStatusExW, "EnumServicesStatusExW" },
+        { (void **)&g_orig.EnumServicesStatusExA, "EnumServicesStatusExA" },
+        { (void **)&g_orig.EnumServicesStatusW, "EnumServicesStatusW" },
+        { (void **)&g_orig.EnumServicesStatusA, "EnumServicesStatusA" },
+        { (void **)&g_orig.CloseServiceHandle, "CloseServiceHandle" },
+        { (void **)&g_orig.GetServiceDisplayNameW, "GetServiceDisplayNameW" },
+        { (void **)&g_orig.GetServiceDisplayNameA, "GetServiceDisplayNameA" },
+        { (void **)&g_orig.OpenEventLogW, "OpenEventLogW" },
+        { (void **)&g_orig.OpenEventLogA, "OpenEventLogA" },
+        { (void **)&g_orig.ClearEventLogW, "ClearEventLogW" },
+        { (void **)&g_orig.ClearEventLogA, "ClearEventLogA" },
+        { (void **)&g_orig.ReadEventLogW, "ReadEventLogW" },
+        { (void **)&g_orig.ReadEventLogA, "ReadEventLogA" },
+        { (void **)&g_orig.GetNumberOfEventLogRecords, "GetNumberOfEventLogRecords" },
+        { (void **)&g_orig.CloseEventLog, "CloseEventLog" },
     };
     for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
         HMODULE order[] = { g_orig.hKernelBase, g_orig.hKernel32, g_orig.hAdvapi32, g_orig.hNtdll };
@@ -1226,6 +1312,19 @@ static void *ws_wrapper_for_real(const void *addr)
  * resolutions (via the REAL resolver g_orig.GetProcAddress -- never our hook).
  * Safety: no match returns NULL and the caller keeps `real`; never fail-closed,
  * never invents a pointer. */
+/* wevtapi.dll is not one of the four "system" modules captured at init, but its
+ * Evt* exports are targets. Without this check, `GetProcAddress(wevtapi,
+ * "EvtClearLog")` failed the identity test and wevtutil kept the REAL clear
+ * (measured 2026-11-23: Application log really cleared by `wevtutil cl`). */
+static HMODULE ws_evtapi_module(void)
+{
+    static HMODULE mod;
+    if (!mod) {
+        mod = GetModuleHandleW(L"wevtapi.dll");
+    }
+    return mod;
+}
+
 static void *ws_name_identity(const char *name, const void *real)
 {
     if (!name || !real || !g_orig.GetProcAddress) {
@@ -1243,6 +1342,10 @@ static void *ws_name_identity(const char *name, const void *real)
         if ((const void *)g_orig.GetProcAddress(order[k], name) == real) {
             return wrapper;
         }
+    }
+    HMODULE evt = ws_evtapi_module();
+    if (evt && (const void *)g_orig.GetProcAddress(evt, name) == real) {
+        return wrapper;
     }
     return NULL;
 }

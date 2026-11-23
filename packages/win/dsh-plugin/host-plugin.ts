@@ -43,7 +43,11 @@ import { WindowsStageExecutor, resolveDshModuleRoot } from '../src/executor.ts'
 import { canonical, compareKey, isInside, maskSessionId } from '../src/paths.ts'
 import { renderCandidateDiff } from '../src/tools.ts'
 import { verifyStageRootAlive } from '../src/stage-guard.ts'
-import { SERVICE_SIDE_UNCOVERED, SERVICE_SIDE_CHANNEL_LABELS } from '../src/service-side.ts'
+import {
+  SERVICE_SIDE_CHANNEL_LABELS,
+  SERVICE_SIDE_REDIRECTED,
+  SERVICE_SIDE_UNCOVERED,
+} from '../src/service-side.ts'
 import { createNtRuntime, defaultNtLayout } from '../src/nt/runtime.ts'
 import { NtSupervisor } from '../src/nt/supervisor.ts'
 import { REVIEW_BASENAME, getReviewService, isRegistryCandidate, resolveReviewStoreDir, disposeReviewServices } from './review-service.ts'
@@ -712,15 +716,20 @@ export function buildTrustCard(options = {}) {
       serviceSide: {
         stated: true,
         coveredByKernelBoundary: tier.launchMode === 'nt',
-        redirectedChannels: [SERVICE_SIDE_CHANNELS.WMI_PROCESS_CREATE],
-        redirectedLabels: [SERVICE_SIDE_CHANNEL_LABELS[SERVICE_SIDE_CHANNELS.WMI_PROCESS_CREATE]],
+        redirectedChannels: Object.keys(SERVICE_SIDE_REDIRECTED),
+        redirectedLabels: Object.keys(SERVICE_SIDE_REDIRECTED).map(
+          (channel) => SERVICE_SIDE_CHANNEL_LABELS[channel] ?? channel,
+        ),
         uncoveredChannels: SERVICE_SIDE_UNCOVERED,
         uncoveredLabels: SERVICE_SIDE_UNCOVERED.map((channel) => SERVICE_SIDE_CHANNEL_LABELS[channel] ?? channel),
         knownEscapesBlockedByText: true,
         boundaryKind: 'redirect-or-policy-text-denial',
         note:
-          'TS 档只覆盖本进程树的 IAT 文件/注册表调用。WMI 进程创建（wmic process call create）已**重定向**：' +
-          '内层命令改走注入器，子进程写入回到暂存树；其余服务侧通道（SCM/计划任务/日志/卷影/Defender/防火墙/BCD）' +
+          'TS 档只覆盖本进程树的 IAT 文件/注册表调用，另有三个服务侧通道做了**客户端重定向**：' +
+          'WMI 进程创建（内层命令改走注入器）、SCM（advapi32 覆盖层 + sc.exe 助手：创建/改配/删除/启停' +
+          '写会话日志并与真实 SCM 合并，服务键同步镜像到注册表覆盖层）、EventLog（清日志记账，' +
+          'wevtutil/PowerShell 两条路径都已覆盖，已清通道的查询返回空）、计划任务（schtasks 助手记账，' +
+          'query/delete 与 staged 状态一致）。其余（卷影/Defender/防火墙/BCD）' +
           '尚未重定向，已知构造按文本策略拒绝（不是内核边界）。真正的全覆盖需要 NT（ProjFS + minifilter）档。',
       },
     },
@@ -772,7 +781,7 @@ function formatTierLines(card) {
       coverage.coveredByKernelBoundary
         ? '  · 覆盖边界：当前档位是内核边界（NT/ProjFS+minifilter），服务侧写入在边界内。'
         : '  · 覆盖边界：TS 档只覆盖**本进程树**的 IAT 文件/注册表调用；' +
-            `WMI 进程创建已重定向（${(coverage.redirectedLabels ?? []).join('、') || '无'}，内层命令改走注入器、写入回到暂存）；` +
+            `已重定向（${(coverage.redirectedLabels ?? []).join('、') || '无'}：写入落到会话日志/暂存，读取与真实系统合并）；` +
             `其余（${coverage.uncoveredLabels.join('、')}）尚未重定向，已知构造按命令文本拒绝` +
             '（`SERVICE_SIDE_ESCAPE_BLOCKED`，策略面、**不是**内核边界）。',
     )
