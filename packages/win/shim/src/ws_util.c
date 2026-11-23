@@ -704,6 +704,9 @@ void ws_env_scrub_contract(void)
         L"WINSTAGE_STAGE_OUTSIDE", L"WINSTAGE_SHELL",
         L"WINSTAGE_REGSTAGE_SESSION_DIR", L"WINSTAGE_REGSTAGE_ROOT",
         L"DSH_REGSTAGE_SESSION_DIR", L"DSH_REGSTAGE_ROOT",
+        /* Transport-only helpers: never visible in the carrier's `set`. */
+        L"WINSTAGE_HELPER_DIR", L"WINSTAGE_INJECT_DLL", L"WINSTAGE_INJECT_REPORT",
+        L"WINSTAGE_CLI_TOKEN", L"WINSTAGE_DEBUG_FIND",
     };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         SetEnvironmentVariableW(names[i], NULL);
@@ -733,6 +736,22 @@ void ws_config_from_env(void)
     if (!buf[0]) env_to_w(L"WINSTAGE_AUDIT_LOG", buf, WS_PATH_MAX);
     if (buf[0]) {
         ws_strlcpy_w(g_ws.auditPath, buf, WS_PATH_MAX);
+    }
+    /* Neutral helper dir (injector/probe copies + job file). Children need it to
+     * rewrite their own `sc`/`wmic` calls without leaking the plugin path. */
+    env_to_w(L"WINSTAGE_HELPER_DIR", buf, WS_PATH_MAX);
+    if (buf[0]) {
+        ws_strlcpy_w(g_ws.helperDir, buf, WS_PATH_MAX);
+    }
+    env_to_w(L"WINSTAGE_CLI_TOKEN", buf, WS_PATH_MAX);
+    if (buf[0]) {
+        ws_strlcpy_w(g_ws.cliToken, buf, 80);
+    }
+    /* Triage switch: verbose FindFirst tracing (not a feature; it exists so a
+     * hang can be attributed to the hook without guessing). */
+    env_to_w(L"WINSTAGE_DEBUG_FIND", buf, WS_PATH_MAX);
+    if (buf[0] && !(buf[0] == L'0' && buf[1] == 0)) {
+        g_ws.debugFind = 1;
     }
     /* Triage switches (default off). They exist so a single build can bisect
      * which hook family breaks a target, instead of guessing. */

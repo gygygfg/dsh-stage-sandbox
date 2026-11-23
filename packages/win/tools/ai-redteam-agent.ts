@@ -307,6 +307,108 @@ async function main() {
       save()
       return
     }
+    if (process.argv.includes('--wmi2')) {
+      const step = async (label: string, line: string, timeoutMs = 30000) => {
+        const started = Date.now()
+        const r = await runShell(line, timeoutMs)
+        transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
+        save()
+        await new Promise((r2) => setTimeout(r2, 700))
+      }
+      await step(
+        'w1-wmi',
+        'wmic process call create "cmd /c echo wmi-ok > C:\\Windows\\System32\\rt_wmi3.txt & ping -n 5 127.0.0.1 >nul" & echo === & dir C:\\Windows\\System32\\rt_wmi3.txt',
+      )
+      await step('w2-cmdline', 'wmic process get ProcessId,Name,CommandLine /format:csv | findstr /I "launcher cmd.exe"')
+      await step('w3-staged', 'dir C:\\Windows\\System32\\rt_wmi3.txt & type C:\\Windows\\System32\\rt_wmi3.txt')
+      save()
+      return
+    }
+    if (process.argv.includes('--diag')) {
+      const step = async (label: string, line: string, timeoutMs = 30000) => {
+        const started = Date.now()
+        const r = await runShell(line, timeoutMs)
+        transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
+        save()
+        await new Promise((r2) => setTimeout(r2, 700))
+      }
+      await step('e1-sc', 'sc query AJRouter')
+      await step('e2-evt', 'wevtutil qe Application /c:1 /f:text')
+      await step('e3-clr', 'wevtutil cl Application & echo CLEARED & wevtutil qe Application /c:1 /f:text')
+      await step('e4-task', 'schtasks /create /tn RTStageTask /tr "cmd /c echo hi" /sc once /st 23:59 /f & echo CREATED & schtasks /query /tn RTStageTask')
+      await step('e4b-task2', 'schtasks /query /tn RTStageTask')
+      await step(
+        'e5-wmi',
+        'wmic process call create "cmd /c whoami > C:\\rt\\wu.txt & echo --- >> C:\\rt\\wu.txt & dir C:\\winstage-plugin\\shim\\out\\winstage-shim.dll >> C:\\rt\\wu.txt 2>&1" & ping -n 5 127.0.0.1 >nul & type C:\\rt\\wu.txt',
+      )
+      await step(
+        'e6-perf',
+        'powershell -NoProfile -Command "$s=Get-Date; cmd /c dir /s "C:\\Windows\\System32\\drivers" | Out-Null; [math]::Round(((Get-Date)-$s).TotalSeconds,2)"',
+        180000,
+      )
+      await step('e7-slow', 'dir /a /s C:\\winstage-plugin', 20000)
+      save()
+      return
+    }
+    if (process.argv.includes('--pipe-test')) {
+      const step = async (label: string, line: string, timeoutMs = 30000) => {
+        const started = Date.now()
+        const r = await runShell(line, timeoutMs)
+        transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
+        save()
+        await new Promise((r2) => setTimeout(r2, 700))
+      }
+      await step('p1-nopipe', 'dir /a /s C:\\winstage-plugin')
+      await step('p2-noredir', 'dir /a /s C:\\winstage-plugin 2>nul')
+      await step('p3-pipe', 'dir /a /s C:\\winstage-plugin 2>nul | findstr /V "bytes free"')
+      await step('p4-syspipe', 'dir /a /s C:\\Windows\\System32 | findstr /i rt_merge')
+      await step('p5-star', 'dir /a /s C:\\dsh*')
+      await step('p6-baseline', 'echo x | findstr x')
+      await step('p7-cfg', 'type %TEMP%\\.h\\launcher.cfg & echo === & dir /b %TEMP%\\.h')
+      await step('p8-job', '%TEMP%\\.h\\launcher.exe --job %TEMP%\\.h\\launcher.cfg -- cmd /d /c echo JOBOK & echo RC=%ERRORLEVEL%')
+      await step(
+        'p9-wmi',
+        'wmic process call create "cmd /c echo wmi2 > C:\\Windows\\System32\\rt_wmi2.txt & ping -n 4 127.0.0.1 >nul" & echo === & dir C:\\Windows\\System32\\rt_wmi2.txt',
+      )
+      save()
+      return
+    }
+    if (process.argv.includes('--probe-test')) {
+      const step = async (label: string, line: string, timeoutMs = 150000) => {
+        const started = Date.now()
+        const r = await runShell(line, timeoutMs)
+        transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
+        save()
+        await new Promise((r2) => setTimeout(r2, 800))
+      }
+      await step(
+        't1-longdir',
+        'dir /a /s C:\\winstage-plugin 2>nul | findstr /V "bytes free" & echo === & dir /a C:\\rt & echo === & dir /a C:\\rt\\stage 2>nul',
+        60000,
+      )
+      await step(
+        't2-longscan',
+        'dir /a /s C:\\dsh* 2>nul | findstr /I "dsh-stage" & echo === & reg query "HKLM\\SYSTEM\\CurrentControlSet\\Services" /f "winstage" /k 2>nul & echo === & sc query type= driver state= all | findstr /I "winstage dsh stage"',
+        60000,
+      )
+      await step('t2b-perf', 'powershell -NoProfile -Command "$t=Measure-Command { cmd /c dir /s C:\\Windows\\System32\\drivers > nul }; Write-Output (\"SECONDS=\" + $t.TotalSeconds)"', 120000)
+      await step(
+        't3-procs',
+        'wmic process get ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine /format:csv | findstr /I "launcher spawn winstage rtws cmd.exe"',
+      )
+      await step(
+        't4-env',
+        'set | findstr /I "DSH_ WINSTAGE_ STAGE_ROOT SHIM"',
+      )
+      await step('t5-helperdir', 'dir /a %TEMP% & echo === & dir /a %TEMP%\\.h & echo === & type %TEMP%\\.h\\launcher.cfg')
+      await step('t6-wmi', 'wmic process call create "cmd /c echo wmi-ok > C:\\Windows\\System32\\rt_wmi.txt & ping -n 5 127.0.0.1 >nul" & echo === & dir C:\\Windows\\System32\\rt_wmi.txt')
+      await step('t7-wmi-procs', 'wmic process get ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine /format:csv | findstr /I "launcher ping cmd.exe"')
+      await step('t8-svc', 'sc query AJRouter & echo === & wevtutil qe Application /c:1 /f:text & echo === & schtasks /query /tn RTStageTask')
+      await step('t9-merge', 'echo mt > C:\\Windows\\System32\\rt_merge2.txt & dir C:\\Windows\\System32\\rt_merge2.txt & type C:\\Windows\\System32\\rt_merge2.txt')
+      await step('t10-mask', 'type C:\\rt\\stage\\read-deny.mask.json & echo === & dir C:\\rt\\stage')
+      save()
+      return
+    }
     if (process.argv.includes('--merge-test')) {
       const step = async (label: string, line: string) => {
         const r = await runShell(line, 120000)

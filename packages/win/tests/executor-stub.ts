@@ -693,7 +693,7 @@ async function main() {
     check('spawn 失败退出码 127', r?.exitCode === 127, String(r?.exitCode))
     check('spawn 失败标记 launchFailed', r?.launchFailed === true, String(r?.launchFailed))
     check('spawn 失败分类为 runner-failure', r?.classification?.kind === 'runner-failure', JSON.stringify(r?.classification))
-    check('stderr 指明是沙箱启动失败', /sandbox launch failed/.test(r?.stderr ?? ''), r?.stderr?.slice(0, 70))
+    check('stderr 指明是启动失败（不含 sandbox 字样）', /launch failed/.test(r?.stderr ?? '') && !/sandbox/i.test(r?.stderr ?? ''), r?.stderr?.slice(0, 70))
     ex.dispose()
   }
   {
@@ -1100,11 +1100,12 @@ async function main() {
         probeTransparentShim: () => fakeProbe(true),
         spawnTransparentProcess: async (file, args, options) => {
           spawnCalls.push({ file, args, options })
-          // R22-C：真实注入器会写 `--report <json>`（含 `shimInitRc`）；替身必须同样写，
-          // 否则 ShimLauncher 的版本握手会把"没有报告"判成 fail-closed（这正是它的职责）。
-          const reportIndex = args.indexOf('--report')
-          if (reportIndex >= 0 && args[reportIndex + 1]) {
-            writeFileSync(args[reportIndex + 1], JSON.stringify({ ok: true, tool: 'winstage-inject', childPid: 9001, childExitCode: 0, shimInitRc: 0 }))
+          // R22-C：真实注入器会写报告（含 `shimInitRc`）；替身必须同样写，否则
+          // ShimLauncher 的版本握手会把"没有报告"判成 fail-closed（这正是它的职责）。
+          // 透明性修复后报告路径走**环境变量**（命令行里不再出现 --report）。
+          const reportPath = options?.env?.WINSTAGE_INJECT_REPORT
+          if (reportPath) {
+            writeFileSync(reportPath, JSON.stringify({ ok: true, tool: 'winstage-inject', childPid: 9001, childExitCode: 0, shimInitRc: 0 }))
           }
           // 模拟"写入被 shim 暂存"：自检要求暂存树里能找到那个文件
           const scriptText = args.join(' ')
@@ -1131,8 +1132,23 @@ async function main() {
     )
     check('注入器被调用一次', spawnCalls.length === 1, `calls=${spawnCalls.length}`)
     check('调用的是注入器产物路径', spawnCalls[0]?.file === fakeArtifacts.injectorPath, String(spawnCalls[0]?.file))
-    check('注入器参数含 --dll 与 DLL 路径', spawnCalls[0]?.args?.[0] === '--dll' && spawnCalls[0]?.args?.[1] === fakeArtifacts.dllPath, JSON.stringify(spawnCalls[0]?.args?.slice(0, 4)))
-    check('注入器参数用 `--` 分隔目标命令', spawnCalls[0]?.args?.includes('--') === true, JSON.stringify(spawnCalls[0]?.args?.slice(0, 8)))
+    check(
+      '注入器参数不再露 --dll/--report（透明性：命令行里没有产物与暂存路径）',
+      !spawnCalls[0]?.args?.includes('--dll') && !spawnCalls[0]?.args?.includes('--report'),
+      JSON.stringify(spawnCalls[0]?.args?.slice(0, 6)),
+    )
+    check(
+      'DLL 路径改走环境变量 WINSTAGE_INJECT_DLL',
+      spawnCalls[0]?.options?.env?.WINSTAGE_INJECT_DLL === fakeArtifacts.dllPath,
+      String(spawnCalls[0]?.options?.env?.WINSTAGE_INJECT_DLL),
+    )
+    check(
+      '报告路径改走环境变量 WINSTAGE_INJECT_REPORT',
+      typeof spawnCalls[0]?.options?.env?.WINSTAGE_INJECT_REPORT === 'string' &&
+        spawnCalls[0]?.options?.env?.WINSTAGE_INJECT_REPORT.endsWith('.json'),
+      String(spawnCalls[0]?.options?.env?.WINSTAGE_INJECT_REPORT),
+    )
+    check('注入器参数用 `--` 分隔目标命令', spawnCalls[0]?.args?.[0] === '--', JSON.stringify(spawnCalls[0]?.args?.slice(0, 4)))
     const injectorEnv = spawnCalls[0]?.options?.env ?? {}
     check('注入器环境里没有任何 DSH_SANDBOX* 变量', !Object.keys(injectorEnv).some((name) => /^DSH_SANDBOX/i.test(name)), JSON.stringify(Object.keys(injectorEnv).filter((n) => /DSH/.test(n))))
     check('注入器环境带上了 shim 契约变量 DSH_STAGE_ROOT', samePath(injectorEnv.DSH_STAGE_ROOT, STAGING), String(injectorEnv.DSH_STAGE_ROOT))
@@ -1184,7 +1200,11 @@ async function main() {
     const r = await ex.run({ command: 'faketool', cwd: STAGING })
     check('注入失败时 run 不冒泡、给出结构化结果', r.exitCode === 127 && r.launchFailed === true, JSON.stringify({ exitCode: r.exitCode, launchFailed: r.launchFailed }))
     check('注入失败分类为 runner-failure', r.classification.kind === 'runner-failure', JSON.stringify(r.classification))
-    check('注入失败错误里点明 TS_INJECTION_FAILED / fail-closed', /TS_INJECTION_FAILED|refusing to continue unconfined/.test(r.stderr), r.stderr.slice(0, 160))
+    check(
+      '注入失败对模型只说"命令没能启动"，不泄漏沙箱/注入器字样',
+      /could not be started/.test(r.stderr) && !/winstage|sandbox|inject/i.test(r.stderr),
+      r.stderr.slice(0, 160),
+    )
     check('注入失败时没有改用受限令牌路径继续跑', stubs.record.spawnCalls.length === 0, `spawnCalls=${stubs.record.spawnCalls.length}`)
     ex.dispose()
   }

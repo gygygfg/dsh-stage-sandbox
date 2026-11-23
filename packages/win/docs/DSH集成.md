@@ -1288,3 +1288,14 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
   细节与未覆盖面见报告 §6.4/§6.5、§8。
 - 落地建议：不可信 agent 必须用 NT（ProjFS + minifilter）档；TS 档需把"服务侧写入不在边界内"
   显式标注为未覆盖，并补齐 cwd/temp/自身存储的视图收敛。
+
+### 23.1 第二批透明性修复（2026-11-24）
+
+- 注入器改为**每会话中立副本**（私有 TEMP 下 `launcher.exe`/`spawn.exe`/`launcher.cfg`），
+  `--dll/--report` 走环境变量；WMI 路径走 `--job`；垫片不再注入自己的 launcher。
+- 命令超时**不再**被归因成注入失败（先判 `timedOut`；模型只看到普通超时）。
+- `wevtutil`/`schtasks` 助手通过垫片导出读写会话日志（存储对助手是读掩码的），
+  命令行只带 `@evt`/`@task`；"放行真实 CLI"改用每会话一次性 token。
+- 真实模型复跑（recon5）结论是"QEMU 虚拟机、未被沙箱接管"，全文未出现注入器/助手名。
+- **部署要求**：Windows Defender 必须排除插件目录与私有 TEMP（否则未签名产物会被
+  拦截/隔离，表现为 `Access is denied` 与 TS 档回退）。

@@ -184,6 +184,114 @@ static BOOL build_environment(const wchar_t *sets[], int setCount, wchar_t **out
     return TRUE;
 }
 
+/* ── 无参数启动（透明性）──────────────────────────────────────────────────────
+ *
+ * 命令行走 `wmic process get CommandLine` 是可见的。真实红队 recon 正是从
+ * `C:\winstage-plugin\...\winstage-inject.exe --dll ... --report ...` 反查到机制。
+ * 因此：
+ *   · DLL 路径优先取环境变量 `WINSTAGE_INJECT_DLL`（不可见于命令行）；
+ *   · 报告路径取 `WINSTAGE_INJECT_REPORT`；
+ *   · WMI 那条路没有可控环境（服务端起进程），改用 `--job <file>`：一个 base64
+ *     编码的 key=value 文件，和 helper 放在一起，命令行只出现一个中性文件名。
+ * 这三种来源的变量在创建子进程前都会从**本进程环境**里删掉，避免泄漏给载体。
+ */
+static int b64_value(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static int b64_decode(const char *in, unsigned char *out, size_t cap)
+{
+    unsigned int acc = 0;
+    int bits = 0;
+    size_t o = 0;
+    for (const char *p = in; p && *p; p++) {
+        if (*p == '=' ) break;
+        if (*p == '\r' || *p == '\n' || *p == ' ' || *p == '\t') continue;
+        int v = b64_value(*p);
+        if (v < 0) return -1;
+        acc = (acc << 6) | (unsigned int)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (o >= cap) return -1;
+            out[o++] = (unsigned char)((acc >> bits) & 0xFFu);
+        }
+    }
+    return (int)o;
+}
+
+/** Read `path` (base64 text), decode to UTF-8 and return a wide copy. */
+static wchar_t *read_job_text(const wchar_t *path)
+{
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+    char raw[8192];
+    DWORD read = 0;
+    BOOL ok = ReadFile(h, raw, sizeof(raw) - 1, &read, NULL);
+    CloseHandle(h);
+    if (!ok) {
+        return NULL;
+    }
+    raw[read] = 0;
+    unsigned char bytes[6144];
+    int n = b64_decode(raw, bytes, sizeof(bytes));
+    if (n <= 0) {
+        return NULL;
+    }
+    int wc = MultiByteToWideChar(CP_UTF8, 0, (const char *)bytes, n, NULL, 0);
+    if (wc <= 0) {
+        return NULL;
+    }
+    wchar_t *w = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)(wc + 1) * sizeof(wchar_t));
+    if (!w) {
+        return NULL;
+    }
+    MultiByteToWideChar(CP_UTF8, 0, (const char *)bytes, n, w, wc);
+    w[wc] = 0;
+    return w;
+}
+
+static wchar_t *env_dup(const wchar_t *name)
+{
+    DWORD n = GetEnvironmentVariableW(name, NULL, 0);
+    if (n == 0) {
+        return NULL;
+    }
+    wchar_t *out = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, (size_t)n * sizeof(wchar_t));
+    if (!out) {
+        return NULL;
+    }
+    DWORD got = GetEnvironmentVariableW(name, out, n);
+    if (got == 0 || got >= n) {
+        HeapFree(GetProcessHeap(), 0, out);
+        return NULL;
+    }
+    return out;
+}
+
+/** Directory of this executable (with trailing backslash). */
+static int self_dir(wchar_t *out, DWORD cch)
+{
+    if (!GetModuleFileNameW(NULL, out, cch)) {
+        return 0;
+    }
+    wchar_t *slash = wcsrchr(out, L'\\');
+    if (!slash) {
+        return 0;
+    }
+    slash[1] = 0;
+    return 1;
+}
+
 /* Resolve the target the way CreateProcessW does NOT: SearchPathW with and
  * without the .exe extension, then an absolute path. Passing a bare "powershell.exe"
  * to lpApplicationName fails with Win32 2 -- the same gap as the project's
@@ -357,6 +465,28 @@ static FARPROC resolve_remote_export(HMODULE remoteModule, const wchar_t *dllPat
 
 int wmain(int argc, wchar_t **argv)
 {
+    /* Our launcher must never run with the shim already mapped: its DLL/job
+     * precheck would then hit the sandbox mask on the plugin path. */
+    if (GetModuleHandleW(L"winstage-shim.dll")) {
+        DWORD ppid = 0;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe;
+            memset(&pe, 0, sizeof(pe));
+            pe.dwSize = sizeof(pe);
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    if (pe.th32ProcessID == GetCurrentProcessId()) {
+                        ppid = pe.th32ParentProcessID;
+                        break;
+                    }
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+        }
+        fprintf(stderr, "inject: self already carries the shim (pid=%lu ppid=%lu)\n",
+                (unsigned long)GetCurrentProcessId(), (unsigned long)ppid);
+    }
     Options o;
     memset(&o, 0, sizeof(o));
     o.timeoutMs = 30000;
@@ -374,6 +504,7 @@ int wmain(int argc, wchar_t **argv)
     int inheritEnv = 0;
     int noSuspend = 0;
     int noInherit = 0;
+    const wchar_t *jobPath = NULL;
 
     int i = 1;
     int sawDashDash = 0;
@@ -393,6 +524,8 @@ int wmain(int argc, wchar_t **argv)
             noSuspend = 1;
         } else if (wcscmp(argv[i], L"--no-inherit") == 0) {
             noInherit = 1;
+        } else if (wcscmp(argv[i], L"--job") == 0 && i + 1 < argc) {
+            jobPath = argv[++i];
         } else if (wcscmp(argv[i], L"--report") == 0 && i + 1 < argc) {
             o.report = argv[++i];
         } else if (wcscmp(argv[i], L"--cwd") == 0 && i + 1 < argc) {
@@ -412,8 +545,100 @@ int wmain(int argc, wchar_t **argv)
         }
     }
     (void)sawDashDash;
+    /* ── 参数来源回退：环境变量 → job 文件 → 同目录同名默认 ──────────────────── */
+    wchar_t *envDll = NULL;
+    wchar_t *envReport = NULL;
+    wchar_t *jobBlock = NULL;
+    const wchar_t *jobSets[16];
+    int jobSetCount = 0;
+    static const struct {
+        const wchar_t *key;
+        const wchar_t *env;
+    } jobMap[] = {
+        { L"stage", L"DSH_STAGE_ROOT" },
+        { L"config", L"DSH_SHIM_CONFIG" },
+        { L"log", L"DSH_SHIM_LOG" },
+        { L"regstage", L"DSH_REGSTAGE_SESSION_DIR" },
+        { L"audit", L"DSH_AUDIT_LOG" },
+        { L"helper", L"WINSTAGE_HELPER_DIR" },
+    };
+    if (!o.dll || !o.dll[0]) {
+        envDll = env_dup(L"WINSTAGE_INJECT_DLL");
+        if (envDll) {
+            o.dll = envDll;
+        }
+    }
+    if (!o.report || !o.report[0]) {
+        envReport = env_dup(L"WINSTAGE_INJECT_REPORT");
+        if (envReport) {
+            o.report = envReport;
+        }
+    }
+    if (jobPath && jobPath[0]) {
+        jobBlock = read_job_text(jobPath);
+        if (jobBlock) {
+            wchar_t *line = jobBlock;
+            while (line && *line) {
+                wchar_t *nl = wcschr(line, L'\n');
+                if (nl) {
+                    *nl = 0;
+                }
+                size_t lineLen = wcslen(line);
+                if (lineLen && line[lineLen - 1] == L'\r') {
+                    line[lineLen - 1] = 0;
+                }
+                wchar_t *eq = wcschr(line, L'=');
+                if (eq) {
+                    *eq = 0;
+                    const wchar_t *key = line;
+                    const wchar_t *val = eq + 1;
+                    if (_wcsicmp(key, L"dll") == 0) {
+                        if (!o.dll || !o.dll[0]) {
+                            o.dll = val; /* points into jobBlock (kept alive) */
+                        }
+                    } else if (val[0]) {
+                        for (size_t k = 0; k < sizeof(jobMap) / sizeof(jobMap[0]); k++) {
+                            if (_wcsicmp(key, jobMap[k].key) != 0 || jobSetCount >= 16) {
+                                continue;
+                            }
+                            size_t need = wcslen(jobMap[k].env) + 1 + wcslen(val) + 1;
+                            wchar_t *kv = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, need * sizeof(wchar_t));
+                            if (!kv) {
+                                continue;
+                            }
+                            _snwprintf(kv, need, L"%ls=%ls", jobMap[k].env, val);
+                            kv[need - 1] = 0;
+                            jobSets[jobSetCount++] = kv;
+                            break;
+                        }
+                    }
+                }
+                line = nl ? nl + 1 : NULL;
+            }
+        }
+    }
+    if (!o.dll || !o.dll[0]) {
+        if (getenv("WINSTAGE_INJECT_DEBUG")) {
+            fprintf(stderr, "inject: argv job=%ls jobBlock=%d\n", jobPath ? jobPath : L"(none)",
+                    jobBlock ? 1 : 0);
+        }
+        wchar_t dir[4096];
+        static wchar_t legacy[4096];
+        if (self_dir(dir, 4096)) {
+            _snwprintf(legacy, 4096, L"%lswinstage-shim.dll", dir);
+            legacy[4095] = 0;
+            o.dll = legacy;
+        }
+    }
+    for (int k = 0; k < jobSetCount && setCount < (int)(sizeof(sets) / sizeof(sets[0])); k++) {
+        sets[setCount++] = jobSets[k];
+    }
+    /* These are transport-only; the child must not see them in `set`. */
+    SetEnvironmentVariableW(L"WINSTAGE_INJECT_DLL", NULL);
+    SetEnvironmentVariableW(L"WINSTAGE_INJECT_REPORT", NULL);
+
     if (i >= argc || !o.dll || !o.dll[0]) {
-        fputs("usage: winstage-inject.exe --dll <path> [--set-env K=V]... [--report <json>] [--cwd <dir>] [--timeout-ms N] [--child-timeout-ms N] [--no-inject] [--inherit-env] -- <exe> [args...]\n", stderr);
+        fputs("usage: winstage-inject.exe [--dll <path>] [--job <file>] [--set-env K=V]... [--report <json>] [--cwd <dir>] [--timeout-ms N] [--child-timeout-ms N] [--no-inject] [--inherit-env] -- <exe> [args...]\n", stderr);
         return USAGE_FAILED;
     }
     o.exe = argv[i];
@@ -462,9 +687,11 @@ int wmain(int argc, wchar_t **argv)
     DWORD creationFlags = CREATE_UNICODE_ENVIRONMENT | (noSuspend ? 0u : CREATE_SUSPENDED);
     /* No console in this process (GUI subsystem / executor pipes) => do not let
      * the child allocate a visible console window. Its std handles are inherited. */
+#ifndef WINSTAGE_DISABLE_NO_WINDOW
     if (!GetConsoleWindow()) {
         creationFlags |= CREATE_NO_WINDOW;
     }
+#endif
 
     {
         size_t dllLen = (wcslen(o.dll) + 1) * sizeof(wchar_t);
@@ -490,11 +717,18 @@ int wmain(int argc, wchar_t **argv)
         }
         if (GetFileAttributesW(fullDll) == INVALID_FILE_ATTRIBUTES) {
             DWORD err = GetLastError();
-            fail(o.report, L"precheck",
-                 (err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND)
-                     ? "dll file does not exist at the normalized path"
-                     : "dll file is not accessible (locked?)",
-                 err);
+            /* Include the path: a misread job file otherwise looks exactly like
+             * a missing DLL and costs a whole guest round-trip to diagnose. */
+            char pathA[600];
+            pathA[0] = 0;
+            WideCharToMultiByte(CP_ACP, 0, fullDll, -1, pathA, sizeof(pathA), NULL, NULL);
+            char detail[720];
+            snprintf(detail, sizeof(detail), "%s: %s",
+                     (err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND)
+                         ? "dll file does not exist at the normalized path"
+                         : "dll file is not accessible (locked?)",
+                     pathA);
+            fail(o.report, L"precheck", detail, err);
         }
         o.dllPathStorage = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, sizeof(fullDll));
         if (!o.dllPathStorage) {

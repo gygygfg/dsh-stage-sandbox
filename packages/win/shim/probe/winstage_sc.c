@@ -648,6 +648,133 @@ static int cmd_description(int argc, wchar_t **argv)
  * Every other verb is delegated to the real wevtutil unchanged.
  */
 
+/* ── `@evt` / `@task`：日志路径不进命令行 ──────────────────────────────────────
+ *
+ * 服务侧助手是经 CreateProcess 起的，命令行对 `wmic process get CommandLine`
+ * 可见。把 `C:\rt\stage\eventlog.overlay.jsonl` 写在参数里等于把会话存储路径
+ * 直接给 agent 看。改为：调用方只传 `@evt` / `@task`，助手从**自己所在目录**的
+ * job 文件（`launcher.cfg`，与注入器共用；base64 编码的 key=value）里取
+ * `regstage=`，再拼出 journal 路径。
+ */
+static int cli_b64_value(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static int cli_job_value(const wchar_t *key, wchar_t *out, DWORD cch)
+{
+    out[0] = 0;
+    wchar_t self[1024];
+    if (!GetModuleFileNameW(NULL, self, 1024)) {
+        return 0;
+    }
+    wchar_t *slash = wcsrchr(self, L'\\');
+    if (!slash) {
+        return 0;
+    }
+    slash[1] = 0;
+    wchar_t path[1200];
+    _snwprintf(path, 1200, L"%lslauncher.cfg", self);
+    path[1199] = 0;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    char raw[8192];
+    DWORD read = 0;
+    BOOL ok = ReadFile(h, raw, sizeof(raw) - 1, &read, NULL);
+    CloseHandle(h);
+    if (!ok) {
+        return 0;
+    }
+    raw[read] = 0;
+    unsigned char bytes[6144];
+    size_t o = 0;
+    unsigned int acc = 0;
+    int bits = 0;
+    for (const char *q = raw; *q && *q != '='; q++) {
+        if (*q == '\r' || *q == '\n' || *q == ' ' || *q == '\t') continue;
+        int v = cli_b64_value(*q);
+        if (v < 0) return 0;
+        acc = (acc << 6) | (unsigned int)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (o >= sizeof(bytes)) return 0;
+            bytes[o++] = (unsigned char)((acc >> bits) & 0xFFu);
+        }
+    }
+    wchar_t text[4096];
+    int wc = MultiByteToWideChar(CP_UTF8, 0, (const char *)bytes, (int)o, text, 4095);
+    if (wc <= 0) {
+        return 0;
+    }
+    text[wc] = 0;
+    size_t klen = wcslen(key);
+    for (wchar_t *line = text; line && *line;) {
+        wchar_t *nl = wcschr(line, L'\n');
+        if (nl) *nl = 0;
+        size_t len = wcslen(line);
+        if (len && line[len - 1] == L'\r') line[len - 1] = 0;
+        if (_wcsnicmp(line, key, klen) == 0 && line[klen] == L'=') {
+            wcsncpy(out, line + klen + 1, cch - 1);
+            out[cch - 1] = 0;
+            return out[0] ? 1 : 0;
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    return 0;
+}
+
+/* ── shim bridge ──────────────────────────────────────────────────────────────
+ * This helper runs in its own process where the session store is read-masked,
+ * so it cannot read the journals directly. The injected shim exports the same
+ * operations through its raw-API path (see ws_scm.c). Fall back to plain file IO
+ * when the shim is not loaded (standalone use / tests).
+ */
+typedef int(__stdcall *CliJournalAppendFn)(const wchar_t *, const wchar_t *);
+typedef int(__stdcall *CliJournalReadFn)(const wchar_t *, char *, unsigned long);
+typedef int(__stdcall *CliEvtClearedFn)(const wchar_t *);
+
+static void *cli_shim_export(const char *name)
+{
+    HMODULE shim = GetModuleHandleW(L"winstage-shim.dll");
+    if (!shim) {
+        return NULL;
+    }
+    return (void *)GetProcAddress(shim, name);
+}
+
+static const wchar_t *cli_journal_leaf(const wchar_t *path, wchar_t *out, DWORD cch)
+{
+    const wchar_t *base = wcsrchr(path, L'\\');
+    base = base ? base + 1 : path;
+    wcsncpy(out, base, cch - 1);
+    out[cch - 1] = 0;
+    return out;
+}
+
+/** `@evt` / `@task` -> `<regstage>\<leaf>`; other values pass through. */
+static const wchar_t *cli_journal_arg(const wchar_t *arg, wchar_t *buf, DWORD cch, const wchar_t *leaf)
+{
+    if (!arg || arg[0] != L'@') {
+        return arg;
+    }
+    wchar_t dir[1024];
+    if (!cli_job_value(L"regstage", dir, 1024)) {
+        return NULL;
+    }
+    _snwprintf(buf, cch, L"%ls\\%ls", dir, leaf);
+    buf[cch - 1] = 0;
+    return buf;
+}
+
 static int evt_journal_path(const wchar_t *explicitPath, wchar_t *out, DWORD cch)
 {
     if (explicitPath && explicitPath[0]) {
@@ -667,6 +794,10 @@ static int evt_journal_path(const wchar_t *explicitPath, wchar_t *out, DWORD cch
 
 static int evt_channel_cleared(const wchar_t *journalPath, const wchar_t *channel)
 {
+    CliEvtClearedFn shimFn = (CliEvtClearedFn)cli_shim_export("WinstageShimEventLogCleared");
+    if (shimFn && channel && channel[0]) {
+        return shimFn(channel) ? 1 : 0;
+    }
     wchar_t path[2048];
     if (!channel || !channel[0] || !evt_journal_path(journalPath, path, 2048)) {
         return 0;
@@ -768,7 +899,12 @@ static int run_real_wevtutil(int argc, wchar_t **argv)
         pos += wcslen(cmd + pos);
         cmd[pos] = 0;
     }
-    SetEnvironmentVariableW(L"WINSTAGE_CLI_REAL", L"1");
+    {
+        wchar_t cliTok[96];
+        if (cli_job_value(L"token", cliTok, 96)) {
+            SetEnvironmentVariableW(L"WINSTAGE_CLI_REAL", cliTok);
+        }
+    }
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof(si));
@@ -796,7 +932,8 @@ int ws_evt_main(int argc, wchar_t **argv)
         /* `probe --evt <journal.jsonl> <verb> <channel> [...]`; the shim/executor
          * pass the journal path explicitly because the shim scrubs DSH_* from the
          * helper's environment on purpose. */
-        journalPath = argv[0];
+        static wchar_t evtJournal[2048];
+        journalPath = cli_journal_arg(argv[0], evtJournal, 2048, L"eventlog.overlay.jsonl");
         argc--;
         argv++;
     }
@@ -917,21 +1054,33 @@ static void task_load(const wchar_t *journal)
 {
     task_clear_all();
     if (!journal || !journal[0]) return;
-    HANDLE h = CreateFileW(journal, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-    LARGE_INTEGER sz;
-    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > (4 << 20)) {
-        CloseHandle(h);
-        return;
-    }
-    DWORD len = (DWORD)sz.QuadPart;
-    char *buf = (char *)malloc(len + 1);
-    if (!buf) { CloseHandle(h); return; }
+    char *buf = NULL;
     DWORD got = 0;
-    BOOL ok = ReadFile(h, buf, len, &got, NULL);
-    CloseHandle(h);
-    if (!ok) { free(buf); return; }
+    CliJournalReadFn shimRead = (CliJournalReadFn)cli_shim_export("WinstageShimJournalRead");
+    if (shimRead) {
+        wchar_t leaf[256];
+        cli_journal_leaf(journal, leaf, 256);
+        buf = (char *)malloc((4 << 20) + 1);
+        if (!buf) return;
+        int n = shimRead(leaf, buf, (4 << 20) + 1);
+        if (n <= 0) { free(buf); return; }
+        got = (DWORD)n;
+    } else {
+        HANDLE h = CreateFileW(journal, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) return;
+        LARGE_INTEGER sz;
+        if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > (4 << 20)) {
+            CloseHandle(h);
+            return;
+        }
+        DWORD len = (DWORD)sz.QuadPart;
+        buf = (char *)malloc(len + 1);
+        if (!buf) { CloseHandle(h); return; }
+        BOOL ok = ReadFile(h, buf, len, &got, NULL);
+        CloseHandle(h);
+        if (!ok) { free(buf); return; }
+    }
     buf[got] = 0;
     char *line = buf;
     while (line && *line) {
@@ -955,26 +1104,42 @@ static void task_load(const wchar_t *journal)
     free(buf);
 }
 
-static void hex_put(FILE *f, const wchar_t *s)
-{
-    if (!s) return;
-    for (const wchar_t *p = s; *p; p++) {
-        fprintf(f, "%04x", (unsigned)(unsigned short)*p);
-    }
-}
-
 static int task_journal(const wchar_t *journal, const wchar_t *op, const WsTask *t)
 {
     if (!journal || !journal[0]) return 0;
+    wchar_t line[8192];
+    size_t pos = 0;
+    line[0] = 0;
+    _snwprintf(line, 8192, L"{\"op\":\"%ls\",\"name\":\"", op);
+    size_t base = wcslen(line);
+    for (const wchar_t *p = t->name; *p && base + 8 < 8192; p++, base += 4) {
+        _snwprintf(line + base, 8192 - base, L"%04x", (unsigned)(unsigned short)*p);
+    }
+    pos = wcslen(line);
+    _snwprintf(line + pos, 8192 - pos, L"\",\"cmd\":\"");
+    pos = wcslen(line);
+    for (const wchar_t *p = t->cmd; *p && pos + 8 < 8192; p++, pos += 4) {
+        _snwprintf(line + pos, 8192 - pos, L"%04x", (unsigned)(unsigned short)*p);
+    }
+    pos = wcslen(line);
+    _snwprintf(line + pos, 8192 - pos, L"\",\"sched\":\"");
+    pos = wcslen(line);
+    for (const wchar_t *p = t->sched; *p && pos + 8 < 8192; p++, pos += 4) {
+        _snwprintf(line + pos, 8192 - pos, L"%04x", (unsigned)(unsigned short)*p);
+    }
+    pos = wcslen(line);
+    if (pos + 4 < 8192) {
+        wcscpy(line + pos, L"\"}\n");
+    }
+    CliJournalAppendFn shimAppend = (CliJournalAppendFn)cli_shim_export("WinstageShimJournalAppend");
+    if (shimAppend) {
+        wchar_t leaf[256];
+        cli_journal_leaf(journal, leaf, 256);
+        return shimAppend(leaf, line);
+    }
     FILE *f = _wfopen(journal, L"ab");
     if (!f) return 0;
-    fprintf(f, "{\"op\":\"%ls\",\"name\":\"", op);
-    hex_put(f, t->name);
-    fprintf(f, "\",\"cmd\":\"");
-    hex_put(f, t->cmd);
-    fprintf(f, "\",\"sched\":\"");
-    hex_put(f, t->sched);
-    fprintf(f, "\"}\n");
+    fputws(line, f);
     fclose(f);
     return 1;
 }
@@ -1044,7 +1209,12 @@ static int run_real_schtasks(int argc, wchar_t **argv)
         pos += wcslen(cmd + pos);
         cmd[pos] = 0;
     }
-    SetEnvironmentVariableW(L"WINSTAGE_CLI_REAL", L"1");
+    {
+        wchar_t cliTok[96];
+        if (cli_job_value(L"token", cliTok, 96)) {
+            SetEnvironmentVariableW(L"WINSTAGE_CLI_REAL", cliTok);
+        }
+    }
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof(si));
@@ -1068,8 +1238,9 @@ static int run_real_schtasks(int argc, wchar_t **argv)
 int ws_task_main(int argc, wchar_t **argv)
 {
     const wchar_t *journal = NULL;
+    static wchar_t taskJournal[2048];
     if (argc >= 3) {
-        journal = argv[0];
+        journal = cli_journal_arg(argv[0], taskJournal, 2048, L"tasks.overlay.jsonl");
         argc--;
         argv++;
     }

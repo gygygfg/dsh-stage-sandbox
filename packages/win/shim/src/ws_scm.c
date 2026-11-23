@@ -2137,3 +2137,53 @@ BOOL WINAPI ws_CloseEventLog(HANDLE log)
     }
     return CloseEventLog(log);
 }
+
+/* ── helper bridge (exported) ─────────────────────────────────────────────────
+ *
+ * The CLI helper (`spawn.exe`) runs in its own process where the session store is
+ * read-masked, so it cannot read the journals itself. These exports let it ask
+ * the injected shim instead: the shim reads/writes the same files through the
+ * **original** APIs (g_orig), which its own mask never sees. Without this, a
+ * staged `wevtutil cl` looked cleared only inside the clearing process and
+ * `schtasks` lost every staged task between commands.
+ */
+__declspec(dllexport) int __stdcall WinstageShimEventLogCleared(const wchar_t *channel)
+{
+    if (!ws_scm_staged() || !channel || !channel[0]) {
+        return 0;
+    }
+    ws_lock_enter(&g_evtLock);
+    ws_evt_ensure_loaded();
+    int cleared = ws_evt_channel_cleared(channel);
+    ws_lock_leave(&g_evtLock);
+    return cleared;
+}
+
+__declspec(dllexport) int __stdcall WinstageShimJournalAppend(const wchar_t *leaf, const wchar_t *line)
+{
+    if (!leaf || !leaf[0] || !line) {
+        return 0;
+    }
+    return ws_journal_append(leaf, line);
+}
+
+__declspec(dllexport) int __stdcall WinstageShimJournalRead(const wchar_t *leaf, char *buf, unsigned long cap)
+{
+    if (!leaf || !leaf[0] || !buf || cap == 0) {
+        return -1;
+    }
+    wchar_t path[WS_PATH_MAX];
+    if (!ws_scm_journal_path(leaf, path, WS_PATH_MAX)) {
+        return -1;
+    }
+    char *text = NULL;
+    DWORD len = 0;
+    if (!ws_read_text_file(path, &text, &len) || !text) {
+        return -1;
+    }
+    unsigned long n = (len < cap - 1) ? (unsigned long)len : (unsigned long)(cap - 1);
+    memcpy(buf, text, n);
+    buf[n] = 0;
+    HeapFree(GetProcessHeap(), 0, text);
+    return (int)n;
+}

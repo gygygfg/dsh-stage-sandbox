@@ -35,6 +35,7 @@ import { spawn as spawnChildProcess, spawnSync as spawnSyncChildProcess } from '
 import {
   closeSync,
   existsSync,
+  copyFileSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -2765,7 +2766,19 @@ export class WindowsStageExecutor {
           'audit.jsonl',
         )
     this.auditPath = this.options.audit === false ? undefined : auditPath
+    /* Neutral helper copies (see prepareHelperArtifacts). `undefined` = copy
+     * failed; every consumer then falls back to the original artifact paths. */
+    this.helperArtifacts = prepareHelperArtifacts({
+      artifacts: this.transparent?.artifacts,
+      tempDir: this.tempDir,
+      stageRoot: this.stagingRoot,
+      configPath,
+      logPath,
+      auditPath: this.auditPath,
+      regStageDir: this.options.registryStageDir,
+    })
     this.shimLauncher = new ShimLauncher(this.api, {
+      helper: this.helperArtifacts,
       artifacts: this.transparent.artifacts,
       // shim 的环境契约（T4 `winstage_shim.h`）：STAGE_ROOT / CONFIG / LOG。
       // **不设** WINSTAGE_SHIM_DISABLE —— 设了 shim 就完全不生效，等于裸跑。
@@ -2773,6 +2786,11 @@ export class WindowsStageExecutor {
         DSH_STAGE_ROOT: this.stagingRoot,
         DSH_SHIM_LOG: logPath,
         DSH_SHIM_CONFIG: configPath,
+        ...(this.helperArtifacts
+          ? { WINSTAGE_HELPER_DIR: this.helperArtifacts.helperDir, WINSTAGE_CLI_TOKEN: this.helperArtifacts.token }
+          : {}),
+        /* triage only (never set by the product) */
+        ...(process.env.WINSTAGE_DEBUG_FIND ? { WINSTAGE_DEBUG_FIND: process.env.WINSTAGE_DEBUG_FIND } : {}),
         ...(this.auditPath ? { DSH_AUDIT_LOG: this.auditPath } : {}),
         // ── 注册表覆盖层**不得**落在暂存树里（本轮修复）─────────────────────────
         // `WINSTAGE_STAGE_ROOT` 同时是文件族的重定向根**和**注册表 overlay 的默认
@@ -4116,7 +4134,9 @@ export class WindowsStageExecutor {
     if (!artifacts?.injectorPath || !artifacts?.dllPath || !configPath || !regDir) return null
     let scriptPath
     try {
-      scriptPath = join(regDir, `.wmi-${process.pid}-${randomUUID().slice(0, 6)}.cmd`)
+      /* Outside the masked session store: the command that reads this script is
+       * itself injected, so a store path would be denied to it. */
+      scriptPath = join(this.helperArtifacts?.helperDir ?? regDir, `.wmi-${process.pid}-${randomUUID().slice(0, 6)}.cmd`)
       writeFileSync(scriptPath, `@chcp 65001>nul\r\n@echo off\r\n${inner}\r\n`, 'utf8')
     } catch {
       return null
@@ -4126,16 +4146,22 @@ export class WindowsStageExecutor {
      * "Method execution successful / ProcessId"，调用方看到的形态不变；被起的进程是
      * 注入器，由它把真正的 cmd 注入垫片后放行。
      */
-    const injectorCmd = [
-      `"${artifacts.injectorPath}"`,
-      `--dll "${artifacts.dllPath}"`,
-      `--set-env "DSH_STAGE_ROOT=${this.stagingRoot}"`,
-      `--set-env "DSH_SHIM_CONFIG=${configPath}"`,
-      `--set-env "DSH_SHIM_LOG=${join(this.stagingRoot, 'shim.log')}"`,
-      `--set-env "DSH_REGSTAGE_SESSION_DIR=${regDir}"`,
-      `--cwd "${this.stagingRoot}"`,
-      `-- cmd.exe /d /c "${scriptPath}"`,
-    ].join(' ')
+    /* 透明性：优先走中立 helper（命令行只有 `launcher.exe --job ... -- cmd ...`）。
+     * 老形态保留为回落：helper 复制失败时沙箱仍要能工作。 */
+    const launcherPath = this.helperArtifacts?.launcherPath ?? artifacts.injectorPath
+    const jobPath = this.helperArtifacts?.jobPath
+    const injectorCmd = jobPath
+      ? [`"${launcherPath}"`, `--job "${jobPath}"`, `-- cmd.exe /d /c "${scriptPath}"`].join(' ')
+      : [
+          `"${artifacts.injectorPath}"`,
+          `--dll "${artifacts.dllPath}"`,
+          `--set-env "DSH_STAGE_ROOT=${this.stagingRoot}"`,
+          `--set-env "DSH_SHIM_CONFIG=${configPath}"`,
+          `--set-env "DSH_SHIM_LOG=${join(this.stagingRoot, 'shim.log')}"`,
+          `--set-env "DSH_REGSTAGE_SESSION_DIR=${regDir}"`,
+          `--cwd "${this.stagingRoot}"`,
+          `-- cmd.exe /d /c "${scriptPath}"`,
+        ].join(' ')
     const rewritten = [...list.slice(0, at + 3), injectorCmd, ...list.slice(at + 4)]
     return { command, args: rewritten, scriptPath }
   }
@@ -4173,13 +4199,15 @@ export class WindowsStageExecutor {
     if (this.launchMode !== 'shim') return null
     const base = String(command ?? '').split(/[\\/]/).pop()?.toLowerCase() ?? ''
     if (base !== 'schtasks' && base !== 'schtasks.exe') return null
-    const probePath = this.transparent?.artifacts?.probePath
+    const probePath = this.helperArtifacts?.probePath ?? this.transparent?.artifacts?.probePath
     if (!probePath || !existsSync(probePath)) return null
     const journal = this.options.registryStageDir
       ? join(this.options.registryStageDir, 'tasks.overlay.jsonl')
       : null
     if (!journal) return null
-    return { command: probePath, args: ['--task', journal, ...(Array.isArray(args) ? args.map(String) : [])] }
+    /* 透明性：journal 路径（会话存储）不进命令行；助手从自己的 job 文件解析。 */
+    const journalArg = this.helperArtifacts ? '@task' : journal
+    return { command: probePath, args: ['--task', journalArg, ...(Array.isArray(args) ? args.map(String) : [])] }
   }
 
   rewriteWevtutilCommand(command, args) {
@@ -4189,20 +4217,21 @@ export class WindowsStageExecutor {
     const list = Array.isArray(args) ? args.map(String) : []
     const verb = String(list[0] ?? '').toLowerCase()
     if (!['cl', 'clear-log', 'qe', 'query-events'].includes(verb)) return null
-    const probePath = this.transparent?.artifacts?.probePath
+    const probePath = this.helperArtifacts?.probePath ?? this.transparent?.artifacts?.probePath
     if (!probePath || !existsSync(probePath)) return null
     const journal = this.options.registryStageDir
       ? join(this.options.registryStageDir, 'eventlog.overlay.jsonl')
       : null
     if (!journal) return null
-    return { command: probePath, args: ['--evt', journal, ...list] }
+    const journalArg = this.helperArtifacts ? '@evt' : journal
+    return { command: probePath, args: ['--evt', journalArg, ...list] }
   }
 
   rewriteScCommand(command, args) {
     if (this.launchMode !== 'shim') return null
     const base = String(command ?? '').split(/[\\/]/).pop()?.toLowerCase() ?? ''
     if (base !== 'sc' && base !== 'sc.exe') return null
-    const probePath = this.transparent?.artifacts?.probePath
+    const probePath = this.helperArtifacts?.probePath ?? this.transparent?.artifacts?.probePath
     if (!probePath || !existsSync(probePath)) return null
     return { command: probePath, args: ['--sc', ...(Array.isArray(args) ? args.map(String) : [])] }
   }
@@ -4442,7 +4471,10 @@ export class WindowsStageExecutor {
     if (launchFailure) {
       settled = {
         stdout: Buffer.alloc(0),
-        stderr: Buffer.from(`dsh-stage: sandbox launch failed: ${launchFailure.message}`),
+        /* 模型可见通道只拿中性文案：`TS_INJECTION_FAILED: winstage-inject.exe refused ...`
+         * 这类内部归因会直接暴露沙箱（recon 正是从这句确认的）。诊断细节仍在
+         * initReport / shim.log / lastLaunch 里，对操作者可查。 */
+        stderr: Buffer.from(`dsh-stage: launch failed: ${launchFailure.agentMessage ?? 'the command could not be started'}`),
         exitCode: 127,
       }
     } else if (t0) {
@@ -6056,7 +6088,7 @@ export function classifyOutcome({ exitCode, stdout, stderr, launchFailure, start
       policyDenial: false,
     }
   }
-  if (/dsh-stage: sandbox launch failed|windows-acl-run:|SANDBOX_UNAVAILABLE/.test(text)) {
+  if (/dsh-stage: (?:sandbox )?launch failed|windows-acl-run:|SANDBOX_UNAVAILABLE/.test(text)) {
     return { kind: 'runner-failure', reason: 'sandbox runner/launcher refused — classify as a broken sandbox, not a policy denial' }
   }
   // ── BUG-9：启动失败按 NTSTATUS 归类，并把真实值带出来 ────────────────────────
@@ -6141,6 +6173,73 @@ export function defaultPrivateTemp() {
   const base = join(tmpdir(), 'tmp')
   mkdirSync(base, { recursive: true })
   return join(base, randomUUID())
+}
+
+/**
+ * ── 透明性：中立 helper 目录 ──────────────────────────────────────────────────
+ *
+ * 红队 recon 通过 `wmic process get CommandLine` 直接看到
+ * `C:\winstage-plugin\...\winstage-inject.exe --dll ... --report ...`，由此反查到
+ * 整个机制。这里把注入器/助手复制到**本会话私有 TEMP** 下用中性名字启动：
+ *
+ *   <tempDir>\.h\launcher.exe   注入器副本（`-- cmd ...`，无 --dll/--report）
+ *   <tempDir>\.h\spawn.exe      CLI 助手副本（sc/wevtutil/schtasks 改道）
+ *   <tempDir>\.h\launcher.cfg   WMI 路径用的 job 文件（base64，见 injector --job）
+ *
+ * 复制是**尽力而为**：失败就回落原始路径（沙箱照常工作，只是命令行会露名字），
+ * 绝不让透明性优化变成可用性故障。副本在每次启动前按 size/mtime 自愈。
+ */
+export function prepareHelperArtifacts({
+  artifacts,
+  tempDir,
+  stageRoot,
+  configPath,
+  logPath,
+  auditPath,
+  regStageDir,
+} = {}) {
+  if (!artifacts?.injectorPath || !tempDir) return undefined
+  try {
+    const helperDir = join(tempDir, '.h')
+    mkdirSync(helperDir, { recursive: true })
+    const launcherPath = join(helperDir, 'launcher.exe')
+    const probePath = join(helperDir, 'spawn.exe')
+    const jobPath = join(helperDir, 'launcher.cfg')
+    ensureCopy(artifacts.injectorPath, launcherPath)
+    if (artifacts.probePath && existsSync(artifacts.probePath)) ensureCopy(artifacts.probePath, probePath)
+    const lines = [`dll=${artifacts.dllPath ?? ''}`]
+    if (stageRoot) lines.push(`stage=${stageRoot}`)
+    if (configPath) lines.push(`config=${configPath}`)
+    if (logPath) lines.push(`log=${logPath}`)
+    if (regStageDir) lines.push(`regstage=${regStageDir}`)
+    if (auditPath) lines.push(`audit=${auditPath}`)
+    lines.push(`helper=${helperDir}`)
+    /* Per-session token: only the helper may run the REAL sc/wevtutil/schtasks
+     * (the helper image has a neutral name, so a name check alone is forgeable). */
+    const token = randomUUID().replace(/-/g, '')
+    lines.push(`token=${token}`)
+    writeFileSync(jobPath, `${Buffer.from(`${lines.join('\r\n')}\r\n`, 'utf8').toString('base64')}\r\n`, 'utf8')
+    return { helperDir, launcherPath, probePath, jobPath, token }
+  } catch {
+    /* 复制/写文件失败：回落原始产物路径（可用性优先；残余在报告里如实记录）。 */
+    return undefined
+  }
+}
+
+function ensureCopy(source, target) {
+  try {
+    const from = statSync(source)
+    let same = false
+    try {
+      const to = statSync(target)
+      same = to.size === from.size && Math.trunc(to.mtimeMs) === Math.trunc(from.mtimeMs)
+    } catch {
+      same = false
+    }
+    if (!same) copyFileSync(source, target)
+  } catch {
+    throw new Error(`cannot stage helper copy ${source} -> ${target}`)
+  }
 }
 
 /**
@@ -7289,10 +7388,6 @@ function probeTransparentShimUncached(options = {}) {
     canaryRun = runCapturedToFiles(
       artifacts.injectorPath,
       [
-        '--dll',
-        artifacts.dllPath,
-        '--report',
-        reportPath,
         '--',
         canaryTarget,
         '-NoLogo',
@@ -7303,7 +7398,12 @@ function probeTransparentShimUncached(options = {}) {
         '-File',
         canaryScriptPath,
       ],
-      { cwd: stageRoot, env: shimEnv, timeoutMs, captureDir },
+      {
+        cwd: stageRoot,
+        env: { ...shimEnv, WINSTAGE_INJECT_DLL: artifacts.dllPath, WINSTAGE_INJECT_REPORT: reportPath },
+        timeoutMs,
+        captureDir,
+      },
     )
     try {
       injectReport = existsSync(reportPath) ? JSON.parse(readFileSync(reportPath, 'utf8')) : undefined
@@ -7420,11 +7520,21 @@ export class ShimLauncher {
     const captureDir = resolve(this.captureDir || cwd || tmpdir())
     mkdirSync(captureDir, { recursive: true })
     const reportPath = join(captureDir, `.winstage-inject-${randomUUID().slice(0, 6)}.json`)
-    const argv = ['--dll', this.artifacts.dllPath, '--report', reportPath, '--', command, ...args]
+    /* 透明性：命令行里**不再出现** --dll/--report（含插件与暂存路径）。二者经
+     * 环境变量传给注入器，注入器在创建载体前会把它们从自己的环境里删掉。
+     * 进程名/路径用 per-session helper 副本（<temp>/.h/launcher.exe）。 */
+    const injectorPath = this.options.helper?.launcherPath ?? this.artifacts.injectorPath
+    const argv = ['--', command, ...args]
     const started = Date.now()
-    const outcome = await this.spawn(this.artifacts.injectorPath, argv, {
+    const outcome = await this.spawn(injectorPath, argv, {
       cwd,
-      env: { ...this.env, ...(env ?? {}) },
+      env: {
+        ...this.env,
+        ...(env ?? {}),
+        WINSTAGE_INJECT_DLL: this.artifacts.dllPath,
+        WINSTAGE_INJECT_REPORT: reportPath,
+        ...(this.options.helper ? { WINSTAGE_HELPER_DIR: this.options.helper.helperDir } : {}),
+      },
       timeoutMs,
       captureDir,
     })
@@ -7447,16 +7557,40 @@ export class ShimLauncher {
       injectionReport: report,
       durationMs: Date.now() - started,
       dllPath: this.artifacts.dllPath,
-      injectorPath: this.artifacts.injectorPath,
+      injectorPath: injectorPath,
       streamsKind: 'file-descriptor-redirect (no named pipes)',
       jobAssigned: false,
     }
+    /**
+     * ── 超时 ≠ 注入失败（真实缺陷，2026-11-23 深夜）────────────────────────────
+     *
+     * `spawnCaptured` 在超时后用 `taskkill /T /F` 回收整棵树；注入器来不及写
+     * 正式报告，磁盘上留下的是 `trace_stage("resumed")` 的 `{ok:false}`。旧代码
+     * 只看 `report.ok === false` ⇒ 把一次**正常的命令超时**报成
+     * `TS_INJECTION_FAILED ... refused to start the child`。实测（recon）两条长命令
+     * 都是这样：dur≈123s（正好是 120s 超时），模型因此看到"沙箱启动失败"字样。
+     * 判据顺序必须是：先超时，再注入失败。
+     */
+    if (outcome.timedOut === true) {
+      const partial = String(outcome.err ?? '')
+      return {
+        pid: outcome.pid,
+        exitCode: 124,
+        timedOut: true,
+        stdout: outcome.out,
+        stderr: partial ? `${partial}\ndsh-stage: timeout after ${timeoutMs}ms` : `dsh-stage: timeout after ${timeoutMs}ms`,
+        injectionReport: report,
+      }
+    }
     if (outcome.code === SHIM_INJECT_FAILURE_EXIT || report?.ok === false) {
-      throw fail(
+      const error = fail(
         'TS_INJECTION_FAILED',
-        `winstage-inject.exe refused to start the child (exit ${outcome.code}, report.ok=${report?.ok}): ` +
-          `${report?.error ?? outcome.err.slice(0, 300)} — refusing to continue unconfined (fail-closed)`,
+        `the launcher could not start the command (exit ${outcome.code}, stage=${report?.stage ?? 'unknown'}): ` +
+          `${report?.error ?? String(outcome.err ?? '').slice(0, 300)} — not executed (fail-closed)`,
       )
+      /* 模型可见通道只拿到中性一句话；诊断细节留在 lastLaunch / 审计里。 */
+      error.agentMessage = `the command could not be started (exit ${outcome.code})`
+      throw error
     }
     /** R22-C：注入器"成功"只代表 DLL 映射成功；延迟初始化下钩子可能一个都没装。
      *  三件套版本不匹配 / 初始化失败必须在这里 fail-closed，否则子进程会在**没有钩子**

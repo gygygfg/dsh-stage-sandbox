@@ -82,6 +82,42 @@ void ws_proc_set_self_module(HMODULE self)
 
 /* ---------------------------------------------------------- env contract */
 
+/* ── neutral helper lookup ─────────────────────────────────────────────────
+ * The executor copies the injector/probe into a per-session helper dir under a
+ * neutral name. Grandchildren (sc/wevtutil/schtasks/wmic rewrites) must use the
+ * copies, otherwise their command lines show `winstage-*` paths. Legacy
+ * layouts (plugin dir + old names) keep working when the copies are absent.
+ * Returns 2 = neutral helper used, 1 = legacy path, 0 = neither resolvable. */
+static int ws_helper_path(const wchar_t *neutral, const wchar_t *legacy, wchar_t *out, DWORD cch)
+{
+    if (g_ws.helperDir[0] && neutral && neutral[0]) {
+        _snwprintf(out, cch, L"%ls\\%ls", g_ws.helperDir, neutral);
+        out[cch - 1] = 0;
+        DWORD attr;
+        if (g_orig.GetFileAttributesW) {
+            attr = g_orig.GetFileAttributesW(out);
+        } else {
+            attr = GetFileAttributesW(out);
+        }
+        if (attr != INVALID_FILE_ATTRIBUTES) {
+            return 2;
+        }
+    }
+    if (!g_selfDll[0]) {
+        return 0;
+    }
+    wchar_t dir[WS_PATH_MAX];
+    ws_strlcpy_w(dir, g_selfDll, WS_PATH_MAX);
+    wchar_t *slash = wcsrchr(dir, L'\\');
+    if (!slash) {
+        return 0;
+    }
+    slash[1] = 0;
+    _snwprintf(out, cch, L"%ls%ls", dir, legacy);
+    out[cch - 1] = 0;
+    return 1;
+}
+
 /* The shim's DllMain auto-initializes from DSH_STAGE_ROOT /
  * DSH_SHIM_CONFIG / DSH_SHIM_LOG. When the caller passes an explicit
  * environment block those variables are NOT necessarily in it, and an injected
@@ -91,12 +127,14 @@ void ws_proc_set_self_module(HMODULE self)
  * on failure (the caller then fails the CreateProcess* fail-closed). */
 static wchar_t *ws_env_with_contract(const wchar_t *env)
 {
-    static const wchar_t *names[4] = { L"DSH_STAGE_ROOT", L"DSH_SHIM_LOG", L"DSH_SHIM_CONFIG", L"DSH_REGSTAGE_SESSION_DIR" };
-    const wchar_t *values[4] = { g_ws.stageRoot, g_ws.logPath, g_ws.configPath, g_ws.regStageDir };
+    static const wchar_t *names[5] = { L"DSH_STAGE_ROOT", L"DSH_SHIM_LOG", L"DSH_SHIM_CONFIG",
+                                       L"DSH_REGSTAGE_SESSION_DIR", L"WINSTAGE_HELPER_DIR" };
+    const wchar_t *values[5] = { g_ws.stageRoot, g_ws.logPath, g_ws.configPath, g_ws.regStageDir,
+                                 g_ws.helperDir };
     size_t total = 1;
     for (const wchar_t *p = env; p && *p; p += wcslen(p) + 1) {
         int skip = 0;
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 5; i++) {
             size_t nl = wcslen(names[i]);
             if (_wcsnicmp(p, names[i], nl) == 0 && p[nl] == L'=') {
                 skip = 1;
@@ -107,7 +145,7 @@ static wchar_t *ws_env_with_contract(const wchar_t *env)
             total += wcslen(p) + 1;
         }
     }
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         if (values[i] && values[i][0]) {
             total += wcslen(names[i]) + 1 + wcslen(values[i]) + 1;
         }
@@ -133,7 +171,7 @@ static wchar_t *ws_env_with_contract(const wchar_t *env)
         memcpy(block + used, p, (len + 1) * sizeof(wchar_t));
         used += len + 1;
     }
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 5; i++) {
         if (!values[i] || !values[i][0]) {
             continue;
         }
@@ -439,13 +477,18 @@ static int ws_wmic_write_utf8(HANDLE file, const wchar_t *text, int len)
 /** 写内层命令脚本（UTF-8 + chcp 65001）；`\"` 还原成 `"`（wmic 外层引号留下的转义） */
 static int ws_wmic_write_script(const wchar_t *inner, int innerLen, wchar_t *outPath, DWORD cch)
 {
-    const wchar_t *dir = g_ws.regStageDir[0] ? g_ws.regStageDir : g_ws.stageRoot;
+    /* The script is executed by an INJECTED child, so it must live outside the
+     * read-masked store (a script in the store was denied to its own reader:
+     * measured as `Access is denied.` and the WMI command silently not running). */
+    const wchar_t *dir = g_ws.helperDir[0] ? g_ws.helperDir
+                         : (g_ws.regStageDir[0] ? g_ws.regStageDir : g_ws.stageRoot);
     static volatile LONG seq = 0;
     _snwprintf(outPath, cch, L"%ls\\.wmi-%lu-%ld.cmd", dir, (unsigned long)GetCurrentProcessId(),
                (long)InterlockedIncrement(&seq));
     outPath[cch - 1] = 0;
-    HANDLE file = CreateFileW(outPath, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
-                              FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY, NULL);
+    /* raw open: the shim's own write must not be staged either */
+    HANDLE file = ws_open_file_raw_flags(outPath, GENERIC_WRITE, FILE_SHARE_READ, CREATE_ALWAYS,
+                                         FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY);
     if (file == INVALID_HANDLE_VALUE) {
         return 0;
     }
@@ -480,16 +523,29 @@ static wchar_t *ws_wmic_build_inject_cmd(const wchar_t *scriptPath)
     if (!g_selfDll[0] || !g_ws.stageRoot[0] || !g_ws.configPath[0] || !g_ws.logPath[0]) {
         return NULL;
     }
-    wchar_t dir[WS_PATH_MAX];
-    ws_strlcpy_w(dir, g_selfDll, WS_PATH_MAX);
-    wchar_t *slash = wcsrchr(dir, L'\\');
-    if (!slash) {
+    wchar_t injector[WS_PATH_MAX];
+    int helperMode = ws_helper_path(L"launcher.exe", L"winstage-inject.exe", injector, WS_PATH_MAX);
+    if (!helperMode) {
         return NULL;
     }
-    slash[1] = 0;
-    wchar_t injector[WS_PATH_MAX];
-    _snwprintf(injector, WS_PATH_MAX, L"%ls%ls", dir, L"winstage-inject.exe");
-    injector[WS_PATH_MAX - 1] = 0;
+    if (helperMode == 2 && g_ws.helperDir[0]) {
+        /* Neutral form: the job file carries the DLL/contract, so the WMI child's
+         * command line stays `launcher.exe -- cmd.exe /d /c <script>`. */
+        wchar_t job[WS_PATH_MAX];
+        _snwprintf(job, WS_PATH_MAX, L"%ls\\launcher.cfg", g_ws.helperDir);
+        job[WS_PATH_MAX - 1] = 0;
+        size_t jcch = (WS_PATH_MAX * 3) + 1024;
+        wchar_t *jout = (wchar_t *)malloc(jcch * sizeof(wchar_t));
+        if (!jout) {
+            return NULL;
+        }
+        _snwprintf(jout, jcch, L"\"%ls\" --job \"%ls\" -- cmd.exe /d /c \"%ls\"", injector, job, scriptPath);
+        jout[jcch - 1] = 0;
+        if (g_ws.debugFind) {
+            ws_log("wmic injector command: %ls", jout);
+        }
+        return jout;
+    }
 
     wchar_t regPart[WS_PATH_MAX + 64];
     regPart[0] = 0;
@@ -514,6 +570,9 @@ static wchar_t *ws_wmic_build_inject_cmd(const wchar_t *scriptPath)
                injector, g_selfDll, g_ws.stageRoot, g_ws.configPath, g_ws.logPath, regPart, auditPart, g_ws.stageRoot,
                scriptPath);
     out[cch - 1] = 0;
+    if (g_ws.debugFind) {
+        ws_log("wmic injector command (legacy): %ls", out);
+    }
     return out;
 }
 
@@ -523,8 +582,13 @@ static wchar_t *ws_wmic_build_inject_cmd(const wchar_t *scriptPath)
  * runs inside cmd.exe and is still rewritten. */
 static int ws_cli_real_bypass(void)
 {
-    wchar_t flag[8];
-    if (GetEnvironmentVariableW(L"WINSTAGE_CLI_REAL", flag, 8) == 0 || flag[0] != L'1') {
+    /* The helper image is deliberately neutral (`spawn.exe`), so an image-name
+     * check alone could be forged by an agent copying any exe to that name.
+     * Require the per-session token that only the helper can obtain (it lives in
+     * the helper job file, which the agent cannot read once the mask is up). */
+    wchar_t flag[96];
+    DWORD n = GetEnvironmentVariableW(L"WINSTAGE_CLI_REAL", flag, 96);
+    if (n == 0 || n >= 96 || !g_ws.cliToken[0] || wcscmp(flag, g_ws.cliToken) != 0) {
         return 0;
     }
     wchar_t self[WS_PATH_MAX];
@@ -533,7 +597,7 @@ static int ws_cli_real_bypass(void)
     }
     const wchar_t *base = wcsrchr(self, L'\\');
     base = base ? base + 1 : self;
-    return _wcsicmp(base, L"winstage-probe.exe") == 0;
+    return _wcsicmp(base, L"winstage-probe.exe") == 0 || _wcsicmp(base, L"spawn.exe") == 0;
 }
 
 /* --------------------------------------------------------------- sc.exe RPC --
@@ -603,18 +667,9 @@ static int ws_basename_is_cli(const wchar_t *token, int len, const wchar_t *name
 static wchar_t *ws_cli_rewrite_cmd(LPCWSTR app, LPCWSTR cmd, const wchar_t *baseName,
                                    const wchar_t *mode, wchar_t *probeOut, DWORD probeCch)
 {
-    if (!g_selfDll[0]) {
+    if (!ws_helper_path(L"spawn.exe", L"winstage-probe.exe", probeOut, probeCch)) {
         return NULL;
     }
-    wchar_t dir[WS_PATH_MAX];
-    ws_strlcpy_w(dir, g_selfDll, WS_PATH_MAX);
-    wchar_t *slash = wcsrchr(dir, L'\\');
-    if (!slash) {
-        return NULL;
-    }
-    slash[1] = 0;
-    _snwprintf(probeOut, probeCch, L"%lswinstage-probe.exe", dir);
-    probeOut[probeCch - 1] = 0;
 
     const wchar_t *remainder = L"";
     if (cmd && cmd[0]) {
@@ -632,18 +687,44 @@ static wchar_t *ws_cli_rewrite_cmd(LPCWSTR app, LPCWSTR cmd, const wchar_t *base
         return NULL;
     }
     if (wcscmp(mode, L"--evt") == 0 || wcscmp(mode, L"--task") == 0) {
-        wchar_t journal[WS_PATH_MAX];
-        const wchar_t *dir = g_ws.regStageDir[0] ? g_ws.regStageDir : g_ws.stageRoot;
-        const wchar_t *leaf = (wcscmp(mode, L"--evt") == 0) ? L"eventlog.overlay.jsonl"
-                                                           : L"tasks.overlay.jsonl";
-        _snwprintf(journal, WS_PATH_MAX, L"%ls\\%ls", dir, leaf);
-        journal[WS_PATH_MAX - 1] = 0;
-        _snwprintf(out, cch, L"\"%ls\" %ls \"%ls\" %ls", probeOut, mode, journal, remainder);
+        /* Neutral form: the helper resolves the journal from launcher.cfg, so the
+         * command line carries no session-store path. Legacy layout keeps the
+         * explicit path (the helper has no job file next to it). */
+        if (g_ws.helperDir[0]) {
+            const wchar_t *token = (wcscmp(mode, L"--evt") == 0) ? L"@evt" : L"@task";
+            _snwprintf(out, cch, L"\"%ls\" %ls \"%ls\" %ls", probeOut, mode, token, remainder);
+        } else {
+            wchar_t journal[WS_PATH_MAX];
+            const wchar_t *dir = g_ws.regStageDir[0] ? g_ws.regStageDir : g_ws.stageRoot;
+            const wchar_t *leaf = (wcscmp(mode, L"--evt") == 0) ? L"eventlog.overlay.jsonl"
+                                                               : L"tasks.overlay.jsonl";
+            _snwprintf(journal, WS_PATH_MAX, L"%ls\\%ls", dir, leaf);
+            journal[WS_PATH_MAX - 1] = 0;
+            _snwprintf(out, cch, L"\"%ls\" %ls \"%ls\" %ls", probeOut, mode, journal, remainder);
+        }
     } else {
         _snwprintf(out, cch, L"\"%ls\" %ls %ls", probeOut, mode, remainder);
     }
     out[cch - 1] = 0;
     return out;
+}
+
+/* Our own launcher must run UNINJECTED: it reads the helper job file (which
+ * names the masked store/plugin paths) and then injects the real child itself.
+ * Injecting it made its own precheck hit the store mask -- measured as
+ * `dll file is not accessible ... win32Error 5` on the WMI path, where the
+ * launcher is created by a hooked process. */
+static int ws_is_own_launcher(LPCWSTR app, LPWSTR cmd)
+{
+    const wchar_t *image = (app && app[0]) ? app : cmd;
+    if (!image || !image[0]) {
+        return 0;
+    }
+    int start = 0, end = 0;
+    ws_token_span(image, &start, &end);
+    const wchar_t *tok = image + start;
+    int len = end - start;
+    return ws_basename_is_cli(tok, len, L"launcher") || ws_basename_is_cli(tok, len, L"winstage-inject");
 }
 
 static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LPWSTR cmd,                                     LPSECURITY_ATTRIBUTES pa, LPSECURITY_ATTRIBUTES ta, BOOL inherit,
@@ -670,6 +751,7 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
     /* Debug/protected creations cannot be injected safely (the debugger owns the
      * first event) and must not be broken, so they pass through with a log. */
     int exempt = (flags & (DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS | CREATE_PROTECTED_PROCESS)) != 0;
+
     /**
      * ── wmic process call create：把内层命令改道到注入器（见文件头注释）─────────
      * 只处理本机目标；`/node:` 指向远端时无法把注入器一起送过去，失败关闭。
@@ -725,33 +807,63 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
                 return FALSE;
             }
             if (hit == 1) {
-                wchar_t script[WS_PATH_MAX];
-                if (ws_wmic_write_script(inner, innerLen, script, WS_PATH_MAX)) {
-                    wmiRewrite = ws_wmic_build_inject_cmd(script);
+                /* Already redirected? The executor rewrites the top-level `wmic`
+                 * before launching it, so the shim sees an inner command that is
+                 * already our launcher. Wrapping it again would create a SECOND
+                 * injector *inside* the sandbox, whose precheck is then denied by
+                 * the store mask (measured: `win32Error 5` on the plugin DLL). */
+                int tokStart = 0, tokEnd = 0;
+                ws_token_span(inner, &tokStart, &tokEnd);
+                const wchar_t *tok = inner + tokStart;
+                int tokLen = tokEnd - tokStart;
+                wchar_t head[1024];
+                size_t hn = (size_t)(innerLen < 1023 ? innerLen : 1023);
+                memcpy(head, inner, hn * sizeof(wchar_t));
+                head[hn] = 0;
+                /* `--job` is our private launcher flag: whatever the quoting did to
+                 * the first token, its presence means "already redirected". */
+                if (ws_basename_is_cli(tok, tokLen, L"launcher") ||
+                    ws_basename_is_cli(tok, tokLen, L"winstage-inject") || wcsstr(head, L"--job ") != NULL) {
+                    ws_log("wmic process create already redirected; leaving it alone: %ls", head);
+                } else {
+                    wchar_t script[WS_PATH_MAX];
+                    if (ws_wmic_write_script(inner, innerLen, script, WS_PATH_MAX)) {
+                        wmiRewrite = ws_wmic_build_inject_cmd(script);
+                    }
+                    if (!wmiRewrite) {
+                        ws_log("wmic process create: could not build the injector command; failing closed");
+                        SetLastError(ERROR_ACCESS_DENIED);
+                        return FALSE;
+                    }
+                    ws_log("wmic process create redirected through the injector: script=%ls", script);
+                    cmd = wmiRewrite;
+                    app = NULL;
                 }
-                if (!wmiRewrite) {
-                    ws_log("wmic process create: could not build the injector command; failing closed");
-                    SetLastError(ERROR_ACCESS_DENIED);
-                    return FALSE;
-                }
-                ws_log("wmic process create redirected through the injector: script=%ls", script);
-                cmd = wmiRewrite;
-                app = NULL;
             }
         }
     }
+    /* ★ The decision must look at the FINAL image: the CLI/WMI rewrites above turn
+     * `wmic process call create ...` into a direct launch of our own launcher, so
+     * computing this before them injected the launcher into itself and its own
+     * DLL precheck then hit the store mask (measured: win32Error 5). */
+    int ownLauncher = !exempt && ws_is_own_launcher(app, cmd);
+    if (g_ws.debugFind) {
+        ws_log("create-process: app=%ls cmd=%ls own=%d", app ? app : L"(null)", cmd ? cmd : L"(null)", ownLauncher);
+    }
     int forced = 0;
     DWORD newFlags = flags;
-    if (!exempt && !(flags & CREATE_SUSPENDED)) {
+    if (!exempt && !ownLauncher && !(flags & CREATE_SUSPENDED)) {
         newFlags = flags | CREATE_SUSPENDED;
         forced = 1;
     }
     /* The carrier usually has no console (executor pipes) but its children would
      * otherwise allocate one and flash a window for every command. When a real
      * console exists (manual run) the caller's flags are left untouched. */
+#ifndef WINSTAGE_DISABLE_NO_WINDOW
     if (!GetConsoleWindow()) {
         newFlags |= CREATE_NO_WINDOW;
     }
+#endif
     wchar_t *newEnv = NULL;
     wchar_t *inheritedEnv = NULL;
     int inheritContract = 0;
@@ -762,6 +874,12 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
         SetEnvironmentVariableW(L"DSH_SHIM_CONFIG", g_ws.configPath);
         if (g_ws.regStageDir[0]) {
             SetEnvironmentVariableW(L"DSH_REGSTAGE_SESSION_DIR", g_ws.regStageDir);
+        }
+        if (g_ws.helperDir[0]) {
+            SetEnvironmentVariableW(L"WINSTAGE_HELPER_DIR", g_ws.helperDir);
+        }
+        if (g_ws.cliToken[0]) {
+            SetEnvironmentVariableW(L"WINSTAGE_CLI_TOKEN", g_ws.cliToken);
         }
         env = NULL;
         inheritContract = 1;
@@ -804,6 +922,9 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
         SetEnvironmentVariableW(L"DSH_STAGE_ROOT", NULL);
         SetEnvironmentVariableW(L"DSH_SHIM_LOG", NULL);
         SetEnvironmentVariableW(L"DSH_SHIM_CONFIG", NULL);
+        SetEnvironmentVariableW(L"DSH_REGSTAGE_SESSION_DIR", NULL);
+        SetEnvironmentVariableW(L"WINSTAGE_HELPER_DIR", NULL);
+        SetEnvironmentVariableW(L"WINSTAGE_CLI_TOKEN", NULL);
     }
     if (!ok) {
         ws_log("CreateProcess failed err=%lu env=%p newEnv=%p inherited=%d flags=0x%lx",
@@ -827,7 +948,7 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
         SetLastError(ws_saved_last_error);
         return TRUE;
     }
-    if (!ws_inject_into(pi->hProcess)) {
+    if (!ownLauncher && !ws_inject_into(pi->hProcess)) {
         DWORD err = GetLastError();
         ws_lock_enter(&g_procLock);
         g_injectFail++;
@@ -846,6 +967,9 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
     ws_lock_leave(&g_procLock);
     if (scRewrite) {
         ws_log("sc.exe child injected pid=%lu", (unsigned long)pi->dwProcessId);
+    }
+    if (ownLauncher) {
+        ws_log("own launcher created without injection (pid=%lu)", (unsigned long)pi->dwProcessId);
     }
     if (g_ws.verbose) {
         ws_log("child injected (pid=%lu) app=%ls", (unsigned long)pi->dwProcessId,

@@ -1426,6 +1426,12 @@ static int ws_find_split_pattern(const wchar_t *pattern, wchar_t *dir, DWORD dir
     WS_PATH_BUF(cand);
     memcpy(cand, norm, nDir * sizeof(wchar_t));
     cand[nDir] = 0;
+    /* "C:\name" splits at index 2; a drive-relative dir ("C:") resolves against
+     * the process cwd, which is the logical workspace, not the drive root. */
+    if (nDir == 2 && cand[1] == L':') {
+        cand[2] = L'\\';
+        cand[3] = 0;
+    }
     if (wcschr(cand, L'*') || wcschr(cand, L'?')) {
         return 0;
     }
@@ -1713,6 +1719,27 @@ static HANDLE ws_merge_try(const wchar_t *pattern, LPWIN32_FIND_DATAW first, int
             return INVALID_HANDLE_VALUE;
         }
     }
+    /* A concrete (wildcard-free) pattern asks about one entry. If that entry is
+     * masked or lives in the store, answer `Access is denied` -- the same answer
+     * a normal ACL-protected directory gives. Returning "not found" here made
+     * `dir /s <masked-path>` degrade into a recursive whole-drive search. */
+    {
+        WS_PATH_BUF(full);
+        WS_PATH_BUF(pnorm);
+        DWORD err = GetLastError();
+        DWORD n = GetFullPathNameW(pattern, WS_PATH_MAX, full, NULL);
+        SetLastError(err);
+        if (n > 0 && n < WS_PATH_MAX && ws_normalize_path(full, pnorm, WS_PATH_MAX) &&
+            !wcschr(pnorm, L'*') && !wcschr(pnorm, L'?')) {
+            wchar_t rule[256];
+            if (ws_store_denied_path(pnorm) || (ws_mask_declared() && ws_mask_decide_read(pnorm, rule, 256))) {
+                *handled = 1;
+                ws_log_w(L"enumeration of a masked entry refused", pnorm);
+                SetLastError(ERROR_ACCESS_DENIED);
+                return INVALID_HANDLE_VALUE;
+            }
+        }
+    }
     if (!ws_merge_available(dir)) {
         return INVALID_HANDLE_VALUE;
     }
@@ -1788,6 +1815,12 @@ static int ws_store_denied_pattern(const wchar_t *pattern)
     }
     if (!ws_normalize_path(full, norm, WS_PATH_MAX)) {
         return 0;
+    }
+    /* A concrete path (`dir C:\store`, no wildcard) names the store itself; the
+     * parent-only check used to miss it and let cmd fall back to a recursive
+     * whole-drive search (measured: `dir /s C:\store` ran for minutes). */
+    if (ws_store_denied_path(norm)) {
+        return 1;
     }
     wchar_t *last = wcsrchr(norm, L'\\');
     if (last && last != norm) {
@@ -2552,15 +2585,24 @@ HANDLE WINAPI ws_FindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInfoLe
         return INVALID_HANDLE_VALUE;
     }
     ws_callhit_named("FindFirstFileExW");
+    if (g_ws.debugFind) {
+        ws_log_w(L"dbgfind:in", lpFileName);
+    }
     if (ws_store_denied_pattern(lpFileName)) {
         ws_log_w(L"enumeration of the sandbox store refused", lpFileName);
         SetLastError(ERROR_ACCESS_DENIED);
         return INVALID_HANDLE_VALUE;
     }
+    if (g_ws.debugFind) {
+        ws_log("dbgfind:store=pass");
+    }
     if (lpFindFileData && fSearchOp == FindExSearchNameMatch &&
         (fInfoLevelId == FindExInfoStandard || fInfoLevelId == FindExInfoBasic)) {
         int handled = 0;
         HANDLE merged = ws_merge_try(lpFileName, (LPWIN32_FIND_DATAW)lpFindFileData, &handled);
+        if (g_ws.debugFind) {
+            ws_log("dbgfind:merge handled=%d h=%p", handled, (void *)merged);
+        }
         if (handled) {
             return merged;
         }
@@ -4075,6 +4117,27 @@ BOOL WINAPI ws_SetFileAttributesW(LPCWSTR lpFileName, DWORD dwFileAttributes)
  * ws_file_exists() deliberately keeps using the real API on the real path: it
  * decides CoW and whether a real file may be hidden, so it must never consult
  * the overlay (and it must never re-enter these wrappers). */
+/* Error to report for a masked path on the stat family.
+ *
+ * `FILE_NOT_FOUND` is the right answer for a sensitive file (existence must not
+ * leak), but for the shim's own store/plugin root it made `cmd` treat
+ * `dir /s <store>` as a *filename pattern* and recurse over the whole drive
+ * (measured: minutes of FindFirst traffic, then the caller's timeout). An
+ * ACL-protected path answers ACCESS_DENIED -- which also stops the search. */
+static DWORD ws_mask_stat_error(LPCWSTR lpFileName)
+{
+    WS_PATH_BUF(full);
+    WS_PATH_BUF(norm);
+    DWORD err = GetLastError();
+    DWORD n = GetFullPathNameW(lpFileName, WS_PATH_MAX, full, NULL);
+    SetLastError(err);
+    if (n > 0 && n < WS_PATH_MAX && ws_normalize_path(full, norm, WS_PATH_MAX) &&
+        ws_store_denied_path(norm)) {
+        return ERROR_ACCESS_DENIED;
+    }
+    return ERROR_FILE_NOT_FOUND;
+}
+
 static int ws_stat_read_masked(LPCWSTR lpFileName)
 {
     /* R20 FOLLOW-UP（P0）：设备/卷命名空间路径先映射，否则遮蔽判定看到的是
@@ -4200,7 +4263,7 @@ DWORD WINAPI ws_GetFileAttributesW(LPCWSTR lpFileName)
     ws_callhit_named("GetFileAttributesW"); /* R11-D-13d */
     if (ws_stat_read_masked(lpFileName)) {
         WS_DBG("ATTRDBG-W branch=masked in=%ls", lpFileName); /* R11-D-13d-w */
-        SetLastError(ERROR_FILE_NOT_FOUND);
+        SetLastError(ws_mask_stat_error(lpFileName));
         return INVALID_FILE_ATTRIBUTES;
     }
     WS_PATH_BUF(mapped);
@@ -4235,7 +4298,7 @@ BOOL WINAPI ws_GetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS l
     ws_callhit_named("GetFileAttributesExW"); /* R11-D-13d */
     if (ws_stat_read_masked(lpFileName)) {
         WS_DBG("ATTRDBG-ExW branch=masked in=%ls", lpFileName); /* R11-D-13d-w */
-        SetLastError(ERROR_FILE_NOT_FOUND);
+        SetLastError(ws_mask_stat_error(lpFileName));
         return FALSE;
     }
     WS_PATH_BUF(mapped);

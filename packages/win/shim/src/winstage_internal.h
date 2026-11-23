@@ -68,6 +68,15 @@ typedef struct WsConfig {
      * direct "you are sandboxed" tell. Internal loader reads happen before the
      * hooks exist and are unaffected. */
     wchar_t pluginRoot[WS_PATH_MAX];
+    /* Per-session helper dir (neutral copy of the injector/probe + the job file).
+     * Keeping the process command line free of `winstage-*` paths is the point:
+     * a recon run found the mechanism through `wmic process get CommandLine`. */
+    wchar_t helperDir[WS_PATH_MAX];
+    /* Triage: <sessionDir>\\debug-find turns on FindFirst tracing. */
+    int debugFind;
+    /* Per-session token that lets only OUR helper run the real sc/wevtutil/
+     * schtasks (the helper name is neutral, so a name check alone is forgeable). */
+    wchar_t cliToken[80];
     int unstagedWrites;     /* 1 = deny (default, fail closed), 2 = allow the real API */
     int disableFileFamily;  /* debug/triage: leave the file-family hooks uninstalled */
     int disableRegFamily;   /* debug/triage: leave the registry-family hooks uninstalled */
