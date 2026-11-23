@@ -559,6 +559,8 @@ static int ws_under_prefix(const wchar_t *norm, const wchar_t *prefix)
     return norm[n] == 0 || norm[n] == L'\\';
 }
 
+static int ws_store_denied_path(const wchar_t *norm);
+
 /* 1 = intercept, 0 = pass through to the real API unchanged. */
 static int ws_should_intercept(const wchar_t *path, wchar_t *norm, DWORD cch)
 {
@@ -1384,11 +1386,13 @@ static BOOL ws_find_orig_close(HANDLE h)
  * directory component, or a wildcard in the DIRECTORY component: rebuilding
  * "dir\name" would then be a guess, so filtering is skipped and the caller
  * keeps the real API's answer). */
-static int ws_find_dir_of_pattern_w(const wchar_t *pattern, wchar_t *dir, DWORD cch)
+static int ws_find_split_pattern(const wchar_t *pattern, wchar_t *dir, DWORD dirCch, wchar_t *name,
+                                 DWORD nameCch)
 {
     WS_PATH_BUF(full);
     WS_PATH_BUF(norm);
-    dir[0] = 0;
+    if (dir) dir[0] = 0;
+    if (name) name[0] = 0;
     if (!ws_mask_declared() || !pattern || !pattern[0]) {
         return 0;
     }
@@ -1416,7 +1420,7 @@ static int ws_find_dir_of_pattern_w(const wchar_t *pattern, wchar_t *dir, DWORD 
         return 0; /* no directory component ("*" / "\*") or drive-less name */
     }
     size_t nDir = (size_t)(last - norm);
-    if (nDir + 1 > cch) {
+    if (dir && nDir + 1 > dirCch) {
         return 0;
     }
     WS_PATH_BUF(cand);
@@ -1425,8 +1429,14 @@ static int ws_find_dir_of_pattern_w(const wchar_t *pattern, wchar_t *dir, DWORD 
     if (wcschr(cand, L'*') || wcschr(cand, L'?')) {
         return 0;
     }
-    ws_strlcpy_w(dir, cand, cch);
+    if (dir) ws_strlcpy_w(dir, cand, dirCch);
+    if (name) ws_strlcpy_w(name, last + 1, nameCch);
     return 1;
+}
+
+static int ws_find_dir_of_pattern_w(const wchar_t *pattern, wchar_t *dir, DWORD cch)
+{
+    return ws_find_split_pattern(pattern, dir, cch, NULL, 0);
 }
 
 /* Does "dir\name" (the entry the real API just returned) match a read-mask
@@ -1450,6 +1460,341 @@ static int ws_find_entry_masked(const wchar_t *dir, const wchar_t *name, wchar_t
     return ws_mask_decide_read(full, outRule, outRuleCch);
 }
 
+/* ── R43 合并枚举：真实目录 ∪ 暂存目录 ───────────────────────────────────────
+ *
+ * 旧行为只过滤直实枚举里的遮蔽项，于是"写入成功但 dir 看不到"（视图分裂）。
+ * 这里对**存在暂存副本的目录**构造一份合并列表：
+ *   · 真实枚举（同一 pattern）→ 过滤 mask / whiteout；
+ *   · 暂存目录（stageRoot\fs\...\dir，同一 name pattern）→ 过滤 mask / whiteout；
+ *   · 同名以暂存项为准（内容/时间/大小），暂存独有的项追加。
+ * FindFirstFile* 返回一个带 tag 的合成句柄，FindNextFile* 与 FindClose 从列表弹出；
+ * 任何构造失败/条目超限都**回落到旧的真实句柄过滤**（不返回半份列表）。
+ * 只对 sAll 标准/基本 info level、FindExSearchNameMatch 生效。
+ */
+#define WS_FIND_MERGE_MAX 8192
+#define WS_FIND_MERGE_SLOTS 8
+#define WS_FIND_FAKE_TAG ((ULONG_PTR)0x5C4F000000000000ULL)
+#define WS_FIND_FAKE_MASK ((ULONG_PTR)0xFFFF000000000000ULL)
+
+typedef struct WsMergedFind {
+    int used;
+    DWORD count;
+    DWORD index;
+    WIN32_FIND_DATAW *items;
+} WsMergedFind;
+
+typedef struct WsMergeList {
+    WIN32_FIND_DATAW *items;
+    DWORD count;
+    DWORD cap;
+    int overflow;
+} WsMergeList;
+
+static WsMergedFind g_findMerged[WS_FIND_MERGE_SLOTS];
+
+static int ws_find_is_fake(HANDLE h)
+{
+    return ((((ULONG_PTR)h) & WS_FIND_FAKE_MASK) == WS_FIND_FAKE_TAG);
+}
+
+/* caller holds g_findLock */
+static WsMergedFind *ws_find_fake_slot(HANDLE h)
+{
+    ULONG_PTR v = ((ULONG_PTR)h) & ~WS_FIND_FAKE_MASK;
+    if (v == 0 || v > WS_FIND_MERGE_SLOTS) {
+        return NULL;
+    }
+    WsMergedFind *slot = &g_findMerged[v - 1];
+    return slot->used ? slot : NULL;
+}
+
+static HANDLE ws_find_fake_alloc(WIN32_FIND_DATAW *items, DWORD count)
+{
+    if (!items || count == 0) {
+        return NULL;
+    }
+    ws_find_ready();
+    ws_lock_enter(&g_findLock);
+    for (int i = 0; i < WS_FIND_MERGE_SLOTS; i++) {
+        if (!g_findMerged[i].used) {
+            g_findMerged[i].used = 1;
+            g_findMerged[i].count = count;
+            g_findMerged[i].index = 1;
+            g_findMerged[i].items = items;
+            ws_lock_leave(&g_findLock);
+            return (HANDLE)(WS_FIND_FAKE_TAG | (ULONG_PTR)(i + 1));
+        }
+    }
+    ws_lock_leave(&g_findLock);
+    return NULL;
+}
+
+static BOOL ws_find_fake_next(HANDLE h, LPWIN32_FIND_DATAW out)
+{
+    ws_find_ready();
+    ws_lock_enter(&g_findLock);
+    WsMergedFind *slot = ws_find_fake_slot(h);
+    if (!slot) {
+        ws_lock_leave(&g_findLock);
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    if (slot->index >= slot->count) {
+        ws_lock_leave(&g_findLock);
+        SetLastError(ERROR_NO_MORE_FILES);
+        return FALSE;
+    }
+    *out = slot->items[slot->index++];
+    ws_lock_leave(&g_findLock);
+    return TRUE;
+}
+
+static void ws_find_fake_close(HANDLE h)
+{
+    ws_find_ready();
+    ws_lock_enter(&g_findLock);
+    WsMergedFind *slot = ws_find_fake_slot(h);
+    if (slot) {
+        free(slot->items);
+        memset(slot, 0, sizeof(*slot));
+    }
+    ws_lock_leave(&g_findLock);
+}
+
+static int ws_merge_push(WsMergeList *l, const WIN32_FIND_DATAW *d)
+{
+    if (l->count >= WS_FIND_MERGE_MAX) {
+        l->overflow = 1;
+        return 0;
+    }
+    if (l->count == l->cap) {
+        DWORD cap = l->cap ? l->cap * 2 : 32;
+        if (cap > WS_FIND_MERGE_MAX) cap = WS_FIND_MERGE_MAX;
+        WIN32_FIND_DATAW *grown = (WIN32_FIND_DATAW *)realloc(l->items, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            l->overflow = 1;
+            return 0;
+        }
+        l->items = grown;
+        l->cap = cap;
+    }
+    l->items[l->count++] = *d;
+    return 1;
+}
+
+/* dir is the LOGICAL directory; entries are filtered against the logical path. */
+static void ws_merge_collect(const wchar_t *pattern, const wchar_t *dir, WsMergeList *out)
+{
+    WS_PATH_BUF(api);
+    const wchar_t *p = ws_api_path(pattern, api, WS_PATH_MAX);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = g_orig.FindFirstFileW ? g_orig.FindFirstFileW(p, &fd) : FindFirstFileW(p, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        return; /* empty directory (or unreadable): the caller sees count==0 */
+    }
+    for (;;) {
+        WS_PATH_BUF(full);
+        size_t pos = 0;
+        full[0] = 0;
+        if (!ws_append_w(full, WS_PATH_MAX, &pos, dir)) {
+            break;
+        }
+        if (!(pos > 0 && full[pos - 1] == L'\\')) {
+            if (!ws_append_w(full, WS_PATH_MAX, &pos, L"\\")) {
+                break;
+            }
+        }
+        if (!ws_append_w(full, WS_PATH_MAX, &pos, fd.cFileName)) {
+            break;
+        }
+        int skip = ws_logically_whiteouted(full);
+        if (!skip && ws_mask_declared()) {
+            wchar_t rule[256];
+            if (ws_mask_decide_read(full, rule, 256)) {
+                skip = 1;
+            }
+        }
+        if (!skip && !ws_merge_push(out, &fd)) {
+            break;
+        }
+        BOOL next = g_orig.FindNextFileW ? g_orig.FindNextFileW(h, &fd) : FindNextFileW(h, &fd);
+        if (!next) {
+            break;
+        }
+    }
+    ws_find_orig_close(h);
+}
+
+static int ws_merge_available(const wchar_t *dir)
+{
+    WS_PATH_BUF(stagedDir);
+    uint32_t flags = 0;
+    if (!g_ws.haveStageRoot) {
+        return 0;
+    }
+    if (ws_resolve_file(dir, WINSTAGE_IO_READ, stagedDir, &flags) != 0) {
+        return 0;
+    }
+    return (flags & WINSTAGE_RES_STAGED) != 0;
+}
+
+static void ws_merge_build(const wchar_t *pattern, const wchar_t *dir, const wchar_t *namePattern,
+                           WsMergeList *out)
+{
+    out->items = NULL;
+    out->count = 0;
+    out->cap = 0;
+    out->overflow = 0;
+    ws_merge_collect(pattern, dir, out);
+    if (out->overflow) {
+        return;
+    }
+    WS_PATH_BUF(stagedDir);
+    uint32_t flags = 0;
+    if (ws_resolve_file(dir, WINSTAGE_IO_READ, stagedDir, &flags) != 0 || !(flags & WINSTAGE_RES_STAGED)) {
+        return;
+    }
+    WS_PATH_BUF(stagedPattern);
+    size_t pos = 0;
+    stagedPattern[0] = 0;
+    if (!ws_append_w(stagedPattern, WS_PATH_MAX, &pos, stagedDir)) {
+        return;
+    }
+    if (!(pos > 0 && stagedPattern[pos - 1] == L'\\')) {
+        if (!ws_append_w(stagedPattern, WS_PATH_MAX, &pos, L"\\")) {
+            return;
+        }
+    }
+    if (!ws_append_w(stagedPattern, WS_PATH_MAX, &pos, namePattern)) {
+        return;
+    }
+    WsMergeList staged = { 0 };
+    ws_merge_collect(stagedPattern, dir, &staged);
+    if (staged.overflow) {
+        out->overflow = 1;
+        free(staged.items);
+        return;
+    }
+    for (DWORD i = 0; i < staged.count; i++) {
+        int found = -1;
+        for (DWORD j = 0; j < out->count; j++) {
+            if (_wcsicmp(out->items[j].cFileName, staged.items[i].cFileName) == 0) {
+                found = (int)j;
+                break;
+            }
+        }
+        if (found >= 0) {
+            out->items[found] = staged.items[i];
+        } else if (!ws_merge_push(out, &staged.items[i])) {
+            break;
+        }
+    }
+    free(staged.items);
+}
+
+/**
+ * Try the merged path. `*handled` = 1 means this function owns the answer
+ * (including "empty directory" -> INVALID_HANDLE_VALUE); 0 means the caller
+ * must use the old real-handle filter.
+ */
+static HANDLE ws_merge_try(const wchar_t *pattern, LPWIN32_FIND_DATAW first, int *handled)
+{
+    *handled = 0;
+    WS_PATH_BUF(dir);
+    WS_PATH_BUF(name);
+    if (!ws_find_split_pattern(pattern, dir, WS_PATH_MAX, name, WS_PATH_MAX)) {
+        return INVALID_HANDLE_VALUE;
+    }
+    if (ws_mask_declared()) {
+        wchar_t rule[256];
+        if (ws_mask_decide_read(dir, rule, 256)) {
+            *handled = 1;
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+    if (!ws_merge_available(dir)) {
+        return INVALID_HANDLE_VALUE;
+    }
+    WsMergeList list = { 0 };
+    ws_merge_build(pattern, dir, name, &list);
+    if (list.overflow) {
+        free(list.items);
+        return INVALID_HANDLE_VALUE; /* fall back to the real-handle filter */
+    }
+    *handled = 1;
+    if (list.count == 0) {
+        free(list.items);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    HANDLE h = ws_find_fake_alloc(list.items, list.count);
+    if (!h) {
+        free(list.items);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return INVALID_HANDLE_VALUE;
+    }
+    *first = list.items[0];
+    return h;
+}
+
+static void ws_find_data_w2a(const WIN32_FIND_DATAW *w, WIN32_FIND_DATAA *a)
+{
+    memset(a, 0, sizeof(*a));
+    a->dwFileAttributes = w->dwFileAttributes;
+    a->ftCreationTime = w->ftCreationTime;
+    a->ftLastAccessTime = w->ftLastAccessTime;
+    a->ftLastWriteTime = w->ftLastWriteTime;
+    a->nFileSizeHigh = w->nFileSizeHigh;
+    a->nFileSizeLow = w->nFileSizeLow;
+    a->dwReserved0 = w->dwReserved0;
+    a->dwReserved1 = w->dwReserved1;
+    WideCharToMultiByte(CP_ACP, 0, w->cFileName, -1, a->cFileName, (int)sizeof(a->cFileName), NULL, NULL);
+    WideCharToMultiByte(CP_ACP, 0, w->cAlternateFileName, -1, a->cAlternateFileName,
+                        (int)sizeof(a->cAlternateFileName), NULL, NULL);
+}
+
+/* Refuse to enumerate/read the shim's own store + plugin install root even if
+ * the agent guesses the path (the mask hides it, this is the belt). */
+static int ws_store_denied_path(const wchar_t *norm)
+{
+    if (!norm || !norm[0]) {
+        return 0;
+    }
+    if (g_ws.stageRoot[0] && ws_under_prefix(norm, g_ws.stageRoot)) {
+        return 1;
+    }
+    if (g_ws.regStageDir[0] && ws_under_prefix(norm, g_ws.regStageDir)) {
+        return 1;
+    }
+    if (g_ws.pluginRoot[0] && ws_under_prefix(norm, g_ws.pluginRoot)) {
+        return 1;
+    }
+    return 0;
+}
+
+static int ws_store_denied_pattern(const wchar_t *pattern)
+{
+    if (!pattern || !pattern[0]) {
+        return 0;
+    }
+    WS_PATH_BUF(full);
+    WS_PATH_BUF(norm);
+    DWORD err = GetLastError();
+    DWORD n = GetFullPathNameW(pattern, WS_PATH_MAX, full, NULL);
+    SetLastError(err);
+    if (n == 0 || n >= WS_PATH_MAX) {
+        return 0;
+    }
+    if (!ws_normalize_path(full, norm, WS_PATH_MAX)) {
+        return 0;
+    }
+    wchar_t *last = wcsrchr(norm, L'\\');
+    if (last && last != norm) {
+        *last = 0;
+    }
+    return ws_store_denied_path(norm);
+}
 /* ---------------------------------------------------------------- R17 ---- */
 /* R17 CreateHardLink: staging semantics.
  *
@@ -2096,6 +2441,18 @@ HANDLE WINAPI ws_FindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFil
         return INVALID_HANDLE_VALUE;
     }
     ws_callhit_named("FindFirstFileW");
+    if (ws_store_denied_pattern(lpFileName)) {
+        ws_log_w(L"enumeration of the sandbox store refused", lpFileName);
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (lpFindFileData) {
+        int handled = 0;
+        HANDLE merged = ws_merge_try(lpFileName, lpFindFileData, &handled);
+        if (handled) {
+            return merged;
+        }
+    }
     HANDLE h = g_orig.FindFirstFileW ? g_orig.FindFirstFileW(lpFileName, lpFindFileData)
                                      : FindFirstFileW(lpFileName, lpFindFileData);
     if (h == INVALID_HANDLE_VALUE || !lpFindFileData || !ws_mask_declared()) {
@@ -2135,13 +2492,29 @@ HANDLE WINAPI ws_FindFirstFileA(LPCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFile
         return INVALID_HANDLE_VALUE;
     }
     ws_callhit_named("FindFirstFileA");
+    WS_PATH_BUF(patternW);
+    ws_a2w_buf(lpFileName, patternW, WS_PATH_MAX);
+    if (ws_store_denied_pattern(patternW)) {
+        ws_log_w(L"enumeration of the sandbox store refused", patternW);
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (lpFindFileData) {
+        WIN32_FIND_DATAW firstW;
+        int handled = 0;
+        HANDLE merged = ws_merge_try(patternW, &firstW, &handled);
+        if (handled) {
+            if (merged != INVALID_HANDLE_VALUE) {
+                ws_find_data_w2a(&firstW, lpFindFileData);
+            }
+            return merged;
+        }
+    }
     HANDLE h = g_orig.FindFirstFileA ? g_orig.FindFirstFileA(lpFileName, lpFindFileData)
                                      : FindFirstFileA(lpFileName, lpFindFileData);
     if (h == INVALID_HANDLE_VALUE || !lpFindFileData || !ws_mask_declared()) {
         return h;
     }
-    WS_PATH_BUF(patternW);
-    ws_a2w_buf(lpFileName, patternW, WS_PATH_MAX);
     WS_PATH_BUF(dir);
     if (!ws_find_dir_of_pattern_w(patternW, dir, WS_PATH_MAX)) {
         return h;
@@ -2179,6 +2552,19 @@ HANDLE WINAPI ws_FindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInfoLe
         return INVALID_HANDLE_VALUE;
     }
     ws_callhit_named("FindFirstFileExW");
+    if (ws_store_denied_pattern(lpFileName)) {
+        ws_log_w(L"enumeration of the sandbox store refused", lpFileName);
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (lpFindFileData && fSearchOp == FindExSearchNameMatch &&
+        (fInfoLevelId == FindExInfoStandard || fInfoLevelId == FindExInfoBasic)) {
+        int handled = 0;
+        HANDLE merged = ws_merge_try(lpFileName, (LPWIN32_FIND_DATAW)lpFindFileData, &handled);
+        if (handled) {
+            return merged;
+        }
+    }
     HANDLE h = g_orig.FindFirstFileExW
                    ? g_orig.FindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter,
                                              dwAdditionalFlags)
@@ -2227,6 +2613,25 @@ HANDLE WINAPI ws_FindFirstFileExA(LPCSTR lpFileName, FINDEX_INFO_LEVELS fInfoLev
         return INVALID_HANDLE_VALUE;
     }
     ws_callhit_named("FindFirstFileExA");
+    WS_PATH_BUF(patternW);
+    ws_a2w_buf(lpFileName, patternW, WS_PATH_MAX);
+    if (ws_store_denied_pattern(patternW)) {
+        ws_log_w(L"enumeration of the sandbox store refused", patternW);
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (lpFindFileData && fSearchOp == FindExSearchNameMatch &&
+        (fInfoLevelId == FindExInfoStandard || fInfoLevelId == FindExInfoBasic)) {
+        WIN32_FIND_DATAW firstW;
+        int handled = 0;
+        HANDLE merged = ws_merge_try(patternW, &firstW, &handled);
+        if (handled) {
+            if (merged != INVALID_HANDLE_VALUE) {
+                ws_find_data_w2a(&firstW, (LPWIN32_FIND_DATAA)lpFindFileData);
+            }
+            return merged;
+        }
+    }
     HANDLE h = g_orig.FindFirstFileExA
                    ? g_orig.FindFirstFileExA(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter,
                                              dwAdditionalFlags)
@@ -2239,8 +2644,6 @@ HANDLE WINAPI ws_FindFirstFileExA(LPCSTR lpFileName, FINDEX_INFO_LEVELS fInfoLev
         return h;
     }
     LPWIN32_FIND_DATAA data = (LPWIN32_FIND_DATAA)lpFindFileData;
-    WS_PATH_BUF(patternW);
-    ws_a2w_buf(lpFileName, patternW, WS_PATH_MAX);
     WS_PATH_BUF(dir);
     if (!ws_find_dir_of_pattern_w(patternW, dir, WS_PATH_MAX)) {
         return h;
@@ -2270,6 +2673,13 @@ HANDLE WINAPI ws_FindFirstFileExA(LPCSTR lpFileName, FINDEX_INFO_LEVELS fInfoLev
 
 BOOL WINAPI ws_FindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData)
 {
+    if (ws_find_is_fake(hFindFile)) {
+        if (!lpFindFileData) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        return ws_find_fake_next(hFindFile, lpFindFileData);
+    }
     WS_PATH_BUF(dir);
     if (!lpFindFileData || !ws_mask_declared() || !ws_find_lookup(hFindFile, dir, WS_PATH_MAX)) {
         return g_orig.FindNextFileW ? g_orig.FindNextFileW(hFindFile, lpFindFileData)
@@ -2290,6 +2700,18 @@ BOOL WINAPI ws_FindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData
 
 BOOL WINAPI ws_FindNextFileA(HANDLE hFindFile, LPWIN32_FIND_DATAA lpFindFileData)
 {
+    if (ws_find_is_fake(hFindFile)) {
+        if (!lpFindFileData) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        WIN32_FIND_DATAW nextW;
+        if (!ws_find_fake_next(hFindFile, &nextW)) {
+            return FALSE;
+        }
+        ws_find_data_w2a(&nextW, lpFindFileData);
+        return TRUE;
+    }
     WS_PATH_BUF(dir);
     if (!lpFindFileData || !ws_mask_declared() || !ws_find_lookup(hFindFile, dir, WS_PATH_MAX)) {
         return g_orig.FindNextFileA ? g_orig.FindNextFileA(hFindFile, lpFindFileData)
@@ -2312,6 +2734,10 @@ BOOL WINAPI ws_FindNextFileA(HANDLE hFindFile, LPWIN32_FIND_DATAA lpFindFileData
 
 BOOL WINAPI ws_FindClose(HANDLE hFindFile)
 {
+    if (ws_find_is_fake(hFindFile)) {
+        ws_find_fake_close(hFindFile);
+        return TRUE;
+    }
     ws_find_unregister(hFindFile);
     return ws_find_orig_close(hFindFile);
 }

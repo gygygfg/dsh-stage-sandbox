@@ -631,13 +631,19 @@ function maskEntryKind(pattern) {
  * 统一 `\` 分隔符；匹配时按 `flags` 里的 `i` 做大小写不敏感。
  * ⚠ 这与工具面一样是**黑名单**：未列出的敏感对象仍可读；只覆盖被 hook 的打开路径。
  */
-export function exportMaskList() {
+export function exportMaskList(options = {}) {
+  /* Runtime entries (store root / plugin root) are not static knowledge: they
+   * depend on this session's paths. They are appended here so the shim sees the
+   * same `winstage.mask.v1` dialect (patterns are regex sources). */
+  const extraEntries = Array.isArray(options.extraEntries)
+    ? options.extraEntries.filter((entry) => entry && typeof entry.pattern === 'string' && entry.pattern.length > 0)
+    : []
   return {
     schema: 'winstage.mask.v1',
     source: 'src/paths.ts',
     generatedAt: new Date().toISOString(),
     counts: {
-      rules: MASK_CLASSES.length,
+      rules: MASK_CLASSES.length + extraEntries.length,
       probes: MASK_PROBES.length,
       selfMaskId: SELF_MASK_ID,
     },
@@ -654,22 +660,53 @@ export function exportMaskList() {
       invariant: 'maskKey(directory) === maskKey(directory + "\\\\")，且短名/长名写法得到同一个键，maskKey(f) === maskKey(f + ":$DATA")',
     },
     matchModeDefault: 'casefold-regex',
-    entries: MASK_CLASSES.map((rule) => ({
-      id: rule.id,
-      kind: maskEntryKind(rule.pattern),
-      pattern: rule.pattern.source,
-      flags: rule.pattern.flags,
-      matchMode: 'casefold',
-      category: rule.category,
-      reason: rule.reason,
-    })),
+    entries: [
+      ...MASK_CLASSES.map((rule) => ({
+        id: rule.id,
+        kind: maskEntryKind(rule.pattern),
+        pattern: rule.pattern.source,
+        flags: rule.pattern.flags,
+        matchMode: 'casefold',
+        category: rule.category,
+        reason: rule.reason,
+      })),
+      ...extraEntries.map((entry) => ({
+        id: entry.id ?? 'runtime-root',
+        kind: 'path',
+        pattern: entry.pattern,
+        flags: 'i',
+        matchMode: 'casefold',
+        category: entry.category ?? '本工具自身存储',
+        reason: entry.reason ?? '运行时路径（暂存/注入组件所在目录）',
+      })),
+    ],
     probes: MASK_PROBES.map((probe) => ({ id: probe.id, path: probe.path, maskClass: probe.maskClass ?? null })),
+  }
+}
+
+/**
+ * Build a hard read-mask entry for a runtime directory (the staging store, the
+ * plugin install root). The shim's matcher is a case-insensitive regex search;
+ * the source is anchored so "/x/store2" does not match "/x/store".
+ */
+export function maskRootEntry(root, { id, category, reason } = {}) {
+  const raw = typeof root === 'string' ? root.trim() : ''
+  const norm = raw.replace(/[\\/]+$/, '')
+  if (!norm || !(/^[a-zA-Z]:\\/.test(norm) || /^\\\\/.test(norm))) {
+    return null
+  }
+  const escaped = norm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return {
+    id: id ?? 'runtime-root',
+    pattern: `^${escaped}(\\\\|$)`,
+    category: category ?? '本工具自身存储',
+    reason: reason ?? '暂存/注入组件所在目录（对 agent 不可见）',
   }
 }
 
 /** 序列化（`pretty=false` 用于喂 shim；默认 pretty 便于人读与 diff） */
 export function exportMaskJson(options = {}) {
-  return JSON.stringify(exportMaskList(), null, options.pretty === false ? 0 : 2)
+  return JSON.stringify(exportMaskList(options), null, options.pretty === false ? 0 : 2)
 }
 
 /**

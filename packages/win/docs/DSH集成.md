@@ -1282,6 +1282,9 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
   键不存在、Application 日志标记仍在。`schtasks` 也改道到 `winstage-probe.exe --task`，
   任务的 create/delete/run 记账、query 与 staged 状态一致，真实任务不存在。
   卷影/Defender/防火墙/BCD 仍按文本策略拒绝（对外只返回普通 `Access is denied.`）。
-  细节与未覆盖面见报告 §6.4/§6.5。
+- 透明性第一批（同日）：shim 档命令 cwd 改为**逻辑工作区**；会话存储/插件根加入运行时
+  读掩码；私有 TEMP 改为 `%TEMP%\tmp\<uuid>`；`FindFirstFile` 合并真实目录与暂存目录
+  （staged 文件在 `dir`/PowerShell 里可见）；注入器与子进程不再闪窗。残余见报告 §8.5。
+  细节与未覆盖面见报告 §6.4/§6.5、§8。
 - 落地建议：不可信 agent 必须用 NT（ProjFS + minifilter）档；TS 档需把"服务侧写入不在边界内"
   显式标注为未覆盖，并补齐 cwd/temp/自身存储的视图收敛。

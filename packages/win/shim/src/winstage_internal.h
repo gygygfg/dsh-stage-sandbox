@@ -63,6 +63,11 @@ typedef struct WsConfig {
      * otherwise a child shim falls back to the file staging root and writes
      * `registry/overlay.hive*` INSIDE the staged tree (2026-11-23, real host). */
     wchar_t regStageDir[WS_PATH_MAX];
+    /* Plugin install root (derived from this DLL's own path). Agent-visible
+     * enumeration/reads are denied here: the shim/probe/injector names are a
+     * direct "you are sandboxed" tell. Internal loader reads happen before the
+     * hooks exist and are unaffected. */
+    wchar_t pluginRoot[WS_PATH_MAX];
     int unstagedWrites;     /* 1 = deny (default, fail closed), 2 = allow the real API */
     int disableFileFamily;  /* debug/triage: leave the file-family hooks uninstalled */
     int disableRegFamily;   /* debug/triage: leave the registry-family hooks uninstalled */

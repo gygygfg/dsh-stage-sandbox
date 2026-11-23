@@ -46,7 +46,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
 import { classifyServiceSideWrite, SERVICE_SIDE_CHANNELS, serviceSideRedirectFor } from './service-side.ts'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
@@ -59,7 +59,7 @@ import { CREATE_NEW_CONSOLE } from './appcontainer-runtime.ts'
 // 不在本文件重写一份"哪些路径算敏感"：shim 消费的是同一份 `MASK_CLASSES` 投影
 // （`exportMaskJson()` 的 entries/probes 与内部表逐条同源），因此工具层判定与
 // 进程级 read mask 不可能漂移。
-import { exportMaskJson } from './paths.ts'
+import { exportMaskJson, maskRootEntry } from './paths.ts'
 // ── 缺陷③：陈旧 AppContainer 包 SID ACE 的判据只从 `src/appcontainer.ts` 来 ──────
 // 不在本文件重写 SDDL 解析：判据漂移会让"修复"和"测量"对不上。
 // Phase 2 / WP1：暂存根授权的**回读判据**用同一个解析器（`parseSddlDaclAces`），
@@ -2720,7 +2720,18 @@ export class WindowsStageExecutor {
     try {
       mkdirSync(maskSessionDir, { recursive: true })
       readDenyFile = join(maskSessionDir, 'read-deny.mask.json')
-      writeFileSync(readDenyFile, `${exportMaskJson({ pretty: false })}\n`, 'utf8')
+      writeFileSync(
+        readDenyFile,
+        `${exportMaskJson({
+          pretty: false,
+          extraEntries: buildRuntimeMaskEntries({
+            sessionDir: maskSessionDir,
+            stagingRoot: this.stagingRoot,
+            dllPath: this.transparent?.artifacts?.dllPath,
+          }),
+        })}\n`,
+        'utf8',
+      )
       this.readDenyMask = { path: readDenyFile, bytes: statSync(readDenyFile).size }
     } catch (error) {
       const maskError = fail(
@@ -2892,7 +2903,18 @@ export class WindowsStageExecutor {
     const maskSessionDir = registryStageDir || tempDir
     mkdirSync(maskSessionDir, { recursive: true })
     const readDenyFile = join(maskSessionDir, 'read-deny.mask.json')
-    writeFileSync(readDenyFile, `${exportMaskJson({ pretty: false })}\n`, 'utf8')
+    writeFileSync(
+      readDenyFile,
+      `${exportMaskJson({
+        pretty: false,
+        extraEntries: buildRuntimeMaskEntries({
+          sessionDir: maskSessionDir,
+          stagingRoot: this.stagingRoot,
+          dllPath: this.transparent?.artifacts?.dllPath,
+        }),
+      })}\n`,
+      'utf8',
+    )
     this.readDenyMask = { path: readDenyFile, bytes: statSync(readDenyFile).size }
     const { configPath, config, logRotation } = writeShimConfig({
       stageRoot: this.stagingRoot,
@@ -4212,8 +4234,25 @@ export class WindowsStageExecutor {
     if (options.skipStagingWritePreflight !== true) {
       this.assertStagingWriteEnforceable({ command: options.command, args: options.args })
     }
-    const cwd = options.cwd || this.stagingRoot
-    if (!sameDirOrInside(this.stagingRoot, cwd)) {
+    /**
+     * ── 透明性：shim 档的命令在**逻辑工作区**里执行 ────────────────────────────
+     *
+     * 旧实现把子进程 cwd 设成暂存树，于是 `dir .` / `cd` 会直接暴露暂存布局
+     * （`fs`、`wo`、`winstage-shim.config.json`），而且为了不打断相对路径，
+     * 暂存根不能进读掩码。shim 档的写入本来就被垫片重定向，所以让命令以真实
+     * 工作区为 cwd 是安全且透明的：相对写仍落到暂存树。
+     * 非 shim 档（T1/T0）保持"cwd 必须在暂存根内"的硬约束。
+     */
+    let cwd = options.cwd || this.stagingRoot
+    if (
+      this.launchMode === 'shim' &&
+      typeof options.logicalCwd === 'string' &&
+      options.logicalCwd.length > 0 &&
+      isAbsolute(options.logicalCwd)
+    ) {
+      cwd = options.logicalCwd
+    }
+    if (this.launchMode !== 'shim' && !sameDirOrInside(this.stagingRoot, cwd)) {
       throw fail('CWD_OUTSIDE_STAGING', `cwd ${cwd} is outside the staged root ${this.stagingRoot}`)
     }
     // CreateProcess 的 lpCurrentDirectory 必须真实存在，否则同样是 Win32 2。
@@ -6097,9 +6136,41 @@ function cleanupTargets(targets) {
 }
 
 export function defaultPrivateTemp() {
-  const base = join(tmpdir(), 'dsh-stage-temp')
+  /* An innocuous name: `%TEMP%\tmp\<uuid>` is what any tool might use. The
+   * old `dsh-stage-temp` was a direct "sandbox" tell in the agent's TEMP. */
+  const base = join(tmpdir(), 'tmp')
   mkdirSync(base, { recursive: true })
   return join(base, randomUUID())
+}
+
+/**
+ * Runtime read-mask entries for this session. The static table in paths.ts
+ * knows about `\.dshstage`; the real store is a per-session directory under
+ * `%LOCALAPPDATA%\Temp`, plus the plugin install root. Both are appended to
+ * the shim's mask so the agent cannot read/enumerate them.
+ */
+export function buildRuntimeMaskEntries({ sessionDir, stagingRoot, dllPath } = {}) {
+  const entries = []
+  const add = (dir, id, category, reason) => {
+    const entry = maskRootEntry(dir, { id, category, reason })
+    if (entry) entries.push(entry)
+  }
+  if (typeof sessionDir === 'string' && sessionDir) add(sessionDir, 'store-session')
+  if (typeof sessionDir === 'string' && sessionDir) {
+    const parent = dirname(sessionDir)
+    if (basename(parent).toLowerCase() === 'winstage-stage') add(parent, 'store-base')
+  }
+  if (typeof stagingRoot === 'string' && stagingRoot) add(stagingRoot, 'store-stage-root')
+  if (typeof dllPath === 'string' && dllPath) {
+    const dllDir = dirname(dllPath)
+    const parent = dirname(dllDir)
+    const root = dirname(parent)
+    /* <plugin>\shim\out\winstage-shim.dll -> mask <plugin> */
+    if (basename(parent).toLowerCase() === 'shim' && basename(dllDir).toLowerCase() === 'out') {
+      add(root, 'plugin-root', '本工具安装目录', '暂存/注入组件所在目录（对 agent 不可见）')
+    }
+  }
+  return entries
 }
 
 export function canonicalDir(target) {
@@ -6711,7 +6782,7 @@ export function runCapturedToFiles(file, args, options = {}) {
       env: options.env,
       stdio: ['ignore', outFd, errFd],
       timeout: options.timeoutMs ?? 60000,
-      windowsHide: false,
+      windowsHide: true,
     })
     status = result.status
     signal = result.signal
@@ -7442,7 +7513,7 @@ export async function spawnCapturedAsync(file, args, options = {}) {
       cwd: options.cwd,
       env: options.env,
       stdio: ['ignore', outFd, errFd],
-      windowsHide: false,
+      windowsHide: true,
     })
   } finally {
     closeSync(outFd)

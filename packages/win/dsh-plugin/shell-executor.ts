@@ -1908,9 +1908,9 @@ export function createWinStageShellExecutor(options = {}) {
           ? workspace.store.stagedDir
           : undefined
       const logicalRoot =
-        stagedRoot ??
-        (typeof request?.workdir === 'string' && request.workdir.length > 0 ? request.workdir : undefined) ??
         (typeof workspace?.root === 'string' && workspace.root.length > 0 ? workspace.root : undefined) ??
+        (typeof request?.workdir === 'string' && request.workdir.length > 0 ? request.workdir : undefined) ??
+        stagedRoot ??
         ''
       const requested = request?.timeoutMs
       if (requested !== undefined && (!Number.isFinite(requested) || requested <= 0)) {
@@ -2346,8 +2346,10 @@ export function createWinStageShellExecutor(options = {}) {
           execution = await executor.run({
             command: argv.command,
             args: argv.args,
+            /* cwd 仍是暂存根（T1 档必须），shim 档由 executor 换成本次逻辑工作区根；
+             * 这样 agent 的 `dir .` / `cd` 看到的是真实工作区，而不是暂存布局。 */
             cwd: stagedDir,
-            logicalCwd: stagedDir,
+            logicalCwd: workspace?.root ?? stagedDir,
             timeoutMs: spec.timeoutMs,
             env: environment,
           })

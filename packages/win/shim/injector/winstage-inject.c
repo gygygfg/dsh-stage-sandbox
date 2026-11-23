@@ -23,6 +23,7 @@
  * caller redirects them), and the JSON report goes to --report.
  */
 #include <windows.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -459,6 +460,11 @@ int wmain(int argc, wchar_t **argv)
     BOOL envBuilt = inheritEnv ? FALSE : build_environment(sets, setCount, &o.envBlock);
 
     DWORD creationFlags = CREATE_UNICODE_ENVIRONMENT | (noSuspend ? 0u : CREATE_SUSPENDED);
+    /* No console in this process (GUI subsystem / executor pipes) => do not let
+     * the child allocate a visible console window. Its std handles are inherited. */
+    if (!GetConsoleWindow()) {
+        creationFlags |= CREATE_NO_WINDOW;
+    }
 
     {
         size_t dllLen = (wcslen(o.dll) + 1) * sizeof(wchar_t);
@@ -723,3 +729,25 @@ int wmain(int argc, wchar_t **argv)
     CloseHandle(pi.hProcess);
     return rc;
 }
+
+/* A console subsystem injector flashes a console window for every command the
+ * agent runs (and for every wmic-created injector). Build with
+ * -DWINSTAGE_GUI_SUBSYSTEM -mwindows so CreateProcess does not allocate a
+ * console; the child still gets the inherited std handles (pipes/files). */
+#ifdef WINSTAGE_GUI_SUBSYSTEM
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdShow)
+{
+    (void)hInst;
+    (void)hPrev;
+    (void)lpCmdLine;
+    (void)nCmdShow;
+    int argc = 0;
+    wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) {
+        return 112;
+    }
+    int rc = wmain(argc, argv);
+    LocalFree(argv);
+    return rc;
+}
+#endif

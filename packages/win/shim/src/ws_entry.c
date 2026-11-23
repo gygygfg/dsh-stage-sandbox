@@ -145,6 +145,45 @@ static int ws_init_full(const wchar_t *configJsonPath)
     if (!g_stageBound) {
         g_wsStage = g_defaultStage;
     }
+    /* Derive the plugin install root from our own module path
+     * (<root>\shim\out\winstage-shim.dll). Only when that exact shape is
+     * present; a relocated/copied DLL must not mask an unrelated directory. */
+    {
+        HMODULE self = NULL;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)(const void *)&g_ws, &self) &&
+            self) {
+            wchar_t dll[WS_PATH_MAX];
+            DWORD n = GetModuleFileNameW(self, dll, WS_PATH_MAX);
+            if (n > 0 && n < WS_PATH_MAX) {
+                wchar_t dir1[WS_PATH_MAX], dir2[WS_PATH_MAX], dir3[WS_PATH_MAX];
+                ws_strlcpy_w(dir1, dll, WS_PATH_MAX);
+                wchar_t *s1 = wcsrchr(dir1, L'\\');
+                if (s1) {
+                    *s1 = 0;
+                    ws_strlcpy_w(dir2, dir1, WS_PATH_MAX);
+                    wchar_t *s2 = wcsrchr(dir2, L'\\');
+                    if (s2) {
+                        *s2 = 0;
+                        const wchar_t *b1 = wcsrchr(dir1, L'\\');
+                        const wchar_t *b2 = wcsrchr(dir2, L'\\');
+                        b1 = b1 ? b1 + 1 : dir1;
+                        b2 = b2 ? b2 + 1 : dir2;
+                        ws_strlcpy_w(dir3, dir2, WS_PATH_MAX);
+                        wchar_t *s3 = wcsrchr(dir3, L'\\');
+                        if (s3) {
+                            *s3 = 0;
+                            if (_wcsicmp(b1, L"out") == 0 && _wcsicmp(b2, L"shim") == 0 &&
+                                wcslen(dir3) > 2) {
+                                ws_strlcpy_w(g_ws.pluginRoot, dir3, WS_PATH_MAX);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     /* Attach T3's registry staging (app hive + WAL). The session directory is
      * either WINSTAGE_REGSTAGE_SESSION_DIR, DSH_REGSTAGE_ROOT (T3's name), or the
      * file staging root. Failure is not fatal for the file layer but makes every

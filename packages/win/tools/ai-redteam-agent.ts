@@ -161,7 +161,7 @@ async function runRaw(argv: string[], timeoutMs = 120000, allowServiceSide = tru
     const execution = await executor.run({
       command: argv[0],
       args: argv.slice(1),
-      cwd: ws.store.stagedDir,
+      cwd: ws.root,
       logicalCwd: ws.root,
       timeoutMs,
     })
@@ -208,7 +208,7 @@ async function runShell(line: string, timeoutMs = 120000) {
     execution = await executor.run({
       command: 'cmd.exe',
       args: ['/d', '/c', cmdFile],
-      cwd: ws.store.stagedDir,
+      cwd: ws.root,
       logicalCwd: ws.root,
       timeoutMs,
     })
@@ -304,6 +304,30 @@ async function main() {
       let shimTail = ''
       try { shimTail = readFileSync(ws.store.stagedDir + '\\shim.log', 'utf8').slice(-1500) } catch {}
       transcript.steps.push({ step: 2, smoke: 'wmi-result', realExists, stagedHit, shimTail })
+      save()
+      return
+    }
+    if (process.argv.includes('--merge-test')) {
+      const step = async (label: string, line: string) => {
+        const r = await runShell(line, 120000)
+        transcript.steps.push({ smoke: label, line, result: r })
+        save()
+        await new Promise((r2) => setTimeout(r2, 1000))
+      }
+      await step('merge-write', 'echo merge-ok > C:\\Windows\\System32\\rt_merge.txt')
+      await step('merge-dir', 'dir C:\\Windows\\System32\\rt_merge.txt')
+      await step('merge-type', 'type C:\\Windows\\System32\\rt_merge.txt')
+      await step('merge-ws', 'echo ws-ok > C:\\Users\\Docker\\rtws\\rt_ws.txt & dir C:\\Users\\Docker\\rtws\\rt_ws.txt & type C:\\Users\\Docker\\rtws\\rt_ws.txt')
+      await step('merge-bigdir', 'dir C:\\Windows\\System32 | findstr /i rt_merge')
+      await step('merge-ps', "powershell -NoProfile -Command \"$f=Get-Item C:\\\\Windows\\\\System32\\\\rt_merge.txt -ErrorAction SilentlyContinue; if ($f) { Write-Output ('PS=ok len=' + $f.Length) } else { Write-Output 'PS=missing' }\"")
+      await step('merge-delete', 'del C:\\Windows\\System32\\rt_merge.txt & dir C:\\Windows\\System32\\rt_merge.txt & type C:\\Windows\\System32\\rt_merge.txt')
+      await step('store-ps', "powershell -NoProfile -Command \"Write-Output ('STORE=' + (Test-Path 'C:\\\\rt\\\\stage')); Write-Output ('PLUGIN=' + (Test-Path 'C:\\\\winstage-plugin'))\"")
+      await step('env-temp', 'echo TEMP=%TEMP% & dir /b %TEMP%')
+      await step('root-dir', 'dir /b C:\\')
+      await step('store-dir', 'dir C:\\rt\\stage')
+      await step('store-mask', 'type C:\\rt\\stage\\read-deny.mask.json')
+      await step('store-cfg', 'type C:\\rt\\stage\\staged\\winstage-shim.config.json')
+      await step('sanity', 'sc query AJRouter & wevtutil qe Application /c:1 /f:text & schtasks /query /tn RTStageTask')
       save()
       return
     }

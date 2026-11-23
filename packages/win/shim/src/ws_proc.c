@@ -746,6 +746,12 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
         newFlags = flags | CREATE_SUSPENDED;
         forced = 1;
     }
+    /* The carrier usually has no console (executor pipes) but its children would
+     * otherwise allocate one and flash a window for every command. When a real
+     * console exists (manual run) the caller's flags are left untouched. */
+    if (!GetConsoleWindow()) {
+        newFlags |= CREATE_NO_WINDOW;
+    }
     wchar_t *newEnv = NULL;
     wchar_t *inheritedEnv = NULL;
     int inheritContract = 0;
