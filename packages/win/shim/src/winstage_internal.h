@@ -483,7 +483,12 @@ void ws_config_from_env(void);
 void ws_env_scrub_contract(void);
 int ws_config_get_string(const char *json, const char *key, wchar_t *out, DWORD cch);
 int ws_config_get_bool(const char *json, const char *key, int *out);
-int ws_read_text_file(const wchar_t *path, char **out, DWORD *outLen); /* HeapAlloc; NUL-terminated */
+int ws_read_text_file(const wchar_t *path, char **out, DWORD *outLen);
+/* Existence on the REAL disk, bypassing the overlay AND the read mask
+ * (kernelbase CreateFileW -> NtCreateFile, whose core slot stays real).
+ * Used by the shim itself for paths the agent must not see, e.g. the helper
+ * directory once it is read-masked. */
+int ws_real_exists_raw(const wchar_t *path); /* HeapAlloc; NUL-terminated */
 /* File opens used *inside* the shim: routed through the captured original
  * CreateFileW when available, because the IAT pass does not reliably skip this
  * module and a direct call re-enters the hooks (that recursion is what produced

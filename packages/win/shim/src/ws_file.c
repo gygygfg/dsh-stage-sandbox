@@ -871,7 +871,7 @@ static int ws_file_exists(const wchar_t *norm)
  * enumeration dropped every staged-only entry as a duplicate). kernelbase's
  * `CreateFileW` reaches `NtCreateFile`, whose core-module slot is deliberately
  * left real, so this probe lands on the real disk. */
-static int ws_real_exists_raw(const wchar_t *path)
+int ws_real_exists_raw(const wchar_t *path)
 {
     DWORD saved = GetLastError();
     int exists = 0;

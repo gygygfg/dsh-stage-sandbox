@@ -485,13 +485,10 @@ static int ws_helper_path(const wchar_t *neutral, const wchar_t *legacy, wchar_t
     if (g_ws.helperDir[0] && neutral && neutral[0]) {
         _snwprintf(out, cch, L"%ls\\%ls", g_ws.helperDir, neutral);
         out[cch - 1] = 0;
-        DWORD attr;
-        if (g_orig.GetFileAttributesW) {
-            attr = g_orig.GetFileAttributesW(out);
-        } else {
-            attr = GetFileAttributesW(out);
-        }
-        if (attr != INVALID_FILE_ATTRIBUTES) {
+        /* The helper directory is read-masked for sandboxed processes, and
+         * g_orig.GetFileAttributesW still reaches NtQueryAttributesFile (which
+         * we hook) -- so ask the real disk instead. */
+        if (ws_real_exists_raw(out)) {
             return 2;
         }
     }
@@ -870,10 +867,20 @@ static int ws_wmic_write_utf8(HANDLE file, const wchar_t *text, int len)
 static int ws_wmic_write_script(const wchar_t *inner, int innerLen, wchar_t *outPath, DWORD cch)
 {
     /* The script is executed by an INJECTED child, so it must live outside the
-     * read-masked store (a script in the store was denied to its own reader:
-     * measured as `Access is denied.` and the WMI command silently not running). */
-    const wchar_t *dir = g_ws.helperDir[0] ? g_ws.helperDir
-                         : (g_ws.regStageDir[0] ? g_ws.regStageDir : g_ws.stageRoot);
+     * read-masked store AND outside the read-masked helper dir (both were
+     * measured: `Access is denied.` / "not recognized", command silently not
+     * running). The private TEMP root is the one place that is neither. */
+    wchar_t dir[WS_PATH_MAX];
+    dir[0] = 0;
+    if (g_ws.helperDir[0]) {
+        ws_strlcpy_w(dir, g_ws.helperDir, WS_PATH_MAX);
+        wchar_t *slash = wcsrchr(dir, L'\\');
+        if (slash && slash != dir) {
+            *slash = 0; /* <temp>\.h -> <temp> */
+        }
+    } else if (g_ws.stageRoot[0]) {
+        ws_strlcpy_w(dir, g_ws.stageRoot, WS_PATH_MAX);
+    }
     static volatile LONG seq = 0;
     _snwprintf(outPath, cch, L"%ls\\.wmi-%lu-%ld.cmd", dir, (unsigned long)GetCurrentProcessId(),
                (long)InterlockedIncrement(&seq));

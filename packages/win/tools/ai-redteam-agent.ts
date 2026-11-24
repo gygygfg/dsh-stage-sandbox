@@ -324,6 +324,32 @@ async function main() {
       save()
       return
     }
+    if (process.argv.includes('--r54')) {
+      const step = async (label: string, line: string, timeoutMs = 120000) => {
+        const started = Date.now()
+        const r = await runShell(line, timeoutMs)
+        transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
+        save()
+        await new Promise((r2) => setTimeout(r2, 700))
+      }
+      await step('v1-helper', 'dir /a %TEMP% & echo === & dir /a %TEMP%\\.h & echo === & type %TEMP%\\.h\\launcher.cfg & echo CFG_RC=%ERRORLEVEL%')
+      await step(
+        'v2-tree',
+        'powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -in @(\'cmd.exe\',\'launcher.exe\') } | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath | Format-Table -AutoSize | Out-String -Width 200"',
+      )
+      await step(
+        'v3-wmi',
+        'wmic process call create "cmd /c echo wmi5 ^> C:\\Windows\\System32\\rt_wmi5.txt" & ping -n 5 127.0.0.1 >nul & type C:\\Windows\\System32\\rt_wmi5.txt',
+      )
+      await step(
+        'v4-svc',
+        'sc qfailure AJRouter & echo === & sc qsecurity AJRouter & echo === & schtasks /create /tn R54Task /tr "cmd /c echo hi" /sc once /st 23:59 /f & schtasks /query /tn R54Task',
+      )
+      await step('v5-mods', 'tasklist /m /fi "imagename eq cmd.exe"')
+      await step('v6-realpath', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\\ProgramData\\diag\\rp.ps1', 120000)
+      save()
+      return
+    }
     if (process.argv.includes('--r53')) {
       const step = async (label: string, line: string, timeoutMs = 180000) => {
         const started = Date.now()

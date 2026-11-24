@@ -60,7 +60,7 @@ import { CREATE_NEW_CONSOLE } from './appcontainer-runtime.ts'
 // 不在本文件重写一份"哪些路径算敏感"：shim 消费的是同一份 `MASK_CLASSES` 投影
 // （`exportMaskJson()` 的 entries/probes 与内部表逐条同源），因此工具层判定与
 // 进程级 read mask 不可能漂移。
-import { exportMaskJson, maskFileEntry, maskRootEntry } from './paths.ts'
+import { exportMaskJson, maskRootEntry } from './paths.ts'
 // ── 缺陷③：陈旧 AppContainer 包 SID ACE 的判据只从 `src/appcontainer.ts` 来 ──────
 // 不在本文件重写 SDDL 解析：判据漂移会让"修复"和"测量"对不上。
 // Phase 2 / WP1：暂存根授权的**回读判据**用同一个解析器（`parseSddlDaclAces`），
@@ -2730,6 +2730,7 @@ export class WindowsStageExecutor {
             stagingRoot: this.stagingRoot,
             dllPath: this.transparent?.artifacts?.dllPath,
             privateTempDir: tempDir,
+            helperDir: join(tempDir, '.h'),
           }),
         })}\n`,
         'utf8',
@@ -2750,6 +2751,7 @@ export class WindowsStageExecutor {
       logPath,
       extraPassthrough: this.options.shimPassthrough ?? [],
       readDenyFile,
+      /* the masked helper dir must still let the injected cmd read its WMI script */
     })
     this.shimLogRotation = logRotation
     /* ★ Method A（主线）：结构化操作审计。shim 把**整条进程树**的每一次被 hook 的
@@ -2931,6 +2933,7 @@ export class WindowsStageExecutor {
           stagingRoot: this.stagingRoot,
           dllPath: this.transparent?.artifacts?.dllPath,
           privateTempDir: this.tempDir,
+          helperDir: join(this.tempDir, '.h'),
         }),
       })}\n`,
       'utf8',
@@ -4136,9 +4139,9 @@ export class WindowsStageExecutor {
     if (!artifacts?.injectorPath || !artifacts?.dllPath || !configPath || !regDir) return null
     let scriptPath
     try {
-      /* Outside the masked session store: the command that reads this script is
-       * itself injected, so a store path would be denied to it. */
-      scriptPath = join(this.helperArtifacts?.helperDir ?? regDir, `.wmi-${process.pid}-${randomUUID().slice(0, 6)}.cmd`)
+      /* Outside the masked session store AND the masked helper dir: the command
+       * that reads this script is itself injected. */
+      scriptPath = join(this.tempDir ?? regDir, `.wmi-${process.pid}-${randomUUID().slice(0, 6)}.cmd`)
       writeFileSync(scriptPath, `@chcp 65001>nul\r\n@echo off\r\n${inner}\r\n`, 'utf8')
     } catch {
       return null
@@ -6250,7 +6253,7 @@ function ensureCopy(source, target) {
  * `%LOCALAPPDATA%\Temp`, plus the plugin install root. Both are appended to
  * the shim's mask so the agent cannot read/enumerate them.
  */
-export function buildRuntimeMaskEntries({ sessionDir, stagingRoot, dllPath, privateTempDir } = {}) {
+export function buildRuntimeMaskEntries({ sessionDir, stagingRoot, dllPath, privateTempDir, helperDir } = {}) {
   const entries = []
   const add = (dir, id, category, reason) => {
     const entry = maskRootEntry(dir, { id, category, reason })
@@ -6262,15 +6265,18 @@ export function buildRuntimeMaskEntries({ sessionDir, stagingRoot, dllPath, priv
     if (basename(parent).toLowerCase() === 'winstage-stage') add(parent, 'store-base')
   }
   if (typeof stagingRoot === 'string' && stagingRoot) add(stagingRoot, 'store-stage-root')
-  if (typeof privateTempDir === 'string' && privateTempDir) {
-    /* The helper job file names the DLL/staging paths; the helper reads the
-     * values from the shim instead, so the file can be read-masked. */
-    const jobPath = join(privateTempDir, '.h', 'launcher.cfg')
-    const entry = maskFileEntry(jobPath, {
-      id: 'helper-job',
+  {
+    /* The per-session helper directory holds the neutral launcher/probe copies
+     * and the job file that names the DLL/staging paths. Mask the DIRECTORY so
+     * `dir /a %TEMP%\tmp\<session>` shows nothing at all; the only reader inside
+     * the sandbox is the injected helper, which gets its values from the shim
+     * (`WinstageShimJobValue`) instead of the file. */
+    const dir = typeof helperDir === 'string' && helperDir ? helperDir : (typeof privateTempDir === 'string' && privateTempDir ? join(privateTempDir, '.h') : '')
+    const entry = dir ? maskRootEntry(dir, {
+      id: 'helper-dir',
       category: '本工具自身存储',
-      reason: '会话运行参数（含组件/暂存路径，对 agent 不可见）',
-    })
+      reason: '会话运行组件（中立名副本 + 运行参数，对 agent 不可见）',
+    }) : null
     if (entry) entries.push(entry)
   }
   if (typeof dllPath === 'string' && dllPath) {
@@ -6838,7 +6844,14 @@ export function rotateShimLog(logPath, maxBytes = SHIM_LOG_MAX_BYTES) {
   }
 }
 
-export function writeShimConfig({ stageRoot, logPath, extraPassthrough = [], readDenyFile, readDenyFailClosed = true }) {
+export function writeShimConfig({
+  stageRoot,
+  logPath,
+  extraPassthrough = [],
+  readDenyFile,
+  readDenyFailClosed = true,
+  readAllow = [],
+}) {
   const configPath = join(stageRoot, 'winstage-shim.config.json')
   const effectiveLogPath = logPath ?? join(stageRoot, 'shim.log')
   const rotation = rotateShimLog(effectiveLogPath)
@@ -6857,6 +6870,7 @@ export function writeShimConfig({ stageRoot, logPath, extraPassthrough = [], rea
     ...(typeof readDenyFile === 'string' && readDenyFile.length > 0
       ? { readDenyFile, readDenyFailClosed: readDenyFailClosed !== false }
       : {}),
+    ...(Array.isArray(readAllow) && readAllow.length > 0 ? { readAllow } : {}),
     passthrough,
   }
   writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8')

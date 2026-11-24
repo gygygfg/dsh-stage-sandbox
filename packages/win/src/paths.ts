@@ -728,6 +728,25 @@ export function maskFileEntry(file, { id, category, reason } = {}) {
   }
 }
 
+/**
+ * Regex (for the shim's `readAllow` list) matching `<dir>\<leafPattern>`.
+ *
+ * The only reason this exists: the helper directory is read-masked, but the
+ * injected `cmd.exe` must still READ the per-command WMI script the shim writes
+ * there (`<helper>\.wmi-<pid>-<n>.cmd`). The allow list is evaluated before the
+ * deny list, so that one file stays readable while the directory itself does
+ * not exist for the agent.
+ */
+export function readAllowUnder(dir, leafPattern) {
+  const raw = typeof dir === 'string' ? dir.trim() : ''
+  const norm = raw.replace(/[\\/]+$/, '')
+  if (!norm || !(/^[a-zA-Z]:\\/.test(norm) || /^\\\\/.test(norm))) {
+    return null
+  }
+  const escaped = norm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return `^${escaped}\\\\${leafPattern}`
+}
+
 /** 序列化（`pretty=false` 用于喂 shim；默认 pretty 便于人读与 diff） */
 export function exportMaskJson(options = {}) {
   return JSON.stringify(exportMaskList(options), null, options.pretty === false ? 0 : 2)
