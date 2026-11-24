@@ -1,26 +1,23 @@
-/* WinStageSandbox -- T4 shim: process injector.
+/* WinStageSandbox -- T4 shim: process injector (command-line helper).
  *
  * Method (d) from task-4: create the target process suspended, write the DLL
  * path into its address space, run a remote thread on kernel32!LoadLibraryW,
- * wait for it, then resume the main thread. The shim's DllMain auto-initializes
- * from the environment, so by the time the target's main thread executes its
- * first user instruction the hooks are already installed.
+ * wait for it, then call the exported WinstageShimInit remotely and resume the
+ * main thread. By the time the target's main thread executes its first
+ * instruction the hooks are installed.
  *
- * Rejected alternatives (reasons in docs/T4-shim?.md):
- *   - QueueUserAPC(LoadLibraryW): early APCs are not reliably delivered to all
- *     processes before the entry point runs (and never to console-less ones).
- *   - PE import-table rewriting of the child: changes the on-disk/in-memory
- *     image, breaks signature assumptions, and is a much larger attack surface.
- *   - AppInit_DLLs / IFEO: writes global machine state (registry), which is
- *     exactly what this project must not do.
+ * The launch/inject sequence itself lives in ws_launch.c: the host's native
+ * addon (shim/addon/winstage-addon.c) uses the very same code, so it can create
+ * the child **inside the harness process** instead of spawning this helper.
+ * This file is now only the CLI/reporting shell around it.
  *
  * Usage:
  *   winstage-inject.exe --dll <path> [--set-env NAME=VALUE]... [--report <file>]
- *                       [--cwd <dir>] [--timeout-ms <n>] -- <exe> [args...]
+ *                       [--cwd <dir>] [--timeout-ms <n>] [--forward-stdin]
+ *                       -- <exe> [args...]
  *
  * Exit codes: 111 = injection failure, 112 = bad usage; otherwise the child's
- * exit code. stdout/stderr of the child are inherited from this process (the
- * caller redirects them), and the JSON report goes to --report.
+ * exit code.
  */
 #include <windows.h>
 #include <shellapi.h>
@@ -28,22 +25,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
-#include <tlhelp32.h>
+
+#include "ws_launch.h"
 
 #define INJECT_FAILED 111
 #define USAGE_FAILED  112
-
-typedef struct {
-    wchar_t *dllPathStorage;
-    const wchar_t *dll;
-    const wchar_t *report;
-    const wchar_t *cwd;
-    DWORD timeoutMs;
-    DWORD childTimeoutMs;
-    const wchar_t *exe;
-    wchar_t *cmdline;      /* mutable, passed to CreateProcessW */
-    wchar_t *envBlock;     /* extra environment entries */
-} Options;
 
 static int write_report(const wchar_t *path, const char *json)
 {
@@ -79,9 +65,9 @@ static void json_escape_path(const wchar_t *path, char *out, size_t cch)
 /* ★ round-3 诊断（Lead）：注入器**分阶段**落报告。
  *
  * 动机（实测，`carrier-flake` 100 次里 2 次）：注入器退出码 0、子载体零输出，而
- * `--report` 指定的文件**根本不存在** —— 既没走成功路径（":498-503"）也没走
- * `fail()`（两条都写报告）。没有阶段信息就无法判断它停在哪一段。做法：参数解析完
- * 立刻写 `stage:"started"`，之后每过一个里程碑**覆盖**一次，正式结果同样覆盖它。
+ * `--report` 指定的文件**根本不存在** —— 既没走成功路径也没走 `fail()`（两条都写
+ * 报告）。没有阶段信息就无法判断它停在哪一段。做法：参数解析完立刻写
+ * `stage:"started"`，之后每过一个里程碑**覆盖**一次，正式结果同样覆盖它。
  * 本文件只是诊断产物（不属于 shim ABI），故常开；`write_report` 失败时把
  * "报告写不出去"也吐到 stderr，避免又一个静默失败。 */
 static void trace_stage(const wchar_t *report, const char *stage, unsigned long extra)
@@ -100,15 +86,15 @@ static void trace_stage(const wchar_t *report, const char *stage, unsigned long 
     }
 }
 
-static void fail(const wchar_t *report, const wchar_t *stage, const char *detail, DWORD lastError)
+static void fail(const wchar_t *report, const wchar_t *stage, const char *detail, DWORD error)
 {
-    char pathA[4096];
-    json_escape_path(stage, pathA, sizeof(pathA));
-    char json[5120];
+    char stageA[256];
+    json_escape_path(stage, stageA, sizeof(stageA));
+    char json[1024];
     snprintf(json, sizeof(json),
              "{\"ok\":false,\"tool\":\"winstage-inject\",\"stage\":\"%s\",\"error\":\"%s\","
              "\"win32Error\":%lu}\n",
-             pathA, detail, (unsigned long)lastError);
+             stageA, detail, (unsigned long)error);
     fputs(json, stderr);
     if (!write_report(report, json)) {
         fputs("{\"reportWrite\":\"failed\",\"stage\":\"fail\"}\n", stderr);
@@ -119,10 +105,9 @@ static void fail(const wchar_t *report, const wchar_t *stage, const char *detail
 /* ── stdin forwarding (2026-11-24) ──────────────────────────────────────────
  *
  * The command text must not appear on any command line: an agent that lists
- * processes would read `helper.exe -- cmd.exe /d /c C:\Windows\Temp\~x.cmd`
- * (measured). With `--forward-stdin` the caller writes the shell input to our
- * stdin; we hand it to the child through a pipe and create the child as a plain
- * `cmd.exe /d /q`, so the model-visible command line carries no script path.
+ * processes would read `helper.exe -- cmd.exe /d /c C:\Windows\Temp\~x.cmd`.
+ * With `--forward-stdin` the caller writes the shell input to our stdin; we hand
+ * it to the child through a pipe and create the child as a plain `cmd.exe /d /q`.
  */
 static int read_all_stdin(char **out, DWORD *outLen)
 {
@@ -162,74 +147,6 @@ static int read_all_stdin(char **out, DWORD *outLen)
     return 1;
 }
 
-static BOOL build_environment(const wchar_t *sets[], int setCount, wchar_t **out)
-{
-    /* Start from our own environment and append/override NAME=VALUE entries. */
-    wchar_t *cur = GetEnvironmentStringsW();
-    if (!cur) {
-        return FALSE;
-    }
-    size_t cap = 65536;
-    wchar_t *block = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, cap * sizeof(wchar_t));
-    if (!block) {
-        FreeEnvironmentStringsW(cur);
-        return FALSE;
-    }
-    size_t used = 0;
-    int append_block = 0;
-    for (wchar_t *p = cur; *p; p += wcslen(p) + 1) {
-        if ((p[0] == L'=' && p[1] != 0)) {
-            /* "=C:=C:\..." pseudo entries must be preserved verbatim and first */
-            append_block++;
-        }
-        size_t len = wcslen(p);
-        if (used + len + 2 >= cap) {
-            break;
-        }
-        memcpy(block + used, p, (len + 1) * sizeof(wchar_t));
-        used += len;
-        block[used++] = L'\0';
-    }
-    FreeEnvironmentStringsW(cur);
-    (void)append_block;
-
-    for (int i = 0; i < setCount; i++) {
-        const wchar_t *kv = sets[i];
-        const wchar_t *eq = wcschr(kv, L'=');
-        if (!eq) {
-            continue;
-        }
-        size_t nameLen = (size_t)(eq - kv);
-        /* remove an existing entry with the same name (case-insensitive) */
-        wchar_t *w = block;
-        while (*w) {
-            size_t len = wcslen(w);
-            if (_wcsnicmp(w, kv, nameLen) == 0 && w[nameLen] == L'=') {
-                memmove(w, w + len + 1, (used - (size_t)(w - block) - len) * sizeof(wchar_t));
-                used -= len + 1;
-                continue;
-            }
-            w += len + 1;
-        }
-        size_t len = wcslen(kv);
-        if (used + len + 2 >= cap) {
-            continue;
-        }
-        memcpy(block + used, kv, (len + 1) * sizeof(wchar_t));
-        used += len;
-        block[used++] = L'\0';
-    }
-    block[used] = L'\0';
-    /* Environment blocks are double-NUL terminated; the loop above already
-     * wrote the terminator for each entry, so ensure a final empty entry. */
-    if (used == 0 || block[used - 1] != L'\0') {
-        block[used++] = L'\0';
-    }
-    block[used] = L'\0';
-    *out = block;
-    return TRUE;
-}
-
 /* ── 无参数启动（透明性）──────────────────────────────────────────────────────
  *
  * 命令行走 `wmic process get CommandLine` 是可见的。真实红队 recon 正是从
@@ -257,7 +174,7 @@ static int b64_decode(const char *in, unsigned char *out, size_t cap)
     int bits = 0;
     size_t o = 0;
     for (const char *p = in; p && *p; p++) {
-        if (*p == '=' ) break;
+        if (*p == '=') break;
         if (*p == '\r' || *p == '\n' || *p == ' ' || *p == '\t') continue;
         int v = b64_value(*p);
         if (v < 0) return -1;
@@ -338,207 +255,20 @@ static int self_dir(wchar_t *out, DWORD cch)
     return 1;
 }
 
-/* Resolve the target the way CreateProcessW does NOT: SearchPathW with and
- * without the .exe extension, then an absolute path. Passing a bare "powershell.exe"
- * to lpApplicationName fails with Win32 2 -- the same gap as the project's
- * documented "no PATHEXT resolution" defect. */
-static BOOL resolve_executable(const wchar_t *in, wchar_t *out, DWORD cch)
-{
-    out[0] = 0;
-    wchar_t found[4096];
-    DWORD n = 0;
-    if (wcschr(in, L'\\') || wcschr(in, L'/')) {
-        if (GetFileAttributesW(in) != INVALID_FILE_ATTRIBUTES) {
-            n = GetFullPathNameW(in, cch, out, NULL);
-            return n > 0 && n < cch;
-        }
-        return FALSE;
-    }
-    if (SearchPathW(NULL, in, NULL, 4096, found, NULL) > 0) {
-        n = GetFullPathNameW(found, cch, out, NULL);
-        return n > 0 && n < cch;
-    }
-    if (SearchPathW(NULL, in, L".exe", 4096, found, NULL) > 0) {
-        n = GetFullPathNameW(found, cch, out, NULL);
-        return n > 0 && n < cch;
-    }
-    return FALSE;
-}
-
-/* Append one argument using the CommandLineToArgvW/MSVCRT quoting rules, so the
- * child's CRT parses the same argv the caller meant. */
-static BOOL append_quoted_arg(wchar_t *buf, size_t cap, size_t *pos, const wchar_t *arg)
-{
-    size_t len = wcslen(arg);
-    int needQuote = (len == 0);
-    for (size_t i = 0; i < len; i++) {
-        if (arg[i] == L' ' || arg[i] == L'\t' || arg[i] == L'"') {
-            needQuote = 1;
-            break;
-        }
-    }
-    if (*pos + 1 >= cap) {
-        return FALSE;
-    }
-    if (needQuote) {
-        buf[(*pos)++] = L'"';
-    }
-    size_t backslashes = 0;
-    for (size_t i = 0; i < len; i++) {
-        if (arg[i] == L'\\') {
-            backslashes++;
-            continue;
-        }
-        if (arg[i] == L'"') {
-            /* escape the quote and double the preceding backslashes */
-            for (size_t k = 0; k < backslashes * 2 + 1; k++) {
-                if (*pos + 1 >= cap) return FALSE;
-                buf[(*pos)++] = L'\\';
-            }
-            if (*pos + 1 >= cap) return FALSE;
-            buf[(*pos)++] = L'"';
-            backslashes = 0;
-            continue;
-        }
-        for (size_t k = 0; k < backslashes; k++) {
-            if (*pos + 1 >= cap) return FALSE;
-            buf[(*pos)++] = L'\\';
-        }
-        backslashes = 0;
-        if (*pos + 1 >= cap) return FALSE;
-        buf[(*pos)++] = arg[i];
-    }
-    /* trailing backslashes must be doubled inside quotes */
-    for (size_t k = 0; k < backslashes * (needQuote ? 2 : 1); k++) {
-        if (*pos + 1 >= cap) return FALSE;
-        buf[(*pos)++] = L'\\';
-    }
-    if (needQuote) {
-        if (*pos + 1 >= cap) return FALSE;
-        buf[(*pos)++] = L'"';
-    }
-    buf[*pos] = 0;
-    return TRUE;
-}
-
-/* ★ R20①（carrier）—— 延迟初始化的第二步。
- *
- * DllMain 现在**不做**初始化（只登记意图），所以远程 LoadLibraryW 成功只代表
- * "模块映射进来了"，钩子还没装。注入器在本进程把同一个 DLL 加载一次、用
- * GetProcAddress 拿到 `WinstageShimInit`，再用
-
- *     远程地址 = 远程模块基址 + (本地导出地址 - 本地模块基址)
-
- * 算出它在目标进程里的地址（同一 DLL 映像的相对偏移在两个进程里一致；系统 DLL
- * 同址的假设已在 LoadLibraryW 那步用过，这里是同一原理但更严格 —— 只用同一个文件）。
- * 之后在目标进程里起第二个远程线程调用它，等返回码（= 初始化结果）后才由调用方
- * ResumeThread。DllMain 已惰性化，因此这里在本进程的 LoadLibrary 不会装任何钩子。
- *
- * 失败处理：LoadLibrary 失败 ⇒ 老行为（fail closed）。初始化线程以异常码结束
- * ⇒ 进程没有可用钩子，同样 fail closed。初始化返回普通 Win32 错误码时保持旧语义
- * （注入成功、子进程继续；rc 写进报告），因为 DISABLE=1（rc=1058）与"配置不全导致
- * DllMain 初始化失败但进程照跑"在 R20 之前就是这个行为。 */
-/**
- * Find the module base of the DLL we just loaded in the target process.
- *
- * WHY THIS EXISTS (2026-11-23, real Windows 10 / x64):
- *   `LoadLibraryW` runs in a remote thread, and the only value we can read back
- *   through `GetExitCodeThread` is a **DWORD**. On x64 the module handle is a
- *   64-bit pointer (normally 0x7ff8...), so that read-back truncates it. Adding
- *   the export RVA to the truncated value made the "call WinstageShimInit"
- *   thread start at an unmapped / CFG-invalid address; the target died with
- *   `0xC0000409` and every injection ended in exit 111 ("remote
- *   WinstageShimInit failed"), which silently kept the whole lane on T1.
- *
- *   Enumerating the target's modules is the authoritative way to recover the
- *   real base: the loader already knows it, and the path match also rejects a
- *   stale copy that happens to be mapped into the target.
- *
- * @returns module base, or NULL when the snapshot cannot be taken (caller
- *          falls back to the legacy truncated handle).
- */
-static HMODULE find_remote_module(DWORD pid, const wchar_t *dllPath)
-{
-    if (!dllPath) {
-        return NULL;
-    }
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (snap == INVALID_HANDLE_VALUE) {
-        return NULL;
-    }
-    MODULEENTRY32W me;
-    memset(&me, 0, sizeof(me));
-    me.dwSize = sizeof(me);
-    HMODULE found = NULL;
-    if (Module32FirstW(snap, &me)) {
-        do {
-            if (me.szExePath[0] && _wcsicmp(me.szExePath, dllPath) == 0) {
-                found = (HMODULE)(void *)me.modBaseAddr;
-                break;
-            }
-            const wchar_t *a = wcsrchr(me.szExePath, L'\\');
-            const wchar_t *b = wcsrchr(dllPath, L'\\');
-            if (a && b && _wcsicmp(a + 1, b + 1) == 0) {
-                found = (HMODULE)(void *)me.modBaseAddr;
-                break;
-            }
-        } while (Module32NextW(snap, &me));
-    }
-    CloseHandle(snap);
-    return found;
-}
-
-static FARPROC resolve_remote_export(HMODULE remoteModule, const wchar_t *dllPath)
-{
-    if (!remoteModule || !dllPath) {
-        SetLastError(ERROR_INVALID_HANDLE);
-        return NULL;
-    }
-    HMODULE local = LoadLibraryExW(dllPath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!local) {
-        return NULL;
-    }
-    FARPROC localFn = GetProcAddress(local, "WinstageShimInit");
-    FARPROC remoteFn = NULL;
-    if (localFn) {
-        remoteFn = (FARPROC)((BYTE *)(ULONG_PTR)remoteModule + ((BYTE *)localFn - (BYTE *)local));
-    } else {
-        SetLastError(ERROR_PROC_NOT_FOUND);
-    }
-    FreeLibrary(local);
-    return remoteFn;
-}
-
 int wmain(int argc, wchar_t **argv)
 {
     /* Our launcher must never run with the shim already mapped: its DLL/job
      * precheck would then hit the sandbox mask on the plugin path. */
     if (GetModuleHandleW(L"winstage-shim.dll")) {
-        DWORD ppid = 0;
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snap != INVALID_HANDLE_VALUE) {
-            PROCESSENTRY32W pe;
-            memset(&pe, 0, sizeof(pe));
-            pe.dwSize = sizeof(pe);
-            if (Process32FirstW(snap, &pe)) {
-                do {
-                    if (pe.th32ProcessID == GetCurrentProcessId()) {
-                        ppid = pe.th32ParentProcessID;
-                        break;
-                    }
-                } while (Process32NextW(snap, &pe));
-            }
-            CloseHandle(snap);
-        }
-        fprintf(stderr, "inject: self already carries the shim (pid=%lu ppid=%lu)\n",
-                (unsigned long)GetCurrentProcessId(), (unsigned long)ppid);
+        fprintf(stderr, "inject: self already carries the shim (pid=%lu)\n",
+                (unsigned long)GetCurrentProcessId());
     }
-    Options o;
-    memset(&o, 0, sizeof(o));
-    o.timeoutMs = 30000;
-    o.childTimeoutMs = 300000; /* the child is terminated after this; a hung child
-                                * otherwise outlives the injector and keeps the DLL
-                                * and staging handles locked (real cleanup flakes) */
+    WsLaunchRequest req;
+    memset(&req, 0, sizeof(req));
+    req.timeoutMs = 30000;
+#ifndef WINSTAGE_DISABLE_NO_WINDOW
+    req.noWindow = 1;
+#endif
 
     const wchar_t *sets[64];
     int setCount = 0;
@@ -546,39 +276,38 @@ int wmain(int argc, wchar_t **argv)
      * creation can be bisected against the injection itself):
      *   --no-inject    create + resume the target WITHOUT the remote load
      *   --inherit-env  pass no environment block (let CreateProcessW inherit)  */
-    int noInject = 0;
     int inheritEnv = 0;
-    int noSuspend = 0;
     int forwardStdin = 0;
-    int noInherit = 0;
+    const wchar_t *reportPath = NULL;
     const wchar_t *jobPath = NULL;
+    DWORD childTimeoutMs = 300000; /* the child is terminated after this; a hung child
+                                    * otherwise outlives the injector and keeps the DLL
+                                    * and staging handles locked (real cleanup flakes) */
 
     int i = 1;
-    int sawDashDash = 0;
     for (; i < argc; i++) {
         if (wcscmp(argv[i], L"--") == 0) {
-            sawDashDash = 1;
             i++;
             break;
         }
         if (wcscmp(argv[i], L"--dll") == 0 && i + 1 < argc) {
-            o.dll = argv[++i];
+            req.dll = argv[++i];
         } else if (wcscmp(argv[i], L"--no-inject") == 0) {
-            noInject = 1;
+            req.noInject = 1;
         } else if (wcscmp(argv[i], L"--inherit-env") == 0) {
             inheritEnv = 1;
         } else if (wcscmp(argv[i], L"--no-suspend") == 0) {
-            noSuspend = 1;
+            req.noSuspend = 1;
         } else if (wcscmp(argv[i], L"--forward-stdin") == 0) {
             forwardStdin = 1;
         } else if (wcscmp(argv[i], L"--no-inherit") == 0) {
-            noInherit = 1;
+            req.noInheritHandles = 1;
         } else if (wcscmp(argv[i], L"--job") == 0 && i + 1 < argc) {
             jobPath = argv[++i];
         } else if (wcscmp(argv[i], L"--report") == 0 && i + 1 < argc) {
-            o.report = argv[++i];
+            reportPath = argv[++i];
         } else if (wcscmp(argv[i], L"--cwd") == 0 && i + 1 < argc) {
-            o.cwd = argv[++i];
+            req.cwd = argv[++i];
         } else if (wcscmp(argv[i], L"--set-env") == 0 && i + 1 < argc) {
             if (setCount < (int)(sizeof(sets) / sizeof(sets[0]))) {
                 sets[setCount++] = argv[++i];
@@ -586,14 +315,14 @@ int wmain(int argc, wchar_t **argv)
                 i++;
             }
         } else if (wcscmp(argv[i], L"--timeout-ms") == 0 && i + 1 < argc) {
-            o.timeoutMs = (DWORD)_wtoi(argv[++i]);
+            req.timeoutMs = (DWORD)_wtoi(argv[++i]);
         } else if (wcscmp(argv[i], L"--child-timeout-ms") == 0 && i + 1 < argc) {
-            o.childTimeoutMs = (DWORD)_wtoi(argv[++i]);
+            childTimeoutMs = (DWORD)_wtoi(argv[++i]);
         } else {
             break;
         }
     }
-    (void)sawDashDash;
+
     /* ── 参数来源回退：环境变量 → job 文件 → 同目录同名默认 ──────────────────── */
     wchar_t *envDll = NULL;
     wchar_t *envReport = NULL;
@@ -611,16 +340,16 @@ int wmain(int argc, wchar_t **argv)
         { L"audit", L"DSH_AUDIT_LOG" },
         { L"helper", L"WINSTAGE_HELPER_DIR" },
     };
-    if (!o.dll || !o.dll[0]) {
+    if (!req.dll || !req.dll[0]) {
         envDll = env_dup(L"WINSTAGE_INJECT_DLL");
         if (envDll) {
-            o.dll = envDll;
+            req.dll = envDll;
         }
     }
-    if (!o.report || !o.report[0]) {
+    if (!reportPath || !reportPath[0]) {
         envReport = env_dup(L"WINSTAGE_INJECT_REPORT");
         if (envReport) {
-            o.report = envReport;
+            reportPath = envReport;
         }
     }
     if (jobPath && jobPath[0]) {
@@ -642,8 +371,8 @@ int wmain(int argc, wchar_t **argv)
                     const wchar_t *key = line;
                     const wchar_t *val = eq + 1;
                     if (_wcsicmp(key, L"dll") == 0) {
-                        if (!o.dll || !o.dll[0]) {
-                            o.dll = val; /* points into jobBlock (kept alive) */
+                        if (!req.dll || !req.dll[0]) {
+                            req.dll = val; /* points into jobBlock (kept alive) */
                         }
                     } else if (val[0]) {
                         for (size_t k = 0; k < sizeof(jobMap) / sizeof(jobMap[0]); k++) {
@@ -666,7 +395,7 @@ int wmain(int argc, wchar_t **argv)
             }
         }
     }
-    if (!o.dll || !o.dll[0]) {
+    if (!req.dll || !req.dll[0]) {
         if (getenv("WINSTAGE_INJECT_DEBUG")) {
             fprintf(stderr, "inject: argv job=%ls jobBlock=%d\n", jobPath ? jobPath : L"(none)",
                     jobBlock ? 1 : 0);
@@ -676,7 +405,7 @@ int wmain(int argc, wchar_t **argv)
         if (self_dir(dir, 4096)) {
             _snwprintf(legacy, 4096, L"%lswinstage-shim.dll", dir);
             legacy[4095] = 0;
-            o.dll = legacy;
+            req.dll = legacy;
         }
     }
     for (int k = 0; k < jobSetCount && setCount < (int)(sizeof(sets) / sizeof(sets[0])); k++) {
@@ -686,145 +415,78 @@ int wmain(int argc, wchar_t **argv)
     SetEnvironmentVariableW(L"WINSTAGE_INJECT_DLL", NULL);
     SetEnvironmentVariableW(L"WINSTAGE_INJECT_REPORT", NULL);
 
-    if (i >= argc || !o.dll || !o.dll[0]) {
+    if (i >= argc || !req.dll || !req.dll[0]) {
         fputs("usage: winstage-inject.exe [--dll <path>] [--job <file>] [--set-env K=V]... [--report <json>] [--cwd <dir>] [--timeout-ms N] [--child-timeout-ms N] [--no-inject] [--inherit-env] -- <exe> [args...]\n", stderr);
         return USAGE_FAILED;
     }
-    o.exe = argv[i];
-    /* ★ round-3 诊断：参数解析完成 ⇒ 立刻落下第一份阶段报告（此后每个里程碑覆盖它）。
-     * 若某次失败run 连 `stage:"started"` 都没有，说明问题在参数解析/启动之前；
-     * 若停在 started 之后、injected 之前，则卡在解析目标/预检/注入那一段。 */
-    trace_stage(o.report, "started", (unsigned long)argc);
+    req.exe = argv[i];
+    req.args = (const wchar_t *const *)(argv + i + 1);
+    req.argCount = argc - (i + 1);
+    /* ★ round-3 诊断：参数解析完成 ⇒ 立刻落下第一份阶段报告（此后每个里程碑覆盖它）。 */
+    trace_stage(reportPath, "started", (unsigned long)argc);
 
-    /* Resolve the target: absolute path, PATH lookup, or PATH + ".exe". */
-    wchar_t resolvedExe[4096];
-    if (!resolve_executable(o.exe, resolvedExe, 4096)) {
-        fail(o.report, L"resolve-executable",
-             "cannot resolve the target executable (give an absolute path; PATHEXT/App Paths are not implied)",
-             GetLastError() ? GetLastError() : ERROR_FILE_NOT_FOUND);
-    }
-
-    /* Build a command line that preserves the caller's argv: argv[0] is the
-     * resolved executable and every argument is quoted per the MSVCRT rules. */
-    size_t clLen = 0;
-    for (int k = i; k < argc; k++) {
-        clLen += wcslen(argv[k]) * 2 + 16;
-    }
-    clLen += wcslen(resolvedExe) * 2 + 16;
-    o.cmdline = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, clLen * sizeof(wchar_t));
-    if (!o.cmdline) {
-        fail(o.report, L"alloc", "cannot allocate command line", GetLastError());
-    }
-    size_t pos = 0;
-    if (!append_quoted_arg(o.cmdline, clLen, &pos, resolvedExe)) {
-        fail(o.report, L"args", "command line too long", ERROR_FILENAME_EXCED_RANGE);
-    }
-    for (int k = i + 1; k < argc; k++) {
-        if (pos + 1 >= clLen) {
-            fail(o.report, L"args", "command line too long", ERROR_FILENAME_EXCED_RANGE);
+    wchar_t *envBlock = NULL;
+    if (!inheritEnv) {
+        if (!ws_build_environment(sets, setCount, &envBlock)) {
+            fail(reportPath, L"env", "cannot build the environment block", GetLastError());
         }
-        o.cmdline[pos++] = L' ';
-        o.cmdline[pos] = 0;
-        if (!append_quoted_arg(o.cmdline, clLen, &pos, argv[k])) {
-            fail(o.report, L"args", "command line too long", ERROR_FILENAME_EXCED_RANGE);
-        }
+        req.envBlock = envBlock;
     }
-    o.exe = resolvedExe;
-
-    BOOL envBuilt = inheritEnv ? FALSE : build_environment(sets, setCount, &o.envBlock);
-
-    DWORD creationFlags = CREATE_UNICODE_ENVIRONMENT | (noSuspend ? 0u : CREATE_SUSPENDED);
-    /* No console in this process (GUI subsystem / executor pipes) => do not let
-     * the child allocate a visible console window. Its std handles are inherited. */
-#ifndef WINSTAGE_DISABLE_NO_WINDOW
-    if (!GetConsoleWindow()) {
-        creationFlags |= CREATE_NO_WINDOW;
-    }
-#endif
-
-    {
-        size_t dllLen = (wcslen(o.dll) + 1) * sizeof(wchar_t);
-        if (dllLen > 32767) {
-            fail(o.report, L"args", "dll path too long", ERROR_FILENAME_EXCED_RANGE);
-        }
-    }
-
-    /* Normalize the DLL path first, then check existence: a literal
-     * "is this absolute?" test broke callers that passed a relative path with a
-     * different working directory, and reported it as "not found". */
-    {
-        wchar_t fullDll[4096];
-        DWORD n = GetFullPathNameW(o.dll, 4096, fullDll, NULL);
-        if (n == 0 || n >= 4096) {
-            fail(o.report, L"precheck", "cannot normalize the dll path", GetLastError());
-        }
-        /* A freshly written DLL can be briefly locked by a crash handler or the
-         * virus scanner; retry the existence check before declaring failure. */
-        int attemptsLeft = 4;
-        while (GetFileAttributesW(fullDll) == INVALID_FILE_ATTRIBUTES && attemptsLeft-- > 0) {
-            Sleep(250);
-        }
-        if (GetFileAttributesW(fullDll) == INVALID_FILE_ATTRIBUTES) {
-            DWORD err = GetLastError();
-            /* Include the path: a misread job file otherwise looks exactly like
-             * a missing DLL and costs a whole guest round-trip to diagnose. */
-            char pathA[600];
-            pathA[0] = 0;
-            WideCharToMultiByte(CP_ACP, 0, fullDll, -1, pathA, sizeof(pathA), NULL, NULL);
-            char detail[720];
-            snprintf(detail, sizeof(detail), "%s: %s",
-                     (err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND)
-                         ? "dll file does not exist at the normalized path"
-                         : "dll file is not accessible (locked?)",
-                     pathA);
-            fail(o.report, L"precheck", detail, err);
-        }
-        o.dllPathStorage = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, sizeof(fullDll));
-        if (!o.dllPathStorage) {
-            fail(o.report, L"alloc", "cannot allocate dll path storage", GetLastError());
-        }
-        memcpy(o.dllPathStorage, fullDll, sizeof(fullDll));
-        o.dll = o.dllPathStorage;
-    }
-
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    memset(&si, 0, sizeof(si));
-    memset(&pi, 0, sizeof(pi));
-    si.cb = sizeof(si);
 
     char *stdinData = NULL;
     DWORD stdinLen = 0;
     HANDLE stdinRead = NULL;
     HANDLE stdinWrite = NULL;
-    if (forwardStdin && !noInherit) {
-        if (!read_all_stdin(&stdinData, &stdinLen)) {
-            fail(o.report, L"stdin", "cannot read forwarded stdin", GetLastError());
-        }
+    if (forwardStdin && !req.noInheritHandles) {
         SECURITY_ATTRIBUTES sa;
         memset(&sa, 0, sizeof(sa));
         sa.nLength = sizeof(sa);
         sa.bInheritHandle = TRUE;
         if (!CreatePipe(&stdinRead, &stdinWrite, &sa, 0)) {
-            fail(o.report, L"stdin", "cannot create the stdin pipe", GetLastError());
+            fail(reportPath, L"stdin", "cannot create the stdin pipe", GetLastError());
         }
-        SetHandleInformation(stdinRead, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
         SetHandleInformation(stdinWrite, HANDLE_FLAG_INHERIT, 0);
-        si.dwFlags |= STARTF_USESTDHANDLES;
-        si.hStdInput = stdinRead;
-        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
-        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        req.stdinHandle = stdinRead;
+        req.stdoutHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+        req.stderrHandle = GetStdHandle(STD_ERROR_HANDLE);
+        if (!read_all_stdin(&stdinData, &stdinLen)) {
+            fail(reportPath, L"stdin", "cannot read forwarded stdin", GetLastError());
+        }
     }
 
-    if (!CreateProcessW(o.exe, o.cmdline, NULL, NULL, noInherit ? FALSE : TRUE, creationFlags,
-                        envBuilt ? o.envBlock : NULL, o.cwd, &si, &pi)) {
-        fail(o.report, L"CreateProcessW", "cannot create the target process", GetLastError());
+    WsLaunchResult launched;
+    if (!ws_launch(&req, &launched)) {
+        if (stdinRead) CloseHandle(stdinRead);
+        if (stdinWrite) CloseHandle(stdinWrite);
+        char detailA[WS_LAUNCH_DETAIL_MAX];
+        WideCharToMultiByte(CP_UTF8, 0, launched.detail, -1, detailA, sizeof(detailA), NULL, NULL);
+        char dllA[4096];
+        json_escape_path(req.dll, dllA, sizeof(dllA));
+        char exitA[32];
+        if (launched.haveRemoteThreadExit) {
+            snprintf(exitA, sizeof(exitA), "%lu", (unsigned long)launched.remoteThreadExit);
+        } else {
+            snprintf(exitA, sizeof(exitA), "null");
+        }
+        char initA[32];
+        if (launched.haveShimInitRc) {
+            snprintf(initA, sizeof(initA), "%lu", (unsigned long)launched.shimInitRc);
+        } else {
+            snprintf(initA, sizeof(initA), "null");
+        }
+        char json[8192];
+        snprintf(json, sizeof(json),
+                 "{\"ok\":false,\"tool\":\"winstage-inject\",\"stage\":\"%ls\",\"error\":\"%s\","
+                 "\"win32Error\":%lu,\"remoteThreadExit\":%s,\"shimInitRc\":%s,\"dll\":\"%s\"}\n",
+                 launched.stage, detailA, (unsigned long)launched.error, exitA, initA, dllA);
+        fputs(json, stderr);
+        write_report(reportPath, json);
+        return INJECT_FAILED;
     }
+
     if (stdinRead) {
         CloseHandle(stdinRead);
         stdinRead = NULL;
-    }
-    if (stdinWrite) {
         DWORD off = 0;
         while (off < stdinLen) {
             DWORD wrote = 0;
@@ -840,204 +502,25 @@ int wmain(int argc, wchar_t **argv)
         HeapFree(GetProcessHeap(), 0, stdinData);
         stdinData = NULL;
     }
+    trace_stage(reportPath, "resumed", (unsigned long)launched.pid);
 
-    int rc = 0;
-    DWORD injectErr = 0;
-    HMODULE remoteModule = NULL;
-    BOOL injected = FALSE;
-    void *remoteMem = NULL;
-    DWORD remoteExitCode = 0;
-    int haveRemoteExitCode = 0;
-    DWORD shimInitRc = 0;
-    int haveShimInitRc = 0;
-    int shimInitFailed = 0;
-
-    size_t dllBytes = (wcslen(o.dll) + 1) * sizeof(wchar_t);
-    if (noInject) {
-        /* Diagnostic: let the target run untouched (no remote load). Used to tell
-         * "the injection broke X" apart from "creating the target like this broke
-         * X". */
-        injected = TRUE;
-    } else {
-    remoteMem = VirtualAllocEx(pi.hProcess, NULL, dllBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    SIZE_T written = 0;
-    if (!remoteMem) {
-        injectErr = GetLastError();
-    } else if (!WriteProcessMemory(pi.hProcess, remoteMem, o.dll, dllBytes, &written) || written != dllBytes) {
-        injectErr = GetLastError() ? GetLastError() : ERROR_PARTIAL_COPY;
-    }
-    if (!injectErr) {
-        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-        FARPROC pLoadLibraryW = GetProcAddress(k32, "LoadLibraryW");
-        if (!pLoadLibraryW) {
-            injectErr = ERROR_PROC_NOT_FOUND;
-        } else {
-            HANDLE th = CreateRemoteThread(pi.hProcess, NULL, 0,
-                                           (LPTHREAD_START_ROUTINE)pLoadLibraryW, remoteMem, 0, NULL);
-            if (!th) {
-                injectErr = GetLastError();
-            } else {
-                DWORD wait = WaitForSingleObject(th, o.timeoutMs);
-                if (wait != WAIT_OBJECT_0) {
-                    injectErr = ERROR_TIMEOUT;
-                } else {
-                    DWORD moduleResult = 0;
-                    if (!GetExitCodeThread(th, &moduleResult)) {
-                        injectErr = GetLastError();
-                    } else {
-                        remoteExitCode = moduleResult;
-                        haveRemoteExitCode = 1;
-                        if (moduleResult == 0) {
-                            /* LoadLibraryW in the target returned NULL. Its
-                             * GetLastError lives in the dead remote thread and is
-                             * not readable, so report a distinct code instead of
-                             * inventing ERROR_MOD_NOT_FOUND. */
-                            injectErr = ERROR_DLL_INIT_FAILED;
-                        } else {
-                            /* Prefer the module table: the DWORD exit code above
-                             * truncates a 64-bit HMODULE (see find_remote_module). */
-                            remoteModule = find_remote_module(pi.dwProcessId, o.dll);
-                            if (!remoteModule) {
-                                remoteModule = (HMODULE)(ULONG_PTR)moduleResult;
-                            }
-                            injected = TRUE;
-                        }
-                    }
-                }
-                CloseHandle(th);
-            }
-        }
-    }
-    }
-
-    /* ★ R20①：模块已映射（remoteModule != NULL）⇒ 在目标进程里调用导出的
-     * WinstageShimInit()，等它返回（就绪）后才继续。 */
-    if (injected && !noInject && remoteModule) {
-        trace_stage(o.report, "loaded", (unsigned long)(ULONG_PTR)remoteModule);
-        FARPROC remoteInit = resolve_remote_export(remoteModule, o.dll);
-        if (!remoteInit) {
-            injectErr = GetLastError() ? GetLastError() : ERROR_PROC_NOT_FOUND;
-            shimInitFailed = 1;
-            injected = FALSE;
-        } else {
-            HANDLE ith = CreateRemoteThread(pi.hProcess, NULL, 0,
-                                            (LPTHREAD_START_ROUTINE)remoteInit, NULL, 0, NULL);
-            if (!ith) {
-                injectErr = GetLastError();
-                shimInitFailed = 1;
-                injected = FALSE;
-            } else {
-                DWORD initWait = WaitForSingleObject(ith, o.timeoutMs);
-                DWORD initRc = 0;
-                if (initWait != WAIT_OBJECT_0) {
-                    injectErr = ERROR_TIMEOUT;
-                    shimInitFailed = 1;
-                    injected = FALSE;
-                } else if (!GetExitCodeThread(ith, &initRc)) {
-                    injectErr = GetLastError();
-                    shimInitFailed = 1;
-                    injected = FALSE;
-                } else {
-                    shimInitRc = initRc;
-                    haveShimInitRc = 1;
-                    if ((initRc & 0x80000000u) != 0) {
-                        /* 初始化线程以异常码结束 ⇒ 目标进程里钩子没装成，
-                         * 继续放行会变成"看起来沙箱、实际直写" ⇒ fail closed。 */
-                        injectErr = initRc;
-                        shimInitFailed = 1;
-                        injected = FALSE;
-                    }
-                }
-                CloseHandle(ith);
-            }
-        }
-    }
-
-    /* ★ round-3 诊断：注入阶段收尾（成功/失败都落一份，便于事后分段定位） */
-    trace_stage(o.report, injected ? "injected" : "inject-failed", 0);
-    if (!injected) {
-        char detail[256];
-        snprintf(detail, sizeof(detail), shimInitFailed ? "remote WinstageShimInit failed"
-                                                        : "remote LoadLibraryW failed");
-        TerminateProcess(pi.hProcess, INJECT_FAILED);
-        char pathA[4096];
-        json_escape_path(L"inject", pathA, sizeof(pathA));
-        char json[6144];
-        char dllA[4096];
-        json_escape_path(o.dll, dllA, sizeof(dllA));
-        char exitA[32];
-        if (haveRemoteExitCode) {
-            snprintf(exitA, sizeof(exitA), "%lu", (unsigned long)remoteExitCode);
-        } else {
-            snprintf(exitA, sizeof(exitA), "null");
-        }
-        char initA[32];
-        if (haveShimInitRc) {
-            snprintf(initA, sizeof(initA), "%lu", (unsigned long)shimInitRc);
-        } else {
-            snprintf(initA, sizeof(initA), "null");
-        }
-        snprintf(json, sizeof(json),
-                 "{\"ok\":false,\"tool\":\"winstage-inject\",\"stage\":\"%s\",\"error\":\"%s\","
-                 "\"win32Error\":%lu,\"remoteThreadExit\":%s,\"shimInitRc\":%s,\"dll\":\"%s\"}\n",
-                 pathA, detail, (unsigned long)injectErr, exitA, initA, dllA);
-        fputs(json, stderr);
-        write_report(o.report, json);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        if (remoteMem) {
-            /* the process is gone; nothing to free */
-        }
-        return INJECT_FAILED;
-    }
-
-    /* ★ round-4：把孩子收进 Job Object 并设置 `KILL_ON_JOB_CLOSE` —— 让"孤儿载体"从根上
-     * 不可能出现。实测形态：载体挂住时，外部（`spawnSync` 超时、任务管理器强杀）会先杀掉
-     * **注入器本身**，于是下面 `TerminateProcess(pi.hProcess, …)` 那条清理路径根本没机会执行，
-     * 载体就带着 `winstage-shim.dll` 长期驻留：① 锁住 DLL，令下一次 `build-shim` 发布失败
-     * （EPERM；实测残留 pid 4004 的 powershell 正是这么来的）；② 继续往暂存树里写。
-     * Job 的 `KILL_ON_JOB_CLOSE` 由内核保证：注入器以**任何方式**消失时 Job 句柄关闭，
-     * 载体连带被杀（孙进程也随 Job 一起走）。
-     * 尽力而为：`CreateJobObjectW`/`SetInformationJobObject`/`AssignProcessToJobObject` 任一
-     * 失败（例如宿主不允许嵌套 Job）就放弃并完全退回现状行为。句柄**故意不关** ——
-     * 它活到进程结束，正是这条保证的实现方式。 */
-    static HANDLE g_childJob = NULL;
-    g_childJob = CreateJobObjectW(NULL, NULL);
-    if (g_childJob) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
-        memset(&jeli, 0, sizeof(jeli));
-        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if (!SetInformationJobObject(g_childJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli)) ||
-            !AssignProcessToJobObject(g_childJob, pi.hProcess)) {
-            CloseHandle(g_childJob);
-            g_childJob = NULL;
-        }
-    }
-
-    ResumeThread(pi.hThread);
-    /* ★ round-3 诊断：子进程已放行。事后判读：
-     *   停在 `stage:"injected"` ⇒ 注入器在放行前就没了（注入/句柄/线程那段）；
-     *   停在 `stage:"resumed"`  ⇒ 注入器活着，而**子载体零输出**（问题在载体侧）；
-     *   留下正式报告（含 childExitCode）⇒ 注入器走完了，看子退出码即可。 */
-    trace_stage(o.report, "resumed", (unsigned long)pi.dwProcessId);
-    DWORD waitChild = WaitForSingleObject(pi.hProcess, o.childTimeoutMs);
+    DWORD waitChild = WaitForSingleObject(launched.hProcess, childTimeoutMs);
     DWORD childExit = 0;
     int childTimedOut = 0;
     if (waitChild == WAIT_TIMEOUT) {
         childTimedOut = 1;
-        TerminateProcess(pi.hProcess, 124);
-        WaitForSingleObject(pi.hProcess, 10000);
+        TerminateProcess(launched.hProcess, 124);
+        WaitForSingleObject(launched.hProcess, 10000);
         childExit = 124;
     }
-    GetExitCodeProcess(pi.hProcess, &childExit);
-    rc = (int)childExit;
+    GetExitCodeProcess(launched.hProcess, &childExit);
 
     {
         char dllA[4096];
-        json_escape_path(o.dll, dllA, sizeof(dllA));
+        json_escape_path(req.dll, dllA, sizeof(dllA));
         char initA[32];
-        if (haveShimInitRc) {
-            snprintf(initA, sizeof(initA), "%lu", (unsigned long)shimInitRc);
+        if (launched.haveShimInitRc) {
+            snprintf(initA, sizeof(initA), "%lu", (unsigned long)launched.shimInitRc);
         } else {
             snprintf(initA, sizeof(initA), "null");
         }
@@ -1046,14 +529,20 @@ int wmain(int argc, wchar_t **argv)
                  "{\"ok\":true,\"tool\":\"winstage-inject\",\"dll\":\"%s\",\"childPid\":%lu,"
                  "\"childExitCode\":%lu,\"childTimedOut\":%s,\"remoteModule\":\"0x%llx\","
                  "\"shimInitRc\":%s}\n",
-                 dllA, (unsigned long)pi.dwProcessId, (unsigned long)childExit,
-                 childTimedOut ? "true" : "false", (unsigned long long)(ULONG_PTR)remoteModule,
+                 dllA, (unsigned long)launched.pid, (unsigned long)childExit,
+                 childTimedOut ? "true" : "false", (unsigned long long)(ULONG_PTR)launched.remoteModule,
                  initA);
-        write_report(o.report, json);
+        write_report(reportPath, json);
     }
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return rc;
+    CloseHandle(launched.hThread);
+    CloseHandle(launched.hProcess);
+    if (launched.hJob) {
+        CloseHandle(launched.hJob);
+    }
+    if (envBlock) {
+        HeapFree(GetProcessHeap(), 0, envBlock);
+    }
+    return (int)childExit;
 }
 
 /* A console subsystem injector flashes a console window for every command the

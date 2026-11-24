@@ -387,6 +387,14 @@ async function main() {
         transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
         save()
       }
+      /* stdio 在**孙进程**里也必须落到捕获文件：进程树的每一层（cmd -> powershell /
+       * 内层 cmd / 管道两端的 tasklist|findstr）都必须有输出，否则"沙箱能跑但看不见
+       * 结果"。这四条就是 2026-11-24 宿主内启动时实测到的回归：孙进程曾拿到 NUL/
+       * 控制台句柄 -> 零输出 + 管道挂住（修复见 shim/src/ws_proc.c 的 stdio 转发）。 */
+      await step('s1-child-cmd', 'cmd /d /c "echo CHILD-OK" & echo MARK-CHILD=%errorlevel%')
+      await step('s2-grandchild-ps', 'powershell -NoProfile -Command "Write-Output PS-OK" & echo MARK-PS=%errorlevel%')
+      await step('s3-pipe', 'tasklist /fo csv /nh | findstr /i "cmd"')
+      await step('s4-cim', 'powershell -NoProfile -Command "$p=Get-CimInstance Win32_Process; Write-Output (\'CIM-COUNT=\' + @($p).Count)" & echo MARK-CIM=%errorlevel%')
       await step('c1-echo', 'echo hello & echo 100%%')
       await step('c2-exit', 'exit /b 7')
       await step(

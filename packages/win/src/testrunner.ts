@@ -257,6 +257,8 @@ export const OFFLINE_SUITES = [
   { id: 'r44-write-barrier', script: 'tests/r44-write-barrier.ts', title: 'R44 写屏障判定（文本只读不得作为边界：T1/T1S/T0 内核屏障放行、TS/无屏障拒绝、lane 可见；41 断言）' },
   // R45：显式内核边界档（tier=T1S）+ 默认 TS 的边界诚实可见性（T1S 不再误报降级）。
   { id: 'r45-kernel-lane', script: 'tests/r45-kernel-lane.ts', title: 'R45 显式内核边界档（tier=T1S 探测/装配 fail-closed、TS 边界文案、T1S 不误报降级；34 断言）' },
+  // 宿主进程内启动器（N-API addon）：进程树里不再出现 helper；缺失/失败如实回退。
+  { id: 'native-addon-wiring', script: 'tests/native-addon-wiring.ts', title: '宿主进程内启动器接线（N-API addon 稳定 ABI/不链接 libnode、生产启用/替身禁用/失败回退、addon 不入侵三件套契约、shim 转发被重定向的 stdio；23 断言）' },
   // R46：已保存撤销（对标 NeoAI review undo；文件面 + 冲突整批零写 + 记录 checksum）。
   { id: 'r46-undo', script: 'tests/r46-undo.ts', title: 'R46 已保存撤销（apply 后 undo/冲突零写/新建删除/删除恢复/幂等/损坏 fail-closed；31 断言）' },
   // R50：设置开关"写入被回滚"的根因回归。插件行在设置事务里重建时，新一代 Store 走

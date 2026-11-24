@@ -751,8 +751,11 @@ function main() {
   results.push(buildOne(zig, {
     label: 'injector',
     out: path.join(OUT, 'winstage-inject.exe'),
-    sources: [path.join(SHIM, 'injector', 'winstage-inject.c')],
-    extra: ['-municode'],
+    sources: [
+      path.join(SHIM, 'injector', 'winstage-inject.c'),
+      path.join(SHIM, 'injector', 'ws_launch.c'),
+    ],
+    extra: ['-municode', '-I', path.join(SHIM, 'injector')],
   }));
   results.push(buildOne(zig, {
     label: 'probe',
@@ -842,6 +845,57 @@ function main() {
    * downgrade -- that is exactly how the 10-01 outage stayed invisible. */
   const integrity = assertArtifactIntegrity(OUT, names);
 
+  /* ── optional 4th artifact: the host-side addon ────────────────────────────
+   * `winstage-addon.node` lets the harness process create + inject the child
+   * itself (process tree: `DeepSeek Harness.exe -> cmd.exe`) instead of spawning
+   * bin\elevate.exe. It is deliberately NOT in `artifactNames()`: `--check`,
+   * `--repair-stale` and `--sweep` keep their exact three-artifact contract.
+   * A build failure here is a warning, not a build failure -- the DLL/injector
+   * triple is the lane's hard requirement and must never be displaced by an
+   * optional piece. `initReport.nativeLauncher` reports whether it is there. */
+  let addonInfo = { built: false, reason: 'not attempted' };
+  try {
+    const addonOut = path.join(OUT, 'winstage-addon.node');
+    const stagedAddon = buildOne(zig, {
+      label: 'addon',
+      out: addonOut,
+      sources: [
+        path.join(SHIM, 'addon', 'winstage-addon.c'),
+        path.join(SHIM, 'injector', 'ws_launch.c'),
+      ],
+      extra: ['-I', path.join(SHIM, 'injector')],
+      shared: true,
+    });
+    const addonPe = parseOrFail(stagedAddon.tmp);
+    if (addonPe.machine !== 'x86_64' || !addonPe.isDll || !addonPe.exports.includes('napi_register_module_v1')) {
+      throw new BuildError('native addon has the wrong PE shape', {
+        machine: addonPe.machine,
+        isDll: addonPe.isDll,
+        exports: addonPe.exports,
+      });
+    }
+    if (!addonPe.importDlls.every((name) => !/^node(\.exe)?$/i.test(name))) {
+      throw new BuildError('native addon must not import libnode (it resolves N-API in the host)', {
+        imports: addonPe.importDlls,
+      });
+    }
+    const publishedAddon = publishArtifacts([{ final: addonOut, tmp: stagedAddon.tmp, label: 'addon' }]);
+    if (!publishedAddon.ok) {
+      throw new BuildError('could not publish winstage-addon.node', { failed: publishedAddon.failed });
+    }
+    addonInfo = {
+      built: true,
+      path: path.relative(REPO, addonOut).replace(/\\/g, '/'),
+      bytes: fs.statSync(addonOut).size,
+      exports: addonPe.exports,
+      imports: addonPe.importDlls,
+      warnings: stagedAddon.warnings,
+    };
+    results.push(stagedAddon);
+  } catch (e) {
+    addonInfo = { built: false, reason: e.message };
+  }
+
   const report = {
     ok: true,
     toolchain: path.relative(REPO, zig).replace(/\\/g, '/'),
@@ -866,6 +920,7 @@ function main() {
         bytes: fs.statSync(path.join(OUT, 'winstage-probe.exe')).size,
         machine: probeInfo.machine,
       },
+      addon: addonInfo,
     },
     integrity: integrity.detail,
     warnings: results.reduce((n, r) => n + r.warnings, 0),
@@ -886,6 +941,11 @@ function main() {
     log(`dll      -> ${report.artifacts.dll.path} (${report.artifacts.dll.bytes} bytes, ${dllInfo.exports.length} exports)`);
     log(`injector -> ${report.artifacts.injector.path} (${report.artifacts.injector.bytes} bytes)`);
     log(`probe    -> ${report.artifacts.probe.path} (${report.artifacts.probe.bytes} bytes)`);
+    if (addonInfo.built) {
+      log(`addon    -> ${addonInfo.path} (${addonInfo.bytes} bytes, export napi_register_module_v1)`);
+    } else {
+      log(`addon    -> NOT BUILT: ${addonInfo.reason} (the lane keeps using the helper process)`);
+    }
     log(`imports  : ${dllInfo.importDlls.join(', ')}`);
     log(`exports  : ${dllInfo.exports.join(', ')}`);
     log(`warnings : ${report.warnings} (full compiler output in shim/out/build-logs)`);

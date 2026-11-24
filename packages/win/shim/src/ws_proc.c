@@ -1310,6 +1310,43 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
             return FALSE;
         }
     }
+    /* ── 转发调用方**被重定向的** stdio（2026-11-24 实测修复）─────────────────
+     *
+     * 被子进程读走的捕获文件（executor 的 .out/.err）只有在**每一层**都显式转发时
+     * 才能到孙进程：cmd/其它 shell 创建子进程时通常 si.dwFlags 为 0，靠"继承"，
+     * 而控制台状态一旦变化（例如宿主进程没有控制台），孩子拿到的就是 NUL/控制台
+     * 句柄 —— 实测：`cmd /c echo X`、`powershell -Command ...`、`tasklist | findstr`
+     * 在被注入的 cmd 下要么零输出、要么直接挂住（管道的读端没被继承）。
+     *
+     * 规则（保守）：
+     *   · 调用方**没有**指定 STARTF_USESTDHANDLES，且
+     *   · 调用方的 stdout 是磁盘文件或管道（不是控制台/字符设备），
+     *   就把这三个句柄显式写进 si 并把 inherit 置真（它们本来就是可继承的）。
+     * 这样读到的是**调用方自己的**句柄，语义上就是"孩子写到我写的地方"。
+     */
+    STARTUPINFOW stdioSi;
+    {
+        HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
+        DWORD outType = GetFileType(hOut);
+        DWORD errType = GetFileType(hErr);
+        int captured = (outType == FILE_TYPE_DISK || outType == FILE_TYPE_PIPE ||
+                        errType == FILE_TYPE_DISK || errType == FILE_TYPE_PIPE);
+        /* STARTUPINFOEXW callers keep their attribute list; copying only the base
+         * struct would leave a dangling lpAttributeList behind. */
+        if (!exempt && si && captured && !(si->dwFlags & STARTF_USESTDHANDLES) &&
+            !(si->dwFlags & EXTENDED_STARTUPINFO_PRESENT) && hOut && hErr &&
+            hOut != INVALID_HANDLE_VALUE && hErr != INVALID_HANDLE_VALUE) {
+            stdioSi = *si;
+            stdioSi.dwFlags |= STARTF_USESTDHANDLES;
+            stdioSi.hStdInput = (hIn && hIn != INVALID_HANDLE_VALUE) ? hIn : NULL;
+            stdioSi.hStdOutput = hOut;
+            stdioSi.hStdError = hErr;
+            si = &stdioSi;
+            inherit = TRUE;
+        }
+    }
     BOOL ok = hasToken
                   ? g_orig.CreateProcessAsUserW(token, app, cmd, pa, ta, inherit, newFlags,
                                                 newEnv ? newEnv : env, cwd, si, pi)

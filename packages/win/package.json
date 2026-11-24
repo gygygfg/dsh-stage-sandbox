@@ -84,6 +84,7 @@
     "shim/src/",
     "shim/include/",
     "shim/injector/",
+    "shim/addon/",
     "shim/probe/",
     "patches/",
     "tools/build-shim.ts",

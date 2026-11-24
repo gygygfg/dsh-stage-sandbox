@@ -2073,6 +2073,7 @@ export class WindowsStageExecutor {
     /** 去令牌化可用性探测的完整结果（含逐级 checks） */
     this.transparent = undefined
     this.shimLauncher = undefined
+    this.nativeLauncher = undefined
     /**
      * R25-A：T1S（受限令牌 + shim）的 opt-in 解析结果 / 档位判定 / 装配结果。
      * 默认（`WINSTAGE_T1_SHIM` 未设）三者都是 undefined ⇒ T1 逐字不变。
@@ -2780,7 +2781,20 @@ export class WindowsStageExecutor {
       auditPath: this.auditPath,
       regStageDir: this.options.registryStageDir,
     })
+    /* 宿主进程内启动器（可选）：按 参数 → 环境变量 → 产物目录 顺序加载，缺失不抛错，
+     * 只如实记录。生产环境里 capability 恒等于模块内的 spawnCapturedAsync；测试替身
+     * 是**另一个函数** —— 只有后者才禁用 addon（替身要能观察到 helper 调用）。 */
+    const spawnIsTestDouble =
+      typeof cap.spawnTransparentProcess === 'function' && cap.spawnTransparentProcess !== spawnCapturedAsync
+    this.nativeLauncher = spawnIsTestDouble
+      ? {
+          available: false,
+          error: 'the capability supplies its own spawnTransparentProcess (test double); native launcher disabled',
+          tried: [],
+        }
+      : loadNativeAddon({ shimDir: this.transparent?.artifacts?.shimDir })
     this.shimLauncher = new ShimLauncher(this.api, {
+      native: this.nativeLauncher,
       helper: this.helperArtifacts,
       artifacts: this.transparent.artifacts,
       // shim 的环境契约（T4 `winstage_shim.h`）：STAGE_ROOT / CONFIG / LOG。
@@ -2861,6 +2875,17 @@ export class WindowsStageExecutor {
       ...this.dimensionSummaries(),
       backend: 'winstage-shim-iat',
       enforcement: 'shim-user-mode',
+      /* 进程创建发生在哪里：native-addon = 宿主自己 CreateProcess（进程树里没有
+       * helper）；否则走 bin\elevate.exe（多一层）。available=false 时 error 说明原因。 */
+      nativeLauncher: this.nativeLauncher
+        ? {
+            available: this.nativeLauncher.available === true,
+            path: this.nativeLauncher.path,
+            version: this.nativeLauncher.version,
+            error: this.nativeLauncher.error,
+            tried: this.nativeLauncher.tried,
+          }
+        : undefined,
       jobEnabled: false,
       jobAccounting: null,
       treeReclaim: 'taskkill /T /F (transparent mode has no Job Object)',
@@ -6631,7 +6656,77 @@ export function resolveShimArtifacts(options = {}) {
     dllPath: resolve(options.dllPath || process.env.WINSTAGE_SHIM_DLL || join(shimDir, 'winstage-shim.dll')),
     injectorPath: resolve(options.injectorPath || process.env.WINSTAGE_SHIM_INJECTOR || join(shimDir, 'winstage-inject.exe')),
     probePath: resolve(options.probePath || process.env.WINSTAGE_SHIM_PROBE || join(shimDir, 'winstage-probe.exe')),
+    /* Host-side in-process launcher (N-API addon). Optional: when it is absent
+     * or cannot be loaded the lane keeps spawning winstage-inject.exe. */
+    addonPath: resolve(options.addonPath || process.env.WINSTAGE_SANDBOX_ADDON || join(shimDir, 'winstage-addon.node')),
   }
+}
+
+/**
+ * 宿主进程内启动器（N-API addon）的加载器。
+ *
+ * 为什么需要它：helper 进程（`bin\elevate.exe`）在进程树里始终多一层，
+ * 真实模型 `Get-CimInstance Win32_Process` 一眼就能看到
+ * `DeepSeek Harness.exe -> elevate.exe -- cmd.exe /d /c run-*.cmd`。
+ * addon 让宿主**自己** CreateProcess（CREATE_SUSPENDED + 注入），进程树就是
+ * `DeepSeek Harness.exe -> cmd.exe`，没有任何多余进程。
+ *
+ * 加载顺序：显式参数 → `WINSTAGE_SANDBOX_ADDON` → 插件产物旁边
+ * （`dist/winstage-addon.node`；打包入口与 addon 同目录）→ shim 产物目录。
+ * 任何一步失败都**不抛错**：返回 `{available:false, error}` 并由 initReport
+ * 如实记录，执行路径继续走 helper（可观测，不是静默降级）。
+ */
+export function loadNativeAddon({ addonPath, shimDir } = {}) {
+  const candidates = []
+  const push = (value) => {
+    if (typeof value !== 'string' || value.length === 0) return
+    if (!candidates.includes(value)) candidates.push(value)
+  }
+  push(addonPath)
+  push(process.env.WINSTAGE_SANDBOX_ADDON)
+  try {
+    push(join(dirname(fileURLToPath(import.meta.url)), 'winstage-addon.node'))
+  } catch {
+    /* import.meta.url 不可用时跳过这一候选 */
+  }
+  if (typeof shimDir === 'string' && shimDir) push(join(shimDir, 'winstage-addon.node'))
+  const tried = []
+  let lastError
+  for (const candidate of candidates) {
+    let full = candidate
+    try {
+      full = resolve(candidate)
+    } catch {
+      /* 保留原样，交给 existsSync 判定 */
+    }
+    tried.push(full)
+    if (!existsSync(full)) {
+      if (!lastError) lastError = `not found: ${full}`
+      continue
+    }
+    try {
+      const addon = require_(full)
+      if (
+        !addon ||
+        typeof addon.launch !== 'function' ||
+        typeof addon.poll !== 'function' ||
+        typeof addon.terminate !== 'function'
+      ) {
+        lastError = `module does not export launch/poll/terminate: ${full}`
+        continue
+      }
+      return {
+        available: true,
+        path: full,
+        version: typeof addon.version === 'string' ? addon.version : 'unknown',
+        addon,
+        tried,
+      }
+    } catch (error) {
+      lastError = `${full}: ${error?.message ?? error}`
+    }
+  }
+  return { available: false, error: lastError ?? 'no candidate path', tried }
 }
 
 /* ═══════════════ R20②：注册表写尝试的**归因能力**（机读，不冒充已归因）═══════════════
@@ -7559,8 +7654,96 @@ export class ShimLauncher {
     this.env = options.env ?? {}
     this.captureDir = options.captureDir
     this.spawn = typeof options.spawn === 'function' ? options.spawn : spawnCapturedAsync
+    /* Host-side launcher (see loadNativeAddon). `undefined` = use the helper. */
+    this.native = options.native?.available && options.native?.addon ? options.native : undefined
+    this.nativeFailure = undefined
     this.tracked = new Set()
     this.lastLaunch = undefined
+  }
+
+  /**
+   * 宿主进程内启动（addon）：没有任何 helper 进程。
+   *
+   * 输出仍走**文件**（addon 用 CreateFileW 打开 stdio 路径后交给 CreateProcess），
+   * 所以这里与 spawnCapturedAsync 的契约一致：等进程退出 → 读文件 → 删临时文件。
+   * 等待用 15ms 轮询 `poll(pid)`：addon 只保留进程句柄，JS 侧决定超时/终止，
+   * 不需要线程或 uv 句柄。
+   */
+  async launchWithNative({ command, args, cwd, env, timeoutMs, stdin, reportPath }) {
+    const captureDir = resolve(this.captureDir || cwd || tmpdir())
+    mkdirSync(captureDir, { recursive: true })
+    const stamp = `${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`
+    const outPath = join(captureDir, `.winstage-run-${stamp}.out`)
+    const errPath = join(captureDir, `.winstage-run-${stamp}.err`)
+    const started = Date.now()
+    let pid
+    try {
+      const launched = this.native.addon.launch({
+        dll: this.artifacts.dllPath,
+        exe: command,
+        args,
+        cwd,
+        env: { ...this.env, ...(env ?? {}) },
+        stdoutPath: outPath,
+        stderrPath: errPath,
+        ...(typeof stdin === 'string' ? { stdin } : {}),
+        reportPath,
+        timeoutMs: 30000,
+      })
+      pid = launched?.pid
+      if (!Number.isInteger(pid) || pid <= 0) throw new Error('the native launcher returned no pid')
+    } catch (error) {
+      for (const path of [outPath, errPath]) {
+        try {
+          unlinkSync(path)
+        } catch {
+          /* 清理失败不影响判定 */
+        }
+      }
+      /* No child was created ⇒ the caller may still try the helper lane. */
+      throw Object.assign(new Error(`native launch failed: ${error?.message ?? error}`), {
+        code: 'NATIVE_LAUNCH_FAILED',
+      })
+    }
+    this.tracked.add(pid)
+    let timedOut = false
+    let killedAt = 0
+    let code = null
+    for (;;) {
+      const done = this.native.addon.poll(pid)
+      if (done) {
+        code = done.code
+        break
+      }
+      const now = Date.now()
+      if (!timedOut && now - started >= timeoutMs) {
+        timedOut = true
+        killedAt = now
+        try {
+          this.native.addon.terminate(pid, 124)
+        } catch {
+          /* 终止失败时仍等退出；下一次轮询会看到真实退出码 */
+        }
+      }
+      if (timedOut && now - killedAt > 10000) {
+        /* The child refused to die: report the timeout, leave the handle to the
+         * job object (killed when the slot is reaped/at process exit). */
+        code = 124
+        break
+      }
+      await new Promise((doneSleep) => setTimeout(doneSleep, 15))
+    }
+    this.tracked.delete(pid)
+    const out = readTextFile(outPath)
+    const err = readTextFile(errPath)
+    for (const path of [outPath, errPath]) {
+      try {
+        unlinkSync(path)
+      } catch {
+        /* 清理失败不影响判定 */
+      }
+    }
+    return { pid, code: timedOut ? 124 : code, timedOut, out, err }
   }
 
   /** 启动一个去令牌化子进程并等它退出（输出经文件描述符重定向读回） */
@@ -7577,19 +7760,37 @@ export class ShimLauncher {
     const injectorPath = this.options.helper?.launcherPath ?? this.artifacts.injectorPath
     const argv = [...(typeof stdin === 'string' ? ['--forward-stdin'] : []), '--', command, ...args]
     const started = Date.now()
-    const outcome = await this.spawn(injectorPath, argv, {
-      cwd,
-      env: {
-        ...this.env,
-        ...(env ?? {}),
-        WINSTAGE_INJECT_DLL: this.artifacts.dllPath,
-        WINSTAGE_INJECT_REPORT: reportPath,
-        ...(this.options.helper ? { WINSTAGE_HELPER_DIR: this.options.helper.helperDir } : {}),
-      },
-      timeoutMs,
-      captureDir,
-      stdin,
-    })
+    let launcherKind = 'helper-process'
+    let outcome
+    if (this.native) {
+      try {
+        outcome = await this.launchWithNative({ command, args, cwd, env, timeoutMs, stdin, reportPath })
+        launcherKind = 'native-addon'
+      } catch (error) {
+        if (error?.code !== 'NATIVE_LAUNCH_FAILED') throw error
+        /* The addon could not create a process at all (missing export support in
+         * this host build, AV interference, ...). Fall back to the helper for the
+         * rest of the session instead of failing the command; the reason stays
+         * observable in lastLaunch / initReport. */
+        this.nativeFailure = String(error?.message ?? error)
+        this.native = undefined
+      }
+    }
+    if (!outcome) {
+      outcome = await this.spawn(injectorPath, argv, {
+        cwd,
+        env: {
+          ...this.env,
+          ...(env ?? {}),
+          WINSTAGE_INJECT_DLL: this.artifacts.dllPath,
+          WINSTAGE_INJECT_REPORT: reportPath,
+          ...(this.options.helper ? { WINSTAGE_HELPER_DIR: this.options.helper.helperDir } : {}),
+        },
+        timeoutMs,
+        captureDir,
+        stdin,
+      })
+    }
     this.tracked.delete(outcome.pid)
     let report
     try {
@@ -7609,9 +7810,14 @@ export class ShimLauncher {
       injectionReport: report,
       durationMs: Date.now() - started,
       dllPath: this.artifacts.dllPath,
-      injectorPath: injectorPath,
-      streamsKind: 'file-descriptor-redirect (no named pipes)',
-      jobAssigned: false,
+      injectorPath: launcherKind === 'native-addon' ? this.native?.path : injectorPath,
+      launcher: launcherKind,
+      ...(this.nativeFailure ? { nativeFallback: this.nativeFailure } : {}),
+      streamsKind:
+        launcherKind === 'native-addon'
+          ? 'file handles passed to CreateProcess (PROC_THREAD_ATTRIBUTE_HANDLE_LIST)'
+          : 'file-descriptor-redirect (no named pipes)',
+      jobAssigned: launcherKind === 'native-addon',
     }
     /**
      * ── 超时 ≠ 注入失败（真实缺陷，2026-11-23 深夜）────────────────────────────
@@ -7669,9 +7875,17 @@ export class ShimLauncher {
   terminateAll(exitCode = 1) {
     const failures = []
     for (const pid of [...this.tracked]) {
+      let nativeKilled = false
+      if (this.native) {
+        try {
+          nativeKilled = Boolean(this.native.addon.terminate(pid, exitCode))
+        } catch {
+          nativeKilled = false
+        }
+      }
       const killed = killProcessTree(pid)
       this.tracked.delete(pid)
-      if (!killed.ok) failures.push(`${pid}: ${killed.detail}`)
+      if (!nativeKilled && !killed.ok) failures.push(`${pid}: ${killed.detail}`)
     }
     return failures
   }

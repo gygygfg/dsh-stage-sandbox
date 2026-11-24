@@ -1369,3 +1369,18 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
 - PPID 伪造（父进程=宿主）再次实测仍失败（injector 111 / `remote WinstageShimInit failed`），
   已回退；彻底去掉多出来的父进程需要宿主进程内 `CreateProcess(SUSPENDED)` + N-API 注入。
 - 交互式 `cmd /d /q` + stdin 试过：命令行干净但会输出 cmd 横幅/提示符，已回退。
+
+### 23.9 宿主进程内注入（2026-11-24）
+
+- 新增 `shim/addon/winstage-addon.c`（N-API，`launch`/`poll`/`terminate`）+ 共用的
+  `shim/injector/ws_launch.c`。宿主自己 `CreateProcess(SUSPENDED)` + 注入，
+  进程树是 `DeepSeek Harness.exe -> cmd.exe`，**不再有 `elevate.exe` helper**。
+- addon 不链接 libnode（`napi_*` 全部 `GetProcAddress`），单条 `zig cc -shared` 可构建；
+  `build-shim` 额外产出 `shim/out/winstage-addon.node`（不进三件套契约），
+  `build-plugin` 拷进 `dist/`；缺失或加载失败时**如实回退** helper
+  （`initReport.nativeLauncher.available=false` + `error`）。
+- 实测：`chainI.json`（lane=shim/TS）里 `cmd.exe` 的父进程就是 harness；无 helper。
+- shim 侧同步修复：`CreateProcess*` 钩子在调用方 stdout/stderr 是被重定向的文件/管道、
+  且未指定 `STARTF_USESTDHANDLES` 时，把这几个句柄转发给子进程 —— 否则孙进程拿到
+  NUL/控制台句柄（`cmd /c echo` 零输出、`tasklist | findstr` 挂住），两条都是实测。
+- 已知差异：宿主 lane 的 cmd 无控制台，`chcp 65001` 不生效（GBK 输出）；产品 `pwsh` 路径不受影响。
