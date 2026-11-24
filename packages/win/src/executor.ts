@@ -3277,6 +3277,12 @@ export class WindowsStageExecutor {
         timeoutMs: this.options.shimProbeTimeoutMs,
         captureDir: this.stagingRoot,
         registryStageDir: this.options.registryStageDir,
+        /* The artifact directory is a first-class option (the CLI/host
+         * normally passes WINSTAGE_SHIM_DIR). Without forwarding it here the
+         * probe looked for `shim\out` under the process cwd and reported
+         * "not found", i.e. a correctly deployed shim silently fell back to
+         * the restricted-token lane (measured 2026-11-24). */
+        ...(this.options.shimDir ? { shimDir: this.options.shimDir } : {}),
         ...(this.options.shimOptions ?? {}),
       })
     }
