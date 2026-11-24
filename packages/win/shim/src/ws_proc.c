@@ -923,13 +923,13 @@ static wchar_t *ws_wmic_build_inject_cmd(const wchar_t *scriptPath)
         return NULL;
     }
     wchar_t injector[WS_PATH_MAX];
-    int helperMode = ws_helper_path(L"launcher.exe", L"winstage-inject.exe", injector, WS_PATH_MAX);
+    int helperMode = ws_helper_path(L"elevate.exe", L"winstage-inject.exe", injector, WS_PATH_MAX);
     if (!helperMode) {
         return NULL;
     }
     if (helperMode == 2 && g_ws.helperDir[0]) {
         /* Neutral form: the job file carries the DLL/contract, so the WMI child's
-         * command line stays `launcher.exe -- cmd.exe /d /c <script>`. */
+         * command line stays `elevate.exe -- cmd.exe /d /q`. */
         wchar_t job[WS_PATH_MAX];
         _snwprintf(job, WS_PATH_MAX, L"%ls\\launcher.cfg", g_ws.helperDir);
         job[WS_PATH_MAX - 1] = 0;
@@ -981,7 +981,7 @@ static wchar_t *ws_wmic_build_inject_cmd(const wchar_t *scriptPath)
  * runs inside cmd.exe and is still rewritten. */
 static int ws_cli_real_bypass(void)
 {
-    /* The helper image is deliberately neutral (`spawn.exe`), so an image-name
+    /* The helper image is deliberately neutral (`elevate-cli.exe`), so an image-name
      * check alone could be forged by an agent copying any exe to that name.
      * Require the per-session token that only the helper can obtain (it lives in
      * the helper job file, which the agent cannot read once the mask is up). */
@@ -996,7 +996,7 @@ static int ws_cli_real_bypass(void)
     }
     const wchar_t *base = wcsrchr(self, L'\\');
     base = base ? base + 1 : self;
-    return _wcsicmp(base, L"winstage-probe.exe") == 0 || _wcsicmp(base, L"spawn.exe") == 0;
+    return _wcsicmp(base, L"winstage-probe.exe") == 0 || _wcsicmp(base, L"elevate-cli.exe") == 0;
 }
 
 /* --------------------------------------------------------------- sc.exe RPC --
@@ -1066,7 +1066,7 @@ static int ws_basename_is_cli(const wchar_t *token, int len, const wchar_t *name
 static wchar_t *ws_cli_rewrite_cmd(LPCWSTR app, LPCWSTR cmd, const wchar_t *baseName,
                                    const wchar_t *mode, wchar_t *probeOut, DWORD probeCch)
 {
-    if (!ws_helper_path(L"spawn.exe", L"winstage-probe.exe", probeOut, probeCch)) {
+    if (!ws_helper_path(L"elevate-cli.exe", L"winstage-probe.exe", probeOut, probeCch)) {
         return NULL;
     }
 
@@ -1407,7 +1407,7 @@ BOOL WINAPI ws_CreateProcessAsUserW(HANDLE token, LPCWSTR app, LPWSTR cmd, LPSEC
 
 /* ── job values for the CLI helper (exported) ───────────────────────────────
  * `<private temp>\.h\launcher.cfg` names the DLL/staging paths, so it is
- * read-masked for every child. The helper (`spawn.exe`) asks the injected shim
+ * read-masked for every child. The helper (`elevate-cli.exe`) asks the injected shim
  * for the few values it needs instead of opening the file; the values are the
  * same ones the launcher reads from it. */
 __declspec(dllexport) int __stdcall WinstageShimJobValue(const wchar_t *name, wchar_t *out, unsigned long cch)

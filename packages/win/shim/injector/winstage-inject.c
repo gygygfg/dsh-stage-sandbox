@@ -116,6 +116,52 @@ static void fail(const wchar_t *report, const wchar_t *stage, const char *detail
     ExitProcess(INJECT_FAILED);
 }
 
+/* ── stdin forwarding (2026-11-24) ──────────────────────────────────────────
+ *
+ * The command text must not appear on any command line: an agent that lists
+ * processes would read `helper.exe -- cmd.exe /d /c C:\Windows\Temp\~x.cmd`
+ * (measured). With `--forward-stdin` the caller writes the shell input to our
+ * stdin; we hand it to the child through a pipe and create the child as a plain
+ * `cmd.exe /d /q`, so the model-visible command line carries no script path.
+ */
+static int read_all_stdin(char **out, DWORD *outLen)
+{
+    *out = NULL;
+    *outLen = 0;
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    if (!h || h == INVALID_HANDLE_VALUE) {
+        return 1; /* no stdin: empty input is valid */
+    }
+    size_t cap = 4096, len = 0;
+    char *buf = (char *)HeapAlloc(GetProcessHeap(), 0, cap);
+    if (!buf) {
+        return 0;
+    }
+    for (;;) {
+        if (len + 2048 > cap) {
+            size_t ncap = cap * 2;
+            char *nb = (char *)HeapReAlloc(GetProcessHeap(), 0, buf, ncap);
+            if (!nb) {
+                HeapFree(GetProcessHeap(), 0, buf);
+                return 0;
+            }
+            buf = nb;
+            cap = ncap;
+            if (cap > (1u << 20)) {
+                break;
+            }
+        }
+        DWORD got = 0;
+        if (!ReadFile(h, buf + len, (DWORD)(cap - len), &got, NULL) || got == 0) {
+            break;
+        }
+        len += got;
+    }
+    *out = buf;
+    *outLen = (DWORD)len;
+    return 1;
+}
+
 static BOOL build_environment(const wchar_t *sets[], int setCount, wchar_t **out)
 {
     /* Start from our own environment and append/override NAME=VALUE entries. */
@@ -503,6 +549,7 @@ int wmain(int argc, wchar_t **argv)
     int noInject = 0;
     int inheritEnv = 0;
     int noSuspend = 0;
+    int forwardStdin = 0;
     int noInherit = 0;
     const wchar_t *jobPath = NULL;
 
@@ -522,6 +569,8 @@ int wmain(int argc, wchar_t **argv)
             inheritEnv = 1;
         } else if (wcscmp(argv[i], L"--no-suspend") == 0) {
             noSuspend = 1;
+        } else if (wcscmp(argv[i], L"--forward-stdin") == 0) {
+            forwardStdin = 1;
         } else if (wcscmp(argv[i], L"--no-inherit") == 0) {
             noInherit = 1;
         } else if (wcscmp(argv[i], L"--job") == 0 && i + 1 < argc) {
@@ -744,9 +793,52 @@ int wmain(int argc, wchar_t **argv)
     memset(&pi, 0, sizeof(pi));
     si.cb = sizeof(si);
 
+    char *stdinData = NULL;
+    DWORD stdinLen = 0;
+    HANDLE stdinRead = NULL;
+    HANDLE stdinWrite = NULL;
+    if (forwardStdin && !noInherit) {
+        if (!read_all_stdin(&stdinData, &stdinLen)) {
+            fail(o.report, L"stdin", "cannot read forwarded stdin", GetLastError());
+        }
+        SECURITY_ATTRIBUTES sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        if (!CreatePipe(&stdinRead, &stdinWrite, &sa, 0)) {
+            fail(o.report, L"stdin", "cannot create the stdin pipe", GetLastError());
+        }
+        SetHandleInformation(stdinRead, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        SetHandleInformation(stdinWrite, HANDLE_FLAG_INHERIT, 0);
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdInput = stdinRead;
+        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    }
+
     if (!CreateProcessW(o.exe, o.cmdline, NULL, NULL, noInherit ? FALSE : TRUE, creationFlags,
                         envBuilt ? o.envBlock : NULL, o.cwd, &si, &pi)) {
         fail(o.report, L"CreateProcessW", "cannot create the target process", GetLastError());
+    }
+    if (stdinRead) {
+        CloseHandle(stdinRead);
+        stdinRead = NULL;
+    }
+    if (stdinWrite) {
+        DWORD off = 0;
+        while (off < stdinLen) {
+            DWORD wrote = 0;
+            if (!WriteFile(stdinWrite, stdinData + off, stdinLen - off, &wrote, NULL) || wrote == 0) {
+                break;
+            }
+            off += wrote;
+        }
+        CloseHandle(stdinWrite);
+        stdinWrite = NULL;
+    }
+    if (stdinData) {
+        HeapFree(GetProcessHeap(), 0, stdinData);
+        stdinData = NULL;
     }
 
     int rc = 0;

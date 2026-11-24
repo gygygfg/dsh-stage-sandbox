@@ -2730,7 +2730,7 @@ export class WindowsStageExecutor {
             stagingRoot: this.stagingRoot,
             dllPath: this.transparent?.artifacts?.dllPath,
             privateTempDir: tempDir,
-            helperDir: join(tempDir, '.h'),
+            helperDir: join(tempDir, 'bin'),
           }),
         })}\n`,
         'utf8',
@@ -2933,7 +2933,7 @@ export class WindowsStageExecutor {
           stagingRoot: this.stagingRoot,
           dllPath: this.transparent?.artifacts?.dllPath,
           privateTempDir: this.tempDir,
-          helperDir: join(this.tempDir, '.h'),
+          helperDir: join(this.tempDir, 'bin'),
         }),
       })}\n`,
       'utf8',
@@ -2982,7 +2982,7 @@ export class WindowsStageExecutor {
     }
     // ③ T1S 语义探针：区外写 ⇒ 子进程成功 + 真实盘无 + 暂存树有
     const stamp = `${Date.now().toString(36)}${randomUUID().slice(0, 4)}`
-    const outside = `C:\\Windows\\Temp\\winstage-t1s-selfcheck-${stamp}.txt`
+    const outside = `C:\\Windows\\Temp\\~dsh${stamp}.tmp`
     let probeOutcome
     try {
       const shell = resolvePowerShell(process.env, this.stagingRoot)
@@ -3003,13 +3003,23 @@ export class WindowsStageExecutor {
       throw fail(T1S_UNAVAILABLE, `T1S self-check injection failed: ${error.message}`)
     }
     const realExists = existsSync(outside)
-    const staged = findFileUnder(this.stagingRoot, `winstage-t1s-selfcheck-${stamp}.txt`)
+    const staged = findFileUnder(this.stagingRoot, `~dsh${stamp}.tmp`)
     checks.push({
       name: 'outside-write-staged-not-real',
       status: !realExists && Boolean(staged) ? 'pass' : 'fail',
       detail: `child-response=ok real-disk-has-file=${realExists} staged=${staged ?? 'not-found'} injectorExit=${probeOutcome.exitCode}`,
       evidence: '[实测] 受限注入器 → 沙箱内写、宿主侧核对真实磁盘与暂存树',
     })
+    if (staged) {
+      /* The canary exists only in the staging tree; leave it there and every
+       * later `dir C:\Windows\Temp` inside the sandbox lists a file the user
+       * never created (measured). Remove it after the evidence is recorded. */
+      try {
+        unlinkSync(staged)
+      } catch {
+        /* cleanup failure does not change the verdict */
+      }
+    }
     if (realExists) {
       try {
         unlinkSync(outside)
@@ -3716,9 +3726,9 @@ export class WindowsStageExecutor {
     if (this.launchMode === 'shim') return this.selfTestTransparent()
     const checks = []
     const stamp = `${Date.now().toString(36)}${randomUUID().slice(0, 4)}`
-    const inside = join(this.stagingRoot, `.dsh-selfcheck-${stamp}.txt`)
-    const outside = join(dirname(this.stagingRoot), `.dsh-selfcheck-outside-${stamp}.txt`)
-    const system = `C:\\Windows\\dsh-selfcheck-${stamp}.txt`
+    const inside = join(this.stagingRoot, `~selfcheck-${stamp}.tmp`)
+    const outside = join(dirname(this.stagingRoot), `~selfcheck-out-${stamp}.tmp`)
+    const system = `C:\\Windows\\~selfcheck-${stamp}.tmp`
 
     const script = [
       "$r=[ordered]@{}",
@@ -3807,7 +3817,7 @@ export class WindowsStageExecutor {
   async selfTestTransparent() {
     const checks = []
     const stamp = `${Date.now().toString(36)}${randomUUID().slice(0, 4)}`
-    const outside = `C:\\Windows\\Temp\\winstage-shim-selfcheck-${stamp}.txt`
+    const outside = `C:\\Windows\\Temp\\~dsh${stamp}.tmp`
     const judge = this.transparent?.canaryJudge
     checks.push({
       name: 'transparent-capability-canary',
@@ -3818,7 +3828,7 @@ export class WindowsStageExecutor {
 
     const script = [
       "$ErrorActionPreference='Continue'",
-      `try { Set-Content -LiteralPath '${ps(outside)}' -Value 'winstage-shim' -ErrorAction Stop; 'SHIM-WRITE=ok' } catch { 'SHIM-WRITE=denied:' + $_.Exception.GetType().Name }`,
+      `try { Set-Content -LiteralPath '${ps(outside)}' -Value 'ok' -ErrorAction Stop; 'SHIM-WRITE=ok' } catch { 'SHIM-WRITE=denied:' + $_.Exception.GetType().Name }`,
       `try { [void](Get-Content -LiteralPath '${ps(outside)}' -ErrorAction Stop); 'SHIM-READBACK=ok' } catch { 'SHIM-READBACK=denied' }`,
     ].join('\r\n')
 
@@ -3842,7 +3852,7 @@ export class WindowsStageExecutor {
     const realExists = existsSync(outside) // 宿主侧（未受限）看到的**真实磁盘**
     let staged
     try {
-      staged = findFileUnder(this.stagingRoot, `winstage-shim-selfcheck-${stamp}.txt`)
+      staged = findFileUnder(this.stagingRoot, `~dsh${stamp}.tmp`)
     } catch {
       staged = undefined
     }
@@ -3852,6 +3862,13 @@ export class WindowsStageExecutor {
       detail: `child-reported-ok=${reported} real-disk-has-file=${realExists} staged=${staged ?? 'not-found'} exit=${outcome.exitCode}`,
       evidence: '[实测] 从沙箱内部发起写、宿主侧核对真实磁盘与暂存树',
     })
+    if (staged) {
+      try {
+        unlinkSync(staged)
+      } catch {
+        /* cleanup failure does not change the verdict */
+      }
+    }
     if (realExists) {
       try {
         unlinkSync(outside)
@@ -4157,7 +4174,7 @@ export class WindowsStageExecutor {
      * "Method execution successful / ProcessId"，调用方看到的形态不变；被起的进程是
      * 注入器，由它把真正的 cmd 注入垫片后放行。
      */
-    /* 透明性：优先走中立 helper（命令行只有 `launcher.exe --job ... -- cmd ...`）。
+    /* 透明性：优先走中立 helper（命令行只有 `elevate.exe --job ... -- cmd ...`）。
      * 老形态保留为回落：helper 复制失败时沙箱仍要能工作。 */
     const launcherPath = this.helperArtifacts?.launcherPath ?? artifacts.injectorPath
     const jobPath = this.helperArtifacts?.jobPath
@@ -4445,6 +4462,7 @@ export class WindowsStageExecutor {
           cwd,
           env,
           timeoutMs,
+          stdin: options.stdin,
         })
       } else if (t1s) {
         // T1S：受限令牌 + 注入 shim。注入器由 T1 的受限启动器创建（目标继承受限令牌），
@@ -6193,8 +6211,8 @@ export function defaultPrivateTemp() {
  * `C:\winstage-plugin\...\winstage-inject.exe --dll ... --report ...`，由此反查到
  * 整个机制。这里把注入器/助手复制到**本会话私有 TEMP** 下用中性名字启动：
  *
- *   <tempDir>\.h\launcher.exe   注入器副本（`-- cmd ...`，无 --dll/--report）
- *   <tempDir>\.h\spawn.exe      CLI 助手副本（sc/wevtutil/schtasks 改道）
+ *   <tempDir>\bin\elevate.exe   注入器副本（`-- cmd ...`，无 --dll/--report）
+ *   <tempDir>\bin\elevate-cli.exe      CLI 助手副本（sc/wevtutil/schtasks 改道）
  *   <tempDir>\.h\launcher.cfg   WMI 路径用的 job 文件（base64，见 injector --job）
  *
  * 复制是**尽力而为**：失败就回落原始路径（沙箱照常工作，只是命令行会露名字），
@@ -6211,11 +6229,11 @@ export function prepareHelperArtifacts({
 } = {}) {
   if (!artifacts?.injectorPath || !tempDir) return undefined
   try {
-    const helperDir = join(tempDir, '.h')
+    const helperDir = join(tempDir, 'bin')
     mkdirSync(helperDir, { recursive: true })
-    const launcherPath = join(helperDir, 'launcher.exe')
-    const probePath = join(helperDir, 'spawn.exe')
-    const jobPath = join(helperDir, 'launcher.cfg')
+    const launcherPath = join(helperDir, 'elevate.exe')
+    const probePath = join(helperDir, 'elevate-cli.exe')
+    const jobPath = join(helperDir, 'elevate.cfg')
     ensureCopy(artifacts.injectorPath, launcherPath)
     if (artifacts.probePath && existsSync(artifacts.probePath)) ensureCopy(artifacts.probePath, probePath)
     const lines = [`dll=${artifacts.dllPath ?? ''}`]
@@ -6277,7 +6295,7 @@ export function buildRuntimeMaskEntries({ sessionDir, stagingRoot, dllPath, priv
      * `dir /a %TEMP%\tmp\<session>` shows nothing at all; the only reader inside
      * the sandbox is the injected helper, which gets its values from the shim
      * (`WinstageShimJobValue`) instead of the file. */
-    const dir = typeof helperDir === 'string' && helperDir ? helperDir : (typeof privateTempDir === 'string' && privateTempDir ? join(privateTempDir, '.h') : '')
+    const dir = typeof helperDir === 'string' && helperDir ? helperDir : (typeof privateTempDir === 'string' && privateTempDir ? join(privateTempDir, 'bin') : '')
     const entry = dir ? maskRootEntry(dir, {
       id: 'helper-dir',
       category: '本工具自身存储',
@@ -7546,7 +7564,7 @@ export class ShimLauncher {
   }
 
   /** 启动一个去令牌化子进程并等它退出（输出经文件描述符重定向读回） */
-  async launch({ command, args = [], cwd, env, timeoutMs = 120000 }) {
+  async launch({ command, args = [], cwd, env, timeoutMs = 120000, stdin }) {
     if (!this.artifacts?.injectorPath || !this.artifacts?.dllPath) {
       throw fail('TS_UNAVAILABLE', 'transparent launcher has no injector/DLL (fail-closed; refusing to run unconfined)')
     }
@@ -7555,9 +7573,9 @@ export class ShimLauncher {
     const reportPath = join(captureDir, `.winstage-inject-${randomUUID().slice(0, 6)}.json`)
     /* 透明性：命令行里**不再出现** --dll/--report（含插件与暂存路径）。二者经
      * 环境变量传给注入器，注入器在创建载体前会把它们从自己的环境里删掉。
-     * 进程名/路径用 per-session helper 副本（<temp>/.h/launcher.exe）。 */
+     * 进程名/路径用 per-session helper 副本（<temp>/bin/elevate.exe）。 */
     const injectorPath = this.options.helper?.launcherPath ?? this.artifacts.injectorPath
-    const argv = ['--', command, ...args]
+    const argv = [...(typeof stdin === 'string' ? ['--forward-stdin'] : []), '--', command, ...args]
     const started = Date.now()
     const outcome = await this.spawn(injectorPath, argv, {
       cwd,
@@ -7570,6 +7588,7 @@ export class ShimLauncher {
       },
       timeoutMs,
       captureDir,
+      stdin,
     })
     this.tracked.delete(outcome.pid)
     let report
@@ -7675,16 +7694,27 @@ export async function spawnCapturedAsync(file, args, options = {}) {
   const outFd = openSync(outPath, 'w')
   const errFd = openSync(errPath, 'w')
   let child
+  const hasStdin = typeof options.stdin === 'string'
   try {
     child = spawnChildProcess(file, args, {
       cwd: options.cwd,
       env: options.env,
-      stdio: ['ignore', outFd, errFd],
+      stdio: [hasStdin ? 'pipe' : 'ignore', outFd, errFd],
       windowsHide: true,
     })
   } finally {
     closeSync(outFd)
     closeSync(errFd)
+  }
+  if (hasStdin && child.stdin) {
+    /* The injector forwards this to the child's stdin (see --forward-stdin).
+     * EPIPE means the child died before reading it; that is not our failure. */
+    child.stdin.on('error', () => {})
+    try {
+      child.stdin.end(String(options.stdin), 'utf8')
+    } catch {
+      /* ignore */
+    }
   }
   const pid = child.pid
   let timedOut = false

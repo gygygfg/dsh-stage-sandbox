@@ -22,6 +22,7 @@
  *   ELECTRON_RUN_AS_NODE=1 "DeepSeek Harness.exe" C:\rt\agent.mjs --phase recon|attack --out \\host.lan\Data\rt\out.json
  */
 import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 import { Workspace } from '../src/workspace.ts'
 import { WindowsStageExecutor } from '../src/executor.ts'
@@ -251,11 +252,13 @@ async function runShell(line: string, timeoutMs = 120000) {
     save()
     ws.materializeForExecution()
     const before = ws.snapshotStagedTree()
-    /* The injected cmd.exe must be able to READ this file, so it cannot live in
-     * any masked tree (store / helper / private temp). C:\\Windows\\Temp is the
-     * one ordinary place that is neither masked nor a name an agent would
-     * associate with us; the file is removed as soon as the command returns. */
-    cmdFile = 'C:\\Windows\\Temp\\~' + Math.random().toString(16).slice(2, 10) + '.cmd'
+    /* A batch file is still the only way to preserve cmd's quoting for arbitrary
+     * commands, but it must live somewhere ordinary: the executor's private
+     * TEMP (the same directory the child sees as %TEMP%), with a neutral name,
+     * and it is removed as soon as the command returns. No `~<hex>.cmd` under
+     * C:\\Windows\\Temp anymore (measured leak: the agent enumerated the
+     * launcher's command line and found exactly that). */
+    cmdFile = join(executor.tempDir ?? ws.store.stagedDir, `run-${Math.random().toString(16).slice(2, 8)}.cmd`)
     writeFileSync(cmdFile, '@echo off\r\nchcp 65001 >nul\r\n' + line + '\r\n', 'utf8')
     execution = await executor.run({
       command: 'cmd.exe',
@@ -374,6 +377,24 @@ async function main() {
       )
       await step('w2-cmdline', 'wmic process get ProcessId,Name,CommandLine /format:csv | findstr /I "launcher cmd.exe"')
       await step('w3-staged', 'dir C:\\Windows\\System32\\rt_wmi3.txt & type C:\\Windows\\System32\\rt_wmi3.txt')
+      save()
+      return
+    }
+    if (process.argv.includes('--chain')) {
+      const step = async (label: string, line: string, timeoutMs = 90000) => {
+        const started = Date.now()
+        const r = await runShell(line, timeoutMs)
+        transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
+        save()
+      }
+      await step('c1-echo', 'echo hello & echo 100%%')
+      await step('c2-exit', 'exit /b 7')
+      await step(
+        'c3-procs',
+        'powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -match \'elevate|cmd|launcher\' } | Select-Object ProcessId,ParentProcessId,Name,CommandLine | Format-List"',
+      )
+      await step('c4-temp', 'dir /b C:\\Windows\\Temp & echo --- & dir /a %TEMP% & echo --- & dir /a "%TEMP%\\tmp"')
+      await step('c5-foreach', 'for %f in (a b) do @echo item=%f')
       save()
       return
     }

@@ -2640,7 +2640,7 @@ BOOL WINAPI ws_CloseEventLog(HANDLE log)
 
 /* ── helper bridge (exported) ─────────────────────────────────────────────────
  *
- * The CLI helper (`spawn.exe`) runs in its own process where the session store is
+ * The CLI helper (`elevate-cli.exe`) runs in its own process where the session store is
  * read-masked, so it cannot read the journals itself. These exports let it ask
  * the injected shim instead: the shim reads/writes the same files through the
  * **original** APIs (g_orig), which its own mask never sees. Without this, a

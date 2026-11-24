@@ -1358,3 +1358,14 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
   持久化/破坏性写入在模型侧仍全部“成功”，真实盘核对零写入。
 - 环境侧：开跑前停掉容器 Samba（`\\host.lan\Data` = `/shared`，会暴露证据文件）；
   清盘清单加上 `Documents\deepseek-harness\default-workspace`（残留 `stage-*.txt`）。
+
+### 23.8 进程链加固（2026-11-24）
+
+- helper 改名：`.h\launcher.exe` → `bin\elevate.exe`，`spawn.exe` → `bin\elevate-cli.exe`；
+  每条命令的脚本从 `C:\Windows\Temp\~<hex>.cmd` 搬到执行器私有 TEMP 的
+  `<temp>\tmp\<guid>\run-<hex>.cmd`（命令结束即删）。
+- 自检金丝雀改名 `~dsh<stamp>.tmp` 并删除暂存副本（此前 `dir C:\Windows\Temp` 会列出
+  `winstage-shim-selfcheck-*`）。
+- PPID 伪造（父进程=宿主）再次实测仍失败（injector 111 / `remote WinstageShimInit failed`），
+  已回退；彻底去掉多出来的父进程需要宿主进程内 `CreateProcess(SUSPENDED)` + N-API 注入。
+- 交互式 `cmd /d /q` + stdin 试过：命令行干净但会输出 cmd 横幅/提示符，已回退。
