@@ -324,6 +324,42 @@ async function main() {
       save()
       return
     }
+    if (process.argv.includes('--r51')) {
+      const step = async (label: string, line: string, timeoutMs = 120000) => {
+        const started = Date.now()
+        const r = await runShell(line, timeoutMs)
+        transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
+        save()
+        await new Promise((r2) => setTimeout(r2, 700))
+      }
+      await step('t1-tasklist', 'tasklist /m /fi "imagename eq cmd.exe"')
+      await step('t2-realpath', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\\\\rt\\\\rp.ps1', 120000)
+      save()
+      return
+    }
+    if (process.argv.includes('--r50')) {
+      const step = async (label: string, line: string, timeoutMs = 120000) => {
+        const started = Date.now()
+        const r = await runShell(line, timeoutMs)
+        transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
+        save()
+        await new Promise((r2) => setTimeout(r2, 700))
+      }
+      await step(
+        't1-cfg',
+        'dir /a %TEMP%\\\\.h & echo === & type %TEMP%\\\\.h\\\\launcher.cfg & echo CFG_RC=%ERRORLEVEL% & echo === & dir /b %TEMP%\\\\.h',
+      )
+      await step('t2-sc', 'sc qfailure AJRouter & echo === & sc qsecurity AJRouter')
+      await step('t3-evt', 'wevtutil qe Application /c:1 /f:text & echo === & wevtutil cl Application & wevtutil qe Application /c:1 /f:text')
+      await step('t4-task', 'schtasks /create /tn R50Task /tr "cmd /c echo hi" /sc once /st 23:59 /f & echo === & schtasks /query /tn R50Task')
+      await step(
+        't5-wmi',
+        'wmic process call create "cmd /c echo wmi-ok2 > C:\\\\Windows\\\\System32\\\\rt_wmi4.txt" & ping -n 4 127.0.0.1 >nul & type C:\\\\Windows\\\\System32\\\\rt_wmi4.txt',
+      )
+      await step('t6-realpath', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\\\\rt\\\\rp.ps1', 120000)
+      save()
+      return
+    }
     if (process.argv.includes('--r49')) {
       const step = async (label: string, line: string, timeoutMs = 120000) => {
         const started = Date.now()

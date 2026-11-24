@@ -5035,6 +5035,94 @@ BOOL WINAPI ws_GetFileInformationByHandle(HANDLE hFile, LPVOID lpFileInformation
 static NTSTATUS(NTAPI *ws_ntqif_orig)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, int);
 static volatile LONG ws_ntqifResolved;
 
+/* ── Transparency: rewrite a staged NAME buffer in place ────────────────────
+ *
+ * `GetFileInformationByHandleEx(FileNameInfo)` and
+ * `NtQueryInformationFile(FileNameInformation)` both answer "where does this
+ * handle point". Measured shapes on the guest: `\\?\C:\...`, `\??\C:\...`, the
+ * volume-relative `\rt\stage\...` and plain `C:\...`. A path under
+ * `<stageRoot>\fs\` is mapped back to its logical name and re-framed in the
+ * SAME shape, so the caller cannot tell the answer was rewritten and a name is
+ * never made longer (the logical path is always shorter).
+ * Returns 1 when the buffer was rewritten (and `*lenChars` updated). */
+static int ws_map_name_in_place(WCHAR *name, DWORD *lenChars, DWORD capChars)
+{
+    if (!name || !lenChars) {
+        return 0;
+    }
+    DWORD cch = *lenChars;
+    if (cch < 2 || cch > capChars) {
+        return 0;
+    }
+    WS_PATH_BUF(full);
+    size_t pos = 0;
+    full[0] = 0;
+    int kind = 0; /* 1 = \\?\ 2 = \??\ 3 = volume-relative 4 = drive-absolute */
+    int fits = 1;
+    DWORD start = 0;
+    if (cch > 4 && name[0] == L'\\' && name[1] == L'\\' && name[2] == L'?' && name[3] == L'\\') {
+        kind = 1;
+        start = 4;
+    } else if (cch > 4 && name[0] == L'\\' && name[1] == L'?' && name[2] == L'?' && name[3] == L'\\') {
+        kind = 2;
+        start = 4;
+    } else if (name[0] == L'\\' && name[1] != L'\\') {
+        if (!(g_ws.haveStageRoot && g_ws.stageRoot[1] == L':')) {
+            return 0;
+        }
+        kind = 3;
+        wchar_t drive[3] = { g_ws.stageRoot[0], L':', 0 };
+        fits = ws_append_w(full, WS_PATH_MAX, &pos, drive);
+    } else if (name[1] == L':') {
+        kind = 4;
+    }
+    if (!kind || !fits) {
+        return 0;
+    }
+    for (DWORD i = start; i < cch && fits; i++) {
+        wchar_t one[2] = { name[i], 0 };
+        fits = ws_append_w(full, WS_PATH_MAX, &pos, one);
+    }
+    WS_PATH_BUF(logical);
+    if (!fits || !ws_logical_from_staged(full, logical, WS_PATH_MAX) || !logical[0]) {
+        return 0;
+    }
+    WS_PATH_BUF(out);
+    size_t opos = 0;
+    out[0] = 0;
+    int okOut = 1;
+    switch (kind) {
+    case 1: {
+        int unc = (logical[0] == L'\\' && logical[1] == L'\\');
+        okOut = ws_append_w(out, WS_PATH_MAX, &opos, unc ? L"\\\\?\\UNC\\" : L"\\\\?\\") &&
+                ws_append_w(out, WS_PATH_MAX, &opos, unc ? logical + 2 : logical);
+        break;
+    }
+    case 2:
+        okOut = ws_append_w(out, WS_PATH_MAX, &opos, L"\\??\\") &&
+                ws_append_w(out, WS_PATH_MAX, &opos, logical);
+        break;
+    case 3: {
+        const wchar_t *rel = (logical[1] == L':') ? logical + 2 : logical;
+        okOut = ws_append_w(out, WS_PATH_MAX, &opos, rel);
+        break;
+    }
+    default:
+        okOut = ws_append_w(out, WS_PATH_MAX, &opos, logical);
+        break;
+    }
+    DWORD lcch = (DWORD)wcslen(out);
+    if (!okOut || lcch > capChars) {
+        return 0;
+    }
+    memcpy(name, out, (size_t)lcch * sizeof(WCHAR));
+    if (lcch < capChars) {
+        name[lcch] = 0;
+    }
+    *lenChars = lcch;
+    return 1;
+}
+
 NTSTATUS NTAPI ws_NtQueryInformationFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
                                          PVOID FileInformation, ULONG Length, int FileInformationClass)
 {
@@ -5051,6 +5139,26 @@ NTSTATUS NTAPI ws_NtQueryInformationFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoS
         st = ws_ntqif_orig(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     } else {
         st = NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+    }
+    /* Transparency: FileNameInformation (9) hands out the staging path. Same
+     * rewrite as the Win32 variant; the buffer is caller-owned and the mapped
+     * name is always shorter, so nothing can overflow.
+     *
+     * DISABLED (2026-11-24): measured `GetFinalPathNameByHandleW` returning 0 /
+     * ERROR_ACCESS_DENIED for staged handles once this ran -- kernelbase's own
+     * path resolution goes through this class, so rewriting its buffer makes the
+     * API fail for exactly the files we redirect. The Win32 wrapper
+     * (ws_GetFinalPathNameByHandleW) already answers the logical path, which is
+     * what libuv/Python/forensic tools call; the raw Nt path is left untouched. */
+    if (0 && st == 0 && FileInformationClass == 9 && FileInformation && Length >= sizeof(ULONG) + sizeof(WCHAR)) {
+        ULONG *lenBytes = (ULONG *)FileInformation;
+        DWORD cch = *lenBytes / sizeof(WCHAR);
+        if (*lenBytes <= Length - (ULONG)sizeof(ULONG)) {
+            DWORD cap = (Length - (DWORD)sizeof(ULONG)) / (DWORD)sizeof(WCHAR) - 1;
+            if (ws_map_name_in_place((WCHAR *)((BYTE *)FileInformation + sizeof(ULONG)), &cch, cap)) {
+                *lenBytes = cch * (ULONG)sizeof(WCHAR);
+            }
+        }
     }
     WS_DBG("ATTRDBG-NTQIF seq=%ld handle=%p class=%d status=0x%lx", /* R11-D-13d-seq */
            ws_seq(), (void *)FileHandle, FileInformationClass, (unsigned long)st);
@@ -5079,71 +5187,15 @@ BOOL WINAPI ws_GetFileInformationByHandleEx(HANDLE hFile, int FileInformationCla
                                           lpFileInformation, dwBufferSize);
     }
     DWORD e = GetLastError();
-    /* Transparency: FILE_NAME_INFO (class 2) leaks the staging path too.
-     * Measured shapes on the guest: `\\?\C:\...`, `\??\C:\...` and the
-     * volume-relative `\rt\stage\...` (no drive letter). All three are rebuilt
-     * in the SAME shape, so the caller cannot tell the answer was rewritten. */
+    /* Transparency: FILE_NAME_INFO (class 2) leaks the staging path too. */
     if (ok && FileInformationClass == 2 && lpFileInformation &&
-        dwBufferSize >= sizeof(DWORD) + sizeof(WCHAR)) {
+        dwBufferSize >= sizeof(DWORD) + 2 * sizeof(WCHAR)) {
         WsFileNameInfo *ni = (WsFileNameInfo *)lpFileInformation;
-        DWORD bytes = ni->FileNameLength;
-        if (bytes >= 2 * sizeof(WCHAR) && bytes <= dwBufferSize - sizeof(DWORD)) {
-            DWORD cch = bytes / sizeof(WCHAR);
-            WCHAR *name = ni->FileName;
-            WS_PATH_BUF(full);
-            size_t pos = 0;
-            full[0] = 0;
-            int kind = 0; /* 1 = \\?\ form, 2 = \??\ form, 3 = volume-relative */
-            int fits = 1;
-            if (cch > 4 && name[0] == L'\\' && name[1] == L'\\' && name[2] == L'?' && name[3] == L'\\') {
-                kind = 1;
-                for (DWORD i = 4; i < cch && fits; i++) {
-                    wchar_t one[2] = { name[i], 0 };
-                    fits = ws_append_w(full, WS_PATH_MAX, &pos, one);
-                }
-            } else if (cch > 4 && name[0] == L'\\' && name[1] == L'?' && name[2] == L'?' &&
-                       name[3] == L'\\') {
-                kind = 2;
-                for (DWORD i = 4; i < cch && fits; i++) {
-                    wchar_t one[2] = { name[i], 0 };
-                    fits = ws_append_w(full, WS_PATH_MAX, &pos, one);
-                }
-            } else if (name[0] == L'\\' && name[1] != L'\\' && g_ws.haveStageRoot && g_ws.stageRoot[1] == L':') {
-                /* volume-relative: prepend the staging volume's drive letter */
-                kind = 3;
-                wchar_t drive[3] = { g_ws.stageRoot[0], L':', 0 };
-                fits = ws_append_w(full, WS_PATH_MAX, &pos, drive);
-                for (DWORD i = 0; i < cch && fits; i++) {
-                    wchar_t one[2] = { name[i], 0 };
-                    fits = ws_append_w(full, WS_PATH_MAX, &pos, one);
-                }
-            }
-            WS_PATH_BUF(logical);
-            if (fits && kind && ws_logical_from_staged(full, logical, WS_PATH_MAX) && logical[0]) {
-                WS_PATH_BUF(out);
-                size_t opos = 0;
-                out[0] = 0;
-                int okOut = 1;
-                if (kind == 1) {
-                    int unc = (logical[0] == L'\\' && logical[1] == L'\\');
-                    okOut = ws_append_w(out, WS_PATH_MAX, &opos, unc ? L"\\\\?\\UNC\\" : L"\\\\?\\") &&
-                            ws_append_w(out, WS_PATH_MAX, &opos, unc ? logical + 2 : logical);
-                } else if (kind == 2) {
-                    okOut = ws_append_w(out, WS_PATH_MAX, &opos, L"\\??\\") &&
-                            ws_append_w(out, WS_PATH_MAX, &opos, logical);
-                } else {
-                    /* back to volume-relative: drop "C:" */
-                    const wchar_t *rel = (logical[1] == L':') ? logical + 2 : logical;
-                    okOut = ws_append_w(out, WS_PATH_MAX, &opos, rel);
-                }
-                DWORD lcch = (DWORD)wcslen(out);
-                DWORD need = lcch * (DWORD)sizeof(WCHAR);
-                if (okOut && need <= bytes &&
-                    need + (DWORD)sizeof(WCHAR) <= dwBufferSize - (DWORD)sizeof(DWORD)) {
-                    memcpy(ni->FileName, out, (size_t)lcch * sizeof(WCHAR));
-                    ni->FileName[lcch] = 0;
-                    ni->FileNameLength = need;
-                }
+        if (ni->FileNameLength <= dwBufferSize - sizeof(DWORD)) {
+            DWORD cch = ni->FileNameLength / sizeof(WCHAR);
+            DWORD cap = (dwBufferSize - (DWORD)sizeof(DWORD)) / (DWORD)sizeof(WCHAR) - 1;
+            if (ws_map_name_in_place(ni->FileName, &cch, cap)) {
+                ni->FileNameLength = cch * sizeof(WCHAR);
             }
         }
     }

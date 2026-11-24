@@ -664,6 +664,8 @@ static int cmd_description(int argc, wchar_t **argv)
  * job 文件（`launcher.cfg`，与注入器共用；base64 编码的 key=value）里取
  * `regstage=`，再拼出 journal 路径。
  */
+static void *cli_shim_export(const char *name); /* defined below */
+
 static int cli_b64_value(char c)
 {
     if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -677,6 +679,15 @@ static int cli_b64_value(char c)
 static int cli_job_value(const wchar_t *key, wchar_t *out, DWORD cch)
 {
     out[0] = 0;
+    /* The job file is read-masked for sandboxed processes (its base64 body names
+     * the DLL/staging paths), so ask the injected shim first. */
+    {
+        typedef int(__stdcall * CliJobValueFn)(const wchar_t *, wchar_t *, unsigned long);
+        CliJobValueFn shimValue = (CliJobValueFn)cli_shim_export("WinstageShimJobValue");
+        if (shimValue && shimValue(key, out, (unsigned long)cch)) {
+            return out[0] ? 1 : 0;
+        }
+    }
     wchar_t self[1024];
     if (!GetModuleFileNameW(NULL, self, 1024)) {
         return 0;
@@ -755,6 +766,26 @@ typedef int(__stdcall *CliEvtClearedFn)(const wchar_t *);
  * both names so the helper works with either image. */
 static HMODULE cli_shim_handle(void)
 {
+    /* The shim renames its loader entry, but the loader's module hash is keyed by
+     * the name it was loaded with, so GetModuleHandle("wds.dll") never matches.
+     * Ask every loaded module whether it exports the shim's init symbol. */
+    typedef BOOL(WINAPI * CliEnumModulesFn)(HANDLE, HMODULE *, DWORD, LPDWORD);
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    CliEnumModulesFn enumModules =
+        k32 ? (CliEnumModulesFn)(void *)GetProcAddress(k32, "K32EnumProcessModules") : NULL;
+    HMODULE mods[512];
+    DWORD needed = 0;
+    if (enumModules && enumModules(GetCurrentProcess(), mods, (DWORD)sizeof(mods), &needed)) {
+        DWORD n = needed / (DWORD)sizeof(HMODULE);
+        if (n > 512) {
+            n = 512;
+        }
+        for (DWORD i = 0; i < n; i++) {
+            if (mods[i] && GetProcAddress(mods[i], "WinstageShimInit")) {
+                return mods[i];
+            }
+        }
+    }
     HMODULE shim = GetModuleHandleW(L"wds.dll");
     if (!shim) {
         shim = GetModuleHandleW(L"winstage-shim.dll");

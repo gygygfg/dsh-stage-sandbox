@@ -1310,3 +1310,11 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
   映射回逻辑路径（三种前缀形态）。
 - `ChangeServiceConfig2`/`SetServiceObjectSecurity` 进 overlay；`sc sdset/failure/
   triggerinfo/qsecurity/qfailure` 由助手实现。
+
+### 23.3 第三批续（2026-11-24 中午）
+
+- `launcher.cfg` 进读遮蔽（精确文件条目），助手改用垫片导出 `WinstageShimJobValue`。
+- 模块列表不再删条目（`tasklist /m` 读 PEB，删了只会让助手找不到自己）；
+  loader 表项改名 + 命名 API 中性化即可。
+- `NtQueryInformationFile(FileNameInformation)` 的改写实测会让 kernelbase 的
+  `GetFinalPathNameByHandleW` 对被暂存文件返回 `ERROR_ACCESS_DENIED`，已关闭（Win32 层覆盖足够）。

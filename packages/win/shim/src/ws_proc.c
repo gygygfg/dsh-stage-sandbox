@@ -1397,3 +1397,35 @@ BOOL WINAPI ws_CreateProcessAsUserW(HANDLE token, LPCWSTR app, LPWSTR cmd, LPSEC
     }
     return ws_create_process_common(token, 1, app, cmd, pa, ta, inherit, flags, env, cwd, si, pi);
 }
+
+/* ── job values for the CLI helper (exported) ───────────────────────────────
+ * `<private temp>\.h\launcher.cfg` names the DLL/staging paths, so it is
+ * read-masked for every child. The helper (`spawn.exe`) asks the injected shim
+ * for the few values it needs instead of opening the file; the values are the
+ * same ones the launcher reads from it. */
+__declspec(dllexport) int __stdcall WinstageShimJobValue(const wchar_t *name, wchar_t *out, unsigned long cch)
+{
+    if (!name || !out || cch < 2) {
+        return 0;
+    }
+    out[0] = 0;
+    const wchar_t *v = NULL;
+    if (_wcsicmp(name, L"regstage") == 0) {
+        v = g_ws.regStageDir;
+    } else if (_wcsicmp(name, L"stage") == 0) {
+        v = g_ws.stageRoot;
+    } else if (_wcsicmp(name, L"log") == 0) {
+        v = g_ws.logPath;
+    } else if (_wcsicmp(name, L"config") == 0) {
+        v = g_ws.configPath;
+    } else if (_wcsicmp(name, L"helper") == 0) {
+        v = g_ws.helperDir;
+    } else if (_wcsicmp(name, L"token") == 0) {
+        v = g_ws.cliToken;
+    }
+    if (!v || !v[0]) {
+        return 0;
+    }
+    ws_strlcpy_w(out, v, (size_t)cch);
+    return 1;
+}

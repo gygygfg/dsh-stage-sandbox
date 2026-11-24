@@ -60,7 +60,7 @@ import { CREATE_NEW_CONSOLE } from './appcontainer-runtime.ts'
 // 不在本文件重写一份"哪些路径算敏感"：shim 消费的是同一份 `MASK_CLASSES` 投影
 // （`exportMaskJson()` 的 entries/probes 与内部表逐条同源），因此工具层判定与
 // 进程级 read mask 不可能漂移。
-import { exportMaskJson, maskRootEntry } from './paths.ts'
+import { exportMaskJson, maskFileEntry, maskRootEntry } from './paths.ts'
 // ── 缺陷③：陈旧 AppContainer 包 SID ACE 的判据只从 `src/appcontainer.ts` 来 ──────
 // 不在本文件重写 SDDL 解析：判据漂移会让"修复"和"测量"对不上。
 // Phase 2 / WP1：暂存根授权的**回读判据**用同一个解析器（`parseSddlDaclAces`），
@@ -2729,6 +2729,7 @@ export class WindowsStageExecutor {
             sessionDir: maskSessionDir,
             stagingRoot: this.stagingRoot,
             dllPath: this.transparent?.artifacts?.dllPath,
+            privateTempDir: tempDir,
           }),
         })}\n`,
         'utf8',
@@ -2929,6 +2930,7 @@ export class WindowsStageExecutor {
           sessionDir: maskSessionDir,
           stagingRoot: this.stagingRoot,
           dllPath: this.transparent?.artifacts?.dllPath,
+          privateTempDir: this.tempDir,
         }),
       })}\n`,
       'utf8',
@@ -6248,7 +6250,7 @@ function ensureCopy(source, target) {
  * `%LOCALAPPDATA%\Temp`, plus the plugin install root. Both are appended to
  * the shim's mask so the agent cannot read/enumerate them.
  */
-export function buildRuntimeMaskEntries({ sessionDir, stagingRoot, dllPath } = {}) {
+export function buildRuntimeMaskEntries({ sessionDir, stagingRoot, dllPath, privateTempDir } = {}) {
   const entries = []
   const add = (dir, id, category, reason) => {
     const entry = maskRootEntry(dir, { id, category, reason })
@@ -6260,6 +6262,17 @@ export function buildRuntimeMaskEntries({ sessionDir, stagingRoot, dllPath } = {
     if (basename(parent).toLowerCase() === 'winstage-stage') add(parent, 'store-base')
   }
   if (typeof stagingRoot === 'string' && stagingRoot) add(stagingRoot, 'store-stage-root')
+  if (typeof privateTempDir === 'string' && privateTempDir) {
+    /* The helper job file names the DLL/staging paths; the helper reads the
+     * values from the shim instead, so the file can be read-masked. */
+    const jobPath = join(privateTempDir, '.h', 'launcher.cfg')
+    const entry = maskFileEntry(jobPath, {
+      id: 'helper-job',
+      category: '本工具自身存储',
+      reason: '会话运行参数（含组件/暂存路径，对 agent 不可见）',
+    })
+    if (entry) entries.push(entry)
+  }
   if (typeof dllPath === 'string' && dllPath) {
     const dllDir = dirname(dllPath)
     const parent = dirname(dllDir)

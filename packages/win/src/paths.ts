@@ -704,6 +704,30 @@ export function maskRootEntry(root, { id, category, reason } = {}) {
   }
 }
 
+/**
+ * Build a hard read-mask entry for ONE runtime file (not a directory tree).
+ *
+ * Used for the helper job file `<private temp>\.h\launcher.cfg`: its *names* are
+ * neutral, but the base64 body names the DLL/staging paths, so a `type` on it
+ * would hand an agent the whole mechanism. The helper asks the injected shim
+ * for the values it needs (`WinstageShimJobValue`), so the file itself never
+ * has to be readable by a sandboxed process.
+ */
+export function maskFileEntry(file, { id, category, reason } = {}) {
+  const raw = typeof file === 'string' ? file.trim() : ''
+  const norm = raw.replace(/[\\/]+$/, '')
+  if (!norm || !(/^[a-zA-Z]:\\/.test(norm) || /^\\\\/.test(norm))) {
+    return null
+  }
+  const escaped = norm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return {
+    id: id ?? 'runtime-file',
+    pattern: `^${escaped}$`,
+    category: category ?? '本工具自身存储',
+    reason: reason ?? '会话运行参数（含组件/暂存路径，对 agent 不可见）',
+  }
+}
+
 /** 序列化（`pretty=false` 用于喂 shim；默认 pretty 便于人读与 diff） */
 export function exportMaskJson(options = {}) {
   return JSON.stringify(exportMaskList(options), null, options.pretty === false ? 0 : 2)

