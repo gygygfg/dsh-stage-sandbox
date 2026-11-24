@@ -914,6 +914,62 @@ LSTATUS ws_mask_init(void)
     return g_mask.declared ? (g_mask.loaded ? 1 : -1) : 0;
 }
 
+int ws_mask_rule_is_hidden(const wchar_t *label)
+{
+    if (!label || !label[0]) {
+        return 0;
+    }
+    /* Must stay in sync with src/paths.ts: runtime roots are emitted by
+     * buildRuntimeMaskEntries(), `stage-store` is a MASK_CLASSES entry. */
+    static const wchar_t *hidden[] = {
+        L"plugin-root", L"helper-dir", L"store-session", L"store-base",
+        L"store-stage-root", L"stage-store", NULL,
+    };
+    for (int i = 0; hidden[i]; i++) {
+        if (ws_wcscmp_ci(label, hidden[i]) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* A policy read was refused: say so on stderr instead of pretending the file
+ * does not exist. Capped per process so a recursive walk cannot flood the
+ * command's output. Self-storage rules never reach this (they stay hidden). */
+void ws_mask_note_denied(const wchar_t *path, const wchar_t *rule)
+{
+    static volatile LONG notes;
+    if (ws_mask_rule_is_hidden(rule)) {
+        return;
+    }
+    if (InterlockedIncrement(&notes) > 32) {
+        return;
+    }
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    if (!h || h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    char ruleBuf[192];
+    char pathBuf[1024];
+    ruleBuf[0] = 0;
+    pathBuf[0] = 0;
+    WideCharToMultiByte(CP_UTF8, 0, (rule && rule[0]) ? rule : L"read-mask", -1, ruleBuf, sizeof(ruleBuf) - 1,
+                        NULL, NULL);
+    if (path && path[0]) {
+        WideCharToMultiByte(CP_UTF8, 0, path, -1, pathBuf, sizeof(pathBuf) - 1, NULL, NULL);
+    }
+    const char *head = "[sandbox] read blocked: this file is masked by the sandbox read policy (rule: ";
+    const char *mid = "): ";
+    const char *tail = "\r\n";
+    DWORD wrote = 0;
+    WriteFile(h, head, (DWORD)strlen(head), &wrote, NULL);
+    WriteFile(h, ruleBuf, (DWORD)strlen(ruleBuf), &wrote, NULL);
+    WriteFile(h, mid, (DWORD)strlen(mid), &wrote, NULL);
+    WriteFile(h, pathBuf, (DWORD)strlen(pathBuf), &wrote, NULL);
+    WriteFile(h, tail, (DWORD)strlen(tail), &wrote, NULL);
+}
+
+
 int ws_mask_declared(void)
 {
     return g_mask.declared;

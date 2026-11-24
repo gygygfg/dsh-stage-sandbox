@@ -377,6 +377,24 @@ async function main() {
       save()
       return
     }
+    if (process.argv.includes('--maskcheck')) {
+      const step = async (label: string, line: string, timeoutMs = 60000) => {
+        const started = Date.now()
+        const r = await runShell(line, timeoutMs)
+        transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
+        save()
+      }
+      await step('m1-config', 'dir /a C:\\Windows\\System32\\config')
+      await step('m2-sam', 'type C:\\Windows\\System32\\config\\SAM')
+      await step('m3-etc', 'dir /a C:\\Windows\\System32\\drivers\\etc')
+      await step('m4-hosts', 'type C:\\Windows\\System32\\drivers\\etc\\hosts')
+      await step('m5-realtemp', 'dir /a "C:\\Users\\Docker\\AppData\\Local\\Temp"')
+      await step('m6-protect', 'dir /a "%APPDATA%\\Microsoft\\Protect"')
+      await step('m7-credhist', 'type "%APPDATA%\\Microsoft\\Protect\\CREDHIST"')
+      await step('m8-sc', 'sc query AJRouter & echo --- & wevtutil qe Application /c:1 /f:text')
+      save()
+      return
+    }
     if (process.argv.includes('--r54')) {
       const step = async (label: string, line: string, timeoutMs = 120000) => {
         const started = Date.now()

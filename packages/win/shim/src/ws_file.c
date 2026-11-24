@@ -1496,7 +1496,15 @@ static int ws_find_entry_masked(const wchar_t *dir, const wchar_t *name, wchar_t
     if (!ws_append_w(full, WS_PATH_MAX, &pos, name)) {
         return 1;
     }
-    return ws_mask_decide_read(full, outRule, outRuleCch);
+    wchar_t localRule[256];
+    wchar_t *rule = outRule ? outRule : localRule;
+    DWORD ruleCch = outRule ? outRuleCch : 256;
+    if (!ws_mask_decide_read(full, rule, ruleCch)) {
+        return 0;
+    }
+    /* Policy masks stay VISIBLE (open is denied with an explicit message);
+     * only the sandbox's own storage is hidden from enumeration. */
+    return ws_mask_rule_is_hidden(rule);
 }
 
 /* ── R43 合并枚举：真实目录 ∪ 暂存目录 ───────────────────────────────────────
@@ -1691,7 +1699,7 @@ static void ws_merge_collect(const wchar_t *pattern, const wchar_t *dir, WsMerge
         int skip = ws_logically_whiteouted(full);
         if (!skip && ws_mask_declared()) {
             wchar_t rule[256];
-            if (ws_mask_decide_read(full, rule, 256)) {
+            if (ws_mask_decide_read(full, rule, 256) && ws_mask_rule_is_hidden(rule)) {
                 skip = 1;
             }
         }
@@ -1955,7 +1963,7 @@ static HANDLE ws_merge_try(const wchar_t *pattern, LPWIN32_FIND_DATAW first, int
     }
     if (ws_mask_declared()) {
         wchar_t rule[256];
-        if (ws_mask_decide_read(dir, rule, 256)) {
+        if (ws_mask_decide_read(dir, rule, 256) && ws_mask_rule_is_hidden(rule)) {
             *handled = 1;
             SetLastError(ERROR_FILE_NOT_FOUND);
             return INVALID_HANDLE_VALUE;
@@ -1974,7 +1982,8 @@ static HANDLE ws_merge_try(const wchar_t *pattern, LPWIN32_FIND_DATAW first, int
         if (n > 0 && n < WS_PATH_MAX && ws_normalize_path(full, pnorm, WS_PATH_MAX) &&
             !wcschr(pnorm, L'*') && !wcschr(pnorm, L'?')) {
             wchar_t rule[256];
-            if (ws_store_denied_path(pnorm) || (ws_mask_declared() && ws_mask_decide_read(pnorm, rule, 256))) {
+            if (ws_store_denied_path(pnorm) ||
+                (ws_mask_declared() && ws_mask_decide_read(pnorm, rule, 256) && ws_mask_rule_is_hidden(rule))) {
                 *handled = 1;
                 ws_log_w(L"enumeration of a masked entry refused", pnorm);
                 SetLastError(ERROR_ACCESS_DENIED);
@@ -2483,6 +2492,7 @@ NTSTATUS NTAPI ws_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, PO
         wchar_t rule[256];
         if (ws_mask_decide_read(norm, rule, 256)) {
             ws_log_w(L"read/write denied by mask (NtCreateFile)", norm);
+            ws_mask_note_denied(norm, rule);
             if (IoStatusBlock) {
                 IoStatusBlock->Status = WS_R20_STATUS_ACCESS_DENIED;
                 IoStatusBlock->Information = 0;
@@ -2745,7 +2755,7 @@ HANDLE WINAPI ws_FindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFil
         return h;
     }
     wchar_t rule[256];
-    if (ws_mask_decide_read(dir, rule, 256)) {
+    if (ws_mask_decide_read(dir, rule, 256) && ws_mask_rule_is_hidden(rule)) {
         ws_find_orig_close(h);
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
@@ -2802,7 +2812,7 @@ HANDLE WINAPI ws_FindFirstFileA(LPCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFile
         return h;
     }
     wchar_t rule[256];
-    if (ws_mask_decide_read(dir, rule, 256)) {
+    if (ws_mask_decide_read(dir, rule, 256) && ws_mask_rule_is_hidden(rule)) {
         ws_find_orig_close(h);
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
@@ -2875,7 +2885,7 @@ HANDLE WINAPI ws_FindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInfoLe
         return h;
     }
     wchar_t rule[256];
-    if (ws_mask_decide_read(dir, rule, 256)) {
+    if (ws_mask_decide_read(dir, rule, 256) && ws_mask_rule_is_hidden(rule)) {
         ws_find_orig_close(h);
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
@@ -2940,7 +2950,7 @@ HANDLE WINAPI ws_FindFirstFileExA(LPCSTR lpFileName, FINDEX_INFO_LEVELS fInfoLev
         return h;
     }
     wchar_t rule[256];
-    if (ws_mask_decide_read(dir, rule, 256)) {
+    if (ws_mask_decide_read(dir, rule, 256) && ws_mask_rule_is_hidden(rule)) {
         ws_find_orig_close(h);
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
@@ -3502,6 +3512,7 @@ static HANDLE ws_create_file_core(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWO
             if (readAccessMask || (!writeAccessMask && !destructiveMask)) {
                 ws_log_w(L"read masked", rawName);
                 WS_TRACE_FILE("CreateFile read denied by mask rule %ls", maskedBy);
+                ws_mask_note_denied(rawName, maskedBy);
                 SetLastError(ERROR_ACCESS_DENIED);
                 return INVALID_HANDLE_VALUE;
             }
@@ -4397,7 +4408,12 @@ static int ws_stat_read_masked(LPCWSTR lpFileName)
         p = eff;
     }
     wchar_t maskedBy[256];
-    return ws_mask_declared() && p && p[0] && ws_mask_decide_read(p, maskedBy, 256);
+    if (!(ws_mask_declared() && p && p[0] && ws_mask_decide_read(p, maskedBy, 256))) {
+        return 0;
+    }
+    /* A policy-masked file still exists for stat/attributes; only the sandbox's
+     * own storage must look absent. */
+    return ws_mask_rule_is_hidden(maskedBy);
 }
 
 /* PowerShell's AppLocker / App-Control lock-down probe.

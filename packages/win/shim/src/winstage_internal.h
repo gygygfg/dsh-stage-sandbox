@@ -587,6 +587,14 @@ LSTATUS ws_mask_init(void);
 int ws_mask_declared(void);
 int ws_mask_rule_count(void);
 int ws_mask_decide_read(const wchar_t *path, wchar_t *outRule, DWORD outRuleCch);
+/* Self-storage rules (plugin root / store / helper dir / private temp) stay
+ * INVISIBLE: an agent must not even learn that these directories exist.
+ * Every other mask rule is a *policy* boundary: the entry is listed normally
+ * and an attempted READ answers "masked by the sandbox" (see ws_mask_note_denied). */
+int ws_mask_rule_is_hidden(const wchar_t *label);
+/* Tell the caller, on stderr, that a read was blocked by the read policy.
+ * Hidden (self-storage) rules pass `rule` = hidden and are not announced. */
+void ws_mask_note_denied(const wchar_t *path, const wchar_t *rule);
 void ws_mask_normalized(const wchar_t *path, wchar_t *out, DWORD cch);
 int ws_mask_check_probes(const wchar_t *maskFile, const wchar_t *outFile, char *summary, DWORD summaryCch);
 int ws_mask_check_path_file(const wchar_t *maskFile, const wchar_t *path, char *out, DWORD cch);
