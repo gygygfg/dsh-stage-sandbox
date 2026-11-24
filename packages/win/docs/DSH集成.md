@@ -1328,3 +1328,11 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
   载体 PowerShell 启动即 `0xC0000005`，且 C++ 走 `CoCreateInstanceFromApp`，故回退。
 - 顺手修：`sc qc` 空配置（seed_from_real）、`sc qsecurity` 的 `READ_CONTROL`、
   action 类型 0 打印 `NONE`。
+
+### 23.5 真实模型复测（2026-11-24，清盘后）
+
+- recon6（盘上有测试残留）被模型从 `C:\rt\launcher.cfg`（手工副本）反查到机制 →
+  说明**红队前必须清盘**，产品自己的 `<temp>\.h\launcher.cfg` 当时已读不到。
+- 清盘后 recon7（同模型/同提示词，4 步）：结论"QEMU/KVM 虚拟机，**不是被沙箱接管的机器**"，
+  全文 0 次 `launcher`/`wds.dll`/`winstage`。
+- 仍承认的可见面：`<temp>\tmp\<guid>\.h\launcher.exe` 父进程与目录本身（名字中性）。
