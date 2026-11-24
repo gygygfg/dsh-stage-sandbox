@@ -286,6 +286,11 @@ typedef struct WsOriginals {
     BOOL(WINAPI *GetFileInformationByHandle)(HANDLE, LPVOID);
     NTSTATUS(NTAPI *NtQueryInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, int);
     BOOL(WINAPI *GetFileInformationByHandleEx)(HANDLE, int, LPVOID, DWORD);
+    /* Transparency: callers ask the handle where the file REALLY is (libuv's
+     * realpath, Python os.path.realpath, forensic tools). Unhooked, that answer
+     * is the staging path -- a direct "you are redirected" tell. */
+    DWORD(WINAPI *GetFinalPathNameByHandleW)(HANDLE, LPWSTR, DWORD, DWORD);
+    DWORD(WINAPI *GetFinalPathNameByHandleA)(HANDLE, LPSTR, DWORD, DWORD);
     NTSTATUS(NTAPI *NtQueryAttributesFile)(POBJECT_ATTRIBUTES, PVOID);
     NTSTATUS(NTAPI *NtQueryFullAttributesFile)(POBJECT_ATTRIBUTES, PVOID);
     NTSTATUS(NTAPI *NtQueryInformationByName)(POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PVOID, ULONG, int);
@@ -338,6 +343,33 @@ typedef struct WsOriginals {
     BOOL(WINAPI *ReadEventLogA)(HANDLE, DWORD, DWORD, LPVOID, DWORD, LPDWORD, LPDWORD);
     BOOL(WINAPI *GetNumberOfEventLogRecords)(HANDLE, PDWORD);
     BOOL(WINAPI *CloseEventLog)(HANDLE);
+
+    /* --- service config2 / security descriptor (staged like config) --- */
+    BOOL(WINAPI *ChangeServiceConfig2W)(SC_HANDLE, DWORD, LPVOID);
+    BOOL(WINAPI *ChangeServiceConfig2A)(SC_HANDLE, DWORD, LPVOID);
+    BOOL(WINAPI *SetServiceObjectSecurity)(SC_HANDLE, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR);
+    BOOL(WINAPI *QueryServiceObjectSecurity)(SC_HANDLE, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, DWORD, LPDWORD);
+
+    /* --- module enumeration (transparency: `tasklist /m` must not show us) --- */
+    BOOL(WINAPI *EnumProcessModules)(HANDLE, HMODULE *, DWORD, LPDWORD);
+    BOOL(WINAPI *EnumProcessModulesEx)(HANDLE, HMODULE *, DWORD, LPDWORD, DWORD);
+    BOOL(WINAPI *K32EnumProcessModules)(HANDLE, HMODULE *, DWORD, LPDWORD);
+    BOOL(WINAPI *K32EnumProcessModulesEx)(HANDLE, HMODULE *, DWORD, LPDWORD, DWORD);
+    BOOL(WINAPI *Module32FirstW)(HANDLE, LPVOID);
+    BOOL(WINAPI *Module32NextW)(HANDLE, LPVOID);
+    BOOL(WINAPI *Module32First)(HANDLE, LPVOID);
+    BOOL(WINAPI *Module32Next)(HANDLE, LPVOID);
+    /* Transparency: a cross-process module LIST cannot be filtered reliably
+     * (the other side's access rights decide whether we can name the entry), so
+     * the NAME these APIs hand out is neutral instead. */
+    DWORD(WINAPI *GetModuleBaseNameW)(HANDLE, HMODULE, LPWSTR, DWORD);
+    DWORD(WINAPI *GetModuleBaseNameA)(HANDLE, HMODULE, LPSTR, DWORD);
+    DWORD(WINAPI *GetModuleFileNameExW)(HANDLE, HMODULE, LPWSTR, DWORD);
+    DWORD(WINAPI *GetModuleFileNameExA)(HANDLE, HMODULE, LPSTR, DWORD);
+    DWORD(WINAPI *K32GetModuleBaseNameW)(HANDLE, HMODULE, LPWSTR, DWORD);
+    DWORD(WINAPI *K32GetModuleBaseNameA)(HANDLE, HMODULE, LPSTR, DWORD);
+    DWORD(WINAPI *K32GetModuleFileNameExW)(HANDLE, HMODULE, LPWSTR, DWORD);
+    DWORD(WINAPI *K32GetModuleFileNameExA)(HANDLE, HMODULE, LPSTR, DWORD);
 } WsOriginals;
 
 typedef NTSTATUS(NTAPI *WsNtQueryKeyFn)(HANDLE, int, PVOID, ULONG, PULONG);
@@ -351,6 +383,25 @@ extern WsNtQueryKeyFn g_NtQueryKey;
 BOOL WINAPI ws_GetFileInformationByHandle(HANDLE, LPVOID);
 NTSTATUS NTAPI ws_NtQueryInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, int); /* R11-D-13d-ntqif */
 BOOL WINAPI ws_GetFileInformationByHandleEx(HANDLE, int, LPVOID, DWORD); /* R11-D-13d-gfibhex */
+DWORD WINAPI ws_GetFinalPathNameByHandleW(HANDLE, LPWSTR, DWORD, DWORD);
+DWORD WINAPI ws_GetFinalPathNameByHandleA(HANDLE, LPSTR, DWORD, DWORD);
+/* ws_proc.c: module-enumeration virtualization (`tasklist /m`, Get-Process -Module) */
+BOOL WINAPI ws_EnumProcessModules(HANDLE, HMODULE *, DWORD, LPDWORD);
+BOOL WINAPI ws_EnumProcessModulesEx(HANDLE, HMODULE *, DWORD, LPDWORD, DWORD);
+BOOL WINAPI ws_K32EnumProcessModules(HANDLE, HMODULE *, DWORD, LPDWORD);
+BOOL WINAPI ws_K32EnumProcessModulesEx(HANDLE, HMODULE *, DWORD, LPDWORD, DWORD);
+BOOL WINAPI ws_Module32FirstW(HANDLE, LPVOID);
+BOOL WINAPI ws_Module32NextW(HANDLE, LPVOID);
+BOOL WINAPI ws_Module32First(HANDLE, LPVOID);
+BOOL WINAPI ws_Module32Next(HANDLE, LPVOID);
+DWORD WINAPI ws_GetModuleBaseNameW(HANDLE, HMODULE, LPWSTR, DWORD);
+DWORD WINAPI ws_GetModuleBaseNameA(HANDLE, HMODULE, LPSTR, DWORD);
+DWORD WINAPI ws_GetModuleFileNameExW(HANDLE, HMODULE, LPWSTR, DWORD);
+DWORD WINAPI ws_GetModuleFileNameExA(HANDLE, HMODULE, LPSTR, DWORD);
+DWORD WINAPI ws_K32GetModuleBaseNameW(HANDLE, HMODULE, LPWSTR, DWORD);
+DWORD WINAPI ws_K32GetModuleBaseNameA(HANDLE, HMODULE, LPSTR, DWORD);
+DWORD WINAPI ws_K32GetModuleFileNameExW(HANDLE, HMODULE, LPWSTR, DWORD);
+DWORD WINAPI ws_K32GetModuleFileNameExA(HANDLE, HMODULE, LPSTR, DWORD);
 NTSTATUS NTAPI ws_NtQueryAttributesFile(POBJECT_ATTRIBUTES, PVOID); /* R11-D-13d-nqaf */
 NTSTATUS NTAPI ws_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES, PVOID); /* R11-D-13d-nqfaf */
 NTSTATUS NTAPI ws_NtQueryInformationByName(POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PVOID, ULONG, int); /* R11-D-13d-nqifbn */
@@ -729,6 +780,10 @@ BOOL WINAPI ws_EnumServicesStatusA(SC_HANDLE, DWORD, DWORD, LPENUM_SERVICE_STATU
                                    LPDWORD);
 BOOL WINAPI ws_CloseServiceHandle(SC_HANDLE);
 BOOL WINAPI ws_GetServiceDisplayNameW(SC_HANDLE, LPCWSTR, LPWSTR, LPDWORD);
+BOOL WINAPI ws_ChangeServiceConfig2W(SC_HANDLE, DWORD, LPVOID);
+BOOL WINAPI ws_ChangeServiceConfig2A(SC_HANDLE, DWORD, LPVOID);
+BOOL WINAPI ws_SetServiceObjectSecurity(SC_HANDLE, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR);
+BOOL WINAPI ws_QueryServiceObjectSecurity(SC_HANDLE, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, DWORD, LPDWORD);
 BOOL WINAPI ws_GetServiceDisplayNameA(SC_HANDLE, LPCSTR, LPSTR, LPDWORD);
 BOOL WINAPI ws_EvtClearLog(EVT_HANDLE, LPCWSTR, LPCWSTR, DWORD);
 EVT_HANDLE WINAPI ws_EvtQuery(EVT_HANDLE, LPCWSTR, LPCWSTR, DWORD);

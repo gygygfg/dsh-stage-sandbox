@@ -87,6 +87,17 @@ static void ws_evt_resolve(void)
 #define WS_SCM_STARTNAME 256
 #define WS_SCM_ENTRIES   128
 #define WS_SCM_HANDLES   64
+/* R46: config2 blobs (description / failure actions / flags) and the security
+ * descriptor. 1 KiB each is far above what `sc failure` / `sc sdset` need; a
+ * larger one is refused (fail closed) instead of reaching the real SCM. */
+#define WS_SCM_BLOB_MAX  1024
+#define WS_SCM_CFG2_MAX  6
+
+typedef struct WsScmCfg2 {
+    DWORD level;
+    DWORD len;
+    unsigned char data[WS_SCM_BLOB_MAX];
+} WsScmCfg2;
 
 #define WS_SCM_TAG       ((ULONG_PTR)0x5C4D000000000000ULL)
 #define WS_EVT_TAG       ((ULONG_PTR)0x5C4E000000000000ULL)
@@ -108,6 +119,13 @@ typedef struct WsScmEntry {
     wchar_t deps[WS_SCM_DEPS];
     wchar_t group[WS_SCM_GROUP];
     wchar_t startName[WS_SCM_STARTNAME];
+    /* Staged SERVICE_CONFIG2 data (level-tagged), replayed from the journal. */
+    WsScmCfg2 cfg2[WS_SCM_CFG2_MAX];
+    int cfg2Count;
+    /* Staged security descriptor (SetServiceObjectSecurity). */
+    DWORD sdInfo;
+    DWORD sdLen;
+    unsigned char sd[WS_SCM_BLOB_MAX];
 } WsScmEntry;
 
 typedef struct WsScmHandle {
@@ -273,6 +291,227 @@ static void ws_hex_put_w(const wchar_t *s, wchar_t *out, size_t cch, size_t *pos
     }
 }
 
+/* ── R46: config2 / security-descriptor blobs ────────────────────────────────
+ * `sc failure`, `sc sdset`, PowerShell `Set-Service -Description` and friends do
+ * not call ChangeServiceConfig: they call ChangeServiceConfig2 /
+ * SetServiceObjectSecurity, which used to reach the REAL SCM. They are staged
+ * here like every other service write, with their own journal record so the
+ * answer survives across commands (`sc failure X ...` then `sc qfailure X`).
+ */
+static void ws_hex_put_b(const unsigned char *b, DWORD len, wchar_t *out, size_t cch, size_t *pos)
+{
+    static const wchar_t digits[] = L"0123456789abcdef";
+    for (DWORD i = 0; i < len && *pos + 2 < cch; i++) {
+        out[(*pos)++] = digits[(b[i] >> 4) & 0xF];
+        out[(*pos)++] = digits[b[i] & 0xF];
+    }
+    if (*pos < cch) {
+        out[*pos] = 0;
+    }
+}
+
+static int ws_json_get_hexbytes(const char *line, const char *key, unsigned char *out, DWORD cap, DWORD *outLen)
+{
+    const char *p = ws_json_find(line, key);
+    if (!p || *p != '"') {
+        return 0;
+    }
+    p++;
+    char hex[8192];
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < sizeof(hex)) {
+        hex[n++] = *p++;
+    }
+    hex[n] = 0;
+    DWORD len = 0;
+    if (!ws_hex_decode_b(hex, out, cap, &len)) {
+        return 0;
+    }
+    if (outLen) {
+        *outLen = len;
+    }
+    return 1;
+}
+
+static WsScmCfg2 *ws_cfg2_find(WsScmEntry *e, DWORD level)
+{
+    for (int i = 0; i < e->cfg2Count; i++) {
+        if (e->cfg2[i].level == level) {
+            return &e->cfg2[i];
+        }
+    }
+    return NULL;
+}
+
+static int ws_cfg2_store(WsScmEntry *e, DWORD level, const unsigned char *data, DWORD len)
+{
+    if (!e || len > WS_SCM_BLOB_MAX) {
+        return 0;
+    }
+    WsScmCfg2 *c = ws_cfg2_find(e, level);
+    if (!c) {
+        if (e->cfg2Count >= WS_SCM_CFG2_MAX) {
+            return 0;
+        }
+        c = &e->cfg2[e->cfg2Count++];
+        c->level = level;
+    }
+    c->len = len;
+    if (len && data) {
+        memcpy(c->data, data, len);
+    }
+    return 1;
+}
+
+static int ws_scm_journal_blob(const wchar_t *op, const WsScmEntry *e, DWORD level,
+                               const unsigned char *data, DWORD len, DWORD info)
+{
+    wchar_t line[8192];
+    size_t pos = 0;
+    line[0] = 0;
+    if (!ws_appendf_w(line, 8192, &pos, L"{\"op\":\"%ls\",\"name\":\"", op)) {
+        return 0;
+    }
+    ws_hex_put_w(e->name, line, 8192, &pos);
+    if (wcscmp(op, L"sd") == 0) {
+        if (!ws_appendf_w(line, 8192, &pos, L"\",\"info\":%lu,\"data\":\"", (unsigned long)info)) {
+            return 0;
+        }
+    } else if (!ws_appendf_w(line, 8192, &pos, L"\",\"level\":%lu,\"data\":\"", (unsigned long)level)) {
+        return 0;
+    }
+    ws_hex_put_b(data, len, line, 8192, &pos);
+    if (!ws_append_w(line, 8192, &pos, L"\"}\n")) {
+        return 0;
+    }
+    return ws_journal_append(L"service.overlay.jsonl", line);
+}
+
+/* SERVICE_FAILURE_ACTIONSW -> flat blob: reset(4) count(4) [type,delay]*count
+ * then `cmd\0` and `reboot\0` as UTF-16. Self-contained (no pointers) so the
+ * journal replay can rebuild the structure the API handed us. */
+static DWORD ws_failure_serialize(const SERVICE_FAILURE_ACTIONSW *fa, unsigned char *out, DWORD cap)
+{
+    DWORD count = (fa->lpsaActions && fa->cActions) ? fa->cActions : 0;
+    const wchar_t *cmd = fa->lpCommand ? fa->lpCommand : L"";
+    const wchar_t *reboot = fa->lpRebootMsg ? fa->lpRebootMsg : L"";
+    DWORD need = 8 + count * 8 +
+                 (DWORD)((wcslen(cmd) + 1 + wcslen(reboot) + 1) * sizeof(wchar_t));
+    if (need > cap) {
+        return 0;
+    }
+    unsigned char *q = out;
+    memcpy(q, &fa->dwResetPeriod, 4);
+    q += 4;
+    memcpy(q, &count, 4);
+    q += 4;
+    for (DWORD i = 0; i < count; i++) {
+        memcpy(q, &fa->lpsaActions[i].Type, 4);
+        q += 4;
+        memcpy(q, &fa->lpsaActions[i].Delay, 4);
+        q += 4;
+    }
+    memcpy(q, cmd, (wcslen(cmd) + 1) * sizeof(wchar_t));
+    q += (wcslen(cmd) + 1) * sizeof(wchar_t);
+    memcpy(q, reboot, (wcslen(reboot) + 1) * sizeof(wchar_t));
+    return need;
+}
+
+static BOOL ws_failure_serve(const unsigned char *blob, DWORD len, LPBYTE buffer, DWORD cb, LPDWORD needed)
+{
+    if (len < 8) {
+        SetLastError(ERROR_INVALID_DATA);
+        return FALSE;
+    }
+    DWORD reset = 0, count = 0;
+    memcpy(&reset, blob, 4);
+    memcpy(&count, blob + 4, 4);
+    DWORD need = 8 + count * 8;
+    if (need > len) {
+        SetLastError(ERROR_INVALID_DATA);
+        return FALSE;
+    }
+    const wchar_t *cmd = (const wchar_t *)(const void *)(blob + need);
+    const wchar_t *reboot = cmd + wcslen(cmd) + 1;
+    DWORD cch = (DWORD)(wcslen(cmd) + 1 + wcslen(reboot) + 1);
+    DWORD size = (DWORD)sizeof(SERVICE_FAILURE_ACTIONSW) + count * (DWORD)sizeof(SC_ACTION) +
+                 cch * (DWORD)sizeof(wchar_t);
+    if (needed) {
+        *needed = size;
+    }
+    if (!buffer || cb < size) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+    SERVICE_FAILURE_ACTIONSW *out = (SERVICE_FAILURE_ACTIONSW *)buffer;
+    memset(out, 0, sizeof(*out));
+    out->dwResetPeriod = reset;
+    out->cActions = count;
+    SC_ACTION *acts = (SC_ACTION *)(out + 1);
+    if (count) {
+        memcpy(acts, blob + 8, count * 8);
+        out->lpsaActions = acts;
+    }
+    wchar_t *str = (wchar_t *)(acts + count);
+    memcpy(str, cmd, (wcslen(cmd) + 1) * sizeof(wchar_t));
+    out->lpCommand = str;
+    wchar_t *reb = str + wcslen(cmd) + 1;
+    memcpy(reb, reboot, (wcslen(reboot) + 1) * sizeof(wchar_t));
+    out->lpRebootMsg = reb;
+    return TRUE;
+}
+
+static BOOL ws_description_serve(const unsigned char *blob, DWORD len, LPBYTE buffer, DWORD cb, LPDWORD needed)
+{
+    DWORD cch = len / (DWORD)sizeof(wchar_t);
+    DWORD size = (DWORD)sizeof(SERVICE_DESCRIPTIONW) + (cch + 1) * (DWORD)sizeof(wchar_t);
+    if (needed) {
+        *needed = size;
+    }
+    if (!buffer || cb < size) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+    SERVICE_DESCRIPTIONW *out = (SERVICE_DESCRIPTIONW *)buffer;
+    out->lpDescription = NULL;
+    if (cch) {
+        wchar_t *str = (wchar_t *)(out + 1);
+        memcpy(str, blob, cch * sizeof(wchar_t));
+        str[cch] = 0;
+        out->lpDescription = str;
+    }
+    return TRUE;
+}
+
+/* Serve one journaled level. Returns 1 = answered, 0 = not journaled. */
+static int ws_cfg2_serve(const WsScmCfg2 *c, LPBYTE buffer, DWORD cb, LPDWORD needed)
+{
+    if (!c) {
+        return 0;
+    }
+    switch (c->level) {
+    case SERVICE_CONFIG_DESCRIPTION:
+        return ws_description_serve(c->data, c->len, buffer, cb, needed) ? 1 : -1;
+    case SERVICE_CONFIG_FAILURE_ACTIONS:
+        return ws_failure_serve(c->data, c->len, buffer, cb, needed) ? 1 : -1;
+    case SERVICE_CONFIG_FAILURE_ACTIONS_FLAG:
+    case SERVICE_CONFIG_DELAYED_AUTO_START_INFO: {
+        DWORD size = sizeof(BOOL);
+        if (needed) {
+            *needed = size;
+        }
+        if (!buffer || cb < size) {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return -1;
+        }
+        *(BOOL *)buffer = (c->len >= 4 && *(const DWORD *)(const void *)c->data) ? TRUE : FALSE;
+        return 1;
+    }
+    default:
+        return 0;
+    }
+}
+
 /* ------------------------------------------------------------ entry lookup */
 
 static void ws_scm_entry_clear(WsScmEntry *e)
@@ -353,6 +592,25 @@ static void ws_scm_apply_record(const char *line)
         e->running = 1;
     } else if (strcmp(opBuf, "stop") == 0) {
         e->running = 0;
+    } else if (strcmp(opBuf, "cfg2") == 0) {
+        unsigned char blob[WS_SCM_BLOB_MAX];
+        DWORD len = 0;
+        DWORD level = ws_json_get_u32(line, "level", 0);
+        if (level && ws_json_get_hexbytes(line, "data", blob, sizeof(blob), &len)) {
+            ws_cfg2_store(e, level, blob, len);
+        }
+        return;
+    } else if (strcmp(opBuf, "sd") == 0) {
+        unsigned char blob[WS_SCM_BLOB_MAX];
+        DWORD len = 0;
+        if (ws_json_get_hexbytes(line, "data", blob, sizeof(blob), &len)) {
+            e->sdInfo = ws_json_get_u32(line, "info", 0);
+            e->sdLen = len;
+            if (len) {
+                memcpy(e->sd, blob, len);
+            }
+        }
+        return;
     } else {
         return;
     }
@@ -1211,6 +1469,20 @@ BOOL WINAPI ws_QueryServiceConfig2W(SC_HANDLE service, DWORD level, LPBYTE buffe
         SetLastError(ERROR_SERVICE_DOES_NOT_EXIST);
         return FALSE;
     }
+    /* R46: a journaled config2 level wins over both the real service and the
+     * synthetic "created" shape, otherwise `sc failure X ... ; sc qfailure X`
+     * would contradict itself. */
+    int served = ws_cfg2_serve(ws_cfg2_find(e, level), buffer, cb, needed);
+    if (served > 0) {
+        ws_lock_leave(&g_scmLock);
+        return TRUE;
+    }
+    if (served < 0) {
+        DWORD err = GetLastError();
+        ws_lock_leave(&g_scmLock);
+        SetLastError(err);
+        return FALSE;
+    }
     if (!e->created && h->real) {
         BOOL ok = g_orig.QueryServiceConfig2W ? g_orig.QueryServiceConfig2W(h->real, level, buffer, cb, needed)
                                              : FALSE;
@@ -1232,6 +1504,19 @@ BOOL WINAPI ws_QueryServiceConfig2W(SC_HANDLE service, DWORD level, LPBYTE buffe
         ((SERVICE_DESCRIPTIONW *)buffer)->lpDescription = NULL;
         ws_lock_leave(&g_scmLock);
         return TRUE;
+    }
+    /* A staged service has no recovery actions: answer the empty shape (that is
+     * exactly what an unconfigured service reports) instead of an error that a
+     * query on a service that `sc query` just showed would contradict. */
+    if (level == SERVICE_CONFIG_FAILURE_ACTIONS) {
+        unsigned char empty[12] = { 0 };
+        BOOL ok = ws_failure_serve(empty, sizeof(empty), buffer, cb, needed);
+        DWORD err = GetLastError();
+        ws_lock_leave(&g_scmLock);
+        if (!ok) {
+            SetLastError(err);
+        }
+        return ok;
     }
     ws_lock_leave(&g_scmLock);
     SetLastError(ERROR_INVALID_LEVEL);
@@ -1268,6 +1553,202 @@ BOOL WINAPI ws_QueryServiceConfig2A(SC_HANDLE service, DWORD level, LPBYTE buffe
     ((SERVICE_DESCRIPTIONA *)buffer)->lpDescription = NULL;
     free(tmp);
     return TRUE;
+}
+
+/* ── R46: the service-write APIs that used to reach the real SCM ────────────
+ * ChangeServiceConfig2 / SetServiceObjectSecurity are what `sc failure`,
+ * `sc sdset`, `sc triggerinfo` and PowerShell's Set-Service actually call.
+ * Left unhooked, a PowerShell one-liner could still change a REAL service. */
+BOOL WINAPI ws_ChangeServiceConfig2W(SC_HANDLE service, DWORD level, LPVOID info)
+{
+    WsScmHandle *h = ws_scm_handle_get(service);
+    if (!h || h->isManager || !ws_scm_staged()) {
+        if (g_orig.ChangeServiceConfig2W) {
+            return g_orig.ChangeServiceConfig2W(service, level, info);
+        }
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    ws_lock_enter(&g_scmLock);
+    ws_scm_ensure_loaded();
+    WsScmEntry *e = &g_scmEntries[h->entry];
+    if (!e->used || e->deleted) {
+        ws_lock_leave(&g_scmLock);
+        SetLastError(ERROR_SERVICE_DOES_NOT_EXIST);
+        return FALSE;
+    }
+    unsigned char blob[WS_SCM_BLOB_MAX];
+    DWORD len = 0;
+    int ok = 1;
+    switch (level) {
+    case SERVICE_CONFIG_DESCRIPTION: {
+        const SERVICE_DESCRIPTIONW *d = (const SERVICE_DESCRIPTIONW *)info;
+        const wchar_t *text = (d && d->lpDescription) ? d->lpDescription : L"";
+        len = (DWORD)(wcslen(text) * sizeof(wchar_t));
+        if (len > WS_SCM_BLOB_MAX) {
+            ok = 0;
+            break;
+        }
+        memcpy(blob, text, len);
+        break;
+    }
+    case SERVICE_CONFIG_FAILURE_ACTIONS:
+        if (!info) {
+            ok = 0;
+            break;
+        }
+        len = ws_failure_serialize((const SERVICE_FAILURE_ACTIONSW *)info, blob, sizeof(blob));
+        ok = len != 0;
+        break;
+    case SERVICE_CONFIG_FAILURE_ACTIONS_FLAG:
+    case SERVICE_CONFIG_DELAYED_AUTO_START_INFO: {
+        DWORD v = (info && *(const BOOL *)info) ? 1 : 0;
+        memcpy(blob, &v, 4);
+        len = 4;
+        break;
+    }
+    default:
+        /* Rare/unknown levels (TRIGGER_INFO, SID_INFO, ...): record the level and
+         * succeed. Refusing is the only other honest option -- forwarding is a
+         * REAL write. */
+        len = 0;
+        break;
+    }
+    if (!ok) {
+        ws_lock_leave(&g_scmLock);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (!ws_cfg2_store(e, level, blob, len) || !ws_scm_journal_blob(L"cfg2", e, level, blob, len, 0)) {
+        ws_lock_leave(&g_scmLock);
+        SetLastError(ERROR_WRITE_FAULT);
+        return FALSE;
+    }
+    if (!e->created) {
+        e->changed = 1;
+    }
+    ws_log_w(L"SCM config2 staged", e->name);
+    ws_lock_leave(&g_scmLock);
+    return TRUE;
+}
+
+BOOL WINAPI ws_ChangeServiceConfig2A(SC_HANDLE service, DWORD level, LPVOID info)
+{
+    if (level == SERVICE_CONFIG_DESCRIPTION) {
+        SERVICE_DESCRIPTIONA *da = (SERVICE_DESCRIPTIONA *)info;
+        wchar_t w[2048];
+        w[0] = 0;
+        if (da && da->lpDescription) {
+            MultiByteToWideChar(CP_ACP, 0, da->lpDescription, -1, w, 2048);
+        }
+        SERVICE_DESCRIPTIONW dw;
+        dw.lpDescription = (da && da->lpDescription) ? w : NULL;
+        return ws_ChangeServiceConfig2W(service, level, &dw);
+    }
+    if (level == SERVICE_CONFIG_FAILURE_ACTIONS && info) {
+        SERVICE_FAILURE_ACTIONSA *fa = (SERVICE_FAILURE_ACTIONSA *)info;
+        wchar_t cmd[1024];
+        wchar_t reboot[1024];
+        cmd[0] = 0;
+        reboot[0] = 0;
+        if (fa->lpCommand) MultiByteToWideChar(CP_ACP, 0, fa->lpCommand, -1, cmd, 1024);
+        if (fa->lpRebootMsg) MultiByteToWideChar(CP_ACP, 0, fa->lpRebootMsg, -1, reboot, 1024);
+        SERVICE_FAILURE_ACTIONSW fw;
+        memset(&fw, 0, sizeof(fw));
+        fw.dwResetPeriod = fa->dwResetPeriod;
+        fw.lpCommand = cmd;
+        fw.lpRebootMsg = reboot;
+        fw.cActions = fa->lpsaActions ? fa->cActions : 0;
+        fw.lpsaActions = fa->lpsaActions;
+        return ws_ChangeServiceConfig2W(service, level, &fw);
+    }
+    return ws_ChangeServiceConfig2W(service, level, info);
+}
+
+BOOL WINAPI ws_SetServiceObjectSecurity(SC_HANDLE service, SECURITY_INFORMATION si,
+                                        PSECURITY_DESCRIPTOR sd)
+{
+    WsScmHandle *h = ws_scm_handle_get(service);
+    if (!h || h->isManager || !ws_scm_staged()) {
+        if (g_orig.SetServiceObjectSecurity) {
+            return g_orig.SetServiceObjectSecurity(service, si, sd);
+        }
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    if (!sd) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    DWORD len = GetSecurityDescriptorLength(sd);
+    if (len == 0 || len > WS_SCM_BLOB_MAX) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    ws_lock_enter(&g_scmLock);
+    ws_scm_ensure_loaded();
+    WsScmEntry *e = &g_scmEntries[h->entry];
+    if (!e->used || e->deleted) {
+        ws_lock_leave(&g_scmLock);
+        SetLastError(ERROR_SERVICE_DOES_NOT_EXIST);
+        return FALSE;
+    }
+    memcpy(e->sd, sd, len);
+    e->sdLen = len;
+    e->sdInfo = si;
+    int ok = ws_scm_journal_blob(L"sd", e, 0, e->sd, e->sdLen, si);
+    if (ok && !e->created) {
+        e->changed = 1;
+    }
+    ws_lock_leave(&g_scmLock);
+    if (!ok) {
+        SetLastError(ERROR_WRITE_FAULT);
+        return FALSE;
+    }
+    ws_log_w(L"SCM security descriptor staged", e->name);
+    return TRUE;
+}
+
+BOOL WINAPI ws_QueryServiceObjectSecurity(SC_HANDLE service, SECURITY_INFORMATION si,
+                                          PSECURITY_DESCRIPTOR sd, DWORD cb, LPDWORD needed)
+{
+    WsScmHandle *h = ws_scm_handle_get(service);
+    if (!h || h->isManager) {
+        if (g_orig.QueryServiceObjectSecurity) {
+            return g_orig.QueryServiceObjectSecurity(service, si, sd, cb, needed);
+        }
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    ws_lock_enter(&g_scmLock);
+    ws_scm_ensure_loaded();
+    WsScmEntry *e = &g_scmEntries[h->entry];
+    if (!e->used || e->deleted) {
+        ws_lock_leave(&g_scmLock);
+        SetLastError(ERROR_SERVICE_DOES_NOT_EXIST);
+        return FALSE;
+    }
+    if (e->sdLen) {
+        DWORD len = e->sdLen;
+        if (needed) {
+            *needed = len;
+        }
+        if (!sd || cb < len) {
+            ws_lock_leave(&g_scmLock);
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return FALSE;
+        }
+        memcpy(sd, e->sd, len);
+        ws_lock_leave(&g_scmLock);
+        return TRUE;
+    }
+    SC_HANDLE real = h->real;
+    ws_lock_leave(&g_scmLock);
+    if (real && g_orig.QueryServiceObjectSecurity) {
+        return g_orig.QueryServiceObjectSecurity(real, si, sd, cb, needed);
+    }
+    SetLastError(ERROR_INVALID_HANDLE);
+    return FALSE;
 }
 
 BOOL WINAPI ws_GetServiceDisplayNameW(SC_HANDLE manager, LPCWSTR name, LPWSTR display, LPDWORD cch)

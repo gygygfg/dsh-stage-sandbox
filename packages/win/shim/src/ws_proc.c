@@ -80,6 +80,398 @@ void ws_proc_set_self_module(HMODULE self)
     ws_log("child injection armed: self=%ls ok=%d", g_selfDllOk ? g_selfDll : L"(unknown)", g_selfDllOk);
 }
 
+/* ── module enumeration: `tasklist /m` must not name this DLL ───────────────
+ *
+ * Measured in the guest: `tasklist /m` (and PowerShell's `Get-Process -Module`)
+ * lists the loaded modules of every process, so `winstage-shim.dll` appeared as
+ * a one-line confession even though the command lines were neutral. We cannot
+ * unlink the module from the PEB (our own code must keep working), but every
+ * ordinary tool goes through one of the APIs below, so we drop the entry from
+ * their answers. Names/paths are compared case-insensitively; a failed lookup
+ * keeps the entry (never hide something we cannot identify).
+ */
+static int ws_module_name_is_self(const wchar_t *pathOrName)
+{
+    if (!g_selfDllOk || !pathOrName || !pathOrName[0]) {
+        return 0;
+    }
+    const wchar_t *a = wcsrchr(pathOrName, L'\\');
+    a = a ? a + 1 : pathOrName;
+    const wchar_t *b = wcsrchr(g_selfDll, L'\\');
+    b = b ? b + 1 : g_selfDll;
+    return _wcsicmp(a, b) == 0;
+}
+
+typedef DWORD(WINAPI *WsGetModuleFileNameExWFn)(HANDLE, HMODULE, LPWSTR, DWORD);
+
+static WsGetModuleFileNameExWFn ws_module_name_fn(void)
+{
+    static volatile LONG resolved;
+    static WsGetModuleFileNameExWFn fn;
+    if (InterlockedCompareExchange(&resolved, 1, 0) == 0) {
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        if (k32) {
+            fn = (WsGetModuleFileNameExWFn)(void *)GetProcAddress(k32, "K32GetModuleFileNameExW");
+        }
+        if (!fn) {
+            HMODULE psapi = GetModuleHandleW(L"psapi.dll");
+            if (psapi) {
+                fn = (WsGetModuleFileNameExWFn)(void *)GetProcAddress(psapi, "GetModuleFileNameExW");
+            }
+        }
+    }
+    return fn;
+}
+
+static int ws_module_entry_is_self(HANDLE hProcess, HMODULE mod)
+{
+    if (!mod) {
+        return 0;
+    }
+    if (g_selfBase && mod == g_selfBase) {
+        return 1;
+    }
+    WsGetModuleFileNameExWFn fn = ws_module_name_fn();
+    if (!fn) {
+        return 0;
+    }
+    WS_PATH_BUF(name);
+    DWORD n = fn(hProcess, mod, name, WS_PATH_MAX);
+    if (n == 0 || n >= WS_PATH_MAX) {
+        if (g_ws.debugFind) {
+            ws_log("module enum: name lookup failed hProc=%p mod=%p err=%lu", (void *)hProcess, (void *)mod,
+                   (unsigned long)GetLastError());
+        }
+        return 0;
+    }
+    return ws_module_name_is_self(name);
+}
+
+/* Drop our module from the array the real API just filled. Only safe when the
+ * caller's buffer holds the WHOLE list (`cb >= *needed`); a truncated buffer is
+ * passed through unchanged (we cannot see the rest of it). */
+static BOOL ws_filter_module_array(HANDLE hProcess, HMODULE *mods, DWORD cb, LPDWORD needed, BOOL ok)
+{
+    if (g_ws.debugFind) {
+        ws_log("module enum: call ok=%d cb=%lu needed=%lu pid=%lu self=%lu", (int)ok, (unsigned long)cb,
+               needed ? (unsigned long)*needed : 0UL, (unsigned long)GetProcessId(hProcess),
+               (unsigned long)GetCurrentProcessId());
+    }
+    if (!ok || !mods || !needed || cb < *needed) {
+        return ok;
+    }
+    DWORD count = *needed / (DWORD)sizeof(HMODULE);
+    if (count == 0) {
+        return ok;
+    }
+    DWORD keep = 0;
+    for (DWORD i = 0; i < count; i++) {
+        if (ws_module_entry_is_self(hProcess, mods[i])) {
+            continue;
+        }
+        mods[keep++] = mods[i];
+    }
+    if (keep != count) {
+        if (g_ws.debugFind) {
+            ws_log("module enum: hid %lu of %lu modules (pid=%lu)", (unsigned long)(count - keep),
+                   (unsigned long)count, (unsigned long)GetProcessId(hProcess));
+        }
+        *needed = keep * (DWORD)sizeof(HMODULE);
+    }
+    return ok;
+}
+
+typedef BOOL(WINAPI *WsEnumModulesFn)(HANDLE, HMODULE *, DWORD, LPDWORD);
+typedef BOOL(WINAPI *WsEnumModulesExFn)(HANDLE, HMODULE *, DWORD, LPDWORD, DWORD);
+
+/* psapi is not in this DLL's import table (and the K32 names may be absent on
+ * old builds): resolve once, then answer with a normal failure if unavailable. */
+static void *ws_enum_modules_sym(const char *k32Name, const char *psapiName, int wantEx)
+{
+    (void)wantEx;
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    void *fn = k32 ? (void *)GetProcAddress(k32, k32Name) : NULL;
+    if (!fn) {
+        HMODULE psapi = LoadLibraryW(L"psapi.dll");
+        if (psapi) {
+            fn = (void *)GetProcAddress(psapi, psapiName);
+        }
+    }
+    return fn;
+}
+
+static WsEnumModulesFn ws_enum_modules_fn(void)
+{
+    static volatile LONG resolved;
+    static WsEnumModulesFn fn;
+    if (InterlockedCompareExchange(&resolved, 1, 0) == 0) {
+        fn = (WsEnumModulesFn)ws_enum_modules_sym("K32EnumProcessModules", "EnumProcessModules", 0);
+    }
+    return fn;
+}
+
+static WsEnumModulesExFn ws_enum_modules_ex_fn(void)
+{
+    static volatile LONG resolved;
+    static WsEnumModulesExFn fn;
+    if (InterlockedCompareExchange(&resolved, 1, 0) == 0) {
+        fn = (WsEnumModulesExFn)ws_enum_modules_sym("K32EnumProcessModulesEx", "EnumProcessModulesEx", 1);
+    }
+    return fn;
+}
+
+BOOL WINAPI ws_EnumProcessModules(HANDLE hProcess, HMODULE *mods, DWORD cb, LPDWORD needed)
+{
+    ws_callhit_named("EnumProcessModules");
+    WsEnumModulesFn real = g_orig.EnumProcessModules ? (WsEnumModulesFn)g_orig.EnumProcessModules
+                                                     : ws_enum_modules_fn();
+    if (!real) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return FALSE;
+    }
+    return ws_filter_module_array(hProcess, mods, cb, needed, real(hProcess, mods, cb, needed));
+}
+
+BOOL WINAPI ws_EnumProcessModulesEx(HANDLE hProcess, HMODULE *mods, DWORD cb, LPDWORD needed, DWORD filter)
+{
+    ws_callhit_named("EnumProcessModulesEx");
+    WsEnumModulesExFn real = g_orig.EnumProcessModulesEx ? (WsEnumModulesExFn)g_orig.EnumProcessModulesEx
+                                                         : ws_enum_modules_ex_fn();
+    if (!real) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return FALSE;
+    }
+    return ws_filter_module_array(hProcess, mods, cb, needed, real(hProcess, mods, cb, needed, filter));
+}
+
+BOOL WINAPI ws_K32EnumProcessModules(HANDLE hProcess, HMODULE *mods, DWORD cb, LPDWORD needed)
+{
+    ws_callhit_named("K32EnumProcessModules");
+    WsEnumModulesFn real = g_orig.K32EnumProcessModules ? (WsEnumModulesFn)g_orig.K32EnumProcessModules
+                                                        : ws_enum_modules_fn();
+    if (!real) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return FALSE;
+    }
+    return ws_filter_module_array(hProcess, mods, cb, needed, real(hProcess, mods, cb, needed));
+}
+
+BOOL WINAPI ws_K32EnumProcessModulesEx(HANDLE hProcess, HMODULE *mods, DWORD cb, LPDWORD needed, DWORD filter)
+{
+    ws_callhit_named("K32EnumProcessModulesEx");
+    WsEnumModulesExFn real = g_orig.K32EnumProcessModulesEx
+                                 ? (WsEnumModulesExFn)g_orig.K32EnumProcessModulesEx
+                                 : ws_enum_modules_ex_fn();
+    if (!real) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return FALSE;
+    }
+    return ws_filter_module_array(hProcess, mods, cb, needed, real(hProcess, mods, cb, needed, filter));
+}
+
+/* ── neutral module NAMES ───────────────────────────────────────────────────
+ * Filtering the module LIST only works when we can identify the entry, which
+ * needs PROCESS_VM_READ on the *other* process (tasklist has it, but the call
+ * is not always made through a hooked path). The name, however, is always
+ * fetched through these APIs: answering `wds.dll` removes the last `winstage`
+ * string from `tasklist /m` even when the entry itself survives.
+ */
+#define WS_MODULE_ALIAS L"wds.dll"
+
+static DWORD ws_alias_into_w(LPWSTR buf, DWORD cch)
+{
+    if (!buf || cch == 0) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    DWORD n = (DWORD)wcslen(WS_MODULE_ALIAS);
+    if (n >= cch) {
+        n = cch - 1;
+    }
+    memcpy(buf, WS_MODULE_ALIAS, (size_t)n * sizeof(wchar_t));
+    buf[n] = 0;
+    return n;
+}
+
+static DWORD ws_alias_into_a(LPSTR buf, DWORD cch)
+{
+    if (!buf || cch == 0) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    DWORD n = (DWORD)strlen("wds.dll");
+    if (n >= cch) {
+        n = cch - 1;
+    }
+    memcpy(buf, "wds.dll", n);
+    buf[n] = 0;
+    return n;
+}
+
+typedef DWORD(WINAPI *WsModuleNameApiW)(HANDLE, HMODULE, LPWSTR, DWORD);
+typedef DWORD(WINAPI *WsModuleNameApiA)(HANDLE, HMODULE, LPSTR, DWORD);
+
+static DWORD ws_module_name_api_w(WsModuleNameApiW real, HANDLE hProcess, HMODULE mod, LPWSTR buf, DWORD cch)
+{
+    DWORD n = real(hProcess, mod, buf, cch);
+    if (n == 0 || !ws_module_entry_is_self(hProcess, mod)) {
+        return n;
+    }
+    return ws_alias_into_w(buf, cch);
+}
+
+static DWORD ws_module_name_api_a(WsModuleNameApiA real, HANDLE hProcess, HMODULE mod, LPSTR buf, DWORD cch)
+{
+    DWORD n = real(hProcess, mod, buf, cch);
+    if (n == 0 || !ws_module_entry_is_self(hProcess, mod)) {
+        return n;
+    }
+    return ws_alias_into_a(buf, cch);
+}
+
+static WsModuleNameApiW ws_module_name_sym_w(const char *k32, const char *psapi)
+{
+    HMODULE k32m = GetModuleHandleW(L"kernel32.dll");
+    void *fn = k32m ? (void *)GetProcAddress(k32m, k32) : NULL;
+    if (!fn) {
+        HMODULE psapi_m = LoadLibraryW(L"psapi.dll");
+        if (psapi_m) {
+            fn = (void *)GetProcAddress(psapi_m, psapi);
+        }
+    }
+    return (WsModuleNameApiW)fn;
+}
+
+static WsModuleNameApiA ws_module_name_sym_a(const char *k32, const char *psapi)
+{
+    HMODULE k32m = GetModuleHandleW(L"kernel32.dll");
+    void *fn = k32m ? (void *)GetProcAddress(k32m, k32) : NULL;
+    if (!fn) {
+        HMODULE psapi_m = LoadLibraryW(L"psapi.dll");
+        if (psapi_m) {
+            fn = (void *)GetProcAddress(psapi_m, psapi);
+        }
+    }
+    return (WsModuleNameApiA)fn;
+}
+
+#define WS_MODNAME_W(field, k32, psapi)                                                       \
+    DWORD WINAPI ws_##field(HANDLE hProcess, HMODULE mod, LPWSTR buf, DWORD cch)              \
+    {                                                                                         \
+        ws_callhit_named(#field);                                                             \
+        WsModuleNameApiW real = g_orig.field ? (WsModuleNameApiW)g_orig.field                 \
+                                             : ws_module_name_sym_w(k32, psapi);              \
+        if (!real) {                                                                          \
+            SetLastError(ERROR_CALL_NOT_IMPLEMENTED);                                         \
+            return 0;                                                                         \
+        }                                                                                     \
+        return ws_module_name_api_w(real, hProcess, mod, buf, cch);                           \
+    }
+
+#define WS_MODNAME_A(field, k32, psapi)                                                       \
+    DWORD WINAPI ws_##field(HANDLE hProcess, HMODULE mod, LPSTR buf, DWORD cch)               \
+    {                                                                                         \
+        ws_callhit_named(#field);                                                             \
+        WsModuleNameApiA real = g_orig.field ? (WsModuleNameApiA)g_orig.field                 \
+                                             : ws_module_name_sym_a(k32, psapi);              \
+        if (!real) {                                                                          \
+            SetLastError(ERROR_CALL_NOT_IMPLEMENTED);                                         \
+            return 0;                                                                         \
+        }                                                                                     \
+        return ws_module_name_api_a(real, hProcess, mod, buf, cch);                           \
+    }
+
+WS_MODNAME_W(GetModuleBaseNameW, "K32GetModuleBaseNameW", "GetModuleBaseNameW")
+WS_MODNAME_A(GetModuleBaseNameA, "K32GetModuleBaseNameA", "GetModuleBaseNameA")
+WS_MODNAME_W(GetModuleFileNameExW, "K32GetModuleFileNameExW", "GetModuleFileNameExW")
+WS_MODNAME_A(GetModuleFileNameExA, "K32GetModuleFileNameExA", "GetModuleFileNameExA")
+WS_MODNAME_W(K32GetModuleBaseNameW, "K32GetModuleBaseNameW", "GetModuleBaseNameW")
+WS_MODNAME_A(K32GetModuleBaseNameA, "K32GetModuleBaseNameA", "GetModuleBaseNameA")
+WS_MODNAME_W(K32GetModuleFileNameExW, "K32GetModuleFileNameExW", "GetModuleFileNameExW")
+WS_MODNAME_A(K32GetModuleFileNameExA, "K32GetModuleFileNameExA", "GetModuleFileNameExA")
+
+BOOL WINAPI ws_Module32FirstW(HANDLE snap, LPVOID entry)
+{
+    ws_callhit_named("Module32FirstW");
+    BOOL(WINAPI * real)(HANDLE, LPMODULEENTRY32W) = g_orig.Module32FirstW
+        ? (BOOL(WINAPI *)(HANDLE, LPMODULEENTRY32W))g_orig.Module32FirstW
+        : Module32FirstW;
+    LPMODULEENTRY32W me = (LPMODULEENTRY32W)entry;
+    if (!me) {
+        return real(snap, me);
+    }
+    for (;;) {
+        if (!real(snap, me)) {
+            return FALSE;
+        }
+        if (!ws_module_name_is_self(me->szModule) && !ws_module_name_is_self(me->szExePath)) {
+            return TRUE;
+        }
+    }
+}
+
+BOOL WINAPI ws_Module32NextW(HANDLE snap, LPVOID entry)
+{
+    ws_callhit_named("Module32NextW");
+    BOOL(WINAPI * real)(HANDLE, LPMODULEENTRY32W) = g_orig.Module32NextW
+        ? (BOOL(WINAPI *)(HANDLE, LPMODULEENTRY32W))g_orig.Module32NextW
+        : Module32NextW;
+    LPMODULEENTRY32W me = (LPMODULEENTRY32W)entry;
+    if (!me) {
+        return real(snap, me);
+    }
+    for (;;) {
+        if (!real(snap, me)) {
+            return FALSE;
+        }
+        if (!ws_module_name_is_self(me->szModule) && !ws_module_name_is_self(me->szExePath)) {
+            return TRUE;
+        }
+    }
+}
+
+BOOL WINAPI ws_Module32First(HANDLE snap, LPVOID entry)
+{
+    ws_callhit_named("Module32First");
+    BOOL(WINAPI * real)(HANDLE, LPMODULEENTRY32) = g_orig.Module32First
+        ? (BOOL(WINAPI *)(HANDLE, LPMODULEENTRY32))g_orig.Module32First
+        : Module32First;
+    LPMODULEENTRY32 me = (LPMODULEENTRY32)entry;
+    if (!me) {
+        return real(snap, me);
+    }
+    for (;;) {
+        if (!real(snap, me)) {
+            return FALSE;
+        }
+        if (!ws_module_name_is_self((const wchar_t *)me->szModule) &&
+            !ws_module_name_is_self((const wchar_t *)me->szExePath)) {
+            return TRUE;
+        }
+    }
+}
+
+BOOL WINAPI ws_Module32Next(HANDLE snap, LPVOID entry)
+{
+    ws_callhit_named("Module32Next");
+    BOOL(WINAPI * real)(HANDLE, LPMODULEENTRY32) = g_orig.Module32Next
+        ? (BOOL(WINAPI *)(HANDLE, LPMODULEENTRY32))g_orig.Module32Next
+        : Module32Next;
+    LPMODULEENTRY32 me = (LPMODULEENTRY32)entry;
+    if (!me) {
+        return real(snap, me);
+    }
+    for (;;) {
+        if (!real(snap, me)) {
+            return FALSE;
+        }
+        if (!ws_module_name_is_self((const wchar_t *)me->szModule) &&
+            !ws_module_name_is_self((const wchar_t *)me->szExePath)) {
+            return TRUE;
+        }
+    }
+}
+
 /* ---------------------------------------------------------- env contract */
 
 /* ── neutral helper lookup ─────────────────────────────────────────────────

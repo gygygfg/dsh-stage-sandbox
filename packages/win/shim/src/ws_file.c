@@ -863,6 +863,39 @@ static int ws_file_exists(const wchar_t *norm)
     return exists;
 }
 
+/* Existence on the REAL disk, bypassing every overlay-aware hook.
+ *
+ * `g_orig.GetFileAttributesW` is NOT real-only: kernelbase reaches the
+ * attributes through `NtQueryAttributesFile`, which the shim also hooks, so a
+ * staged-only file looked "really present" (measured: the overflow/hybrid
+ * enumeration dropped every staged-only entry as a duplicate). kernelbase's
+ * `CreateFileW` reaches `NtCreateFile`, whose core-module slot is deliberately
+ * left real, so this probe lands on the real disk. */
+static int ws_real_exists_raw(const wchar_t *path)
+{
+    DWORD saved = GetLastError();
+    int exists = 0;
+    if (!path || !path[0]) {
+        SetLastError(saved);
+        return 0;
+    }
+    HANDLE h = g_orig.CreateFileW
+                   ? g_orig.CreateFileW(path, FILE_READ_ATTRIBUTES,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL)
+                   : INVALID_HANDLE_VALUE;
+    if (h != INVALID_HANDLE_VALUE) {
+        exists = 1;
+        if (g_orig.CloseHandle) {
+            g_orig.CloseHandle(h);
+        } else {
+            CloseHandle(h);
+        }
+    }
+    SetLastError(saved);
+    return exists;
+}
+
 static void ws_a2w_buf(const char *in, wchar_t *out, DWORD cch)
 {
     out[0] = 0;
@@ -1487,6 +1520,17 @@ typedef struct WsMergedFind {
     DWORD count;
     DWORD index;
     WIN32_FIND_DATAW *items;
+    /* ── hybrid mode (see ws_merge_hybrid) ───────────────────────────────────
+     * Used when the materialised list would exceed WS_FIND_MERGE_MAX: the REAL
+     * handle is served live (filtered) and only the staged-ONLY names are held
+     * here. Without this a directory with >8192 entries fell back to the plain
+     * real handle and every staged-only file vanished from `dir` (the "view
+     * split" the merge was introduced to fix). */
+    HANDLE real;
+    wchar_t *dir; /* logical directory, for masking live real entries */
+    WIN32_FIND_DATAW *overlay;
+    DWORD overlayCount;
+    DWORD overlayIndex;
 } WsMergedFind;
 
 typedef struct WsMergeList {
@@ -1545,6 +1589,32 @@ static BOOL ws_find_fake_next(HANDLE h, LPWIN32_FIND_DATAW out)
         SetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
     }
+    /* Hybrid mode: drain the live real handle first (masked entries skipped),
+     * then the staged-only overlay. */
+    if (slot->real) {
+        for (;;) {
+            WIN32_FIND_DATAW fd;
+            BOOL ok = g_orig.FindNextFileW ? g_orig.FindNextFileW(slot->real, &fd)
+                                           : FindNextFileW(slot->real, &fd);
+            if (!ok) {
+                ws_find_orig_close(slot->real);
+                slot->real = NULL;
+                break;
+            }
+            wchar_t rule[256];
+            if (slot->dir && ws_find_entry_masked(slot->dir, fd.cFileName, rule, 256)) {
+                continue;
+            }
+            *out = fd;
+            ws_lock_leave(&g_findLock);
+            return TRUE;
+        }
+    }
+    if (slot->overlay && slot->overlayIndex < slot->overlayCount) {
+        *out = slot->overlay[slot->overlayIndex++];
+        ws_lock_leave(&g_findLock);
+        return TRUE;
+    }
     if (slot->index >= slot->count) {
         ws_lock_leave(&g_findLock);
         SetLastError(ERROR_NO_MORE_FILES);
@@ -1562,6 +1632,11 @@ static void ws_find_fake_close(HANDLE h)
     WsMergedFind *slot = ws_find_fake_slot(h);
     if (slot) {
         free(slot->items);
+        free(slot->overlay);
+        free(slot->dir);
+        if (slot->real) {
+            ws_find_orig_close(slot->real);
+        }
         memset(slot, 0, sizeof(*slot));
     }
     ws_lock_leave(&g_findLock);
@@ -1698,6 +1773,173 @@ static void ws_merge_build(const wchar_t *pattern, const wchar_t *dir, const wch
     free(staged.items);
 }
 
+/* dir + name -> "dir\name" (dir may be a drive root ending in '\'). */
+static int ws_join_dir(const wchar_t *dir, const wchar_t *name, wchar_t *out, DWORD cch)
+{
+    size_t pos = 0;
+    out[0] = 0;
+    if (!ws_append_w(out, cch, &pos, dir)) {
+        return 0;
+    }
+    if (!(pos > 0 && out[pos - 1] == L'\\') && !ws_append_w(out, cch, &pos, L"\\")) {
+        return 0;
+    }
+    return ws_append_w(out, cch, &pos, name);
+}
+
+static HANDLE ws_find_fake_alloc_hybrid(HANDLE real, const wchar_t *dir, WIN32_FIND_DATAW *overlay,
+                                        DWORD overlayCount, int firstFromOverlay)
+{
+    wchar_t *dirCopy = _wcsdup(dir ? dir : L"");
+    if (!dirCopy) {
+        return NULL;
+    }
+    ws_find_ready();
+    ws_lock_enter(&g_findLock);
+    for (int i = 0; i < WS_FIND_MERGE_SLOTS; i++) {
+        if (!g_findMerged[i].used) {
+            WsMergedFind *slot = &g_findMerged[i];
+            memset(slot, 0, sizeof(*slot));
+            slot->used = 1;
+            slot->real = real;
+            slot->dir = dirCopy;
+            slot->overlay = overlay;
+            slot->overlayCount = overlayCount;
+            slot->overlayIndex = firstFromOverlay ? 1 : 0;
+            ws_lock_leave(&g_findLock);
+            return (HANDLE)(WS_FIND_FAKE_TAG | (ULONG_PTR)(i + 1));
+        }
+    }
+    ws_lock_leave(&g_findLock);
+    free(dirCopy);
+    return NULL;
+}
+
+/* Overflow path: the materialised list exceeded WS_FIND_MERGE_MAX. Serve the
+ * REAL handle live (masked entries skipped) and keep only the staged-ONLY names
+ * — those the real directory does not contain — in an overlay. Memory is bounded
+ * by the staged side (our own store), not by the real directory's size. */
+static HANDLE ws_merge_hybrid(const wchar_t *pattern, const wchar_t *dir, const wchar_t *namePattern,
+                              LPWIN32_FIND_DATAW first)
+{
+    WS_PATH_BUF(api);
+    const wchar_t *ap = ws_api_path(pattern, api, WS_PATH_MAX);
+    WIN32_FIND_DATAW fd;
+    HANDLE real = g_orig.FindFirstFileW ? g_orig.FindFirstFileW(ap, &fd) : FindFirstFileW(ap, &fd);
+    int realVisible = 0;
+    if (real != INVALID_HANDLE_VALUE) {
+        for (;;) {
+            wchar_t rule[256];
+            if (!ws_find_entry_masked(dir, fd.cFileName, rule, 256)) {
+                realVisible = 1;
+                break;
+            }
+            if (!(g_orig.FindNextFileW ? g_orig.FindNextFileW(real, &fd) : FindNextFileW(real, &fd))) {
+                break;
+            }
+        }
+        if (!realVisible) {
+            ws_find_orig_close(real);
+            real = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    WIN32_FIND_DATAW *overlay = NULL;
+    DWORD overlayCount = 0;
+    DWORD overlayCap = 0;
+    WS_PATH_BUF(stagedDir);
+    uint32_t flags = 0;
+    if (ws_resolve_file(dir, WINSTAGE_IO_READ, stagedDir, &flags) == 0 &&
+        (flags & WINSTAGE_RES_STAGED)) {
+        WS_PATH_BUF(stagedPattern);
+        size_t pos = 0;
+        stagedPattern[0] = 0;
+        if (ws_append_w(stagedPattern, WS_PATH_MAX, &pos, stagedDir) &&
+            ((pos > 0 && stagedPattern[pos - 1] == L'\\') || ws_append_w(stagedPattern, WS_PATH_MAX, &pos, L"\\")) &&
+            ws_append_w(stagedPattern, WS_PATH_MAX, &pos, namePattern)) {
+            WIN32_FIND_DATAW sfd;
+            HANDLE sh = g_orig.FindFirstFileW ? g_orig.FindFirstFileW(stagedPattern, &sfd)
+                                              : FindFirstFileW(stagedPattern, &sfd);
+            ws_log("hybrid: staged pattern %ls -> %p (err=%lu)", stagedPattern, (void *)sh,
+                   (unsigned long)GetLastError());
+            if (sh != INVALID_HANDLE_VALUE) {
+                for (;;) {
+                    int skip = 0;
+                    const char *why = "kept";
+                    if (wcscmp(sfd.cFileName, L".") == 0 || wcscmp(sfd.cFileName, L"..") == 0) {
+                        skip = 1;
+                        why = "dot";
+                    }
+                    WS_PATH_BUF(logical);
+                    if (!skip && !ws_join_dir(dir, sfd.cFileName, logical, WS_PATH_MAX)) {
+                        skip = 1;
+                        why = "join";
+                    }
+                    if (!skip && ws_logically_whiteouted(logical)) {
+                        skip = 1;
+                        why = "whiteout";
+                    }
+                    if (!skip && ws_mask_declared()) {
+                        wchar_t rule[256];
+                        if (ws_mask_decide_read(logical, rule, 256)) {
+                            skip = 1;
+                            why = "mask";
+                        }
+                    }
+                    if (!skip) {
+                        /* present in the REAL directory? then the live handle
+                         * already yields it -- do not list it twice. */
+                        if (ws_real_exists_raw(logical)) {
+                            skip = 1;
+                            why = "real-exists";
+                        }
+                    }
+                    if (g_ws.debugFind) {
+                        ws_log("hybrid: entry %ls skip=%d why=%s", sfd.cFileName, skip, why);
+                    }
+                    if (!skip) {
+                        if (overlayCount == overlayCap) {
+                            DWORD cap = overlayCap ? overlayCap * 2 : 64;
+                            WIN32_FIND_DATAW *grown =
+                                (WIN32_FIND_DATAW *)realloc(overlay, (size_t)cap * sizeof(*grown));
+                            if (!grown) {
+                                break;
+                            }
+                            overlay = grown;
+                            overlayCap = cap;
+                        }
+                        overlay[overlayCount++] = sfd;
+                    }
+                    if (!(g_orig.FindNextFileW ? g_orig.FindNextFileW(sh, &sfd) : FindNextFileW(sh, &sfd))) {
+                        break;
+                    }
+                }
+                ws_find_orig_close(sh);
+            }
+        }
+    }
+    if (real == INVALID_HANDLE_VALUE && overlayCount == 0) {
+        free(overlay);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (g_ws.debugFind) {
+        ws_log("find hybrid: dir=%ls real=%d overlay=%lu", dir, realVisible, (unsigned long)overlayCount);
+    }
+    int firstFromOverlay = !realVisible;
+    HANDLE h = ws_find_fake_alloc_hybrid(real, dir, overlay, overlayCount, firstFromOverlay);
+    if (!h) {
+        if (real != INVALID_HANDLE_VALUE) {
+            ws_find_orig_close(real);
+        }
+        free(overlay);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return INVALID_HANDLE_VALUE;
+    }
+    *first = firstFromOverlay ? overlay[0] : fd;
+    return h;
+}
+
 /**
  * Try the merged path. `*handled` = 1 means this function owns the answer
  * (including "empty directory" -> INVALID_HANDLE_VALUE); 0 means the caller
@@ -1746,8 +1988,15 @@ static HANDLE ws_merge_try(const wchar_t *pattern, LPWIN32_FIND_DATAW first, int
     WsMergeList list = { 0 };
     ws_merge_build(pattern, dir, name, &list);
     if (list.overflow) {
+        if (g_ws.debugFind) {
+            ws_log_w(L"find merge overflow, using hybrid", dir);
+        }
         free(list.items);
-        return INVALID_HANDLE_VALUE; /* fall back to the real-handle filter */
+        /* Too many entries to materialise: serve the real handle live plus the
+         * staged-only names (a plain fallback silently dropped them). */
+        HANDLE hybrid = ws_merge_hybrid(pattern, dir, name, first);
+        *handled = 1;
+        return hybrid;
     }
     *handled = 1;
     if (list.count == 0) {
@@ -4435,6 +4684,96 @@ static int ws_logical_from_staged(const wchar_t *norm, wchar_t *out, DWORD cch)
     return 0;
 }
 
+/**
+ * ── Transparency: the REAL path behind a handle ─────────────────────────────
+ *
+ * `GetFinalPathNameByHandleW` answers "where does this handle actually point".
+ * For a file we redirected into the store the answer was
+ * `<session>\stage\staged\fs\C\Users\...\x.txt`, i.e. a one-line confession of
+ * the whole mechanism. Every library that resolves paths (libuv's realpath,
+ * so Node `fs.realpath`; Python `os.path.realpath`) calls this.
+ *
+ * We only rewrite OUR OWN layout: a path under `<stageRoot>\fs\` is mapped back
+ * to the logical path it stands for and re-framed in the caller's requested
+ * form. Anything else is passed through untouched.
+ */
+static int ws_map_staged_path(const wchar_t *path, wchar_t *out, DWORD cch)
+{
+    out[0] = 0;
+    if (!path || !path[0]) {
+        return 0;
+    }
+    WS_PATH_BUF(norm);
+    if (!ws_normalize_path(path, norm, WS_PATH_MAX)) {
+        return 0;
+    }
+    return ws_logical_from_staged(norm, out, cch);
+}
+
+DWORD WINAPI ws_GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath, DWORD cchFilePath, DWORD dwFlags)
+{
+    DWORD orig = g_orig.GetFinalPathNameByHandleW
+                     ? g_orig.GetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags)
+                     : GetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
+    if (orig == 0 || !lpszFilePath || orig >= cchFilePath || cchFilePath == 0) {
+        return orig;
+    }
+    DWORD vol = dwFlags & 0x7UL;
+    if (vol == 0x2UL /* VOLUME_NAME_NT */) {
+        return orig; /* device/volume form: not ours to rebuild */
+    }
+    WS_PATH_BUF(logical);
+    if (!ws_map_staged_path(lpszFilePath, logical, WS_PATH_MAX) || !logical[0]) {
+        return orig;
+    }
+    int unc = (logical[0] == L'\\' && logical[1] == L'\\');
+    WS_PATH_BUF(out);
+    size_t pos = 0;
+    out[0] = 0;
+    if (vol == 0x4UL /* VOLUME_NAME_NONE */) {
+        if (!ws_append_w(out, WS_PATH_MAX, &pos, logical)) {
+            return orig;
+        }
+    } else if (!ws_append_w(out, WS_PATH_MAX, &pos, unc ? L"\\\\?\\UNC\\" : L"\\\\?\\") ||
+               !ws_append_w(out, WS_PATH_MAX, &pos, unc ? logical + 2 : logical)) {
+        return orig;
+    }
+    DWORD need = (DWORD)wcslen(out);
+    if (need + 1 > cchFilePath) {
+        wcsncpy(lpszFilePath, out, cchFilePath - 1);
+        lpszFilePath[cchFilePath - 1] = 0;
+        return need + 1;
+    }
+    memcpy(lpszFilePath, out, ((size_t)need + 1) * sizeof(wchar_t));
+    return need;
+}
+
+DWORD WINAPI ws_GetFinalPathNameByHandleA(HANDLE hFile, LPSTR lpszFilePath, DWORD cchFilePath, DWORD dwFlags)
+{
+    DWORD orig = g_orig.GetFinalPathNameByHandleA
+                     ? g_orig.GetFinalPathNameByHandleA(hFile, lpszFilePath, cchFilePath, dwFlags)
+                     : GetFinalPathNameByHandleA(hFile, lpszFilePath, cchFilePath, dwFlags);
+    if (orig == 0 || !lpszFilePath || orig >= cchFilePath || cchFilePath == 0) {
+        return orig;
+    }
+    WS_PATH_BUF(wide);
+    DWORD n = ws_GetFinalPathNameByHandleW(hFile, wide, WS_PATH_MAX, dwFlags);
+    if (n == 0 || n >= WS_PATH_MAX) {
+        return orig;
+    }
+    int need = WideCharToMultiByte(CP_ACP, 0, wide, -1, NULL, 0, NULL, NULL);
+    if (need <= 1) {
+        return orig;
+    }
+    if ((DWORD)need <= cchFilePath - 1) {
+        WideCharToMultiByte(CP_ACP, 0, wide, -1, lpszFilePath, (int)cchFilePath, NULL, NULL);
+        return (DWORD)(need - 1);
+    }
+    WideCharToMultiByte(CP_ACP, 0, wide, -1, lpszFilePath, (int)(cchFilePath - 1), NULL, NULL);
+    lpszFilePath[cchFilePath - 1] = 0;
+    return (DWORD)need;
+}
+
 /* Is the REAL directory empty? Mirrors the check in ws_remove_directory_locked:
  * a directory delete must fail exactly like the real API when it is not empty. */
 static int ws_real_dir_is_empty(const wchar_t *norm)
@@ -4723,6 +5062,11 @@ NTSTATUS NTAPI ws_NtQueryInformationFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoS
  * NEVER fail-closed: if the captured original is missing we call the real API
  * directly (this module's own import table is never patched). Win32 family =>
  * LastError is saved/restored around the log. */
+typedef struct WsFileNameInfo {
+    DWORD FileNameLength;
+    WCHAR FileName[1];
+} WsFileNameInfo;
+
 BOOL WINAPI ws_GetFileInformationByHandleEx(HANDLE hFile, int FileInformationClass,
                                            LPVOID lpFileInformation, DWORD dwBufferSize)
 {
@@ -4735,6 +5079,74 @@ BOOL WINAPI ws_GetFileInformationByHandleEx(HANDLE hFile, int FileInformationCla
                                           lpFileInformation, dwBufferSize);
     }
     DWORD e = GetLastError();
+    /* Transparency: FILE_NAME_INFO (class 2) leaks the staging path too.
+     * Measured shapes on the guest: `\\?\C:\...`, `\??\C:\...` and the
+     * volume-relative `\rt\stage\...` (no drive letter). All three are rebuilt
+     * in the SAME shape, so the caller cannot tell the answer was rewritten. */
+    if (ok && FileInformationClass == 2 && lpFileInformation &&
+        dwBufferSize >= sizeof(DWORD) + sizeof(WCHAR)) {
+        WsFileNameInfo *ni = (WsFileNameInfo *)lpFileInformation;
+        DWORD bytes = ni->FileNameLength;
+        if (bytes >= 2 * sizeof(WCHAR) && bytes <= dwBufferSize - sizeof(DWORD)) {
+            DWORD cch = bytes / sizeof(WCHAR);
+            WCHAR *name = ni->FileName;
+            WS_PATH_BUF(full);
+            size_t pos = 0;
+            full[0] = 0;
+            int kind = 0; /* 1 = \\?\ form, 2 = \??\ form, 3 = volume-relative */
+            int fits = 1;
+            if (cch > 4 && name[0] == L'\\' && name[1] == L'\\' && name[2] == L'?' && name[3] == L'\\') {
+                kind = 1;
+                for (DWORD i = 4; i < cch && fits; i++) {
+                    wchar_t one[2] = { name[i], 0 };
+                    fits = ws_append_w(full, WS_PATH_MAX, &pos, one);
+                }
+            } else if (cch > 4 && name[0] == L'\\' && name[1] == L'?' && name[2] == L'?' &&
+                       name[3] == L'\\') {
+                kind = 2;
+                for (DWORD i = 4; i < cch && fits; i++) {
+                    wchar_t one[2] = { name[i], 0 };
+                    fits = ws_append_w(full, WS_PATH_MAX, &pos, one);
+                }
+            } else if (name[0] == L'\\' && name[1] != L'\\' && g_ws.haveStageRoot && g_ws.stageRoot[1] == L':') {
+                /* volume-relative: prepend the staging volume's drive letter */
+                kind = 3;
+                wchar_t drive[3] = { g_ws.stageRoot[0], L':', 0 };
+                fits = ws_append_w(full, WS_PATH_MAX, &pos, drive);
+                for (DWORD i = 0; i < cch && fits; i++) {
+                    wchar_t one[2] = { name[i], 0 };
+                    fits = ws_append_w(full, WS_PATH_MAX, &pos, one);
+                }
+            }
+            WS_PATH_BUF(logical);
+            if (fits && kind && ws_logical_from_staged(full, logical, WS_PATH_MAX) && logical[0]) {
+                WS_PATH_BUF(out);
+                size_t opos = 0;
+                out[0] = 0;
+                int okOut = 1;
+                if (kind == 1) {
+                    int unc = (logical[0] == L'\\' && logical[1] == L'\\');
+                    okOut = ws_append_w(out, WS_PATH_MAX, &opos, unc ? L"\\\\?\\UNC\\" : L"\\\\?\\") &&
+                            ws_append_w(out, WS_PATH_MAX, &opos, unc ? logical + 2 : logical);
+                } else if (kind == 2) {
+                    okOut = ws_append_w(out, WS_PATH_MAX, &opos, L"\\??\\") &&
+                            ws_append_w(out, WS_PATH_MAX, &opos, logical);
+                } else {
+                    /* back to volume-relative: drop "C:" */
+                    const wchar_t *rel = (logical[1] == L':') ? logical + 2 : logical;
+                    okOut = ws_append_w(out, WS_PATH_MAX, &opos, rel);
+                }
+                DWORD lcch = (DWORD)wcslen(out);
+                DWORD need = lcch * (DWORD)sizeof(WCHAR);
+                if (okOut && need <= bytes &&
+                    need + (DWORD)sizeof(WCHAR) <= dwBufferSize - (DWORD)sizeof(DWORD)) {
+                    memcpy(ni->FileName, out, (size_t)lcch * sizeof(WCHAR));
+                    ni->FileName[lcch] = 0;
+                    ni->FileNameLength = need;
+                }
+            }
+        }
+    }
     WS_DBG("ATTRDBG-GFIBHEX handle=%p class=%d ok=%d err=%lu",
            (void *)hFile, FileInformationClass, (int)ok, (unsigned long)e);
     SetLastError(e);

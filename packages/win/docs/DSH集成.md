@@ -1299,3 +1299,14 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
 - 真实模型复跑（recon5）结论是"QEMU 虚拟机、未被沙箱接管"，全文未出现注入器/助手名。
 - **部署要求**：Windows Defender 必须排除插件目录与私有 TEMP（否则未签名产物会被
   拦截/隔离，表现为 `Access is denied` 与 TS 档回退）。
+
+### 23.2 第三批修复（2026-11-24 上午）
+
+- `tasklist /m`：改 loader 表项 `BaseDllName`（`wds.dll`）+ 模块枚举/命名 API 三路隐藏。
+  改名必须在 `ws_proc_set_self_module()` 之后（否则注入器会记住不存在的 `wds.dll`）。
+- 目录合并枚举溢出（>8192）改"真实句柄 + 暂存独有覆盖"，不再整体回落。
+  真实盘存在性探测改用 kernelbase `CreateFileW`（`GetFileAttributesW` 会被自己的钩子接管）。
+- `GetFinalPathNameByHandleW/A`、`GetFileInformationByHandleEx(FileNameInfo)` 全部
+  映射回逻辑路径（三种前缀形态）。
+- `ChangeServiceConfig2`/`SetServiceObjectSecurity` 进 overlay；`sc sdset/failure/
+  triggerinfo/qsecurity/qfailure` 由助手实现。

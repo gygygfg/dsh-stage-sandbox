@@ -29,6 +29,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <sddl.h>
+/* Older SDK headers (the mingw one used for the build) lack these. */
+#ifndef SC_ACTION_RUN
+#define SC_ACTION_RUN 3
+#endif
+#ifndef SERVICE_CONFIG_TRIGGER_INFO
+#define SERVICE_CONFIG_TRIGGER_INFO 8
+#endif
 
 static void p(const char *fmt, ...)
 {
@@ -742,9 +750,21 @@ typedef int(__stdcall *CliJournalAppendFn)(const wchar_t *, const wchar_t *);
 typedef int(__stdcall *CliJournalReadFn)(const wchar_t *, char *, unsigned long);
 typedef int(__stdcall *CliEvtClearedFn)(const wchar_t *);
 
+/* The shim renames its own loader entry to a neutral base name (`wds.dll`) so
+ * PEB-walking tools (tasklist /m) do not see the product name; look it up under
+ * both names so the helper works with either image. */
+static HMODULE cli_shim_handle(void)
+{
+    HMODULE shim = GetModuleHandleW(L"wds.dll");
+    if (!shim) {
+        shim = GetModuleHandleW(L"winstage-shim.dll");
+    }
+    return shim;
+}
+
 static void *cli_shim_export(const char *name)
 {
-    HMODULE shim = GetModuleHandleW(L"winstage-shim.dll");
+    HMODULE shim = cli_shim_handle();
     if (!shim) {
         return NULL;
     }
@@ -953,7 +973,7 @@ int ws_evt_main(int argc, wchar_t **argv)
     if (!isClear) {
         return run_real_wevtutil(argc, argv);
     }
-    if (!GetModuleHandleW(L"winstage-shim.dll")) {
+    if (!cli_shim_handle()) {
         /* Not injected: clearing here would hit the real service. */
         fputs("wevtutil: staging layer is not active; refusing to clear the real log\n", stderr);
         return 5;
@@ -1326,6 +1346,251 @@ int ws_task_main(int argc, wchar_t **argv)
     return run_real_schtasks(argc, argv);
 }
 
+/* ── sdset / qsecurity / failure / qfailure / triggerinfo ───────────────────
+ * These verbs used to be refused ("not virtualized"), which made a normal admin
+ * action look impossible on the box. They are now staged like every other
+ * service write: the shim journals the change (ws_scm.c) and every later query
+ * answers from the journal.
+ */
+static int cmd_sdset(int argc, wchar_t **argv, int query)
+{
+    if (argc < 2 || (!query && argc < 3)) {
+        sc_error(query ? L"QueryServiceObjectSecurity" : L"SetServiceObjectSecurity", ERROR_INVALID_PARAMETER);
+        return ERROR_INVALID_PARAMETER;
+    }
+    SC_HANDLE mgr = open_manager();
+    if (!mgr) {
+        DWORD e = GetLastError();
+        sc_error(L"OpenSCManager", e);
+        return (int)e;
+    }
+    SC_HANDLE svc = OpenServiceW(mgr, argv[1], query ? SERVICE_QUERY_STATUS : WRITE_DAC);
+    DWORD e = GetLastError();
+    if (!svc) {
+        CloseServiceHandle(mgr);
+        sc_error(L"OpenService", e);
+        return (int)e;
+    }
+    int rc = 0;
+    if (!query) {
+        PSECURITY_DESCRIPTOR sd = NULL;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(argv[2], SDDL_REVISION_1, &sd, NULL)) {
+            e = GetLastError();
+            sc_error(L"ConvertStringSecurityDescriptorToSecurityDescriptor", e);
+            rc = (int)e;
+        } else {
+            if (!SetServiceObjectSecurity(svc, DACL_SECURITY_INFORMATION, sd)) {
+                e = GetLastError();
+                sc_error(L"SetServiceObjectSecurity", e);
+                rc = (int)e;
+            } else {
+                p("[SC] SetServiceObjectSecurity SUCCESS\n\n");
+            }
+            LocalFree(sd);
+        }
+    } else {
+        DWORD needed = 0;
+        QueryServiceObjectSecurity(svc, DACL_SECURITY_INFORMATION, NULL, 0, &needed);
+        BYTE *buf = (BYTE *)malloc(needed ? needed : 256);
+        if (!buf || !QueryServiceObjectSecurity(svc, DACL_SECURITY_INFORMATION, (PSECURITY_DESCRIPTOR)buf,
+                                                needed, &needed)) {
+            e = GetLastError();
+            sc_error(L"QueryServiceObjectSecurity", e);
+            rc = (int)e;
+        } else {
+            LPWSTR sddl = NULL;
+            if (ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    (PSECURITY_DESCRIPTOR)buf, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &sddl, NULL)) {
+                p("[SC] QueryServiceObjectSecurity SUCCESS\n\nSECURITY_DESCRIPTOR_SDDL: %ls\n\n", sddl);
+                LocalFree(sddl);
+            } else {
+                e = GetLastError();
+                sc_error(L"ConvertSecurityDescriptorToStringSecurityDescriptor", e);
+                rc = (int)e;
+            }
+        }
+        free(buf);
+    }
+    CloseServiceHandle(svc);
+    CloseServiceHandle(mgr);
+    return rc;
+}
+
+static int parse_action_type(const wchar_t *s)
+{
+    if (!_wcsnicmp(s, L"restart", 7)) return SC_ACTION_RESTART;
+    if (!_wcsnicmp(s, L"reboot", 6)) return SC_ACTION_REBOOT;
+    if (!_wcsnicmp(s, L"run", 3)) return SC_ACTION_RUN;
+    return -1;
+}
+
+/* "restart/60000/run/1000" -> actions[]; returns the count. */
+static DWORD parse_actions(const wchar_t *s, SC_ACTION *acts, DWORD max)
+{
+    DWORD n = 0;
+    while (s && *s && n < max) {
+        int type = parse_action_type(s);
+        const wchar_t *slash = wcschr(s, L'/');
+        if (!slash) break;
+        DWORD delay = (DWORD)wcstoul(slash + 1, NULL, 10);
+        if (type >= 0) {
+            acts[n].Type = type;
+            acts[n].Delay = delay;
+            n++;
+        }
+        s = slash + 1;
+        slash = wcschr(s, L'/');
+        if (!slash) break;
+        s = slash + 1;
+    }
+    return n;
+}
+
+/* `sc` splits "reset=" and its value into two argv tokens; accept both forms. */
+static const wchar_t *opt_value(int argc, wchar_t **argv, int *i)
+{
+    const wchar_t *t = argv[*i];
+    const wchar_t *eq = wcschr(t, L'=');
+    if (!eq) return NULL;
+    if (eq[1]) return eq + 1;
+    if (*i + 1 < argc) return argv[++(*i)];
+    return L"";
+}
+
+static int cmd_failure(int argc, wchar_t **argv, int query)
+{
+    if (argc < 2) {
+        sc_error(query ? L"QueryServiceConfig2" : L"ChangeServiceConfig2", ERROR_INVALID_PARAMETER);
+        return ERROR_INVALID_PARAMETER;
+    }
+    SC_HANDLE mgr = open_manager();
+    if (!mgr) {
+        DWORD e = GetLastError();
+        sc_error(L"OpenSCManager", e);
+        return (int)e;
+    }
+    SC_HANDLE svc = OpenServiceW(mgr, argv[1], query ? SERVICE_QUERY_CONFIG : SERVICE_CHANGE_CONFIG);
+    DWORD e = GetLastError();
+    if (!svc) {
+        CloseServiceHandle(mgr);
+        sc_error(L"OpenService", e);
+        return (int)e;
+    }
+    int rc = 0;
+    if (!query) {
+        SERVICE_FAILURE_ACTIONSW fa;
+        SC_ACTION acts[8];
+        memset(&fa, 0, sizeof(fa));
+        memset(acts, 0, sizeof(acts));
+        fa.lpsaActions = acts;
+        for (int i = 2; i < argc; i++) {
+            const wchar_t *t = argv[i];
+            if (!_wcsnicmp(t, L"reset", 5)) {
+                const wchar_t *v = opt_value(argc, argv, &i);
+                if (v) fa.dwResetPeriod = (DWORD)wcstoul(v, NULL, 10);
+            } else if (!_wcsnicmp(t, L"actions", 7)) {
+                const wchar_t *v = opt_value(argc, argv, &i);
+                if (v) fa.cActions = parse_actions(v, acts, 8);
+            } else if (!_wcsnicmp(t, L"reboot", 6)) {
+                const wchar_t *v = opt_value(argc, argv, &i);
+                if (v) fa.lpRebootMsg = (wchar_t *)v;
+            } else if (!_wcsnicmp(t, L"command", 7)) {
+                const wchar_t *v = opt_value(argc, argv, &i);
+                if (v) fa.lpCommand = (wchar_t *)v;
+            }
+        }
+        if (!ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &fa)) {
+            e = GetLastError();
+            sc_error(L"ChangeServiceConfig2", e);
+            rc = (int)e;
+        } else {
+            p("[SC] ChangeServiceConfig2 SUCCESS\n\n");
+        }
+    } else {
+        DWORD needed = 0;
+        QueryServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, NULL, 0, &needed);
+        BYTE *buf = (BYTE *)malloc(needed ? needed : 128);
+        SERVICE_FAILURE_ACTIONSW *fa = NULL;
+        if (buf && QueryServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, buf, needed, &needed)) {
+            fa = (SERVICE_FAILURE_ACTIONSW *)buf;
+        }
+        if (!fa) {
+            e = GetLastError();
+            sc_error(L"QueryServiceConfig2", e);
+            rc = (int)e;
+        } else {
+            char cmd[1024];
+            char reboot[1024];
+            w2a(fa->lpCommand, cmd, sizeof(cmd));
+            w2a(fa->lpRebootMsg, reboot, sizeof(reboot));
+            p("[SC] QueryServiceConfig2 SUCCESS\n\nSERVICE_NAME: %ls\n", argv[1]);
+            p("        RESET_PERIOD (in seconds)    : %lu\n", (unsigned long)fa->dwResetPeriod);
+            p("        REBOOT_MESSAGE               : %s\n", reboot);
+            p("        COMMAND_LINE                 : %s\n", cmd);
+            p("        FAILURE_ACTIONS              :");
+            if (!fa->cActions) {
+                p("\n");
+            }
+            for (DWORD i = 0; i < fa->cActions; i++) {
+                const char *name = fa->lpsaActions[i].Type == SC_ACTION_RESTART ? "RESTART"
+                                   : fa->lpsaActions[i].Type == SC_ACTION_REBOOT ? "REBOOT"
+                                   : fa->lpsaActions[i].Type == SC_ACTION_RUN ? "RUN" : "UNKNOWN";
+                p("%s %s -- Delay = %lu milliseconds.\n", i == 0 ? "" : "                                       ",
+                  name, (unsigned long)fa->lpsaActions[i].Delay);
+            }
+            p("\n");
+        }
+        free(buf);
+    }
+    CloseServiceHandle(svc);
+    CloseServiceHandle(mgr);
+    return rc;
+}
+
+static int cmd_triggerinfo(int argc, wchar_t **argv)
+{
+    if (argc < 2) {
+        sc_error(L"ChangeServiceConfig2", ERROR_INVALID_PARAMETER);
+        return ERROR_INVALID_PARAMETER;
+    }
+    SC_HANDLE mgr = open_manager();
+    if (!mgr) {
+        DWORD e = GetLastError();
+        sc_error(L"OpenSCManager", e);
+        return (int)e;
+    }
+    SC_HANDLE svc = OpenServiceW(mgr, argv[1], SERVICE_CHANGE_CONFIG);
+    DWORD e = GetLastError();
+    if (!svc) {
+        CloseServiceHandle(mgr);
+        sc_error(L"OpenService", e);
+        return (int)e;
+    }
+    /* Triggers are staged as "configured": the exact trigger set is not
+     * reconstructed (nothing on this box fires them), but the call must not
+     * reach the real SCM. */
+    /* Layout of SERVICE_TRIGGER_INFO (not present in this SDK header). Only a
+     * zeroed record is needed: the shim journals the level, nothing fires. */
+    struct {
+        DWORD cTriggers;
+        void *pTriggers;
+        void *pReserved;
+        DWORD dwTrigerType;
+    } ti;
+    memset(&ti, 0, sizeof(ti));
+    int rc = 0;
+    if (!ChangeServiceConfig2W(svc, SERVICE_CONFIG_TRIGGER_INFO, &ti)) {
+        e = GetLastError();
+        sc_error(L"ChangeServiceConfig2", e);
+        rc = (int)e;
+    } else {
+        p("[SC] ChangeServiceConfig2 SUCCESS\n\n");
+    }
+    CloseServiceHandle(svc);
+    CloseServiceHandle(mgr);
+    return rc;
+}
+
 int ws_sc_main(int argc, wchar_t **argv)
 {
     if (argc < 1) {
@@ -1344,8 +1609,13 @@ int ws_sc_main(int argc, wchar_t **argv)
     if (!_wcsicmp(verb, L"queryex")) return cmd_query(argc, argv, 1);
     if (!_wcsicmp(verb, L"description")) return cmd_description(argc, argv);
     if (!_wcsicmp(verb, L"qdescription")) return cmd_description(argc, argv);
-    /* Not virtualized: sdset/failure/triggerinfo and anything else. Fail with a
-     * normal SCM error shape instead of silently reaching the real services.exe. */
+    if (!_wcsicmp(verb, L"sdset")) return cmd_sdset(argc, argv, 0);
+    if (!_wcsicmp(verb, L"qsecurity")) return cmd_sdset(argc, argv, 1);
+    if (!_wcsicmp(verb, L"failure")) return cmd_failure(argc, argv, 0);
+    if (!_wcsicmp(verb, L"qfailure")) return cmd_failure(argc, argv, 1);
+    if (!_wcsicmp(verb, L"triggerinfo")) return cmd_triggerinfo(argc, argv);
+    /* Anything else keeps the old contract: a normal SCM error shape instead of
+     * silently reaching the real services.exe. */
     sc_error(verb, ERROR_INVALID_PARAMETER);
     return ERROR_INVALID_PARAMETER;
 }

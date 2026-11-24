@@ -21,7 +21,7 @@
  * Usage (guest):
  *   ELECTRON_RUN_AS_NODE=1 "DeepSeek Harness.exe" C:\rt\agent.mjs --phase recon|attack --out \\host.lan\Data\rt\out.json
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 
 import { Workspace } from '../src/workspace.ts'
 import { WindowsStageExecutor } from '../src/executor.ts'
@@ -321,6 +321,64 @@ async function main() {
       )
       await step('w2-cmdline', 'wmic process get ProcessId,Name,CommandLine /format:csv | findstr /I "launcher cmd.exe"')
       await step('w3-staged', 'dir C:\\Windows\\System32\\rt_wmi3.txt & type C:\\Windows\\System32\\rt_wmi3.txt')
+      save()
+      return
+    }
+    if (process.argv.includes('--r49')) {
+      const step = async (label: string, line: string, timeoutMs = 120000) => {
+        const started = Date.now()
+        const r = await runShell(line, timeoutMs)
+        transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
+        save()
+        await new Promise((r2) => setTimeout(r2, 700))
+      }
+      await step('t0-plugin', 'dir /a C:\\winstage-plugin & echo === & type C:\\winstage-plugin\\shim\\out\\winstage-shim.dll >nul & echo RC=%ERRORLEVEL%')
+      await step('t1-tasklist', 'tasklist /m /fi "imagename eq cmd.exe"')
+      await step('t2-mod-ps', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\\rt\\mod.ps1')
+      await step('t3-sc', 'sc qfailure AJRouter & echo === & sc qsecurity AJRouter & echo === & sc query AJRouter')
+      await step('t4-dir', 'dir /b C:\\rt\\big | find /c /v "" & echo === & dir /b C:\\rt\\big | findstr /i zz2')
+      await step('t5-realpath', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\\rt\\rp.ps1', 120000)
+      save()
+      return
+    }
+    if (process.argv.includes('--r48')) {
+      const step = async (label: string, line: string, timeoutMs = 180000) => {
+        const started = Date.now()
+        const r = await runShell(line, timeoutMs)
+        transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
+        save()
+        await new Promise((r2) => setTimeout(r2, 700))
+      }
+      await step('t0-write', 'echo zz > C:\\rt\\big\\zz2.txt & type C:\\rt\\big\\zz2.txt')
+      await step('t1-count', 'dir /b C:\\rt\\big | find /c /v ""')
+      await step('t2-find', 'dir /b C:\\rt\\big | findstr /i zz2 & echo FIND_DONE')
+      await step('t3-dir-full', 'dir C:\\rt\\big 2>nul | findstr /i zz2 & echo DIR_DONE')
+      await step('t4-tasklist', 'tasklist /m /fi "imagename eq cmd.exe"')
+      await step('t5-mod-ps', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\\rt\\mod.ps1', 120000)
+      save()
+      return
+    }
+    if (process.argv.includes('--r46')) {
+      const step = async (label: string, line: string, timeoutMs = 60000) => {
+        const started = Date.now()
+        const r = await runShell(line, timeoutMs)
+        transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
+        save()
+        await new Promise((r2) => setTimeout(r2, 700))
+      }
+      await step(
+        'r1-bigdir-write',
+        'echo zz > C:\\rt\\big\\zz_r46.txt & dir /b C:\\rt\\big | findstr /x zz_r46.txt & echo === & dir /b C:\\rt\\big | find /c /v ""',
+        180000,
+      )
+      await step('r2-bigdir-type', 'type C:\\rt\\big\\zz_r46.txt & echo === & dir C:\\rt\\big\\zz_r46.txt', 120000)
+      await step(
+        'r3-realpath',
+        'powershell -NoProfile -ExecutionPolicy Bypass -File C:\\rt\\rp.ps1',
+        120000,
+      )
+      await step('r4-tasklist-modules', 'tasklist /m /fi "imagename eq cmd.exe" & echo MOD_DONE')
+      await step('r5-sc-q', 'sc query AJRouter & echo === & sc qfailure AJRouter & echo === & sc qsecurity AJRouter')
       save()
       return
     }
