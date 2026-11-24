@@ -904,6 +904,13 @@ SC_HANDLE WINAPI ws_OpenServiceW(SC_HANDLE manager, LPCWSTR name, DWORD access)
         if (e) {
             ws_scm_seed_from_real(e, real);
         }
+    } else if (!e->created && real && (!e->image[0] || !e->display[0])) {
+        /* The journal replayed a staged change (description / failure actions /
+         * security descriptor) for a service whose full config was never
+         * recorded. Without this, `Set-Service -StartupType` followed by
+         * `sc qc` answered with an empty TYPE / BINARY_PATH_NAME / DISPLAY_NAME
+         * (measured) -- a contradiction with the real service we just read. */
+        ws_scm_seed_from_real(e, real);
     }
     SC_HANDLE out = ws_scm_return_service(mgr, e, real);
     ws_lock_leave(&g_scmLock);
@@ -1033,6 +1040,12 @@ BOOL WINAPI ws_ChangeServiceConfigW(SC_HANDLE service, DWORD type, DWORD startTy
         ws_lock_leave(&g_scmLock);
         SetLastError(ERROR_SERVICE_DOES_NOT_EXIST);
         return FALSE;
+    }
+    /* Journal the FULL config, not just the fields being changed: a journal
+     * entry with an empty BINARY_PATH_NAME / DISPLAY_NAME made a later
+     * `sc qc` contradict the real service (measured). */
+    if (!e->created && h->real && (!e->image[0] || !e->display[0])) {
+        ws_scm_seed_from_real(e, h->real);
     }
     if (type != SERVICE_NO_CHANGE) e->type = type;
     if (startType != SERVICE_NO_CHANGE) e->startType = startType;
@@ -1619,6 +1632,9 @@ BOOL WINAPI ws_ChangeServiceConfig2W(SC_HANDLE service, DWORD level, LPVOID info
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+    if (!e->created && h->real && (!e->image[0] || !e->display[0])) {
+        ws_scm_seed_from_real(e, h->real);
+    }
     if (!ws_cfg2_store(e, level, blob, len) || !ws_scm_journal_blob(L"cfg2", e, level, blob, len, 0)) {
         ws_lock_leave(&g_scmLock);
         SetLastError(ERROR_WRITE_FAULT);
@@ -1692,6 +1708,9 @@ BOOL WINAPI ws_SetServiceObjectSecurity(SC_HANDLE service, SECURITY_INFORMATION 
         ws_lock_leave(&g_scmLock);
         SetLastError(ERROR_SERVICE_DOES_NOT_EXIST);
         return FALSE;
+    }
+    if (!e->created && h->real && (!e->image[0] || !e->display[0])) {
+        ws_scm_seed_from_real(e, h->real);
     }
     memcpy(e->sd, sd, len);
     e->sdLen = len;

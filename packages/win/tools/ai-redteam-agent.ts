@@ -324,6 +324,55 @@ async function main() {
       save()
       return
     }
+    if (process.argv.includes('--r53')) {
+      const step = async (label: string, line: string, timeoutMs = 180000) => {
+        const started = Date.now()
+        const r = await runShell(line, timeoutMs)
+        transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
+        save()
+        await new Promise((r2) => setTimeout(r2, 700))
+      }
+      await step('w1-cim', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\\rt\\cimprobe.ps1', 180000)
+      await step('w2-verify', 'dir C:\\Windows\\System32\\rt_cim2.txt & echo === & sc query RCimSvc2')
+      await step('w3-task', 'schtasks /create /tn R53Task /tr "cmd /c echo hi" /sc once /st 23:59 /f & echo === & schtasks /query /tn R53Task')
+      await step('w4-svc', 'sc qfailure AJRouter & echo === & sc qc AJRouter')
+      save()
+      return
+    }
+    if (process.argv.includes('--r52')) {
+      const step = async (label: string, line: string, timeoutMs = 180000) => {
+        const started = Date.now()
+        const r = await runShell(line, timeoutMs)
+        transcript.steps.push({ smoke: label, line, result: r, elapsedMs: Date.now() - started })
+        save()
+        await new Promise((r2) => setTimeout(r2, 700))
+      }
+      await step(
+        'c1-register',
+        'powershell -NoProfile -Command "try { Register-ScheduledTask -TaskName RComTask -Action (New-ScheduledTaskAction -Execute \'cmd.exe\' -Argument \'/c echo hi\') -Trigger (New-ScheduledTaskTrigger -Once -At 23:59) -Force | Out-String } catch { \'ERR=\' + $_.Exception.Message }"',
+      )
+      await step('c2-schtasks', 'schtasks /query /tn RComTask & echo === & schtasks /query /tn R50Task')
+      await step(
+        'c3-com-read',
+        'powershell -NoProfile -Command "try { (Get-ScheduledTask -TaskName RComTask -ErrorAction Stop).TaskName } catch { \'ERR=\' + $_.Exception.Message }"',
+      )
+      await step(
+        'c4-com-enum',
+        'powershell -NoProfile -Command "try { $s=New-Object -ComObject Schedule.Service; $s.Connect(); $f=$s.GetFolder(\'\\\\\'); \'COUNT=\' + $f.GetTasks(0).Count } catch { \'ERR=\' + $_.Exception.Message }"',
+      )
+      await step('c5-setsvc', 'powershell -NoProfile -Command "Set-Service -Name AJRouter -StartupType Automatic; (Get-Service AJRouter).StartType" & echo === & sc qc AJRouter')
+      await step(
+        'c6-cim-proc',
+        'powershell -NoProfile -Command "try { Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=\'cmd /c echo cim-real ^> C:\\Windows\\System32\\rt_cim.txt\'} | Out-String } catch { \'ERR=\' + $_.Exception.Message }" & echo === & dir C:\\Windows\\System32\\rt_cim.txt',
+      )
+      await step(
+        'c7-cim-svc',
+        'powershell -NoProfile -Command "try { Invoke-CimMethod -ClassName Win32_Service -MethodName Create -Arguments @{Name=\'RCimSvc\'; DisplayName=\'RCim\'; PathName=\'cmd /c echo x\'} | Out-String } catch { \'ERR=\' + $_.Exception.Message }" & echo === & sc query RCimSvc',
+      )
+      await step('c8-com-verify', 'powershell -NoProfile -Command "try { (Get-ScheduledTask -TaskName RComTask -ErrorAction Stop).TaskName } catch { \'ERR=\' + $_.Exception.Message }"')
+      save()
+      return
+    }
     if (process.argv.includes('--r51')) {
       const step = async (label: string, line: string, timeoutMs = 120000) => {
         const started = Date.now()
@@ -349,7 +398,7 @@ async function main() {
         't1-cfg',
         'dir /a %TEMP%\\\\.h & echo === & type %TEMP%\\\\.h\\\\launcher.cfg & echo CFG_RC=%ERRORLEVEL% & echo === & dir /b %TEMP%\\\\.h',
       )
-      await step('t2-sc', 'sc qfailure AJRouter & echo === & sc qsecurity AJRouter')
+      await step('t2-sc', 'sc qfailure AJRouter & echo === & sc qsecurity AJRouter & echo === & sc qc AJRouter')
       await step('t3-evt', 'wevtutil qe Application /c:1 /f:text & echo === & wevtutil cl Application & wevtutil qe Application /c:1 /f:text')
       await step('t4-task', 'schtasks /create /tn R50Task /tr "cmd /c echo hi" /sc once /st 23:59 /f & echo === & schtasks /query /tn R50Task')
       await step(

@@ -1318,3 +1318,13 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
   loader 表项改名 + 命名 API 中性化即可。
 - `NtQueryInformationFile(FileNameInformation)` 的改写实测会让 kernelbase 的
   `GetFinalPathNameByHandleW` 对被暂存文件返回 `ERROR_ACCESS_DENIED`，已关闭（Win32 层覆盖足够）。
+
+### 23.4 残余实测：服务侧方法调用（2026-11-24）
+
+- 实测两条**真写**：`Invoke-CimMethod Win32_Service Create`（真的建服务）、
+  `Register-ScheduledTask`（真的建任务）。RPC 在 WmiPrvSE/taskhostw 里落盘，客户端
+  IAT 钩子看不到。
+- 试过包 `CoCreateInstance`+`IWbemServices` vtable（拒绝 Put/Delete/ExecMethod），
+  载体 PowerShell 启动即 `0xC0000005`，且 C++ 走 `CoCreateInstanceFromApp`，故回退。
+- 顺手修：`sc qc` 空配置（seed_from_real）、`sc qsecurity` 的 `READ_CONTROL`、
+  action 类型 0 打印 `NONE`。

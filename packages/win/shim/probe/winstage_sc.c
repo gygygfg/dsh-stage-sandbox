@@ -1395,7 +1395,11 @@ static int cmd_sdset(int argc, wchar_t **argv, int query)
         sc_error(L"OpenSCManager", e);
         return (int)e;
     }
-    SC_HANDLE svc = OpenServiceW(mgr, argv[1], query ? SERVICE_QUERY_STATUS : WRITE_DAC);
+    /* Read the descriptor with READ_CONTROL: SERVICE_QUERY_STATUS is enough for
+     * our journal, but a service with no staged descriptor is answered by the
+     * real SCM, which rejects QueryServiceObjectSecurity without READ_CONTROL
+     * (measured: `sc qsecurity` -> Access is denied). */
+    SC_HANDLE svc = OpenServiceW(mgr, argv[1], query ? READ_CONTROL : WRITE_DAC);
     DWORD e = GetLastError();
     if (!svc) {
         CloseServiceHandle(mgr);
@@ -1565,7 +1569,8 @@ static int cmd_failure(int argc, wchar_t **argv, int query)
             for (DWORD i = 0; i < fa->cActions; i++) {
                 const char *name = fa->lpsaActions[i].Type == SC_ACTION_RESTART ? "RESTART"
                                    : fa->lpsaActions[i].Type == SC_ACTION_REBOOT ? "REBOOT"
-                                   : fa->lpsaActions[i].Type == SC_ACTION_RUN ? "RUN" : "UNKNOWN";
+                                   : fa->lpsaActions[i].Type == SC_ACTION_RUN ? "RUN"
+                                   : fa->lpsaActions[i].Type == SC_ACTION_NONE ? "NONE" : "UNKNOWN";
                 p("%s %s -- Delay = %lu milliseconds.\n", i == 0 ? "" : "                                       ",
                   name, (unsigned long)fa->lpsaActions[i].Delay);
             }
