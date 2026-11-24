@@ -75,18 +75,18 @@ await build({
 console.log('built dist/index.mjs, dist/fs-entry.mjs, dist/shell-entry.mjs, dist/client.js (+ shared chunks)')
 
 /* ── 宿主进程内启动器（可选产物）───────────────────────────────────────────────
- * `shim/out/winstage-addon.node` 由 `tools/build-shim.ts` 构建。它让**宿主进程**
+ * `shim/out/wds.node` 由 `tools/build-shim.ts` 构建。它让**宿主进程**
  * 自己 CreateProcess+注入（进程树里不再出现 helper 进程）。这里只做拷贝：
  * 打包/安装阶段不需要 C 工具链；addon 不存在时执行路径继续用 helper，
  * 并由 `initReport.nativeLauncher` 如实说明。
  */
-const addonSource = join(REPO, 'shim', 'out', 'winstage-addon.node')
+const addonSource = join(REPO, 'shim', 'out', 'wds.node')
 if (existsSync(addonSource)) {
-  copyFileSync(addonSource, join(OUT, 'winstage-addon.node'))
-  console.log(`[build-plugin] addon -> dist/winstage-addon.node`)
+  copyFileSync(addonSource, join(OUT, 'wds.node'))
+  console.log(`[build-plugin] addon -> dist/wds.node`)
 } else {
   console.warn(
-    '[build-plugin] shim/out/winstage-addon.node 不存在：这次产物仍可运行（走 helper 进程），' +
+    '[build-plugin] shim/out/wds.node 不存在：这次产物仍可运行（走 helper 进程），' +
       '但进程树里会多一层。运行 `node tools/build-shim.ts` 后再打包即可带上它。',
   )
 }

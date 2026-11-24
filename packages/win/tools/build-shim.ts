@@ -846,7 +846,7 @@ function main() {
   const integrity = assertArtifactIntegrity(OUT, names);
 
   /* ── optional 4th artifact: the host-side addon ────────────────────────────
-   * `winstage-addon.node` lets the harness process create + inject the child
+   * `wds.node` lets the harness process create + inject the child
    * itself (process tree: `DeepSeek Harness.exe -> cmd.exe`) instead of spawning
    * bin\elevate.exe. It is deliberately NOT in `artifactNames()`: `--check`,
    * `--repair-stale` and `--sweep` keep their exact three-artifact contract.
@@ -855,7 +855,7 @@ function main() {
    * optional piece. `initReport.nativeLauncher` reports whether it is there. */
   let addonInfo = { built: false, reason: 'not attempted' };
   try {
-    const addonOut = path.join(OUT, 'winstage-addon.node');
+    const addonOut = path.join(OUT, 'wds.node');
     const stagedAddon = buildOne(zig, {
       label: 'addon',
       out: addonOut,
@@ -881,7 +881,7 @@ function main() {
     }
     const publishedAddon = publishArtifacts([{ final: addonOut, tmp: stagedAddon.tmp, label: 'addon' }]);
     if (!publishedAddon.ok) {
-      throw new BuildError('could not publish winstage-addon.node', { failed: publishedAddon.failed });
+      throw new BuildError('could not publish wds.node', { failed: publishedAddon.failed });
     }
     addonInfo = {
       built: true,

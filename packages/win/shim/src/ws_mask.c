@@ -853,9 +853,15 @@ static int ws_mask_load_rules(const wchar_t *path, WsReRule *list, int *count, i
  * never go red, i.e. it proved nothing. */
 static int ws_mask_case_sensitive_env(void)
 {
+#ifdef WS_TRIAGE_SWITCHES
+    /* 只有诊断构建才允许把遮蔽改成大小写敏感（那会让 `SAM` / `sam` 之类的变体
+     * 绕过遮蔽）。生产构建里这一行永远返回 0：进程不得自己削弱遮蔽。 */
     wchar_t buf[16];
     DWORD n = GetEnvironmentVariableW(L"WINSTAGE_MASK_CASE_SENSITIVE", buf, 16);
     return n > 0 && n < 16 && !(buf[0] == L'0' && buf[1] == 0);
+#else
+    return 0;
+#endif
 }
 
 LSTATUS ws_mask_init(void)

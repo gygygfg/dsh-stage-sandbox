@@ -6327,6 +6327,25 @@ export function buildRuntimeMaskEntries({ sessionDir, stagingRoot, dllPath, priv
       reason: '会话运行组件（中立名副本 + 运行参数，对 agent 不可见）',
     }) : null
     if (entry) entries.push(entry)
+    /* 2026-11-24 审计实测：上面这条是**本次会话**的精确目录。上一个会话被 kill
+     * （没走 dispose）时，它留下的 `%TEMP%\tmp\<uuid>\bin\elevate.cfg` 仍然可读，
+     * 而那个文件的内容是 base64 的 `dll=<plugin>\shim\out\winstage-shim.dll` +
+     * `stage=<stageRoot>` —— 模型 `type` 一次就拿到了整套路径。所以再补一条模式
+     * 规则：私有 TEMP 父目录下的**任意** `<uuid>\bin` 都算 helper 目录。 */
+    const anyHelper = typeof privateTempDir === 'string' && privateTempDir
+      ? (() => {
+          const parent = dirname(privateTempDir)
+          if (!parent || !/[\\/]/.test(parent)) return null
+          const escaped = parent.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+          return {
+            id: 'helper-dir-any-session',
+            pattern: `${escaped}\\\\[^\\\\]+\\\\bin(\\\\|$)`,
+            category: '本工具自身存储',
+            reason: '历次会话的运行组件目录（含组件/暂存路径，对 agent 不可见）',
+          }
+        })()
+      : null
+    if (anyHelper) entries.push(anyHelper)
   }
   if (typeof dllPath === 'string' && dllPath) {
     const dllDir = dirname(dllPath)
@@ -6658,7 +6677,7 @@ export function resolveShimArtifacts(options = {}) {
     probePath: resolve(options.probePath || process.env.WINSTAGE_SHIM_PROBE || join(shimDir, 'winstage-probe.exe')),
     /* Host-side in-process launcher (N-API addon). Optional: when it is absent
      * or cannot be loaded the lane keeps spawning winstage-inject.exe. */
-    addonPath: resolve(options.addonPath || process.env.WINSTAGE_SANDBOX_ADDON || join(shimDir, 'winstage-addon.node')),
+    addonPath: resolve(options.addonPath || process.env.WINSTAGE_SANDBOX_ADDON || join(shimDir, 'wds.node')),
   }
 }
 
@@ -6672,7 +6691,7 @@ export function resolveShimArtifacts(options = {}) {
  * `DeepSeek Harness.exe -> cmd.exe`，没有任何多余进程。
  *
  * 加载顺序：显式参数 → `WINSTAGE_SANDBOX_ADDON` → 插件产物旁边
- * （`dist/winstage-addon.node`；打包入口与 addon 同目录）→ shim 产物目录。
+ * （`dist/wds.node`；打包入口与 addon 同目录）→ shim 产物目录。
  * 任何一步失败都**不抛错**：返回 `{available:false, error}` 并由 initReport
  * 如实记录，执行路径继续走 helper（可观测，不是静默降级）。
  */
@@ -6685,11 +6704,11 @@ export function loadNativeAddon({ addonPath, shimDir } = {}) {
   push(addonPath)
   push(process.env.WINSTAGE_SANDBOX_ADDON)
   try {
-    push(join(dirname(fileURLToPath(import.meta.url)), 'winstage-addon.node'))
+    push(join(dirname(fileURLToPath(import.meta.url)), 'wds.node'))
   } catch {
     /* import.meta.url 不可用时跳过这一候选 */
   }
-  if (typeof shimDir === 'string' && shimDir) push(join(shimDir, 'winstage-addon.node'))
+  if (typeof shimDir === 'string' && shimDir) push(join(shimDir, 'wds.node'))
   const tried = []
   let lastError
   for (const candidate of candidates) {
@@ -7992,6 +8011,40 @@ function readTextFile(path) {
     if (!existsSync(path)) return ''
     const buffer = readFileSync(path)
     if (buffer.length === 0) return ''
+    /**
+     * ── 先判 UTF-16（2026-11-24 真实模型审计实测）────────────────────────────
+     * `wmic`（以及 `wevtutil`、部分 `reg` 输出）直接写 **UTF-16LE**。旧实现只试
+     * UTF-8 → GBK，于是 UTF-16 的 `CommandLine=...` 里每两个字节一个 NUL，按 GBK
+     * 解出来是 `C\0o\0m\0m\0a\0n\0d\0L\0i\0n\0e` 这种交错乱码，UTF-8 校验也
+     * 不会失败（ASCII+NUL 是合法 UTF-8）—— 模型看到的是"这台机器的输出坏了"。
+     *
+     * 判据：BOM 优先；没有 BOM 时看字节分布（偶数位几乎全是非零 ASCII、奇数位几乎
+     * 全是 NUL ⇒ UTF-16LE；反之 UTF-16BE）。只采样前 512 字节，二进制文件本来
+     * 就不该走这里。
+     */
+    if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
+      return new TextDecoder('utf-16le').decode(buffer.subarray(2))
+    }
+    if (buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff) {
+      return new TextDecoder('utf-16be').decode(buffer.subarray(2))
+    }
+    {
+      const probe = buffer.subarray(0, Math.min(buffer.length, 512))
+      let evenZero = 0
+      let oddZero = 0
+      for (let i = 0; i < probe.length; i += 1) {
+        if (probe[i] !== 0) continue
+        if (i % 2 === 0) evenZero += 1
+        else oddZero += 1
+      }
+      const pairs = Math.floor(probe.length / 2) || 1
+      if (oddZero > pairs * 0.4 && evenZero < pairs * 0.05) {
+        return new TextDecoder('utf-16le').decode(buffer)
+      }
+      if (evenZero > pairs * 0.4 && oddZero < pairs * 0.05) {
+        return new TextDecoder('utf-16be').decode(buffer)
+      }
+    }
     try {
       return new TextDecoder('utf-8', { fatal: true }).decode(buffer)
     } catch {

@@ -1393,3 +1393,20 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
 - 红队工装：`--phase maint`（正常运维清单，命中同一批边界）；`attack/pentest/maint`
   都只向模型暴露 `run`（进程内 fs 工具与垫片不是同一份暂存视图，实测会让模型判定
   "write_file 静默失败"）。
+
+### 23.11 安全开关不得是环境变量（2026-11-24 源码审计）
+
+模型拿到源码后的第一轮就把三条"诊断开关"打穿了：
+
+- `WINSTAGE_SHIM_DISABLE=1`（总开关）与 `WINSTAGE_SHIM_DISABLE_FILE=1`：任何子进程
+  都能 `set` 之后 `cmd /c`，于是那个子进程的垫片不装钩子，写入直接落真实盘。
+- `mklink /J` + 写入：`FSCTL_SET_REPARSE_POINT` 未被钩，暂存树里出现指向真实盘的
+  联接点，之后的路径映射会穿过它（读也一样，能绕过读遮蔽）。
+
+修法：删除总开关（宿主不想接管就别注入）；`_FILE` / `_REG` / `UNSTAGED_WRITES` /
+`READ_DENY_FILE` / `MASK_CASE_SENSITIVE` 只在 `-DWS_TRIAGE_SWITCHES` 诊断构建里生效；
+`ws_stage.c` 在解析期拒绝"已存在前缀里有重解析点"的 staged 路径（fail-closed）。
+
+同理，in-process 的 `read_file` 必须与垫片用**同一份**遮蔽清单（垫片的
+`plugin-root` / `store` / `helper-dir` 运行时条目也要进 `Workspace.masks`），否则
+"run 看不到、read_file 看得到"本身就是一条泄漏。

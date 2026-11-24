@@ -122,6 +122,72 @@ static int ws_exists(const wchar_t *path)
  * GetFileAttributes* hooks (ws_file.c) shipped, PowerShell's startup saw C:\ as
  * deleted, decided the session was locked down and refused to load its .psm1
  * modules (Write-Output / Out-File / Test-Path all became "not recognized"). */
+/* ── 2026-11-24 审计实测：暂存树里的重解析点 = 真实盘逃逸 ─────────────────────
+ *
+ * 复现（真实模型审计，`audit6.json` 第 32-38 步）：
+ *     mklink /J C:\audit-junc C:\Windows\System32
+ *     echo junc > C:\audit-junc\audit-2f-junc.txt
+ *     read_file C:\Windows\System32\audit-2f-junc.txt   ->  "junc"   ← 真的写进 System32
+ *
+ * 机理：`mklink` 的目录创建被垫片映射成 `<stage>\fs\C\audit-junc`，随后
+ * `DeviceIoControl(FSCTL_SET_REPARSE_POINT)` 在那个**暂存目录**上建了一个指向真实
+ * `C:\Windows\System32` 的联接点。之后所有形如 `C:\audit-junc\x` 的路径都被映射成
+ * `<stage>\fs\C\audit-junc\x`，而**文件系统**会穿过那个联接点 —— 落在真实盘上。
+ * 读也会穿：读 `C:\audit-junc\SAM` 会真的读到 SAM，绕过读遮蔽。
+ *
+ * 不变式：暂存树里不允许出现任何重解析点。这里在**解析期**判定，只检查**已存在**
+ * 的路径段（尚不存在的段由 ws_ensure_dirs 以普通目录创建，本身安全）。命中即
+ * fail-closed（返回 1 → provider 返回 -1 → 钩子返回 ERROR_ACCESS_DENIED）。 */
+static int ws_stage_tree_has_reparse(const wchar_t *staged)
+{
+    if (!g_ws.haveStageRoot || !g_ws.stageRoot[0] || !staged || !staged[0]) {
+        return 0;
+    }
+    size_t rootLen = wcslen(g_ws.stageRoot);
+    if (wcslen(staged) <= rootLen || _wcsnicmp(staged, g_ws.stageRoot, rootLen) != 0) {
+        return 0;
+    }
+    DWORD ws_saved_last_error = GetLastError();
+    WS_PATH_BUF(cur);
+    ws_strlcpy_w(cur, g_ws.stageRoot, WS_PATH_MAX);
+    const wchar_t *p = staged + rootLen;
+    while (*p == L'\\') {
+        p++;
+    }
+    int hit = 0;
+    while (*p) {
+        const wchar_t *segEnd = p;
+        while (*segEnd && *segEnd != L'\\') {
+            segEnd++;
+        }
+        size_t curLen = wcslen(cur);
+        size_t segLen = (size_t)(segEnd - p);
+        if (curLen + 1 + segLen + 1 >= (size_t)WS_PATH_MAX) {
+            break;
+        }
+        cur[curLen] = L'\\';
+        memcpy(cur + curLen + 1, p, segLen * sizeof(wchar_t));
+        cur[curLen + 1 + segLen] = 0;
+        WS_PATH_BUF(apiBuf);
+        const wchar_t *api = ws_path_api_w(cur, apiBuf, WS_PATH_MAX);
+        DWORD attrs = GetFileAttributesW(api);
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            break; /* not created yet: ws_ensure_dirs will make a plain directory */
+        }
+        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+            ws_log_w(L"staged path crosses a reparse point (refusing)", cur);
+            hit = 1;
+            break;
+        }
+        p = segEnd;
+        while (*p == L'\\') {
+            p++;
+        }
+    }
+    SetLastError(ws_saved_last_error);
+    return hit;
+}
+
 static int ws_marker_exists(const wchar_t *path)
 {
     /* 同 `ws_exists()`：探测结果由返回值表达，不能让 GetFileAttributesW 的
@@ -156,6 +222,9 @@ static int dp_file_resolve(const wchar_t *real_path, uint32_t intent, wchar_t *o
             return 0;
         }
         if (ws_exists(staged)) {
+            if (ws_stage_tree_has_reparse(staged)) {
+                return -1;
+            }
             ws_strlcpy_w(out_path, staged, out_cch);
             *out_flags = WINSTAGE_RES_STAGED | WINSTAGE_RES_EXISTS;
             return 0;
@@ -166,6 +235,9 @@ static int dp_file_resolve(const wchar_t *real_path, uint32_t intent, wchar_t *o
     }
 
     /* write / delete */
+    if (ws_stage_tree_has_reparse(staged)) {
+        return -1;
+    }
     if (!ws_ensure_dirs(staged, 0)) {
         ws_log_w(L"stage parent unreachable", staged);
         return -1;
@@ -183,6 +255,9 @@ static int dp_file_whiteout(const wchar_t *real_path)
     }
     if (ws_exists(wo)) {
         return 0;
+    }
+    if (ws_stage_tree_has_reparse(wo)) {
+        return -1;
     }
     if (!ws_ensure_dirs(wo, 0)) {
         return -1;

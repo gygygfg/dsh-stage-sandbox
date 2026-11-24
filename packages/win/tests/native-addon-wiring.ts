@@ -25,7 +25,7 @@
  *   3. 失败回退：addon 创建进程失败时回退 helper 并把原因留在 `lastLaunch`。
  *   4. addon 源码：导出 `napi_register_module_v1`，**不**链接 libnode（运行时
  *      GetProcAddress 解析），因此单条 `zig cc -shared` 就能构建。
- *   5. 构建接线：`build-shim` 产出 `winstage-addon.node` 且**不**把它塞进
+ *   5. 构建接线：`build-shim` 产出 `wds.node`（中立名，见 §6）且**不**把它塞进
  *      `artifactNames()`（三件套的 --check/--repair-stale 契约不变）；
  *      `build-plugin` 把它拷进 `dist/`。
  *   6. 已构建的 `.node`（若存在）：x64 DLL、导出 `napi_register_module_v1`、
@@ -35,7 +35,7 @@
  *      直接挂住 —— 两条都是实测）。
  */
 import { existsSync, readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { artifactNames } from '../tools/build-shim.ts'
@@ -90,7 +90,7 @@ W('=== 2. 产物解析与加载顺序 ===')
 const artifacts = resolveShimArtifacts({ shimDir: join(REPO, 'shim', 'out') })
 check(
   'resolveShimArtifacts 给出 addonPath',
-  typeof artifacts.addonPath === 'string' && /winstage-addon\.node$/.test(artifacts.addonPath),
+  typeof artifacts.addonPath === 'string' && /wds\.node$/.test(artifacts.addonPath),
   artifacts.addonPath,
 )
 const missing = loadNativeAddon({ addonPath: join(REPO, 'shim', 'out', 'definitely-missing.node') })
@@ -129,12 +129,12 @@ W('')
 W('=== 4. 构建接线 ===')
 const buildShimSrc = read('tools/build-shim.ts')
 check(
-  'build-shim 产出 winstage-addon.node',
-  buildShimSrc.includes("path.join(OUT, 'winstage-addon.node')"),
+  'build-shim 产出 wds.node',
+  buildShimSrc.includes("path.join(OUT, 'wds.node')"),
 )
 check(
   'addon 不属于三件套（--check/--repair-stale 契约不变）',
-  Array.isArray(artifactNames('full')) && artifactNames('full').length === 3 && !artifactNames('full').includes('winstage-addon.node'),
+  Array.isArray(artifactNames('full')) && artifactNames('full').length === 3 && !artifactNames('full').includes('wds.node'),
   artifactNames('full').join(', '),
 )
 check(
@@ -148,7 +148,7 @@ check(
 const buildPluginSrc = read('tools/build-plugin.ts')
 check(
   'build-plugin 把 addon 拷进 dist/',
-  buildPluginSrc.includes('winstage-addon.node') && buildPluginSrc.includes("join(OUT, 'winstage-addon.node')"),
+  buildPluginSrc.includes('wds.node') && buildPluginSrc.includes("join(OUT, 'wds.node')"),
 )
 check(
   'package.json 发布 addon 源码',
@@ -157,9 +157,17 @@ check(
 
 W('')
 W('=== 5. 已构建产物的 PE 形状（不存在则跳过） ===')
-const builtAddon = join(REPO, 'shim', 'out', 'winstage-addon.node')
+const builtAddon = join(REPO, 'shim', 'out', 'wds.node')
+check(
+  /* 2026-11-24 审计实测：模型在 `tasklist /m` 里看到 DeepSeek Harness.exe 加载了
+   * `winstage-addon.node` —— 文件名本身就是"这台机器被 WinStage 接管"的一句话证据
+   * （垫片本体早已改名为 `wds.dll`，addon 漏了）。中立名与 `wds.dll` 同族。 */
+  'addon 文件名不自我暴露（wds.node）',
+  !/winstage/i.test(basename(builtAddon)),
+  builtAddon,
+)
 if (!existsSync(builtAddon)) {
-  W('  - 跳过：shim/out/winstage-addon.node 尚未构建（node tools/build-shim.ts）')
+  W('  - 跳过：shim/out/wds.node 尚未构建（node tools/build-shim.ts）')
 } else {
   let pe
   try {

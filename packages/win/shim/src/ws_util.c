@@ -701,6 +701,8 @@ void ws_env_scrub_contract(void)
         L"DSH_STAGE_ROOT", L"DSH_SHIM_CONFIG", L"DSH_SHIM_LOG", L"DSH_AUDIT_LOG",
         L"WINSTAGE_STAGE_ROOT", L"WINSTAGE_SHIM_CONFIG", L"WINSTAGE_SHIM_LOG", L"WINSTAGE_AUDIT_LOG",
         L"WINSTAGE_READ_DENY_FILE", L"WINSTAGE_SHIM_VERBOSE", L"WINSTAGE_UNSTAGED_WRITES",
+        L"WINSTAGE_SHIM_DISABLE", L"WINSTAGE_SHIM_DISABLE_FILE", L"WINSTAGE_SHIM_DISABLE_REG",
+        L"WINSTAGE_MASK_CASE_SENSITIVE",
         L"WINSTAGE_STAGE_OUTSIDE", L"WINSTAGE_SHELL",
         L"WINSTAGE_REGSTAGE_SESSION_DIR", L"WINSTAGE_REGSTAGE_ROOT",
         L"DSH_REGSTAGE_SESSION_DIR", L"DSH_REGSTAGE_ROOT",
@@ -753,18 +755,19 @@ void ws_config_from_env(void)
     if (buf[0] && !(buf[0] == L'0' && buf[1] == 0)) {
         g_ws.debugFind = 1;
     }
-    /* Triage switches (default off). They exist so a single build can bisect
-     * which hook family breaks a target, instead of guessing. */
+    /* ── 诊断开关：**只在 `-DWS_TRIAGE_SWITCHES` 的诊断构建里读** ───────────────
+     * 2026-11-24 审计实测：这些是纯环境变量，沙箱里的任何进程都能给子进程设上，
+     * 而其中三条直接等于"真实盘写"：
+     *   WINSTAGE_SHIM_DISABLE_FILE=1   → 文件族钩子不装（写全落真实盘）
+     *   WINSTAGE_SHIM_DISABLE_REG=1    → 注册表族钩子不装
+     *   WINSTAGE_UNSTAGED_WRITES=passthrough → 暂存失败时改调真实 API
+     *   WINSTAGE_READ_DENY_FILE=<空>   → 换一份空遮蔽表（读遮蔽全失效）
+     * 生产构建不定义 WS_TRIAGE_SWITCHES ⇒ 这些变量被**忽略**；诊断构建自己加
+     * `-DWS_TRIAGE_SWITCHES` 再复现。安全开关不得是"进程自己能改的东西"。 */
+#ifdef WS_TRIAGE_SWITCHES
     env_to_w(L"WINSTAGE_READ_DENY_FILE", buf, WS_PATH_MAX);
     if (buf[0]) {
         ws_strlcpy_w(g_ws.readDenyFile, buf, WS_PATH_MAX);
-    }
-    env_to_w(L"WINSTAGE_SHIM_VERBOSE", buf, WS_PATH_MAX);
-    if (buf[0] && !(buf[0] == L'0' && buf[1] == 0)) {
-        g_ws.verbose = 1;
-        g_ws.traceStagedOps = 1;
-    g_ws.unstagedWrites = 1;
-
     }
     env_to_w(L"WINSTAGE_UNSTAGED_WRITES", buf, WS_PATH_MAX);
     if (buf[0] && ws_wcscmp_ci(buf, L"passthrough") == 0) {
@@ -779,6 +782,14 @@ void ws_config_from_env(void)
     env_to_w(L"WINSTAGE_SHIM_DISABLE_REG", buf, WS_PATH_MAX);
     if (buf[0] && !(buf[0] == L'0' && buf[1] == 0)) {
         g_ws.disableRegFamily = 1;
+    }
+#endif
+    /* 日志类开关没有安全含义（`verbose` 只写日志；`unstagedWrites` 保持默认
+     * 1 = fail-closed），所以生产构建保留 —— triage 时它们最常用。 */
+    env_to_w(L"WINSTAGE_SHIM_VERBOSE", buf, WS_PATH_MAX);
+    if (buf[0] && !(buf[0] == L'0' && buf[1] == 0)) {
+        g_ws.verbose = 1;
+        g_ws.traceStagedOps = 1;
     }
 }
 

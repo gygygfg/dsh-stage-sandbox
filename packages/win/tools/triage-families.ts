@@ -8,6 +8,12 @@
 // and prints a compact matrix. Uses absolute target paths.
 //
 // Usage: node tools/triage-families.ts [--json]
+//
+// ⚠ 2026-11-24：B/C/D 三档靠 `WINSTAGE_SHIM_DISABLE_REG` / `_FILE` 关掉钩子族。
+// 那两条是**纯环境变量**，沙箱里的进程也能设 —— 审计实测直接等于"真实盘写"。
+// 现在它们只在 `-DWS_TRIAGE_SWITCHES` 的诊断构建里生效；用生产 DLL 跑这个矩阵，
+// B/C/D 会和 A 一样（开关被忽略）。要复现请先构建诊断 DLL。
+
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';

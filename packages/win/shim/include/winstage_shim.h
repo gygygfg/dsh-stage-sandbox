@@ -70,13 +70,14 @@ __declspec(dllexport) int __cdecl WinstageShimStatsJson(char *buf, unsigned cch)
 /* Environment contract (read at init):
  *   WINSTAGE_STAGE_ROOT   required for staging; e.g. C:\...\shim\.stage\run1
  *   WINSTAGE_SHIM_CONFIG  optional path to the JSON config
- *   WINSTAGE_SHIM_DISABLE if set and not "0", the shim does nothing (escape
- *                         hatch so host tooling can run unsandboxed)
+ *   (removed) WINSTAGE_SHIM_DISABLE -- 2026-11-24: an environment-variable
+ *                         off switch is a bypass (any sandboxed child can set
+ *                         it for its own children). A host that does not want
+ *                         the shim simply does not inject it.
  *   WINSTAGE_SHIM_LOG     optional log file path (overrides config)
  */
 #define WINSTAGE_ENV_STAGE_ROOT L"WINSTAGE_STAGE_ROOT"
 #define WINSTAGE_ENV_CONFIG     L"WINSTAGE_SHIM_CONFIG"
-#define WINSTAGE_ENV_DISABLE    L"WINSTAGE_SHIM_DISABLE"
 #define WINSTAGE_ENV_LOG        L"WINSTAGE_SHIM_LOG"
 
 #ifdef __cplusplus

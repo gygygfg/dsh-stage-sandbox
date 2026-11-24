@@ -111,9 +111,13 @@ static int ws_init_full(const wchar_t *configJsonPath)
     if (g_ws.initialized) {
         return 0;
     }
-    if (ws_env_truthy(WINSTAGE_ENV_DISABLE)) {
-        return ERROR_SERVICE_DISABLED;
-    }
+    /* ── 2026-11-24 审计实测（audit6 第 10-13 步）：`WINSTAGE_SHIM_DISABLE=1` 是
+     * 一个纯环境变量的总开关 —— 沙箱里的任何进程都可以 `set` 它再 `cmd /c` 一个
+     * 子进程，子进程的垫片就不初始化了，于是 `echo x > C:\Windows\System32\x`
+     * 真的落到真实盘（read_file 复核：文件存在）。同样的洞还有 `_FILE` / `_REG` /
+     * `UNSTAGED_WRITES=passthrough` / `READ_DENY_FILE` / `MASK_CASE_SENSITIVE`。
+     * 修法：**环境变量不得是安全开关**。总开关删除（宿主不想接管就别注入）；
+     * 其余诊断开关只在 `-DWS_TRIAGE_SWITCHES` 的诊断构建里生效。 */
     ws_config_defaults();
     ws_config_from_env();
     WS_PATH_BUF(envRoot);
@@ -381,9 +385,6 @@ int __cdecl WinstageShimStatsJson(char *buf, unsigned cch)
 
 static int ws_wants_autoinit(void)
 {
-    if (ws_env_truthy(WINSTAGE_ENV_DISABLE)) {
-        return 0;
-    }
     WS_PATH_BUF(v);
     ws_env_get(WINSTAGE_ENV_STAGE_ROOT, v, WS_PATH_MAX);
     if (v[0]) {

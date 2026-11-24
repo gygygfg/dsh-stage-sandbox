@@ -390,7 +390,12 @@ if (!helloAny) {
 
 /* -------------------------------------------------- S3 WINSTAGE_SHIM_DISABLE=1 */
 
-section('S3 对照：WINSTAGE_SHIM_DISABLE=1 仍正常（且不初始化）')
+/* 2026-11-24 审计实测（audit6 第 10-13 步）：这个开关原本"设了就当没注入"。
+ * 但它是**纯环境变量** —— 沙箱里的任何进程都能 `set WINSTAGE_SHIM_DISABLE=1` 再
+ * `cmd /c` 一个子进程，子进程的垫片就不初始化，于是写真的落到
+ * `C:\Windows\System32`（read_file 复核：文件存在）。开关已删除；这里改成
+ * "设了也被忽略"的安全属性断言。 */
+section('S3 安全属性：WINSTAGE_SHIM_DISABLE 被忽略（垫片照常初始化）')
 if (!helloAny) {
   skip('S3 DISABLE 对照', CSC ? '夹具未编译成功' : '缺 csc')
 } else {
@@ -401,8 +406,8 @@ if (!helloAny) {
     `status=${r.status} text=${r.text.slice(0, 160)}`,
   )
   check(
-    'S3.2 DISABLE=1 时 shim 不初始化（report.shimInitRc=1058 ERROR_SERVICE_DISABLED，无 shim.log）',
-    r.report?.shimInitRc === 1058 && !existsSync(r.log),
+    'S3.2 DISABLE=1 被忽略：垫片照常初始化（shimInitRc=0 且有 shim.log）',
+    r.report?.shimInitRc === 0 && existsSync(r.log),
     `shimInitRc=${r.report?.shimInitRc} logExists=${existsSync(r.log)}`,
   )
 }
