@@ -1384,3 +1384,12 @@ L6/L6e 段是**只读**的：只读 profile 文件，不写任何 profile 文件
   且未指定 `STARTF_USESTDHANDLES` 时，把这几个句柄转发给子进程 —— 否则孙进程拿到
   NUL/控制台句柄（`cmd /c echo` 零输出、`tasklist | findstr` 挂住），两条都是实测。
 - 已知差异：宿主 lane 的 cmd 无控制台，`chcp 65001` 不生效（GBK 输出）；产品 `pwsh` 路径不受影响。
+
+### 23.10 捕获输出的编码（2026-11-24）
+
+- 宿主内启动（§23.9）的 carrier 没有控制台，`chcp 65001` 不生效；中文 Windows 工具按
+  GBK 写字节。`readTextFile()` 改成"先 fatal UTF-8，失败回退 gbk → windows-1252"，
+  避免模型看到 `�û���Ϲ` 这类不可逆的 U+FFFD。
+- 红队工装：`--phase maint`（正常运维清单，命中同一批边界）；`attack/pentest/maint`
+  都只向模型暴露 `run`（进程内 fs 工具与垫片不是同一份暂存视图，实测会让模型判定
+  "write_file 静默失败"）。

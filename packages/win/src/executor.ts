@@ -7975,9 +7975,36 @@ export function findFileUnder(root, name, depth = 0) {
   return undefined
 }
 
+/**
+ * 读取子进程的捕获文件（stdout/stderr）。
+ *
+ * ── 为什么不能无条件 `readFileSync(path, 'utf8')`（2026-11-24 实测）────────────
+ * 中文 Windows 上系统工具（`whoami` / `dir` / `tasklist` / `ipconfig` …）按**控制台
+ * 代码页**（936/GBK）写字节。宿主的 `cmd` 只有在**有控制台**时 `chcp 65001` 才生效；
+ * 宿主内启动（N-API）的孩子没有控制台，于是这些字节是 GBK，而 UTF-8 解码会把每个
+ * 汉字变成 U+FFFD（不可逆）——模型看到的是 `�û���Ϣ`，等于"沙箱输出坏了"。
+ *
+ * 判据：先按 **fatal UTF-8** 解码；失败才回退到 GBK / windows-1252。
+ * GBK 与 ASCII 兼容，所以"UTF-8 内容 + 少量 GBK 片段"也能正确还原。
+ */
 function readTextFile(path) {
   try {
-    return existsSync(path) ? readFileSync(path, 'utf8') : ''
+    if (!existsSync(path)) return ''
+    const buffer = readFileSync(path)
+    if (buffer.length === 0) return ''
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(buffer)
+    } catch {
+      /* 不是合法 UTF-8：按中文 Windows 的 ANSI 代码页再试 */
+    }
+    for (const encoding of ['gbk', 'windows-1252']) {
+      try {
+        return new TextDecoder(encoding).decode(buffer)
+      } catch {
+        /* 该运行时没有这个解码器：换下一个 */
+      }
+    }
+    return buffer.toString('utf8')
   } catch {
     return ''
   }
