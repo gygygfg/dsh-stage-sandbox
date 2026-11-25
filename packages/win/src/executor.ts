@@ -61,6 +61,7 @@ import { CREATE_NEW_CONSOLE } from './appcontainer-runtime.ts'
 // （`exportMaskJson()` 的 entries/probes 与内部表逐条同源），因此工具层判定与
 // 进程级 read mask 不可能漂移。
 import { exportMaskJson, maskRootEntry } from './paths.ts'
+import { findDestructiveGitCommand } from './git-path.ts'
 // ── 缺陷③：陈旧 AppContainer 包 SID ACE 的判据只从 `src/appcontainer.ts` 来 ──────
 // 不在本文件重写 SDDL 解析：判据漂移会让"修复"和"测量"对不上。
 // Phase 2 / WP1：暂存根授权的**回读判据**用同一个解析器（`parseSddlDaclAces`），
@@ -4430,7 +4431,34 @@ export class WindowsStageExecutor {
       }
     }
 
-    const { env, rejected } = buildChildEnvironment(options.env, {
+    /*
+     * ── 破坏性 git 子命令（对象库/仓库结构的不可逆操作）──────────────────────────
+     *
+     * 为什么必须单独拦：**非 shim 档**下 `.git/objects` 在暂存架构里直连真实盘（见
+     * `workspace.ts::materializeGitControlDir` 的取舍）。`git gc --prune=now` /
+     * `git prune` / `git repack` 会**删除真实对象**，而对象一旦被删，暂存层既没有
+     * 副本、也无法回滚——这不是"审批后能否撤销"的问题，是根本没东西可撤。
+     *
+     * 只拒绝这一小撮；`git add/commit/checkout/reset` 仍照常执行（它们的写入落在
+     * 暂存树，经 `git-integrity` 闸门按对象→指针顺序发布）。与 NeoAI 的差异及理由
+     * 见 `docs/GIT-暂存与完整性.md`。
+     *
+     * 对外只返回普通拒绝（不暴露沙箱/暂存），子命令留在结构化字段里供运营侧日志。
+     */
+    if (options.skipDestructiveGitPreflight !== true) {
+      const destructive = findDestructiveGitCommand([options.command, ...(options.args ?? [])].join(' '))
+      if (destructive !== undefined) {
+        const error = fail('ACCESS_DENIED', 'Access is denied.')
+        error.policyDenial = true
+        error.retryable = false
+        error.gitSubcommand = destructive.subcommand
+        error.evidence = { reason: destructive.reason }
+        error.remediation = ['run this command on the host, outside the sandbox']
+        throw error
+      }
+    }
+
+    const { env, rejected } = buildChildEnvironment({ ...(options.env ?? {}), GIT_OPTIONAL_LOCKS: '0' }, {
       tempDir: this.tempDir,
       cwd,
       tier: this.tier,

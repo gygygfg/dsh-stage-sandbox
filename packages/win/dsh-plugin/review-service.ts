@@ -35,6 +35,7 @@ import { countCandidateDiff, renderCandidateDiff } from '../src/tools.ts'
 import { MASK_REASON, maskSensitiveLines, redactedToken } from './sensitive-content.ts'
 import { unstagedSnapshot } from './unstaged-ledger.ts'
 import { REGISTRY_CANDIDATE_SOURCE, createRegistryStage, registryWireBytes } from '../src/registry-stage.ts'
+import { gitPathClass } from '../src/git-path.ts'
 import { createRegExeReader, createRegExeWriter } from '../src/registry-bindings.ts'
 
 /**
@@ -1605,6 +1606,13 @@ export class ReviewService {
       risk: verdict.risk,
       safety: verdict.safety,
       riskReason: verdict.riskReason,
+    }
+    // 原子组：`.git` 的指针/对象是一个不可拆的决定（index 与 refs 必须一起落地）。
+    // 面板与 `approve(paths)` 据此整组呈现/整组应用；逐文件取消不适用于 `.git`。
+    const gitKind = gitPathClass(change.path)
+    if (gitKind !== undefined) {
+      item.atomicGroup = 'git'
+      item.gitClass = gitKind
     }
     // ── 基线漂移（"多轮修改后视图不一致"的根因）──────────────────────────────
     // `applyOneChange()` 在真实文件偏离 **候选冻结的 before** 时以 STALE_BASELINE 拒绝

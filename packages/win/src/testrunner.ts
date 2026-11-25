@@ -275,6 +275,15 @@ export const OFFLINE_SUITES = [
   //   全部是离线确定性断言（假驱动端口/注入命令输出/临时 Unix socket），
   //   不需要 Windows、不加载驱动、不碰真实工作区 ⇒ 归 OFFLINE_SUITES。
   //   与 verify.cmd 的清单必须逐字一致（两处同时改）。
+  // 2026-11-26 `.git` 暂存（对标 NeoAI 的 git_path_class / _apply_order / 引用完整性闸门）：
+  //   git-path      —— 分类/排序/危险子命令（纯函数）
+  //   git-integrity —— 真实仓库上的引用完整性闸门（index/pack/packed-refs）
+  //   git-staging   —— 真实仓库上的控制面复制 + 对象库 junction + 真实索引不被改写
+  //   前两个只读真实盘上的临时仓库，不写用户工作区；无需管理员 ⇒ 离线档。
+  //   与 verify.cmd 的清单必须逐字一致（tests/suite-wiring.ts 机器检查）。
+  { id: 'git-path', script: 'tests/git-path.ts', title: 'git 路径分类/发布顺序/危险子命令（hooks/config 永不发布；对象→普通→指针）' },
+  { id: 'git-integrity', script: 'tests/git-integrity.ts', title: 'git 引用完整性闸门（真实 index/pack/packed-refs；悬空引用整单拒绝）' },
+  { id: 'git-staging', script: 'tests/git-staging.ts', title: 'git 控制面暂存（复制 + 对象库 junction；真实 index 不被命令改写）' },
   { id: 'run-all', script: 'tests/nt/run-all.ts', title: 'NT 内核后端控制面（15 个套件聚合：策略/路径/视图/驱动/状态/执行器/apply/runtime/supervisor）' },
 ]
 

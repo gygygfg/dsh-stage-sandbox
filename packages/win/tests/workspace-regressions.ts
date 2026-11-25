@@ -509,9 +509,10 @@ W('=== 4. R18/KNOWN-03：init 之后真实盘新建的文件必须被物化（�
   // init 之后才在真实盘上出现的文件（旧实现只遍历 manifest ⇒ 沙箱内不可见）
   writeFileSync(join(root, 'late.txt'), 'late-content\n')
   writeFileSync(join(root, 'late-mod.txt'), 'v1\n')
-  // R42-GIT：VCS/依赖不再"复制内容"进工作副本，而是 junction 直连真实盘
-  // （否则沙箱内 git / node / pytest 直接不可用；见 src/workspace.ts 的注释）。
-  mkdirSync(join(root, '.git'), { recursive: true })
+  // 2026-11-26：`.git` 从「整棵 junction」改为「控制面复制 + 对象库 junction」。
+  // 原因：整棵 junction 让 `.git/hooks/**` 与 `.git/config` 直落真实盘，盲批也能装
+  // 持久化钩子（暂存/候选/审批整条链路被绕过）。见 src/workspace.ts::materializeGitControlDir。
+  mkdirSync(join(root, '.git', 'objects', 'ab'), { recursive: true })
   writeFileSync(join(root, '.git', 'HEAD'), 'ref: refs/heads/main\n')
   mkdirSync(join(root, 'node_modules', 'pkg'), { recursive: true })
   writeFileSync(join(root, 'node_modules', 'pkg', 'index.js'), 'module.exports=1\n')
@@ -524,17 +525,69 @@ W('=== 4. R18/KNOWN-03：init 之后真实盘新建的文件必须被物化（�
     existsSync(ws.staged('late.txt')) && readFileSync(ws.staged('late.txt'), 'utf8') === 'late-content\n',
     JSON.stringify({ realFiles: materialized.realFiles, copied: materialized.copied }),
   )
-  const gitLink = ws.staged('.git')
   check(
-    '`.git` 以 junction 直连真实盘（VCS 元数据可读，不复制内容）',
-    materialized.linked === 2 &&
-      existsSync(gitLink) &&
-      readFileSync(join(gitLink, 'HEAD'), 'utf8') === 'ref: refs/heads/main\n',
-    JSON.stringify({ linked: materialized.linked, gitLink, exists: existsSync(gitLink) }),
+    '`.git` 控制面被复制进暂存（HEAD 逐字节一致）',
+    materialized.gitMode === 'staged' &&
+      existsSync(ws.staged('.git/HEAD')) &&
+      readFileSync(ws.staged('.git/HEAD'), 'utf8') === 'ref: refs/heads/main\n',
+    JSON.stringify({ gitMode: materialized.gitMode, gitFiles: materialized.gitFiles }),
+  )
+  check(
+    '`.git/objects` 仍是 junction（对象库直连真实盘，不复制）',
+    lstatSync(ws.staged('.git/objects')).isSymbolicLink() === true,
+    JSON.stringify({ staged: ws.staged('.git/objects') }),
+  )
+  {
+    // 文件工具直接写 `.git/config`/hooks ⇒ 候选生成之前就拒绝（纵深防御）。
+    let refused = undefined
+    try {
+      ws.writeFile(join(root, '.git', 'config'), 'x')
+    } catch (error) {
+      refused = error.code
+    }
+    check('文件工具写 .git/config 被拒（SANDBOX_GIT_INTERNAL）', refused === 'SANDBOX_GIT_INTERNAL', String(refused))
+    let refusedHook = undefined
+    try {
+      ws.writeFile(join(root, '.git', 'hooks', 'pre-push'), '#!/bin/sh\n')
+    } catch (error) {
+      refusedHook = error.code
+    }
+    check('文件工具写 .git/hooks/pre-push 被拒', refusedHook === 'SANDBOX_GIT_INTERNAL', String(refusedHook))
+    let refusedDelete = undefined
+    try {
+      ws.remove(join(root, '.git', 'config'))
+    } catch (error) {
+      refusedDelete = error.code
+    }
+    check('文件工具删除 .git/config 被拒', refusedDelete === 'SANDBOX_GIT_INTERNAL', String(refusedDelete))
+  }
+  {
+    // 捕获阶段就丢弃 config/hooks/锁（否则一条 `git config user.email` 会毒化整轮）。
+    const internal = ws.ingestCapturedChanges([
+      { path: '.git/config', op: 'write', kind: 'file' },
+      { path: '.git/hooks/post-commit', op: 'write', kind: 'file' },
+      { path: '.git/index.lock', op: 'write', kind: 'file' },
+    ])
+    check(
+      '`.git` config/hooks/锁在捕获阶段被丢弃且不进入清单',
+      internal.ingested === 0 &&
+        internal.skipped.length === 3 &&
+        internal.skipped.every((entry) => String(entry.reason).startsWith('git-internal-')) &&
+        ws.manifest.entries['.git/config'] === undefined &&
+        ws.manifest.entries['.git/hooks/post-commit'] === undefined,
+      JSON.stringify(internal),
+    )
+  }
+  check(
+    '`.git/hooks` / `.git/config` 发布闸门整单拒绝（纵深防御）',
+    ws._gitPublishGate([{ path: '.git/config', op: 'write' }]).ok === false &&
+      ws._gitPublishGate([{ path: '.git/hooks/post-commit', op: 'write' }]).ok === false,
+    JSON.stringify(ws._gitPublishGate([{ path: '.git/config', op: 'write' }])),
   )
   check(
     '`node_modules` 以 junction 直连真实盘（依赖树可解析，不复制内容）',
-    existsSync(ws.staged(join('node_modules', 'pkg', 'index.js'))) &&
+    lstatSync(ws.staged('node_modules')).isSymbolicLink() === true &&
+      existsSync(ws.staged(join('node_modules', 'pkg', 'index.js'))) &&
       readFileSync(ws.staged(join('node_modules', 'pkg', 'index.js')), 'utf8') === 'module.exports=1\n',
     'node_modules linked',
   )
@@ -545,11 +598,12 @@ W('=== 4. R18/KNOWN-03：init 之后真实盘新建的文件必须被物化（�
     JSON.stringify((materialized.skipped ?? []).slice(0, 6)),
   )
   const linkSnapshot = ws.snapshotStagedTree()
-  const linkedKeys = [...(linkSnapshot.hashes?.keys?.() ?? [])]
+  const linkedKeys = [...(linkSnapshot.hashes?.keys?.() ?? [])].map((key) => String(key).replaceAll('\\', '/'))
   check(
-    '快照不跟随 junction（.git/node_modules 不进哈希树）',
-    !linkedKeys.some((key) => key === '.git' || key.startsWith('.git/') || key.startsWith('node_modules/')),
-    JSON.stringify(linkedKeys.filter((key) => key.includes('.git') || key.includes('node_modules')).slice(0, 3)),
+    '快照跟随 `.git` 控制面（可进入候选），但不跟随对象库与 node_modules',
+    linkedKeys.some((key) => key.endsWith('.git/HEAD')) &&
+      !linkedKeys.some((key) => key.includes('.git/objects') || key.startsWith('node_modules/')),
+    JSON.stringify(linkedKeys.filter((key) => key.includes('.git') || key.includes('node_modules')).slice(0, 5)),
   )
 
   // 模拟沙箱命令：相对路径删除 late.txt（删 staged 副本）→ capture 必须报删除

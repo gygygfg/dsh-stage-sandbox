@@ -25,7 +25,7 @@
  *   - 遮蔽前先规范化，符号链接不能绕过（#16.6）；硬拒绝先于软遮蔽（#16.7）
  */
 
-import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { basename, dirname, join, normalize, relative, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
@@ -43,8 +43,191 @@ import {
   makeRemovable,
 } from './store.ts'
 import { canonical, compareKey, isInside, isMasked, lexical, lexicalInside, maskReason, relativeTo, segments, stableSort } from './paths.ts'
+import { gitPathClass, gitRepoRootOf, orderForApply } from './git-path.ts'
+import { checkGitIntegrity } from './git-integrity.ts'
 // 缺陷③（Fix B）：陈旧 AppContainer 包 SID ACE 的判据与落地只从 executor 来
 import { repairStaleAppContainerAces } from './executor.ts'
+
+export function materializeGitControlTree(realGit, stagedGit, report, stagedEntry) {
+  let info
+  try {
+    info = lstatSync(realGit)
+  } catch {
+    return
+  }
+  /*
+   * 每次执行前**刷新基线**：真实盘是 lower 层，清单里有条目（未发布的暂存方案）才是
+   * upper 层。`.git` 与普通文件同一口径，否则批准过一次 `git commit` 之后暂存副本会
+   * 永久停在旧 index 上，下一次候选必然 `STALE_BASELINE`。
+   */
+  if (existsSync(stagedGit) && lstatSync(stagedGit).isSymbolicLink()) {
+    report.gitMode = 'junction-legacy'
+    return
+  }
+  // 工作树的 `.git` 是**文件**（`gitdir:` 指针），它指向别处的仓库；复制指针而不复制
+  // 目标会让 git 写到真实仓库。保守回落到 junction，并如实标记。
+  if (!info.isDirectory()) {
+    if (!existsSync(stagedGit)) linkGitFallback(realGit, stagedGit, report, 'junction-worktree')
+    else report.gitMode = 'junction-worktree'
+    return
+  }
+  const budget = { bytes: 0, entries: 0, exceeded: false }
+  const skip = (path, reason) => {
+    report.gitSkipped = report.gitSkipped ?? []
+    report.gitSkipped.push({ path, reason })
+  }
+  const copyDir = (dir, target, rel, depth) => {
+    if (budget.exceeded) return
+    if (depth > WALK_MAX_DEPTH) {
+      budget.exceeded = true
+      skip(rel, 'depth-limit')
+      return
+    }
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch (error) {
+      skip(rel, `unreadable:${error.code ?? 'ERR'}`)
+      return
+    }
+    mkdirSync(target, { recursive: true })
+    for (const dirent of entries) {
+      const abs = join(dir, dirent.name)
+      const childRel = rel.length === 0 ? dirent.name : `${rel}/${dirent.name}`
+      const childTarget = join(target, dirent.name)
+      const lower = dirent.name.toLowerCase()
+      // 对象库：不复制，建 junction（见方法注释的取舍）。
+      if (rel.length === 0 && lower === 'objects') {
+        if (existsSync(childTarget)) {
+          if (lstatSync(childTarget).isSymbolicLink()) {
+            report.gitObjectsLinked = true
+            continue
+          }
+          rmSync(childTarget, { recursive: true, force: true })
+        }
+        try {
+          symlinkSync(abs, childTarget, 'junction')
+          report.gitObjectsLinked = true
+        } catch (error) {
+          budget.exceeded = true
+          skip(childRel, `link-failed:${error.code ?? 'ERR'}`)
+        }
+        continue
+      }
+      // 子模块的 `.git/modules/<name>` 是另一套完整仓库；暂存它不在本轮范围，跳过并上报。
+      if (rel.length === 0 && lower === 'modules') {
+        skip(childRel, 'submodules-unsupported')
+        continue
+      }
+      // 锁 / gc 日志是瞬态，不是状态；复制它们只会制造无意义的候选。
+      if (lower.endsWith('.lock') || childRel === 'gc.log') {
+        skip(childRel, 'transient')
+        continue
+      }
+      let childInfo
+      try {
+        childInfo = lstatSync(abs)
+      } catch {
+        continue
+      }
+      if (childInfo.isSymbolicLink()) {
+        skip(childRel, 'reparse-point')
+        continue
+      }
+      if (childInfo.isDirectory()) {
+        copyDir(abs, childTarget, childRel, depth + 1)
+        continue
+      }
+      if (!childInfo.isFile()) {
+        skip(childRel, 'not-a-file')
+        continue
+      }
+      // 清单条目是权威：未发布的暂存内容不能被真实盘覆盖。
+      const entry = stagedEntry(childRel)
+      if (entry !== undefined && entry.state !== STATE.DELETED) {
+        report.gitReused = (report.gitReused ?? 0) + 1
+        continue
+      }
+      /*
+       * 未变就跳过：只比 size + mtime（copy 时保留了源 mtime）。`.git/index` 在大仓库
+       * 可以有几十 MB，而物化是**每条命令**都跑；逐条 st_size/stat 比逐条复制便宜一个量级。
+       * 保留 mtime 还有第二个好处：`git status` 的 racy-index 判定看到的是稳定时间戳。
+       */
+      try {
+        const previous = lstatSync(childTarget)
+        if (previous.isFile() && previous.size === childInfo.size && Math.abs(previous.mtimeMs - childInfo.mtimeMs) < 1) {
+          report.gitReused = (report.gitReused ?? 0) + 1
+          continue
+        }
+      } catch {
+        /* 目标不存在 ⇒ 正常复制 */
+      }
+      if (childInfo.size > GIT_CONTROL_MAX_FILE_BYTES) {
+        budget.exceeded = true
+        skip(childRel, 'file-too-large')
+        continue
+      }
+      budget.entries += 1
+      budget.bytes += childInfo.size
+      if (budget.entries > GIT_CONTROL_MAX_ENTRIES || budget.bytes > GIT_CONTROL_MAX_TOTAL_BYTES) {
+        budget.exceeded = true
+        skip(childRel, 'budget')
+        continue
+      }
+      try {
+        copyFileSync(abs, childTarget)
+        // 保留权限位（POSIX 上钩子/脚本的可执行位属于语义；Windows 上该位无效）。
+        try {
+          chmodSync(childTarget, childInfo.mode & 0o777)
+        } catch {
+          /* 权限位复制失败不改变暂存内容 */
+        }
+        // 保留 mtime：既是下面的"未变快速跳过"的判据，也让 git 看到稳定的时间戳。
+        try {
+          utimesSync(childTarget, childInfo.atime, childInfo.mtime)
+        } catch {
+          /* 时间戳复制失败只影响优化，不影响内容 */
+        }
+        report.gitFiles = (report.gitFiles ?? 0) + 1
+      } catch (error) {
+        report.failed.push({ path: `.git/${childRel}`, message: error.message })
+      }
+    }
+  }
+  try {
+    copyDir(realGit, stagedGit, '', 0)
+    if (budget.exceeded) {
+      // 半截复制不可用（缺 index/HEAD 会让 git 报"not a repository"）；回落到 junction。
+      rmSync(stagedGit, { recursive: true, force: true })
+      linkGitFallback(realGit, stagedGit, report, 'junction-budget')
+      return
+    }
+    report.gitMode = 'staged'
+  } catch (error) {
+    rmSync(stagedGit, { recursive: true, force: true })
+    linkGitFallback(realGit, stagedGit, report, 'junction-fallback')
+    report.failed.push({ path: '.git', message: error.message })
+  }
+}
+
+/**
+ * `.git` 暂存失败时的回落：整棵 junction（旧 R42-GIT 行为），并标记原因。
+ * @param realGit - 真实 `.git`。
+ * @param stagedGit - 暂存树目标。
+ * @param report - 物化报告。
+ * @param mode - 回落原因（`junction-budget` / `junction-fallback` / `junction-worktree`）。
+ */
+export function linkGitFallback(realGit, stagedGit, report, mode) {
+  try {
+    mkdirSync(dirname(stagedGit), { recursive: true })
+    symlinkSync(realGit, stagedGit, 'junction')
+    report.gitMode = mode
+    report.linked = (report.linked ?? 0) + 1
+  } catch (error) {
+    report.gitMode = 'unavailable'
+    report.failed.push({ path: '.git', message: `git fallback link failed: ${error.message}` })
+  }
+}
 
 export class SandboxError extends Error {
   constructor(code, message, detail = {}) {
@@ -180,8 +363,20 @@ const MATERIALIZE_SKIP_DIRS = new Set([
   '.next',
 ])
 
-/** 以 junction 直连真实盘的目录（VCS 元数据 / 依赖树 / 虚拟环境；见上方注释） */
-const MATERIALIZE_LINK_DIRS = new Set(['.git', '.hg', '.svn', 'node_modules', '.venv'])
+/**
+ * 以 junction 直连真实盘的目录（依赖树 / 虚拟环境 / 其他 VCS）。
+ *
+ * ★ `.git` **不在这里**：它改为「可控复制 + 对象库 junction」暂存（见
+ * `materializeGitControlDir`）。原因（安全边界，不是洁癖）：
+ * 整棵 junction 让 `.git/hooks/**` 与 `.git/config` 直落真实盘，载荷在盲批下也能
+ * 装入下一次 `git commit` 会执行的钩子——暂存/候选/审批**整条链路被绕过**。
+ */
+const MATERIALIZE_LINK_DIRS = new Set(['.hg', '.svn', 'node_modules', '.venv'])
+
+/** `.git` 可控复制：单文件/总量/条目数上限（超限 ⇒ 回落到 junction 并如实上报）。 */
+const GIT_CONTROL_MAX_FILE_BYTES = 64 * 1024 * 1024
+const GIT_CONTROL_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+const GIT_CONTROL_MAX_ENTRIES = 50000
 
 const MATERIALIZE_MAX_FILE_BYTES = 8 * 1024 * 1024
 const MATERIALIZE_MAX_TOTAL_BYTES = 256 * 1024 * 1024
@@ -1267,6 +1462,16 @@ export class Workspace {
   writeFile(target, content, opts = {}) {
     const { key: rel, external } = this.keyOf(target)
     if (rel === '') throw new SandboxError('EISDIR', 'cannot write the workspace root')
+    /*
+     * `.git` 的 config/hooks/info/锁：**文件工具一律拒绝**（对标 NeoAI
+     * "文件写入工具以 .git 为目标仍直接拒绝"）。命令产出的这两类条目在
+     * `ingestCapturedChanges` 里已被丢弃，因此这里不会误伤正常流程；
+     * 拒绝发生在候选生成之前，避免"一条 git config 毒化整轮审批"。
+     */
+    const gitKind = gitPathClass(rel)
+    if (gitKind === 'other' || gitKind === 'transient') {
+      throw new SandboxError('SANDBOX_GIT_INTERNAL', `refusing to stage ${rel}: .git ${gitKind} entries are never publishable`, { path: rel })
+    }
     const entry = this.ensureEntry(rel, { kind: 'file', origin: opts.origin })
     // R28: 暂存第一次写时捕获真实文件的 H/S 位（apply 时为"暂存态未显式设置"兜底）
     this._captureBaseWin32(rel, this.absolute(rel), opts)
@@ -1308,6 +1513,10 @@ export class Workspace {
   remove(target, opts = {}) {
     const { key: rel, external } = this.keyOf(target)
     if (rel === '') throw new SandboxError('EPERM', 'refusing to delete the workspace root')
+    // 删除 `.git/config`/hooks 同样拒绝（锁文件允许清理：它只是瞬态）。
+    if (gitPathClass(rel) === 'other') {
+      throw new SandboxError('SANDBOX_GIT_INTERNAL', `refusing to delete ${rel}: .git config/hooks are never publishable`, { path: rel })
+    }
     const state = this.exists(target)
     if (!state.exists && !opts.missingOk) {
       // 已删除 → 幂等成功；从未存在 → 报错，避免幽灵删除（#3.1）
@@ -2498,6 +2707,64 @@ export class Workspace {
     }
   }
 
+  /**
+   * `.git` 发布闸门：按仓库分组做类别 + 引用完整性校验。
+   *
+   * 读的是**应用之后**的视图：本批候选里的 `HEAD`/`refs`/`index` 用暂存内容，
+   * 其余回落到真实盘。对象库由 junction 提供（见 `materializeGitControlDir`）。
+   *
+   * @param chosen - 本批将写入的条目。
+   * @returns `{ ok: true }` 或 `{ ok: false, path, code, reason }`。
+   */
+  _gitPublishGate(chosen): { ok: boolean; path?: string; code?: string; reason?: string } {
+    const groups = new Map()
+    for (const change of chosen) {
+      const root = gitRepoRootOf(change.path)
+      if (root === undefined) continue
+      if (!groups.has(root)) groups.set(root, [])
+      groups.get(root).push(change)
+    }
+    for (const [root, changes] of groups) {
+      let repoRoot
+      try {
+        repoRoot = root === '' ? this.root : this.absolute(root)
+      } catch {
+        return { ok: false, path: changes[0].path, code: 'UNSAFE_RELATIVE_PATH', reason: `无法解析仓库根：${root}` }
+      }
+      const byKey = new Map(changes.map((change) => [compareKey(change.path), change]))
+      const result = checkGitIntegrity({
+        repoRoot,
+        changes,
+        readPost: (logical) => {
+          let key
+          try {
+            key = this.keyOf(logical).key
+          } catch {
+            return undefined
+          }
+          const change = byKey.get(compareKey(key))
+          if (change !== undefined) {
+            if (change.op === 'delete') return undefined
+            try {
+              return readFileSync(this.staged(key))
+            } catch {
+              return undefined
+            }
+          }
+          try {
+            return readFileSync(this.absolute(key))
+          } catch {
+            return undefined
+          }
+        },
+      })
+      if (!result.ok) {
+        return { ok: false, path: changes[0].path, code: result.code, reason: result.reason }
+      }
+    }
+    return { ok: true }
+  }
+
   applyCandidate(id, opts = {}) {
     const lock = this._acquireApplyLock(opts.applyLockTimeoutMs)
     if (!lock.ok) {
@@ -2534,6 +2801,19 @@ export class Workspace {
       return { idempotent: 'ALREADY_APPLIED', applied: [], failed: [], blockedByMask: [], maskWarnings: [], conflicts: [], remaining: 0 }
     }
     const selected = opts.paths ? new Set(opts.paths.map(compareKey)) : undefined
+    /**
+     * ── 原子组：`.git` 的一批变更是**一个**决定 ────────────────────────────────
+     * `git commit` 同时改 index + refs + logs；只应用其中一行会留下"索引与 refs
+     * 互相矛盾"的仓库。因此只要选中集合命中任何一个 `.git` 路径，就把它所属的整组
+     * （本候选里全部 `.git` 路径）一起纳入；逐文件的"取消勾选"在 `.git` 上不可用。
+     * 这与 NeoAI 的 `atomic_group="git"` 同义（`apply`/`reject_file` 强制整组）。
+     */
+    if (selected !== undefined) {
+      const gitKeys = candidate.changes
+        .filter((change) => gitPathClass(change.path) !== undefined)
+        .map((change) => compareKey(change.path))
+      if (gitKeys.some((key) => selected.has(key))) for (const key of gitKeys) selected.add(key)
+    }
     const chosen = candidate.changes.filter((change) => (selected ? selected.has(compareKey(change.path)) : true))
     /**
      * R34d：显式给了 `paths` 就必须**全部命中**（全有或全无），不能只把命中的那部分应用、
@@ -2560,6 +2840,30 @@ export class Workspace {
           `no candidate changes match the requested paths: ${unmatched.join(', ') || '(empty selection)'}`,
           { candidate: candidate.id, paths: opts.paths, unmatched, available: candidate.changes.map((change) => change.path) },
         )
+      }
+    }
+
+    /**
+     * ── `.git` 发布闸门（fail-closed，先于任何写入）──────────────────────────
+     * 类别闸门（config/hooks 永不发布）+ 引用完整性（指针引用的对象必须存在）。
+     * 失败时一个字节都不写，并按既有结果形状返回（`failed[]` + `requeued`）。
+     */
+    const gitGate = this._gitPublishGate(chosen)
+    if (!gitGate.ok) {
+      return {
+        id: candidate.id,
+        status: candidate.status,
+        applied: [],
+        failed: [{ path: gitGate.path, op: 'git', code: gitGate.code, message: gitGate.reason }],
+        blockedByMask: [],
+        maskWarnings: [],
+        conflicts: [],
+        remaining: chosen.map((change) => change.path),
+        totalChanged: candidate.changes.length,
+        requeued: true,
+        rolledBack: false,
+        rollback: [],
+        note: 'git-integrity: refused to publish .git changes (nothing was written)',
       }
     }
 
@@ -2734,7 +3038,8 @@ export class Workspace {
     }
 
     let firstFailure = null
-    for (const change of chosen) {
+    // 发布顺序：对象（0）→ 普通文件（1）→ 指针（2）。见 `git-path.ts::orderForApply`。
+    for (const change of orderForApply(chosen)) {
       const abs = this.absolute(change.path)
       const mask = this.maskOf(abs)
       if (mask) {
@@ -3901,6 +4206,15 @@ export class Workspace {
         if (!rel || rel.startsWith('..')) continue
         if (dirent.isDirectory()) {
           const lower = dirent.name.toLowerCase()
+          if (lower === '.git') {
+            /*
+             * `.git` 不再整棵 junction（那是 R42-GIT 的旧口径，也是 hooks/config 直落
+             * 真实盘的根因）。改为「可控复制 + 对象库 junction」：可变指针进暂存树，
+             * 不可变对象库仍直连真实盘（见 materializeGitControlDir 的取舍说明）。
+             */
+            this.materializeGitControlDir(abs, this.staged(rel), report, rel)
+            continue
+          }
           if (MATERIALIZE_LINK_DIRS.has(lower)) {
             /**
              * R42-GIT：VCS/依赖/venv 用 junction 直连真实盘（不复制）。
@@ -3989,6 +4303,50 @@ export class Workspace {
     walk(this.root, 0)
     return report
   }
+
+  /**
+   * 把真实 `.git` 的**可变部分**复制进暂存树，对象库仍 junction 到真实盘。
+   *
+   * 为什么这样切（安全 / 成本 / 正确性三者唯一可行的交点）
+   * ----------------------------------------------------
+   * · **可变指针必须进暂存**：`index` / `HEAD` / `refs/**` / `logs/**` 决定"下一次
+   *   commit 变成什么"；它们若直连真实盘，暂存层就无法审批它们。`config` 与
+   *   `hooks/**` 更危险（`core.hooksPath`/`core.pager` 是任意命令执行），因此它们
+   *   进暂存后由 `git-integrity` 判为 `other` 并**永不发布**。
+   * · **对象库仍是 junction**：`objects/**` 是内容寻址、只增不改的；复制一个真实仓库
+   *   的对象库动辄数百 MB 到数 GB，每个会话复制一次不可接受。代价是 `git commit`
+   *   会在**审批前**把新对象写进真实对象库——这些对象在 refs 指向它们之前是不可达的
+   *   垃圾，`git gc` 会回收；破坏性对象操作（gc/prune/repack）已被命令守卫拒绝。
+   * · **正确性**：对象先于指针发布的顺序 + 引用完整性闸门，保证任何写入的
+   *   index/refs 引用的对象都已存在（见 `git-integrity.ts`）。
+   *
+   * 失败策略：复制超预算或出错时**回落到整棵 junction**（旧行为），并把
+   * `gitMode` 记成 `junction-*`。这是有意的 fail-open：宁可可用性优先，也不能让
+   * 「.git 不存在」把整个工作流打断；但它**如实上报**，`/winstage status` 与测试
+   * 可以据此判断"这次会话的 .git 没有受暂存保护"。
+   *
+   * @param realGit - 真实 `.git` 绝对路径（目录或文件）。
+   * @param stagedGit - 暂存树里对应的路径。
+   * @param report - 物化报告（写入 `gitMode` / `gitFiles` / `gitSkipped`）。
+   */
+  materializeGitControlDir(realGit, stagedGit, report, gitKey = '.git') {
+    /*
+     * 清单键在 Windows 上用 `\` 分隔，而 copyDir 内部用 `/` 拼相对路径；
+     * 两种写法都查一次，避免"查不到 ⇒ 用真实盘覆盖未发布的暂存内容"。
+     */
+    materializeGitControlTree(realGit, stagedGit, report, (rel) => {
+      const slash = `${gitKey}/${rel}`
+      return this.manifest.entries[slash] ?? this.manifest.entries[slash.replaceAll('/', sep)]
+    })
+  }
+
+  /**
+   * `.git` 暂存失败时的回落：整棵 junction（旧 R42-GIT 行为），并标记原因。
+   * @param realGit - 真实 `.git`。
+   * @param stagedGit - 暂存树目标。
+   * @param report - 物化报告。
+   * @param mode - 回落原因（`junction-budget` / `junction-fallback` / `junction-worktree`）。
+   */
 
   /** 逻辑相对键在该会话里是否有白障（删除标记）：`<staged>/wo/<盘>/…` 或 `_unc` */
   hasWhiteoutFor(rel) {
@@ -4183,6 +4541,17 @@ export class Workspace {
     if (incomingBytes > 0) this.store.assertStagingQuota(incomingBytes)
     try {
       for (const change of captured) {
+        /*
+         * `.git` 的 config/hooks/info/锁**在捕获阶段就丢弃**（对标 NeoAI 的
+         * "未捕获"口径）。理由：它们**永不发布**（`git-integrity` 的 `other` 类），
+         * 若让它们进候选，批准整批时会被闸门整单拒绝——一条 `git config user.email`
+         * 就能毒化整轮。丢弃是安全的（真实盘本来就没被写），且如实记 skipped。
+         */
+        const gitKind = change.deleted ? undefined : gitPathClass(change.path)
+        if (gitKind === 'other' || gitKind === 'transient') {
+          result.skipped.push({ path: change.path, reason: `git-internal-${gitKind}` })
+          continue
+        }
         // 一律经 absolute() 映射（而不是裸 join(root, path)）：
         // 万一 captured 里出现绝对路径（外部条目键就是绝对路径），
         // `join('C:\\ws', 'C:\\out\\a.txt')` 会得到 `C:\ws\C:\out\a.txt` 这种畸形路径。

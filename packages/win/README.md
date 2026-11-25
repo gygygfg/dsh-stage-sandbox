@@ -180,7 +180,8 @@ node tools\ebk-sandbox-test.ts # Windows E2E 测试台（需 docker + KVM，见 
 - **R2 网络面不收敛**：网络策略层存在且 OFFLINE fail-closed，但本机未安装真实过滤器 ⇒ 沙箱内仍可开 socket。
 - **R6 嵌套隔离不可用**：已受限进程无法再建受限令牌 ⇒ 沙箱**必须由未受限宿主进程建立**。
 - **R7 环境块需运行时注入**：依赖包的受限 spawn 固定传 `lpEnvironment=NULL`（违反手册 #8.3）；本实现替换绑定表注入显式环境块，结构不符时 **fail-closed 拒绝启动**。
-- **R42-GIT（日常可用性）**：`.git`/`.hg`/`.svn`/`node_modules`/`.venv` 以 **junction 直连真实盘**（不复制内容）—— 否则沙箱内 `git status` 报 `fatal: not a git repository`、node/pnpm/测试解析不到依赖。代价：沙箱内 `git add/commit`、`pnpm install` 会**直接写真实** `.git`/`node_modules`/`.venv`，不经过暂存/候选/审批；用户内容（源码、数据）仍走暂存。命令 cwd 仍是工作副本路径（`Get-Location` 可见），这是透明暂存的残余。另：沙箱 shell 通过 `GIT_CONFIG_PARAMETERS` 注入 `core.excludesFile`，把 `fs/`、`wo/`、`reg/`、`.winstage-*`、`shim.log` 等**沙箱内部条目**从 git 视图排除，`git add -A` 不会把它们提交进用户仓库。
+- **R42-GIT（日常可用性；2026-11-26 收窄）**：`.hg`/`.svn`/`node_modules`/`.venv` 仍以 **junction 直连真实盘**（不复制内容）。`.git` **不再整棵 junction**：控制面（`HEAD`/`index`/`refs`/`logs`/`config`/`hooks`）复制进暂存树，只有**对象库** `.git/objects` 是 junction。原因：整棵 junction 让 `.git/hooks/**` 与 `.git/config` 直落真实盘，盲批也能装持久化钩子——暂存/候选/审批整条链路被绕过。现在 `.git` 的可变部分走候选与审批，发布前经过「对象→普通→指针」排序 + 引用完整性闸门；`config`/`hooks`/`info` 归 `other` 类，**永不发布**（`SANDBOX_GIT_INTERNAL`）。`git gc/prune/repack/maintenance/filter-branch` 被命令守卫拒绝（它们会删真实对象）。仍未覆盖：`node_modules`/`.venv` 的写入仍直落真实盘；子模块（`.git/modules`）与工作树（`.git` 是文件）回落到 junction；`git commit` 在审批前把**新对象**写进真实对象库（不可达的垃圾，`git gc` 可回收），这是不复制 GB 级对象库的代价。详见 [`docs/GIT-暂存与完整性.md`](docs/GIT-暂存与完整性.md)。
+  另：沙箱 shell 通过 `GIT_CONFIG_PARAMETERS` 注入 `core.excludesFile`，把 `fs/`、`wo/`、`reg/`、`.winstage-*`、`shim.log` 等**沙箱内部条目**从 git 视图排除，`git add -A` 不会把它们提交进用户仓库。
 - **R42-DNS（网络设备放行）**：shim 的 `NtCreateFile` 对非文件系统设备命名空间（`\Device\Afd`/`Nsi`/`KsecDD`/`CNG`/`Tcp`/`Udp`/`Ip`/`RawIp`/`RasAcd`）放行；否则 `getaddrinfo`、socket、TLS 会在沙箱内失败。磁盘/卷/文件系统设备仍 fail-closed，普通文件路径的暂存/遮蔽规则不变。
 - **R43（会话根 vs 沙盒根）**：WinStage 的 shell/fs 工具根是**暂存工作副本**（`store.stagedDir`）：命令的 cwd、工具 workdir、`Get-Location`、`pwd`、`os.getcwd()` 都指向同一个暂存根，不再做"显示真实路径"的虚拟化。**但 DSH 会话 header 的 `cwd` 在会话创建时冻结为真实工作区**（`dsh-workspace` 用 canonical cwd 做 workspace 归属校验），插件无法事后改写；因此会话标题/系统提示里的根仍可能是真实路径。要让**会话根本身**就是暂存副本，必须在创建会话时把 cwd 指向暂存树（session launcher / workspace 集成），这是后续独立改动，不是 shell 层能完成的。
 - **R44（文本判定不得作为边界）**：对标 NeoAI 第 6 条核心不变量。暂存写自检未通过时，旧实现只要文本判“只读”就放行（`bypassed:'read-only'`）——TS（用户态 shim）或未初始化档没有内核写屏障，文本漏判即真实执行且不暂存。本轮改为：只有受限令牌（T1/T1S）或 AppContainer（T0）在场时，文本只读命令才可继续；否则 `STAGING_WRITE_UNVERIFIED_NO_BARRIER` fail-closed。`writeBarrier` 已进入闸门决策、`initReport`、`run()` 与 `sandbox-lane.json`。守卫：`tests/r44-write-barrier.ts`。**默认 `tier='auto'` 仍可能落到 TS（用户态边界）**，本轮只把事实可见化，未改默认值。
@@ -233,6 +234,7 @@ node tests\dsh-patch-guard.ts             # 守门：现场哈希必须恰好是
 ## 8. 文档导航
 
 - 现行设计与规范：[`docs/README.md`](docs/README.md)
+- `.git` 暂存与发布闸门：[`docs/GIT-暂存与完整性.md`](docs/GIT-暂存与完整性.md)
 - 测试入口与套件清单：[`docs/测试套件总览.md`](docs/测试套件总览.md)
 - 修改流程规范：[`docs/项目规范-测试与修改流程.md`](docs/项目规范-测试与修改流程.md)
 - Windows E2E 测试台：[`e2e/README.md`](e2e/README.md)
