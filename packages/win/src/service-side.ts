@@ -194,13 +194,17 @@ export function decodePowerShellEncodedCommand(text) {
  * @param {string[]} args
  * @param {{readFile?: (path: string) => string|null, maxBytes?: number}} [io]
  */
-export function buildServiceSideScanText(command, args = [], io = {}) {
+export function buildServiceSideScanText(
+  command,
+  args = [],
+  io: { readFile?: (path: string, maxBytes?: number) => string | null; maxBytes?: number } = {},
+) {
   const argv = [command, ...(Array.isArray(args) ? args : [])].filter((v) => v !== undefined && v !== null).map(String)
   const parts = [argv.join(' ')]
   const readFile = io.readFile
   const maxBytes = io.maxBytes ?? 256 * 1024
   if (typeof readFile === 'function') {
-    const candidates = new Set()
+    const candidates = new Set<string>()
     for (const token of argv) {
       const cleaned = token.replace(/^["']|["']$/g, '')
       if (!/\.(cmd|bat|ps1)$/i.test(cleaned)) continue
@@ -228,7 +232,11 @@ export function buildServiceSideScanText(command, args = [], io = {}) {
  * @param {{readFile?: Function, maxBytes?: number, allow?: boolean}} [options]
  * @returns {{hit: boolean, channel?: string, label?: string, reason?: string, evidence?: string}}
  */
-export function classifyServiceSideWrite(command, args = [], options = {}) {
+export function classifyServiceSideWrite(
+  command,
+  args = [],
+  options: { readFile?: (path: string, maxBytes?: number) => string | null; maxBytes?: number; allow?: boolean } = {},
+) {
   if (options.allow === true) return { hit: false }
   const text = buildServiceSideScanText(command, args, options)
   const match = matchServiceSideText(text)
@@ -267,7 +275,7 @@ export function serviceSideRedirectFor(channel, lane) {
 }
 
 /** 供状态卡/文档引用：TS 档**尚未覆盖**的服务侧通道清单（WMI/SCM/计划任务/EventLog 已重定向） */
-export const SERVICE_SIDE_UNCOVERED = Object.freeze([
+export const SERVICE_SIDE_UNCOVERED: readonly string[] = Object.freeze([
   SERVICE_SIDE_CHANNELS.VOLUME_SHADOW,
   SERVICE_SIDE_CHANNELS.DEFENDER_POLICY,
   SERVICE_SIDE_CHANNELS.FIREWALL,

@@ -1,3 +1,5 @@
+// @ts-nocheck —— 红队 harness 故意触达 Workspace/Executor 的内部字段（只读观测），
+// 与 tools/ 下其它脚手架一致：不进 tsc 封印面。
 /**
  * WinStage red-team agent harness (runs INSIDE the Windows guest).
  *

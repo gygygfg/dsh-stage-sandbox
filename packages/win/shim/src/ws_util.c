@@ -923,6 +923,9 @@ int ws_config_load_file(const wchar_t *path)
     if (ws_config_get_string(text, "readDenyFile", wbuf, WS_PATH_MAX)) {
         ws_strlcpy_w(g_ws.readDenyFile, wbuf, WS_PATH_MAX);
     }
+    if (ws_config_get_string(text, "workspaceRoot", wbuf, WS_PATH_MAX)) {
+        ws_strlcpy_w(g_ws.workspaceRoot, wbuf, WS_PATH_MAX);
+    }
     int rdFail = -1;
     if (ws_config_get_bool(text, "readDenyFailClosed", &rdFail)) {
         g_ws.readDenyFailMode = rdFail ? 0 : 1;

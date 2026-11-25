@@ -278,10 +278,17 @@ section('S0 静态契约：重活必须在显式初始化里，不得回到 DllM
     dllMainAt < 0 ? 'ws_entry.c 里找不到 DllMain' : `DllMain 之后的 ${dllMainBody.length} 字符内无 ws_init_full`,
   )
   const injector = readText(join(REPO, 'shim', 'injector', 'winstage-inject.c'))
+  /* 2026-11-24：launch/inject 序列从 injector 的 main 移进了 ws_launch.c ——
+   * 宿主进程内的原生启动器（wds.node）与 injector.exe 共用同一份实现，
+   * 于是"显式远程 Init"的契约要落在 ws_launch.c 上，injector 只负责薄壳转发。 */
+  const launcher = readText(join(REPO, 'shim', 'injector', 'ws_launch.c'))
   check(
-    'S0.2 注入器在 LoadLibraryW 之后显式远程调用 WinstageShimInit',
-    injector.includes('WinstageShimInit') && injector.includes('CreateRemoteThread') && injector.includes('resolve_remote_export'),
-    `injector 文本长度=${injector.length}`,
+    'S0.2 LoadLibraryW 之后显式远程调用 WinstageShimInit（ws_launch.c 实现，injector 转发）',
+    launcher.includes('WinstageShimInit') &&
+      launcher.includes('CreateRemoteThread') &&
+      launcher.includes('resolve_remote_export') &&
+      injector.includes('ws_launch'),
+    `injector 文本长度=${injector.length} ws_launch 文本长度=${launcher.length}`,
   )
   const proc = readText(join(SHIM_SRC, 'ws_proc.c'))
   check(
@@ -549,9 +556,20 @@ if (!existsSync(PROBE)) {
     `probe=${JSON.stringify(probe)?.slice(0, 300)} status=${r.status}`,
   )
   check(
-    'S10.2 DISABLE=1 时显式 Init 返回 1058（初始化入口可见、可归因）',
-    probe?.initReturn === 1058,
+    'S10.2 没有暂存根时显式 Init 失败且可归因（不再有 DISABLE 环境变量总开关）',
+    probe?.initReturn === 1610 /* ERROR_BAD_CONFIGURATION */,
     `initReturn=${probe?.initReturn}`,
+  )
+  /* 2026-11-24 审计实测的修复：`WINSTAGE_SHIM_DISABLE=1` 曾能整片关掉垫片
+   * （沙箱内任何进程 set 一下再起子进程即可真写）。总开关已删除，这里钉死它
+   * 不会以环境变量形式回来：ws_entry.c 的初始化路径不得读取它。 */
+  const entrySrc = readText(join(SHIM_SRC, 'ws_entry.c'))
+  /* 注释里允许留历史说明，只断言**代码**不再引用它。 */
+  const entryCode = entrySrc.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
+  check(
+    'S10.3 WINSTAGE_SHIM_DISABLE 不再是初始化开关（ws_entry.c 代码里不读它）',
+    !/WINSTAGE_SHIM_DISABLE/.test(entryCode),
+    `代码中 WINSTAGE_SHIM_DISABLE 出现次数=${(entryCode.match(/WINSTAGE_SHIM_DISABLE/g) ?? []).length}`,
   )
 }
 

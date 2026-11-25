@@ -111,7 +111,12 @@ async function startFakeProvider(
 }
 
 function socketPath(tag: string): string {
-  return join(tmpdir(), `dshnt-supervisor-${tag}-${process.pid}.sock`)
+  /* 生产传输是 Windows 命名管道（src/nt/provider-protocol.ts）；假 control 在
+   * win32 上也走命名管道，因为这台机器 AF_UNIX `listen()` 报 EACCES（详见
+   * tests/nt/runtime.ts 的 transportPath 注释）。 */
+  return process.platform === 'win32'
+    ? `\\\\.\\pipe\\dshnt-supervisor-${tag}-${process.pid}`
+    : join(tmpdir(), `dshnt-supervisor-${tag}-${process.pid}.sock`)
 }
 
 function removeSocket(path: string): void {

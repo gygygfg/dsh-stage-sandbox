@@ -438,7 +438,33 @@ try {
         applyError = error
       }
       check('装配：合法 masks ⇒ apply 不抛错', applyError === undefined, String(applyError?.message ?? 'ok'))
-      check('装配：命令面注册 10 条（7 条暂存命令 + A5 的 approvals/approve/reject）', harness.commands.length === 10, String(harness.commands.length))
+      /* 2026-11-24：命令面从 10 条变成 11 条（新增 `/winstage nt status|doctor|up|down`
+       * 的只读诊断/生命周期入口）。这里同时钉死**清单**，只钉数量会让"多一条少一条"
+       * 互相抵消。 */
+      const EXPECTED_COMMANDS = [
+        'winstage-sandbox/winstage',
+        'winstage-sandbox/winstage-status',
+        'winstage-sandbox/winstage-refresh',
+        'winstage-sandbox/winstage-rebase',
+        'winstage-sandbox/winstage-diff',
+        'winstage-sandbox/winstage-approve',
+        'winstage-sandbox/winstage-reject',
+        'winstage-sandbox/winstage-approvals',
+        'winstage-sandbox/winstage-approval-approve',
+        'winstage-sandbox/winstage-approval-reject',
+        'winstage-sandbox/winstage-nt',
+      ].sort()
+      const actualCommands = harness.commands.map((definition) => definition.definitionId).sort()
+      check(
+        '装配：命令面注册 11 条（10 条暂存/审批 + /winstage nt 诊断）',
+        harness.commands.length === 11,
+        String(harness.commands.length),
+      )
+      check(
+        '装配：命令面清单与 SPECS 逐条一致（增删命令必须同步改这里）',
+        JSON.stringify(actualCommands) === JSON.stringify(EXPECTED_COMMANDS),
+        JSON.stringify(actualCommands),
+      )
       const handler = findBySub(harness.commands)
       const invitation = { rawInput: 'list', agent: { session: { id: 'r24-apply-session' } } }
       let result

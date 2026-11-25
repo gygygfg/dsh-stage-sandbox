@@ -2752,6 +2752,7 @@ export class WindowsStageExecutor {
       logPath,
       extraPassthrough: this.options.shimPassthrough ?? [],
       readDenyFile,
+      workspaceRoot: this.options.workspaceRoot,
       /* the masked helper dir must still let the injected cmd read its WMI script */
     })
     this.shimLogRotation = logRotation
@@ -4611,6 +4612,13 @@ export class WindowsStageExecutor {
       timedOut,
       launchFailed: launchFailure !== undefined,
       launchFailureCode: launchFailure?.win32Code,
+      /* 操作者可见的归因（**不进 stderr**）：模型可见通道只拿中性一句话，
+       * 但"到底哪一步拒绝了"必须对排障者保留 —— 之前只写在注释里承诺
+       * "initReport / shim.log / lastLaunch 可查"，这条路径其实哪儿都没有。 */
+      launchDiagnostic:
+        launchFailure === undefined
+          ? undefined
+          : { api: launchFailure.api, code: launchFailure.win32Code, message: launchFailure.message },
       // ── BUG-9：启动失败归一分类（真实 NTSTATUS 原样带出）─────────────────────
       // 只要有启动失败特征就带上；`denialClaimContradicted` 明确回答
       // "报 Access is denied 但子进程其实已经运行"这类与事实相反的结论。
@@ -6989,6 +6997,7 @@ export function writeShimConfig({
   readDenyFile,
   readDenyFailClosed = true,
   readAllow = [],
+  workspaceRoot,
 }) {
   const configPath = join(stageRoot, 'winstage-shim.config.json')
   const effectiveLogPath = logPath ?? join(stageRoot, 'shim.log')
@@ -7005,6 +7014,9 @@ export function writeShimConfig({
     readThrough: true,
     verbose: false,
     traceStagedOps: true,
+    /* The shim refuses to hide the plugin install root when it overlaps this
+     * tree (dev checkout). Empty/absent = keep hiding it. */
+    ...(typeof workspaceRoot === 'string' && workspaceRoot.length > 0 ? { workspaceRoot } : {}),
     ...(typeof readDenyFile === 'string' && readDenyFile.length > 0
       ? { readDenyFile, readDenyFailClosed: readDenyFailClosed !== false }
       : {}),

@@ -64,6 +64,9 @@ async function startFakeProvider(socketPath: string, reply: string): Promise<Ser
 }
 
 function removeSocket(path: string): void {
+  if (process.platform === 'win32' && path.startsWith('\\\\')) {
+    return // named pipe: nothing on disk to unlink
+  }
   try {
     unlinkSync(path)
   } catch {
@@ -71,7 +74,27 @@ function removeSocket(path: string): void {
   }
 }
 
-const SOCKET = join(tmpdir(), `dshnt-provider-test-${process.pid}.sock`)
+/**
+ * 假 provider 的传输端点。
+ *
+ * 生产传输本来就是 Windows 命名管道（`src/nt/provider-protocol.ts`），但本仓
+ * 早期的假 provider 在 win32 上绑的是 `%TEMP%\*.sock`（AF_UNIX）。实测这台机器
+ * `listen()` 直接 EACCES（AF_UNIX 不可用），整条 nt-runtime/nt-supervisor 套件
+ * 以 "套件异常" 变红。所以在 win32 上让假 provider 也走命名管道——与生产同一传输，
+ * 断言的含义不变。
+ */
+function transportPath(name: string): string {
+  return process.platform === 'win32'
+    ? `\\\\.\\pipe\\${name}-${process.pid}`
+    : join(tmpdir(), `${name}-${process.pid}.sock`)
+}
+
+/**
+ * 每次绑定用**唯一**端点名：命名管道在 close 之后立刻重绑同一名字会
+ * EADDRINUSE（Unix socket 靠 unlink 复用，管道没有这一步）。
+ */
+let socketSeq = 0
+const nextSocket = (): string => transportPath(`dshnt-provider-test-${++socketSeq}`)
 
 await runSuite('nt-runtime', async () => {
   section('1. 默认布局（视图/store 必须是工作区的兄弟目录）')
@@ -100,11 +123,12 @@ await runSuite('nt-runtime', async () => {
   check('非 Windows 上命令执行器拒绝（事实=unknown）', rejected)
 
   section('3. provider 管道探测（真实 socket）')
-  removeSocket(SOCKET)
+  const socket3 = nextSocket()
+  removeSocket(socket3)
   const providerReply = JSON.stringify({ id: 1, ok: true, stats: { views: [{ view: VIEW }] } })
-  const server = await startFakeProvider(SOCKET, providerReply)
+  const server = await startFakeProvider(socket3, providerReply)
   try {
-    const alive = await queryProviderStats(SOCKET, 3000)
+    const alive = await queryProviderStats(socket3, 3000)
     eq('连上即存活', alive.alive, true)
     eq('取到视图根', alive.views, [VIEW])
   } finally {
@@ -115,8 +139,9 @@ await runSuite('nt-runtime', async () => {
   check('给出原因', typeof missing.error === 'string' && missing.error.length > 0, missing.error)
 
   section('4. probe：全部事实为正 → 内核档')
-  removeSocket(SOCKET)
-  const server2 = await startFakeProvider(SOCKET, providerReply)
+  const socket4 = nextSocket()
+  removeSocket(socket4)
+  const server2 = await startFakeProvider(socket4, providerReply)
   const driver = new FakeDriverPort()
   await driver.setPolicy(new TextEncoder().encode('{}'), 'a'.repeat(64), 1)
   const runtime = new NtRuntime(
@@ -127,7 +152,7 @@ await runSuite('nt-runtime', async () => {
       launcherPath: 'C:\\dshnt\\dshnt-launch.exe',
       driver,
       run: goodRun,
-      providerSocket: SOCKET,
+      providerSocket: socket4,
       policy: { valid: true, generation: 1, hash: 'a'.repeat(64) },
       network: { mode: 'offline', enforced: true },
       applyReady: true,
@@ -327,5 +352,6 @@ await runSuite('nt-runtime', async () => {
   const noRuntime = (await bareNt?.handler({ rawInput: 'status' })) as { kind: string; text: string }
   eq('缺少运行时接线时明确报错（不静默）', noRuntime.kind, 'error')
 
-  removeSocket(SOCKET)
+  removeSocket(socket3)
+  removeSocket(socket4)
 })

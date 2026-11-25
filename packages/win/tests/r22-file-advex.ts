@@ -171,6 +171,10 @@ if (process.platform !== 'win32' || !existsSync(DLL) || !existsSync(INJECTOR)) {
         readDenyFile: MASK,
         readDenyFailClosed: true,
         passthrough: [STAGE],
+        /* Fixture dirs live inside the package (the inferred plugin root), so the
+         * store guard must be told where the agent's workspace is -- otherwise
+         * every enumeration here comes back empty. */
+        workspaceRoot: WS,
       }),
     )
     const env = { ...process.env, WINSTAGE_STAGE_ROOT: STAGE, WINSTAGE_SHIM_CONFIG: cfg, WINSTAGE_SHIM_LOG: join(STAGE, 'shim.log') }
@@ -202,19 +206,29 @@ if (process.platform !== 'win32' || !existsSync(DLL) || !existsSync(INJECTOR)) {
       `status=${direct.status} names=${JSON.stringify(names(direct.text))}`,
     )
 
-    // A2 green: injected Ex filters both masked names, keeps normal entries
+    /* 2026-11-24 契约变更（docs/AI红队渗透实测-2026-11-23.md §12）：策略遮蔽是
+     * "可见但不可读" —— 枚举正常列出遮蔽名，读取才被拒。因此这里断言的是
+     * **可见性一致 + 不丢普通条目**（Ex 变体必须与 classic 表现一致），
+     * 边界由 C 段的读拒绝断言承担。 */
+    const visible = (text) =>
+      names(text).includes('.npmrc') &&
+      names(text).includes('.git-credentials') &&
+      names(text).includes('a.txt') &&
+      names(text).includes('b.txt')
+
+    // A2: injected Ex lists the masked names too (visible) and keeps normal entries
     const ex = runInjected(['ex', WS])
     check(
-      'A2 注入后 Ex 变体不泄漏（.npmrc/.git-credentials 消失），普通条目 a.txt/b.txt 不丢',
-      ex.status === 0 && leaked(ex.text).length === 0 && names(ex.text).includes('a.txt') && names(ex.text).includes('b.txt'),
+      'A2 注入后 Ex 变体与 classic 一致：遮蔽名可见、普通条目 a.txt/b.txt 齐全',
+      ex.status === 0 && visible(ex.text),
       `status=${ex.status} names=${JSON.stringify(names(ex.text))}`,
     )
 
     // A3 classic variant regression (R19)
     const classic = runInjected(['classic', WS])
     check(
-      'A3 classic NtQueryDirectoryFile 仍过滤（R19 行为不被本次重构破坏）',
-      classic.status === 0 && leaked(classic.text).length === 0 && names(classic.text).includes('a.txt'),
+      'A3 classic NtQueryDirectoryFile 与 Ex 表现一致（R19 行为不被本次重构破坏）',
+      classic.status === 0 && visible(classic.text),
       `status=${classic.status} names=${JSON.stringify(names(classic.text))}`,
     )
 
@@ -222,19 +236,26 @@ if (process.platform !== 'win32' || !existsSync(DLL) || !existsSync(INJECTOR)) {
     const classes = [1, 2, 3, 12, 37, 38]
     const classResults = classes.map((cls) => {
       const r = runInjected(['ex-class', WS, String(cls)])
-      return { cls, status: r.status, leaked: leaked(r.text).length, hasA: names(r.text).includes('a.txt') }
+      const n = names(r.text)
+      return {
+        cls,
+        status: r.status,
+        masked: n.filter((x) => x === '.npmrc' || x === '.git-credentials').length,
+        hasA: n.includes('a.txt'),
+        hasB: n.includes('b.txt'),
+      }
     })
     check(
-      'A4 Ex 变体覆盖 6 个常见 FileInformationClass（1/2/3/12/37/38）均不泄漏且普通条目不丢',
-      classResults.every((r) => r.status === 0 && r.leaked === 0 && r.hasA),
+      'A4 Ex 变体覆盖 6 个常见 FileInformationClass（1/2/3/12/37/38）遮蔽名均可见且普通条目不丢',
+      classResults.every((r) => r.status === 0 && r.masked === 2 && r.hasA && r.hasB),
       JSON.stringify(classResults),
     )
 
     // A5 SL_RETURN_SINGLE_ENTRY (per-entry retry loop)
     const single = runInjected(['ex-single', WS])
     check(
-      'A5 Ex + SL_RETURN_SINGLE_ENTRY（逐项重试路径）不泄漏、普通条目不丢',
-      single.status === 0 && leaked(single.text).length === 0 && names(single.text).includes('a.txt'),
+      'A5 Ex + SL_RETURN_SINGLE_ENTRY（逐项重试路径）遮蔽名可见、普通条目不丢',
+      single.status === 0 && visible(single.text),
       `status=${single.status} names=${JSON.stringify(names(single.text))}`,
     )
 
@@ -264,39 +285,56 @@ if (process.platform !== 'win32' || !existsSync(DLL) || !existsSync(INJECTOR)) {
       `direct=${directFlags.status} injected=${injFlags.status}`,
     )
 
-    // B1 node readdir carrier
+    // B1 node readdir carrier: visibility parity + the read is still refused
     // (injected node uses the injector directly, not the probe)
     seq += 1
+    const nodeScript =
+      `const fs=require('fs');` +
+      `const d=fs.readdirSync(${JSON.stringify(WS)}).join(',');` +
+      `let r='OK';try{r=String(fs.readFileSync(${JSON.stringify(join(WS, '.npmrc'))},'utf8'))}catch(e){r='ERR:'+e.code}` +
+      `process.stdout.write('DIR:'+d+'|READ:'+r)`
     const node = spawnSync(
       INJECTOR,
-      ['--dll', DLL, '--report', join(SCRATCH, `r-node-${seq}.json`), '--cwd', WS, '--', process.execPath, '-e', `process.stdout.write(require('fs').readdirSync(${JSON.stringify(WS)}).join(','))`],
+      ['--dll', DLL, '--report', join(SCRATCH, `r-node-${seq}.json`), '--cwd', WS, '--', process.execPath, '-e', nodeScript],
       { env, encoding: 'utf8', timeout: 120000 },
     )
     const nodeText = `${node.stdout ?? ''}${node.stderr ?? ''}`
+    const nodeRead = /READ:(.*)$/.exec(nodeText.trim())?.[1] ?? ''
     check(
-      'B1 node fs.readdirSync 载体：注入后遮蔽名不出现、普通条目完整',
-      (node.status ?? -1) === 0 && !nodeText.includes('.npmrc') && !nodeText.includes('.git-credentials') && nodeText.includes('a.txt') && nodeText.includes('b.txt'),
-      `status=${node.status} out=${nodeText.trim().slice(0, 160)}`,
+      'B1 node fs.readdirSync 载体：遮蔽名可见、普通条目完整、读取被拒（新契约第二条）',
+      (node.status ?? -1) === 0 &&
+        nodeText.includes('.npmrc') && nodeText.includes('.git-credentials') &&
+        nodeText.includes('a.txt') && nodeText.includes('b.txt') &&
+        nodeRead.startsWith('ERR') && !nodeRead.includes('R22-MASK-NPMRC'),
+      `status=${node.status} out=${nodeText.trim().slice(0, 200)}`,
     )
 
     // B2 cmd dir carrier
     const CMD = process.env.ComSpec || 'cmd.exe'
-    const cmd = spawnSync(INJECTOR, ['--dll', DLL, '--report', join(SCRATCH, 'r-cmd.json'), '--cwd', WS, '--', CMD, '/d', '/c', 'dir', '/a', '/b', WS], { env, encoding: 'utf8', timeout: 120000 })
+    const cmd = spawnSync(INJECTOR, ['--dll', DLL, '--report', join(SCRATCH, 'r-cmd.json'), '--cwd', WS, '--', CMD, '/d', '/c', `dir /a /b ${WS} & type ${join(WS, '.npmrc')}`], { env, encoding: 'utf8', timeout: 120000 })
     const cmdText = `${cmd.stdout ?? ''}${cmd.stderr ?? ''}`
     check(
-      'B2 cmd `dir /a /b` 载体：注入后遮蔽名不出现、普通条目完整',
-      (cmd.status ?? -1) === 0 && !cmdText.includes('.npmrc') && !cmdText.includes('.git-credentials') && cmdText.includes('a.txt') && cmdText.includes('b.txt'),
-      `status=${cmd.status} out=${cmdText.trim().split(/\r?\n/).slice(0, 8).join(' | ')}`,
+      'B2 cmd `dir /a /b` 载体：遮蔽名可见、普通条目完整、`type` 被拒（新契约第二条）',
+      cmdText.includes('.npmrc') && cmdText.includes('.git-credentials') &&
+        cmdText.includes('a.txt') && cmdText.includes('b.txt') &&
+        !cmdText.includes('R22-MASK-NPMRC'),
+      `status=${cmd.status} out=${cmdText.trim().split(/\r?\n/).slice(0, 10).join(' | ')}`,
     )
 
     // B3 PowerShell Get-ChildItem carrier
     const PS = 'powershell.exe'
-    const ps = spawnSync(INJECTOR, ['--dll', DLL, '--report', join(SCRATCH, 'r-ps.json'), '--cwd', WS, '--', PS, '-NoProfile', '-NonInteractive', '-Command', `(Get-ChildItem -Force -Name ${JSON.stringify(WS)}) -join ','`], { env, encoding: 'utf8', timeout: 180000 })
+    const psCmd =
+      `$d = (Get-ChildItem -Force -Name ${JSON.stringify(WS)}) -join ',';` +
+      `$r = 'OK'; try { $r = (Get-Content -LiteralPath ${JSON.stringify(join(WS, '.npmrc'))} -ErrorAction Stop) -join ';' } catch { $r = 'ERR' };` +
+      `Write-Output ('DIR:' + $d + '|READ:' + $r)`
+    const ps = spawnSync(INJECTOR, ['--dll', DLL, '--report', join(SCRATCH, 'r-ps.json'), '--cwd', WS, '--', PS, '-NoProfile', '-NonInteractive', '-Command', psCmd], { env, encoding: 'utf8', timeout: 180000 })
     const psText = `${ps.stdout ?? ''}${ps.stderr ?? ''}`
     check(
-      'B3 PowerShell `Get-ChildItem -Force` 载体：注入后遮蔽名不出现、普通条目完整',
-      (ps.status ?? -1) === 0 && !psText.includes('.npmrc') && !psText.includes('.git-credentials') && psText.includes('a.txt') && psText.includes('b.txt'),
-      `status=${ps.status} out=${psText.trim().slice(0, 160)}`,
+      'B3 PowerShell `Get-ChildItem -Force` 载体：遮蔽名可见、普通条目完整、`Get-Content` 被拒（新契约第二条）',
+      psText.includes('.npmrc') && psText.includes('.git-credentials') &&
+        psText.includes('a.txt') && psText.includes('b.txt') &&
+        psText.includes('READ:ERR') && !psText.includes('R22-MASK-NPMRC'),
+      `status=${ps.status} out=${psText.trim().slice(0, 200)}`,
     )
 
     // C1 hook really active

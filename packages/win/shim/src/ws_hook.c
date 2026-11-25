@@ -18,6 +18,8 @@
  *     behalf) is NOT covered. See docs/T4-shim?.md "??API ??.
  */
 #include "winstage_internal.h"
+/* offsetof: MSVC reaches it through windows.h, mingw-w64/zig does not. */
+#include <stddef.h>
 
 typedef struct WsHookTarget {
     const char *name;

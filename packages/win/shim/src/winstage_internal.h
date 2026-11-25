@@ -68,6 +68,11 @@ typedef struct WsConfig {
      * direct "you are sandboxed" tell. Internal loader reads happen before the
      * hooks exist and are unaffected. */
     wchar_t pluginRoot[WS_PATH_MAX];
+    /* The agent's workspace root (from the shim config, `workspaceRoot`). Used
+     * only to refuse hiding the plugin root when the two trees overlap: in a dev
+     * checkout the plugin lives inside the workspace, and hiding it made every
+     * enumeration under `<workspace>\packages\...` return nothing. */
+    wchar_t workspaceRoot[WS_PATH_MAX];
     /* Per-session helper dir (neutral copy of the injector/probe + the job file).
      * Keeping the process command line free of `winstage-*` paths is the point:
      * a recon run found the mechanism through `wmic process get CommandLine`. */
