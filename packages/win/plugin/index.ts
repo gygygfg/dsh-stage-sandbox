@@ -40,6 +40,11 @@ export * as risk from './risk.ts'
 export * as approvalHub from './approval-hub.ts'
 export * as reviewState from './review-state.ts'
 export { applyWithGuard, discardAll, renderReview, parseApplyArgs, registerAlignedCommands } from './commands.ts'
+// The review service is the integration seam other processes (and the eval
+// driver) mount to answer a staged change. It has always been reachable by
+// deep import; exporting it from the package entry is what the documentation
+// promises, and what `import('dsh-winstage-sandbox').getReviewService` needs.
+export { getReviewService } from '../dsh-plugin/review-service.ts'
 export { buildAlignedDeps, riskFactsOf, unitOf } from './wire.ts'
 
 /** 插件名（与旧入口逐字一致；`cordis.patch.yml` 的 `name` 断言依赖它）。 */
