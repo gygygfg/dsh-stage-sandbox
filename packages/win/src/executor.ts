@@ -4406,10 +4406,13 @@ export class WindowsStageExecutor {
       const serviceSide = classifyServiceSideWrite(options.command, options.args ?? [], {
         readFile: (path, maxBytes) => {
           try {
-            if (!existsSync(path)) return null
-            const info = statSync(path)
+            // The scan sees the command's own paths (`test.py`, `dist/bundle.py`),
+            // which are relative to the command cwd, not to the host process.
+            const target = isAbsolute(path) ? path : join(cwd, path)
+            if (!existsSync(target)) return null
+            const info = statSync(target)
             if (!info.isFile() || info.size > maxBytes) return null
-            return readFileSync(path, 'utf8')
+            return readFileSync(target, 'utf8')
           } catch {
             return null
           }

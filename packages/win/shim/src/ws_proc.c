@@ -1262,26 +1262,18 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
         int isWmic = (_wcsicmp(base, L"wmic") == 0 || _wcsicmp(base, L"wmic.exe") == 0 ||
                       _wcsicmp(base, L"wmic\"") == 0);
         if (isWmic) {
-            const wchar_t *inner = NULL;
-            int innerLen = 0;
-            int hit = ws_wmic_extract_create(cmd, &inner, &innerLen);
-            if (hit == 2) {
-                ws_log("wmic remote process-create (/node:) cannot be redirected; failing closed");
-                SetLastError(ERROR_ACCESS_DENIED);
-                return FALSE;
-            }
-            if (hit == 1) {
-                /* 2026-11-26：不再改写 WMI 进程创建。
-                 *
-                 * 实测（eval/WINSEC-PREREG.md 的 `wmi-write`）：改写后的内层
-                 * `cmd /c echo > C:\Windows\System32\...` 由未注入的 launcher
-                 * 启动，写的是真实盘；A1 盲批的候选里没有这一行（不可见、不可拒），
-                 * 而 A0 的受限令牌本来会拒绝它。把"看不见的真实写入"交还给调用方，
-                 * 比 fail-closed 更危险。 */
-                ws_log("wmic process call create cannot be staged safely; failing closed");
-                SetLastError(ERROR_ACCESS_DENIED);
-                return FALSE;
-            }
+            /* 2026-11-26：`wmic` 在 CLI 的 shim 档里一律 fail-closed，连只读
+             * 子命令也不放行。
+             *
+             * 原因不是"重写不够好"，而是**解析面不可靠**：`wmic process call
+             * create` 的参数经 Python/`subprocess` 重新拼装后并不总能让
+             * `ws_wmic_extract_create` 命中；未命中时旧代码既不重写也不拒绝，
+             * 真实 WMI 服务照常起子进程（实测 A1 盲批 System32 真的落盘，review
+             * 里没有这一行）。只读 `wmic` 已废弃，拒绝它的代价远小于漏掉一次
+             * 真实写入。 */
+            ws_log("wmic is denied in the shim lane (fail-closed)");
+            SetLastError(ERROR_ACCESS_DENIED);
+            return FALSE;
         }
     }
     /* ★ The decision must look at the FINAL image: the CLI/WMI rewrites above turn

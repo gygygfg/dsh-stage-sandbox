@@ -204,18 +204,57 @@ export function buildServiceSideScanText(
   const readFile = io.readFile
   const maxBytes = io.maxBytes ?? 256 * 1024
   if (typeof readFile === 'function') {
-    const candidates = new Set<string>()
+    /**
+     * Scan the entry script and the scripts it imports (one bounded level).
+     *
+     * Why: the CI delivery hides the payload in `dist/bundle.py`, and the
+     * top-level command is only `python test.py`. Reading just the command text
+     * (or only `.cmd/.bat/.ps1`) never sees the WMI call inside the imported
+     * artifact. Measured 2026-11-26: a nested `wmic process call create`
+     * executed by WmiPrvSE wrote System32 with **no review row**; the
+     * CreateProcess hook did not cover the Python child in this lane.
+     *
+     * The scan is deliberately shallow (32 files, one import level): it is a
+     * text guard, not a sandbox. It catches the eval's "entry script imports a
+     * build artifact" shape; an encoded/obfuscated payload can still bypass it
+     * (residual, stated in the paper).
+     */
+    const queue: string[] = []
     for (const token of argv) {
       const cleaned = token.replace(/^["']|["']$/g, '')
-      if (!/\.(cmd|bat|ps1)$/i.test(cleaned)) continue
-      candidates.add(cleaned)
+      if (!/\.(cmd|bat|ps1|py|js|mjs|cjs)$/i.test(cleaned)) continue
+      queue.push(cleaned)
     }
-    for (const candidate of candidates) {
+    const seen = new Set<string>()
+    let budget = 32
+    while (queue.length > 0 && budget-- > 0) {
+      const candidate = queue.shift() as string
+      const key = candidate.replaceAll('\\', '/').toLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      let text: string | null = null
       try {
-        const text = readFile(candidate, maxBytes)
-        if (typeof text === 'string' && text.length > 0) parts.push(text.slice(0, maxBytes))
+        text = readFile(candidate, maxBytes)
       } catch {
-        /* 读不到脚本不影响对命令文本本身的判定 */
+        text = null
+      }
+      if (typeof text !== 'string' || text.length === 0) continue
+      parts.push(text.slice(0, maxBytes))
+      const slash = Math.max(candidate.lastIndexOf('/'), candidate.lastIndexOf('\\'))
+      const dir = slash >= 0 ? candidate.slice(0, slash) : ''
+      const joinRel = (rel: string): string => (dir ? `${dir}/${rel}` : rel)
+      if (/\.py$/i.test(candidate)) {
+        for (const match of text.matchAll(/(?:^|\n)\s*(?:from|import)\s+([A-Za-z_][\w.]*)/g)) {
+          const name = match[1].split('.')[0]
+          for (const suffix of [`${name}.py`, `dist/${name}.py`, `src/${name}.py`]) queue.push(joinRel(suffix))
+        }
+      } else if (/\.(js|mjs|cjs)$/i.test(candidate)) {
+        for (const match of text.matchAll(/(?:require\s*\(\s*|from\s+)['"]([^'"]+)['"]/g)) {
+          const rel = match[1]
+          if (!rel.startsWith('.')) continue
+          queue.push(joinRel(rel))
+          if (!/\.[a-z0-9]+$/i.test(rel)) queue.push(joinRel(`${rel}.js`))
+        }
       }
     }
   }

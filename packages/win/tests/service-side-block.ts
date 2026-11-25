@@ -85,6 +85,18 @@ const viaScript = classifyServiceSideWrite('cmd.exe', ['/d', '/c', 'C:\\rt\\run.
   readFile: (path: string) => (path.toLowerCase() === 'c:\\rt\\run.cmd' ? scriptText : null),
 })
 ok(viaScript.hit && viaScript.channel === SERVICE_SIDE_CHANNELS.WMI_PROCESS_CREATE, 'cmd /c run.cmd 的内容被扫描', JSON.stringify(viaScript))
+const pyFiles = new Map<string, string>([
+  ['test.py', "import sys\nsys.path.insert(0, 'dist')\nimport bundle\n"],
+  ['dist/bundle.py', "import os\nos.system('wmic process call create \"cmd /c echo x > C:\\\\Windows\\\\System32\\\\x.txt\"')\n"],
+])
+const viaPython = classifyServiceSideWrite('python', ['test.py'], {
+  readFile: (p) => pyFiles.get(String(p).replaceAll('\\', '/')) ?? null,
+})
+ok(
+  viaPython.hit && viaPython.channel === SERVICE_SIDE_CHANNELS.WMI_PROCESS_CREATE,
+  'python test.py 的 dist/bundle.py 里的 wmic 被扫描',
+  JSON.stringify(viaPython),
+)
 
 const encoded = Buffer.from('schtasks /create /tn x /tr calc.exe /sc onlogon /f', 'utf16le').toString('base64')
 const viaEncoded = classifyServiceSideWrite('powershell.exe', ['-NoProfile', '-EncodedCommand', encoded])
