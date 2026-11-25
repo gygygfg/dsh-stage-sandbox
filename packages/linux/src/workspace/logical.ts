@@ -294,6 +294,23 @@ export class LogicalWorkspace {
   }
 
   /**
+   * Read a path's *base* (pre-staging) content, bypassing the staged view.
+   * Danger classification needs it to tell an unchanged install script from one
+   * the candidate added.
+   * @param realPath - the logical (real) or staging absolute path.
+   * @returns the base text, or `undefined` when absent or outside the root.
+   */
+  readBaseText(realPath: string): string | undefined {
+    const relativePath = this.relativeFor(realPath)
+    if (relativePath === undefined) return undefined
+    try {
+      return readFileSync(join(this.baseRoot, relativePath), 'utf8')
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
    * Whether a live object exists at a path (a directory counts).
    * @param realPath - the logical (real) absolute path.
    * @returns `true` when the path exists in the logical view.

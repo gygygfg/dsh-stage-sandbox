@@ -29,21 +29,25 @@ export function diffManifests(base: readonly ManifestEntry[], after: readonly Ma
   for (const [path, entry] of now) {
     const previous = before.get(path)
     if (previous === undefined) {
-      impacts.push(impact('create', path, null, entry.digest ?? null, evidenceId))
+      impacts.push(impact('create', path, null, entry.digest ?? null, evidenceId, null, entry.size ?? null))
       continue
     }
     if (fingerprint(previous) !== fingerprint(entry)) {
       const kind = (previous.digest ?? null) !== (entry.digest ?? null) ? 'write' : 'metadata'
-      impacts.push(impact(kind, path, previous.digest ?? null, entry.digest ?? null, evidenceId))
+      impacts.push(impact(kind, path, previous.digest ?? null, entry.digest ?? null, evidenceId,
+        previous.size ?? null, entry.size ?? null))
     }
   }
   for (const [path, entry] of before) {
-    if (!now.has(path)) impacts.push(impact('delete', path, entry.digest ?? null, null, evidenceId))
+    if (!now.has(path)) impacts.push(impact('delete', path, entry.digest ?? null, null, evidenceId, entry.size ?? null, null))
   }
   return impacts.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
 }
 
 /** Build one observed filesystem impact. */
-function impact(kind: FsImpact['kind'], path: string, beforeHash: string | null, afterHash: string | null, evidenceId: string): FsImpact {
-  return { kind, path, beforeHash, afterHash, source: 'observed', coverage: 'complete', evidenceId }
+function impact(
+  kind: FsImpact['kind'], path: string, beforeHash: string | null, afterHash: string | null,
+  evidenceId: string, beforeBytes: number | null = null, afterBytes: number | null = null,
+): FsImpact {
+  return { kind, path, beforeHash, afterHash, beforeBytes, afterBytes, source: 'observed', coverage: 'complete', evidenceId }
 }

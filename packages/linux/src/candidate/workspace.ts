@@ -159,6 +159,11 @@ export class CandidateWorkspace {
     return this.logical.readText(realPath)
   }
 
+  /** Read the pre-staging (base) content of a path. */
+  readBaseText(realPath: string): string | undefined {
+    return this.logical.readBaseText(realPath)
+  }
+
   /**
    * Write a real file through the staging tree.
    * @param realPath - the real absolute path.

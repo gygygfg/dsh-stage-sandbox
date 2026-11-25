@@ -24,6 +24,10 @@ export interface FsImpact {
   readonly beforeHash: string | null
   /** The content digest after the effect, or `null` when absent/unknown. */
   readonly afterHash: string | null
+  /** The byte size before the effect, when the backend observed it. */
+  readonly beforeBytes?: number | null
+  /** The byte size after the effect, when the backend observed it. */
+  readonly afterBytes?: number | null
   /** Whether the record was observed or estimated. */
   readonly source: ImpactSource
   /** The category coverage at the time. */

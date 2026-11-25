@@ -520,7 +520,10 @@ export class WorkspaceStagingService extends Service {
       changes,
       commands,
       cwd: workspaceRoot,
-      ...(workspace === undefined ? {} : { readFile: (path: string) => workspace.readText(path) }),
+      ...(workspace === undefined ? {} : {
+        readFile: (path: string) => workspace.readText(path),
+        readBase: (path: string) => workspace.readBaseText(path),
+      }),
     })
   }
 

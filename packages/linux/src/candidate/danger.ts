@@ -76,6 +76,11 @@ export interface DangerInput {
   /** The number of file changes above which a bulk-edit reason is raised; defaults to 20. */
   readonly bulkThreshold?: number
   /**
+   * Reads the *base* (pre-staging) content of a workspace path. Used to tell a
+   * manifest's unchanged scripts from ones the candidate added or rewrote.
+   */
+  readonly readBase?: (path: string) => string | undefined
+  /**
    * The working directory commands ran in, for resolving scripts they
    * delegate to. Defaults to the workspace root.
    */
@@ -146,6 +151,26 @@ const DOWNLOADERS: ReadonlySet<string> = new Set(['curl', 'wget', 'aria2c'])
 /** Network senders that could exfiltrate data. */
 const NETWORK_SENDERS: ReadonlySet<string> = new Set(['curl', 'wget', 'scp', 'rsync', 'nc', 'ncat', 'socat', 'ssh', 'ftp', 'tftp'])
 
+/**
+ * Interpreters that can open a socket from an inline program. A red-team
+ * payload rarely calls `curl`; it calls the language it is already running.
+ */
+const INLINE_NET_CLIENTS: ReadonlySet<string> = new Set(['python', 'python3', 'node', 'deno', 'bun', 'perl', 'ruby', 'php'])
+
+/** Manifest files whose script entries run automatically on install/publish. */
+const MANIFEST_FILES: readonly string[] = [
+  'package.json', 'pyproject.toml', 'setup.py', 'setup.cfg', 'composer.json', 'cargo.toml', 'go.mod',
+]
+
+/** Lifecycle script names that execute on install, publish, or pack. */
+const LIFECYCLE_SCRIPT = /(?:^|[^a-z])(?:postinstall|preinstall|prepare|prepublish|prepack|postpack)(?:[^a-z]|$)/iu
+
+/** Shell/interpreter fragments that turn a lifecycle script into code execution. */
+const SCRIPT_EXEC = /(?:curl|wget|powershell|sh\s+-c|bash\s+-c|node\s+-e|python\d?\s+-c|base64\s+-d|\|\s*(?:ba)?sh\b)/iu
+
+/** Inline network APIs, so an interpreter sending data is not mistaken for a local script. */
+const INLINE_NETWORK = /\b(?:urllib|http\.client|httplib|requests|socket|fetch|axios|https?)\.?/iu
+
 /** Whether a manifest path escapes the workspace root. */
 function escapesWorkspace(path: string): boolean {
   if (isAbsolute(path)) return true
@@ -164,6 +189,18 @@ function isSystemPath(path: string): boolean {
 /** Whether a path contains a protected segment. */
 function hasSensitiveSegment(path: string): boolean {
   return path.split(/[\\/]/u).some(segment => SENSITIVE_SEGMENTS.includes(segment))
+}
+
+/**
+ * Whether free text (a command line, not a path) names a protected object.
+ * A payload writes `open('.env')`, not a path with separators, so segment-wise
+ * path matching alone would miss it.
+ * @param text - the command line.
+ * @returns true when a protected name appears as a word.
+ */
+function mentionsSensitive(text: string): boolean {
+  const words = text.split(/[^a-z0-9._-]+/u)
+  return words.some(word => SENSITIVE_SEGMENTS.includes(word))
 }
 
 /** Extract the first http(s) URL from a command line, if any. */
@@ -213,9 +250,60 @@ function installsThirdParty(exe: string, args: readonly string[], commandLine: s
   return false
 }
 
+
+/** Manifest files whose `scripts` object runs automatically on install. */
+const JSON_MANIFESTS = new Set(['package.json', 'composer.json'])
+
+/**
+ * Reasons a manifest write adds or rewrites an install-time script.
+ *
+ * A payload hidden in a build artifact only leaves an ordinary-looking write to
+ * `package.json`; the command line says `python3 test.py`. The only evidence is
+ * the file content, which is why the classifier compares the staged manifest
+ * with its base version instead of trusting the change kind.
+ * @param change - the staged change.
+ * @param workspaceRoot - the real workspace root.
+ * @param input - the readers supplied by the workspace service.
+ * @returns the manifest-script reasons.
+ */
+function classifyManifest(change: FsImpact, workspaceRoot: string, input: DangerInput): DangerReason[] {
+  const name = basename(change.path).toLowerCase()
+  if (!JSON_MANIFESTS.has(name)) return []
+  if (change.kind !== 'write' && change.kind !== 'create') return []
+  if (isAbsolute(change.path) || change.path.startsWith('..')) return []
+  const read = input.readFile
+  if (read === undefined) return []
+  const absolute = `${workspaceRoot.replace(/\/$/u, '')}/${change.path}`
+  const parse = (text: string | undefined): Record<string, unknown> | undefined => {
+    if (text === undefined) return undefined
+    try {
+      const parsed = JSON.parse(text) as unknown
+      return typeof parsed === 'object' && parsed !== null ? parsed as Record<string, unknown> : undefined
+    } catch {
+      return undefined
+    }
+  }
+  const now = parse(read(absolute))
+  if (now === undefined) return []
+  const before = parse(input.readBase?.(absolute)) ?? {}
+  const scriptsOf = (manifest: Record<string, unknown>): Record<string, unknown> =>
+    typeof manifest.scripts === 'object' && manifest.scripts !== null ? manifest.scripts as Record<string, unknown> : {}
+  const oldScripts = scriptsOf(before)
+  const newScripts = scriptsOf(now)
+  const reasons: DangerReason[] = []
+  for (const [key, value] of Object.entries(newScripts)) {
+    if (typeof value !== 'string' || oldScripts[key] === value) continue
+    if (SCRIPT_EXEC.test(value)) {
+      reasons.push({ code: 'MANIFEST_SCRIPT_INJECTION', level: 'L3', detail: `install script "${key}" runs a shell command (${value.slice(0, 80)})`, path: change.path })
+    } else {
+      reasons.push({ code: 'MANIFEST_SCRIPT_ADDED', level: 'L2', detail: `adds or rewrites the install script "${key}"`, path: change.path })
+    }
+  }
+  return reasons
+}
+
 /** Classify one staged filesystem change. */
-function classifyChange(change: FsImpact, workspaceRoot: string): DangerReason[] {
-  void workspaceRoot
+function classifyChange(change: FsImpact, workspaceRoot: string, input: DangerInput): DangerReason[] {
   const reasons: DangerReason[] = []
   const system = isSystemPath(change.path)
   const escape = escapesWorkspace(change.path)
@@ -232,11 +320,28 @@ function classifyChange(change: FsImpact, workspaceRoot: string): DangerReason[]
   if (DESTRUCTIVE_KINDS.has(change.kind) && !system) {
     reasons.push({ code: `DESTRUCTIVE_${change.kind.toUpperCase()}`, level: 'L2', detail: `${change.kind} of ${change.path} is not easily undone`, path: change.path })
   }
+  // A write that removes the file's content is a deletion the user did not ask
+  // for: the path still exists, so a path-only policy sees an ordinary write.
+  const beforeBytes = change.beforeBytes ?? 0
+  const afterBytes = change.afterBytes ?? 0
+  const wiped = change.kind === 'write' && beforeBytes >= 64 && afterBytes === 0
+  const shrunk = change.kind === 'write' && beforeBytes >= 1024 && afterBytes <= beforeBytes / 2
+  if (wiped) {
+    reasons.push({ code: 'CONTENT_WIPED', level: 'L3', detail: `${change.path} was truncated from ${beforeBytes} bytes to empty`, path: change.path })
+  } else if (shrunk) {
+    reasons.push({ code: 'CONTENT_TRUNCATED', level: 'L2', detail: `${change.path} shrank from ${beforeBytes} to ${afterBytes} bytes`, path: change.path })
+  }
+  // A git hook runs on the user's next commit, outside this sandbox.
+  if (/(?:^|\/)\.git\/hooks\//u.test(change.path) && !system) {
+    reasons.push({ code: 'PERSISTENCE_HOOK', level: 'L2', detail: `installs a git hook that runs on later commands (${change.path})`, path: change.path })
+  }
   if (change.kind === 'metadata') {
     reasons.push({ code: 'METADATA_CHANGE', level: 'L2', detail: `permission or metadata change on ${change.path}`, path: change.path })
   }
   // An ordinary workspace write that touches nothing protected is L1 (green).
-  if (!system && !escape && !sensitive && !DESTRUCTIVE_KINDS.has(change.kind) && change.kind !== 'metadata') {
+  const hook = /(?:^|\/)\.git\/hooks\//u.test(change.path)
+  if (!system && !escape && !sensitive && !DESTRUCTIVE_KINDS.has(change.kind) && change.kind !== 'metadata'
+      && !hook && !wiped && !shrunk) {
     reasons.push({ code: 'WORKSPACE_WRITE', level: 'L1', detail: `${change.kind} of ${change.path}`, path: change.path })
   }
   return reasons
@@ -300,9 +405,18 @@ function classifyCommand(intent: CommandIntent): DangerReason[] {
     reasons.push({ code: 'PRIVILEGE_ESCALATION', level: 'L2', detail: `runs with elevated privileges (${line.slice(0, 120)})` })
   }
 
-  // Sensitive data sent to a remote host.
-  if (NETWORK_SENDERS.has(exe) && hasSensitiveSegment(line)) {
+  // Sensitive data sent to a remote host. A payload usually runs inside the
+  // language already at hand, so an inline program counts as a network sender
+  // when it also names a sensitive path.
+  const networkish = url !== undefined || INLINE_NETWORK.test(line)
+  if ((NETWORK_SENDERS.has(exe) || INLINE_NET_CLIENTS.has(exe)) && networkish && mentionsSensitive(line)) {
     reasons.push({ code: 'SENSITIVE_EXFIL', level: 'L3', detail: `may send sensitive data to a remote host (${line.slice(0, 120)})` })
+  }
+
+  // Adding a lifecycle script to a manifest is persistence plus code execution
+  // on the next install, even when the file change itself looks like a write.
+  if (MANIFEST_FILES.some(manifest => line.includes(manifest)) && LIFECYCLE_SCRIPT.test(line) && SCRIPT_EXEC.test(line)) {
+    reasons.push({ code: 'MANIFEST_SCRIPT_INJECTION', level: 'L3', detail: `adds an install-time script to a manifest (${line.slice(0, 120)})` })
   }
 
   // A raw git mutation couples `.git` (index/object/ref) and must be reviewed;
@@ -342,7 +456,10 @@ function consequencesOf(level: DangerLevel, reasons: readonly DangerReason[]): s
 export function assessDanger(input: DangerInput): DangerAssessment {
   const reasons: DangerReason[] = []
   const bulkThreshold = input.bulkThreshold ?? 20
-  for (const change of input.changes) reasons.push(...classifyChange(change, input.workspaceRoot))
+  for (const change of input.changes) {
+    reasons.push(...classifyChange(change, input.workspaceRoot, input))
+    reasons.push(...classifyManifest(change, input.workspaceRoot, input))
+  }
   for (const command of input.commands ?? []) {
     reasons.push(...classifyCommand(command))
     if (input.readFile === undefined) continue
