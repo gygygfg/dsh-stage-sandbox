@@ -108,6 +108,8 @@ import {
   writeBarrierFor,
   // ── R45：T1S（受限令牌 + shim）是**已生效**档位，不是"降级" ──────────────────
   T1S_LAUNCH_MODE,
+  // ── 2026-11-26：请求档位 `auto`/`TS` 时不因 ACL 缺失提前拒绝（shim 通道不需要 ACL）──
+  TRANSPARENT_TIER,
   // ── WP6/WP7′：错误语义分层 + 限制即失败（同一口径，不另造第二套判定）──────────
   //   `classifyFailureSemantics` / `transparencyViolations` 是**纯函数**，
   //   本文件与 `_r3/wp6-test.ts` 复用同一份实现 ⇒ 两处口径不会漂移。
@@ -2111,20 +2113,43 @@ export function createWinStageShellExecutor(options = {}) {
       try {
         const capabilities =
           typeof executor.capabilities === 'function' ? executor.capabilities() : { aclAvailable: false }
-        if (!capabilities || capabilities.aclAvailable !== true) {
+        const aclMissing = !capabilities || capabilities.aclAvailable !== true
+        /**
+         * ★ 2026-11-26（Windows CLI 实测）：ACL 缺失**不等于**执行后端不可用。
+         *
+         * 透明垫片档（`tier:'auto'|'TS'`）的子进程是**普通令牌**，写面由 shim 在用户态
+         * 暂存，整条通道**不需要** `@deepseek-ai/dsh-sandbox-windows-acl`（`src/executor.ts`
+         * 的 `init()` 在 `launchMode === 'shim'` 时直接 `initTransparent()` 返回，ACL 闸门
+         * 根本不在那条路径上）。而这里曾无条件按 `aclAvailable` 拒绝 ⇒
+         * **shim 明明可用也被判成"执行后端不可用"**，模型只看到
+         * `ENV_FAULT_RETRYABLE: 执行环境故障`（实测：Win10 + DSH 0.2.2-rc.5 的 CLI 通道，
+         * `pwsh` 未安装时更是无从判断是解释器还是 ACL）。
+         *
+         * 现在的口径：**显式 ACL 档（T1/T1S/T0）仍然在这里 fail-closed**（缺 ACL ⇒ 立即
+         * 拒绝，文案与历史逐字相同）；`auto`/`TS` 交给紧接着的 `executor.init()` 判定——
+         * shim 探测通过就走透明档，探测不过则 `init()` 自己抛 `SANDBOX_UNAVAILABLE`
+         * （下面 `WINSTAGE_SHELL_INIT_FAILED` 分支），**仍然不会退回未受限执行**。
+         */
+        const requestedTier = String(this.tier ?? 'auto').toUpperCase()
+        const tierMayUseShim = requestedTier === 'AUTO' || requestedTier === TRANSPARENT_TIER
+        if (aclMissing) {
           // 机制措辞（aclAvailable / aclError）只进人工侧通道：模型只看到"环境故障、可重试"。
           this.logError(
             '执行后端不可用：' +
               `aclAvailable=${JSON.stringify(capabilities?.aclAvailable ?? null)}` +
-              `${capabilities?.aclError ? `, ${capabilities.aclError}` : ''}；` +
-              '本设计不允许退回未受限执行 ⇒ 本次命令没有执行。',
+              `${capabilities?.aclError ? `, ${capabilities.aclError}` : ''}` +
+              (tierMayUseShim
+                ? `；请求档位 ${requestedTier} 允许透明垫片通道，交由 init() 判定（垫片不可用则拒绝执行）。`
+                : '；本设计不允许退回未受限执行 ⇒ 本次命令没有执行。'),
           )
-          throw semanticShellFailure('WINSTAGE_SHELL_EXECUTION_BACKEND_UNAVAILABLE', {
-            winstage: {
-              aclAvailable: capabilities?.aclAvailable ?? null,
-              aclError: capabilities?.aclError ?? null,
-            },
-          })
+          if (!tierMayUseShim) {
+            throw semanticShellFailure('WINSTAGE_SHELL_EXECUTION_BACKEND_UNAVAILABLE', {
+              winstage: {
+                aclAvailable: capabilities?.aclAvailable ?? null,
+                aclError: capabilities?.aclError ?? null,
+              },
+            })
+          }
         }
         if (typeof executor.init !== 'function' || typeof executor.run !== 'function') {
           throw semanticShellFailure('WINSTAGE_SHELL_EXECUTOR_INVALID')
