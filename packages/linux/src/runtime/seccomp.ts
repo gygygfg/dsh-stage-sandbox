@@ -26,7 +26,6 @@ const BPF_RET_K = 0x06
 const SECCOMP_RET_KILL_PROCESS = 0x80000000
 const SECCOMP_RET_ALLOW = 0x7fff0000
 const SECCOMP_RET_ERRNO_EPERM = 0x00050000 + 1
-const SECCOMP_RET_ERRNO_ENOSYS = 0x00050000 + 38
 const AUDIT_ARCH_X86_64 = 0xc000003e
 const AUDIT_ARCH_AARCH64 = 0xc00000b7
 /** `__X32_SYSCALL_BIT`: x32 shares the x86_64 arch but offsets the number. */
@@ -36,8 +35,6 @@ const X32_SYSCALL_BIT = 0x40000000
 const ARG0_OFFSET = 16
 const ARG1_OFFSET = 24
 const ARG2_OFFSET = 32
-/** clone(2) namespace flags: NEWNS|NEWCGROUP|NEWUTS|NEWIPC|NEWUSER|NEWPID|NEWNET. */
-const CLONE_NS_MASK = 0x7e020000
 /** mknod mode device bits: S_IFCHR(0x2000) | S_IFBLK(0x6000). */
 const S_IFDEV_MASK = 0x6000
 /** Allowed socket address families: AF_UNIX/AF_INET/AF_INET6/AF_NETLINK. */
@@ -46,8 +43,6 @@ const AF_ALLOW: readonly number[] = [1, 2, 10, 16]
 /** One architecture's denylist. */
 interface ArchSpec {
   readonly audit: number
-  readonly clone: number
-  readonly clone3?: number
   readonly socket: number
   readonly x32Guard?: boolean
   readonly mknod?: number
@@ -58,8 +53,6 @@ interface ArchSpec {
 const ARCH: Record<string, ArchSpec> = {
   x86_64: {
     audit: AUDIT_ARCH_X86_64,
-    clone: 56,
-    clone3: 435,
     socket: 41,
     x32Guard: true,
     mknod: 133,
@@ -73,7 +66,6 @@ const ARCH: Record<string, ArchSpec> = {
   },
   aarch64: {
     audit: AUDIT_ARCH_AARCH64,
-    clone: 220,
     socket: 198,
     mknodat: 33,
     blocked: [
@@ -132,16 +124,13 @@ export function buildSeccompFilter(arch: string): Uint8Array | undefined {
     for (let i = 0; i < n; i += 1) w.insn(BPF_JEQ_K, n - i + 1, 0, AF_ALLOW[i] as number)
     w.insn(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM)
   }
-  // clone: deny namespace-creating flags, else allow.
-  w.insn(BPF_JEQ_K, 0, 3, spec.clone)
-  w.insn(BPF_LD_ABS, 0, 0, ARG0_OFFSET)
-  w.insn(BPF_JSET_K, 0, 1, CLONE_NS_MASK)
-  w.insn(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM)
-  // clone3: can't deref the flags pointer → ENOSYS so glibc falls back to clone.
-  if (spec.clone3 !== undefined) {
-    w.insn(BPF_JEQ_K, 0, 1, spec.clone3)
-    w.insn(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_ENOSYS)
-  }
+  // clone(2) is deliberately NOT filtered. bwrap installs `--seccomp` before it
+  // finishes creating its own namespaces on current kernels (observed on 6.12),
+  // so a CLONE_NEW* denial makes the wrapper itself fail with a misleading
+  // "Creating new namespace failed: Operation not permitted" — every confined
+  // command dies before exec. Namespace isolation stays with bwrap's mount/pid/
+  // user namespaces, and `unshare(2)`/`setns(2)` remain denied below, so the
+  // payload cannot move itself into a new namespace it controls.
   // mknod/mknodat: deny device nodes (mode has S_IFCHR/S_IFBLK).
   if (spec.mknod !== undefined) {
     w.insn(BPF_JEQ_K, 0, 3, spec.mknod)
@@ -183,7 +172,7 @@ export function ensureSeccompFilter(options: SeccompOptions, dir: string, arch: 
   if (name === undefined) return { ok: false, reason: `SANDBOX_SECCOMP_ARCH_UNSUPPORTED: ${arch}` }
   const bytes = buildSeccompFilter(name)
   if (bytes === undefined) return { ok: false, reason: `SANDBOX_SECCOMP_BUILD_FAILED: ${name}` }
-  const path = join(dir, `baseline-v1-${name}.bpf`)
+  const path = join(dir, `baseline-v2-${name}.bpf`)
   try {
     mkdirSync(dir, { recursive: true })
     writeFileSync(path, bytes)

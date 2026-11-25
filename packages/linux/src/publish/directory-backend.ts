@@ -9,7 +9,7 @@
  * @module dsh-sandbox-linux/publish/directory-backend
  */
 
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { CandidateRef } from '../control/records.ts'
 import { digestFile, manifestDigest, scanTree, type ManifestEntry } from '../candidate/manifest.ts'
@@ -34,7 +34,9 @@ function removePath(path: string): void {
   const stats = lstatSync(path)
   if (stats.isDirectory() && !stats.isSymbolicLink()) {
     for (const name of readdirSync(path)) removePath(join(path, name))
-    rmSync(path, { recursive: false, force: true })
+    // `rm` treats "is a directory" as an error (EISDIR) even when empty; a
+    // directory has to be removed with rmdir once its children are gone.
+    rmdirSync(path)
     return
   }
   unlinkSync(path)

@@ -11,7 +11,7 @@
  * @module dsh-sandbox-linux
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { launcherPath as landlockLauncherPath } from '@deepseek-ai/node-addon-system/landlock-run'
@@ -47,6 +47,25 @@ import type { BackendDeps, Runner, SandboxInternals } from './backends.ts'
 import { bwrapProfileArgs, landlockProfileArgs } from './profiles.ts'
 
 export type { SandboxInternals } from './backends.ts'
+
+/**
+ * Pick the directory generated seccomp baselines are written under. The default
+ * tmpdir is masked by the sandbox profile's private `/tmp`, so prefer
+ * `/var/lib/dsh-seccomp`: `/var/lib` is part of the profile's read-only
+ * whitelist and therefore visible at any nesting depth (a resident shell spawns
+ * the filter wrapper from inside the sandbox). Falls back to tmpdir when that
+ * directory cannot be created (unprivileged installs).
+ * @returns the writable directory to generate baselines into.
+ */
+function resolveSeccompDir(): string {
+  const preferred = '/var/lib/dsh-seccomp'
+  try {
+    mkdirSync(preferred, { recursive: true, mode: 0o755 })
+    return preferred
+  } catch {
+    return join(tmpdir(), 'dsh-seccomp')
+  }
+}
 
 /** Plugin config. All optional — `static Config` supplies the defaults. */
 export interface Config {
@@ -218,7 +237,7 @@ export class LinuxSandboxProvider extends SandboxProvider {
     this.probeTimeoutMs = config.probeTimeoutMs as number
     assertPositiveFinite('probeTimeoutMs', this.probeTimeoutMs)
     this.runtime = buildRuntimeOptions(config)
-    this.seccompDir = join(tmpdir(), 'dsh-seccomp')
+    this.seccompDir = resolveSeccompDir()
     ctx.effect(() => () => {
       this.overlays.clear()
     })
@@ -293,6 +312,20 @@ export class LinuxSandboxProvider extends SandboxProvider {
     if ((this.internals.platform ?? process.platform) !== 'linux') return false
     if (this.runnerCommand !== undefined) return false
     return this.overlaySupport ??= probeOverlaySupport(this.probeTimeoutMs)
+  }
+
+  /**
+   * Whether an overlay can be mounted for a branch whose staging tree lives at
+   * `stagingRoot`. bwrap mounts the profile's private tmpfs roots before the
+   * overlay, so a staging tree under one of them (`<tmpdir>/dsh-logical-*` by
+   * default) is unreachable and bwrap fails with "Can't find source path".
+   * Callers fall back to the full-copy staging tree in that case.
+   * @param stagingRoot - the branch's staging tree on the host.
+   * @returns true when the overlay path is usable for this branch.
+   */
+  overlayUsable(stagingRoot: string): boolean {
+    if (!this.overlaySupported()) return false
+    return !this.runtime.tmpfsRoots.some(root => stagingRoot === root || stagingRoot.startsWith(`${root}/`))
   }
 
   /**
@@ -381,6 +414,12 @@ export class LinuxSandboxProvider extends SandboxProvider {
     const profile = bwrapProfileArgs(policy, this.runtime, overlay)
     const seccomp = this.resolveSeccomp()
     if (seccomp === undefined) return ['bwrap', ...profile]
+    // The wrapper opens the filter before bwrap starts, but a *resident* shell
+    // spawns it from inside the sandbox, where a tmpfs root masks the default
+    // location. Bind the file in so every nesting depth can open it.
+    if (this.runtime.tmpfsRoots.some(root => seccomp === root || seccomp.startsWith(`${root}/`))) {
+      profile.push('--ro-bind-try', seccomp, seccomp)
+    }
     return seccompWrapper(seccomp, ['bwrap', ...profile, '--seccomp', '9'])
   }
 

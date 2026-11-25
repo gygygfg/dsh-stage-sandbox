@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process'
 import { mkdtempSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -55,7 +56,7 @@ describe('seccomp filter', () => {
       expect(resolution.ok).toBe(true)
       if (resolution.ok) {
         expect(statSync(resolution.path).size % 8).toBe(0)
-        expect(resolution.path).toContain('baseline-v1-x86_64.bpf')
+        expect(resolution.path).toContain('baseline-v2-x86_64.bpf')
       }
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -70,4 +71,52 @@ describe('seccomp filter', () => {
     expect(argv[2]).toContain('exec "$@"')
     expect(argv.slice(3)).toEqual(['bash', 'bwrap', '--seccomp', '9', '--', '/bin/true'])
   })
+
+  // Regression: the baseline used to deny clone(2)/clone3(2) with CLONE_NEW*
+  // flags. bwrap installs the filter before it finishes creating its own
+  // namespaces, so every confined command died with
+  //   bwrap: Creating new namespace failed: Operation not permitted
+  // before it ever reached the payload.
+  it.skipIf(process.platform !== 'linux' || spawnSync('bwrap', ['--version']).status !== 0)(
+    'does not stop bwrap from creating its own namespaces',
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), 'dsh-seccomp-run-'))
+      try {
+        const resolution = ensureSeccompFilter({ enabled: true, require: false }, dir, 'x64')
+        expect(resolution.ok).toBe(true)
+        if (!resolution.ok) return
+        const argv = seccompWrapper(resolution.path, [
+          'bwrap', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--die-with-parent',
+          '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc',
+          '--seccomp', '9', '--', '/bin/true',
+        ])
+        const run = spawnSync(argv[0] as string, argv.slice(1) as string[], { encoding: 'utf8' })
+        expect(run.stderr).not.toContain('Creating new namespace failed')
+        expect(run.status).toBe(0)
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  // The escape it was meant to stop is still stopped: `unshare(2)` stays denied.
+  it.skipIf(process.platform !== 'linux' || spawnSync('bwrap', ['--version']).status !== 0)(
+    'still denies unshare(2) inside the payload',
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), 'dsh-seccomp-uns-'))
+      try {
+        const resolution = ensureSeccompFilter({ enabled: true, require: false }, dir, 'x64')
+        expect(resolution.ok).toBe(true)
+        if (!resolution.ok) return
+        const argv = seccompWrapper(resolution.path, [
+          'bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc',
+          '--seccomp', '9', '--', 'unshare', '-Ur', 'true',
+        ])
+        const run = spawnSync(argv[0] as string, argv.slice(1) as string[], { encoding: 'utf8' })
+        expect(run.status).not.toBe(0)
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    },
+  )
 })

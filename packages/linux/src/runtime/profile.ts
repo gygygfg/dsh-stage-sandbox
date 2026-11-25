@@ -314,6 +314,9 @@ export function bwrapProfileArgs(
     if (overlay === undefined) {
       args.push('--bind', policy.workspaceRoot, policy.workspaceRoot)
     } else {
+      // A staging tree under a masked tmpfs root cannot be mounted here (the
+      // source is already hidden); callers pick the full-copy path instead
+      // (see `SandboxProvider.overlayUsable`).
       args.push('--overlay-src', policy.workspaceRoot, '--overlay', overlay.upper, overlay.work, policy.workspaceRoot)
       for (const bind of overlay.binds ?? []) {
         args.push(bind.readOnly === true ? '--ro-bind' : '--bind', bind.src, bind.dest)

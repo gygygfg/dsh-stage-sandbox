@@ -94,6 +94,8 @@ export class LogicalWorkspace {
   /** A private empty directory for an overlay `work` sibling, created lazily. */
   private overlayWorkDir: string | null = null
   private revision = 0
+  /** Whether the full base snapshot has been copied into the staging tree. */
+  private fullView = false
 
   /**
    * @param options - the base root, scope, evidence pointer, and staging parent.
@@ -139,6 +141,20 @@ export class LogicalWorkspace {
     if (!this.copyOnWrite && existsSync(this.baseRoot)) {
       cpSync(this.baseRoot, this.stagingRoot, { recursive: true, force: true, errorOnExist: false })
     }
+  }
+
+  /**
+   * Make the staging tree a complete private copy of the base so a *command*
+   * redirected into it sees every base file. The copy-on-write delta is enough
+   * for the filesystem provider (it merges base + delta on read), but a shell
+   * executor works on real paths: without this the command runs in an empty
+   * directory. Existing staged files win, so calling it after a write is safe.
+   */
+  ensureFullView(): void {
+    this.materialize()
+    if (this.fullView || !existsSync(this.baseRoot)) return
+    cpSync(this.baseRoot, this.stagingRoot, { recursive: true, force: false, errorOnExist: false })
+    this.fullView = true
   }
 
   /**
@@ -442,7 +458,9 @@ export class LogicalWorkspace {
   /** The current logical entries: base ∪ staged delta, minus deletions. */
   entries(): ManifestEntry[] {
     this.materialize()
-    if (!this.copyOnWrite) {
+    // A full view is authoritative on its own: scanning it is what makes a
+    // command's deletions visible (the base+delta merge cannot see them).
+    if (!this.copyOnWrite || this.fullView) {
       const entries = scanTree(this.stagingRoot)
       return this.deletions.size === 0 ? entries : entries.filter(entry => !this.isDeletedOrUnderDeleted(entry.path))
     }

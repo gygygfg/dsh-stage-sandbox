@@ -217,6 +217,14 @@ export class WorkspaceStagingService extends Service {
       evidenceId: `evidence:fs:${workspaceRoot}:${branchId}`,
       copyOnWrite: this.copyOnWrite,
     })
+    // Copy-on-write assumes the bwrap overlay can be mounted for this branch.
+    // When it cannot (staging under a masked tmpfs root), commands fall back to
+    // the staging tree, which then has to be a complete copy or the shell runs
+    // in an empty directory.
+    const provider = this.ctx.get('sandbox', false) as LinuxSandboxProvider | undefined
+    if (this.copyOnWrite && provider?.overlayUsable?.(workspace.root) !== true) {
+      workspace.ensureFullView()
+    }
     this.branches.set(key, workspace)
     return workspace
   }

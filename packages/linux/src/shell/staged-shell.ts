@@ -104,7 +104,8 @@ export class StagedShellExecutor extends SandboxBashExecutor {
     const policy = staged.sandboxPolicy
     if (policy === undefined || policy.mode === 'danger-full-access') return false
     if (!this.ctx.sandboxWorkspace.residentEnabled) return false
-    return this.provider()?.overlaySupported() === true
+    const workspace = this.ctx.sandboxWorkspace.workspaceFor(policy.workspaceRoot)
+    return this.provider()?.overlayUsable(workspace.root) === true
   }
 
   /** Run a foreground command in the persistent resident server. */
@@ -160,11 +161,12 @@ export class StagedShellExecutor extends SandboxBashExecutor {
     this.ctx.sandboxWorkspace.recordCommand(policy.workspaceRoot, { command: spec.command })
     // Overlay path: run at the real root and let `ctx.sandbox.confine` build
     // the overlay from the registered layer.
-    if (workspace.isCopyOnWrite && this.provider()?.overlaySupported() === true) {
+    if (workspace.isCopyOnWrite && this.provider()?.overlayUsable(workspace.root) === true) {
       this.provider()?.registerOverlay(policy.workspaceRoot, workspace.overlaySpec())
       return { ...spec, sandboxPolicy: policy }
     }
-    // Fallback: the staging tree is a full private copy, so redirect into it.
+    // Fallback: the staging tree must be a full private copy, so redirect into it.
+    workspace.ensureFullView()
     const workdir = workspace.pathFor(spec.workdir) ?? spec.workdir
     const stagedPolicy: SandboxExecutionPolicy = { ...policy, workspaceRoot: workspace.root }
     return { ...spec, workdir, sandboxPolicy: stagedPolicy }
@@ -180,10 +182,11 @@ export class StagedShellExecutor extends SandboxBashExecutor {
   private overlayRoot(spec: ShellExecSpec): string | undefined {
     const policy = spec.sandboxPolicy
     if (policy === undefined || policy.mode === 'danger-full-access') return undefined
-    if (this.provider()?.overlaySupported() !== true) return undefined
-    // The fallback redirects into the staging tree, whose policy root IS a
-    // staging path — that is not an overlay.
     if (this.ctx.sandboxWorkspace.isStagingPath(policy.workspaceRoot)) return undefined
+    // The fallback redirects into the staging tree; only a staging tree outside
+    // the profile's masked tmpfs roots can actually be mounted as an overlay.
+    const workspace = this.ctx.sandboxWorkspace.workspaceFor(policy.workspaceRoot)
+    if (this.provider()?.overlayUsable(workspace.root) !== true) return undefined
     return policy.workspaceRoot
   }
 

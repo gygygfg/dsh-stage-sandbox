@@ -63,6 +63,15 @@ export class CandidateWorkspace {
     this.root = this.logical.stagingRoot
   }
 
+  /**
+   * Make the staging tree a full private copy of the base for command execution
+   * (the copy-on-write delta alone leaves a redirected shell with an empty
+   * directory).
+   */
+  ensureFullView(): void {
+    this.logical.ensureFullView()
+  }
+
   /** Whether the overlay has been copied from the base. */
   get materialized(): boolean {
     return this.logical.materialized
