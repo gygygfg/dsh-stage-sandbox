@@ -100,7 +100,7 @@ ok(matchServiceSideText('') === null, '空文本不命中')
 ok(matchServiceSideText('echo win32_process') === null, '只出现类名不命中（没有 .Create）')
 
 process.stdout.write('\n=== 6. 重定向判定 + wmic 改写 ===\n')
-ok(serviceSideRedirectFor(SERVICE_SIDE_CHANNELS.WMI_PROCESS_CREATE, 'shim') === 'injector-rewrite', 'shim 档 WMI 可重定向')
+ok(serviceSideRedirectFor(SERVICE_SIDE_CHANNELS.WMI_PROCESS_CREATE, 'shim') === null, 'shim 档 WMI 不再重定向（fail-closed）')
 ok(serviceSideRedirectFor(SERVICE_SIDE_CHANNELS.WMI_PROCESS_CREATE, 't1') === null, '非 shim 档不声明重定向')
 ok(serviceSideRedirectFor(SERVICE_SIDE_CHANNELS.SCM_SERVICE, 'shim') === 'scm-client-overlay', 'shim 档 SCM 可重定向（客户端覆盖层）')
 ok(serviceSideRedirectFor(SERVICE_SIDE_CHANNELS.EVENT_LOG, 'shim') === 'eventlog-journal', 'shim 档事件日志可重定向（记账+空查询）')
@@ -108,6 +108,7 @@ ok(serviceSideRedirectFor(SERVICE_SIDE_CHANNELS.TASK_SCHEDULER, 'shim') === 'tas
 ok(!SERVICE_SIDE_UNCOVERED.includes(SERVICE_SIDE_CHANNELS.SCM_SERVICE), 'SCM 不再列为未覆盖')
 ok(!SERVICE_SIDE_UNCOVERED.includes(SERVICE_SIDE_CHANNELS.EVENT_LOG), '事件日志不再列为未覆盖')
 ok(!SERVICE_SIDE_UNCOVERED.includes(SERVICE_SIDE_CHANNELS.TASK_SCHEDULER), '计划任务不再列为未覆盖')
+ok(SERVICE_SIDE_UNCOVERED.includes(SERVICE_SIDE_CHANNELS.WMI_PROCESS_CREATE), 'WMI 列为未覆盖（fail-closed）')
 
 const tmp = mkdtempSync(join(tmpdir(), 'winstage-wmi-'))
 try {
@@ -126,10 +127,9 @@ try {
     'create',
     'cmd.exe /d /c "echo x > C:\\Windows\\System32\\x.txt"',
   ])
-  ok(rewritten && rewritten.command === 'wmic', '保留 wmic 调用（输出形态不变）', JSON.stringify(rewritten?.command))
-  ok(Array.isArray(rewritten?.args) && rewritten.args[3].includes('winstage-inject.exe'), '内层命令改为注入器', rewritten?.args?.[3]?.slice(0, 90))
-  ok(typeof rewritten?.scriptPath === 'string' && existsSync(rewritten.scriptPath), '内层命令写入会话目录脚本')
-  ok(/echo x > C:\\Windows/.test(readFileSync(rewritten.scriptPath, 'utf8')), '脚本内容保真')
+  // 2026-11-26 实测：改写后的内层 cmd 由未注入的 launcher 启动，写真实盘且候选里
+  // 没有这一行（不可见、不可拒）。因此 WMI 进程创建改为 fail-closed：不再改写。
+  ok(rewritten === null, 'wmic process create 不再改写（fail-closed）', JSON.stringify(rewritten))
   ok(executor.rewriteWmicProcessCreate('wmic', ['os', 'get', 'caption']) === null, '非 process create 不改写')
   ok(executor.rewriteWmicProcessCreate('cmd.exe', ['/c', 'dir']) === null, '非 wmic 不改写')
   ok(executor.rewriteWmicProcessCreate('wmic', ['/node:remote', 'process', 'call', 'create', 'x']) === null, '远端目标不改写')

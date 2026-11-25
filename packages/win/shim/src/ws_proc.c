@@ -1108,6 +1108,21 @@ static wchar_t *ws_cli_rewrite_cmd(LPCWSTR app, LPCWSTR cmd, const wchar_t *base
     return out;
 }
 
+/** Case-insensitive substring test over a command line. */
+static int ws_contains_ci(const wchar_t *haystack, const wchar_t *needle)
+{
+    if (!haystack || !needle || !needle[0]) {
+        return 0;
+    }
+    const size_t n = wcslen(needle);
+    for (const wchar_t *p = haystack; *p; p++) {
+        if (_wcsnicmp(p, needle, n) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Our own launcher must run UNINJECTED: it reads the helper job file (which
  * names the masked store/plugin paths) and then injects the real child itself.
  * Injecting it made its own precheck hit the store mask -- measured as
@@ -1118,8 +1133,7 @@ static int ws_is_own_launcher(LPCWSTR app, LPWSTR cmd)
     const wchar_t *image = (app && app[0]) ? app : cmd;
     if (!image || !image[0]) {
         return 0;
-    }
-    int start = 0, end = 0;
+    }    int start = 0, end = 0;
     ws_token_span(image, &start, &end);
     const wchar_t *tok = image + start;
     int len = end - start;
@@ -1185,6 +1199,57 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
             app = scProbe;
         }
     }
+    /**
+     * ── 未覆盖的服务侧通道：在 CreateProcess 层 fail-closed ─────────────────────
+     *
+     * `service-side.ts::SERVICE_SIDE_UNCOVERED` 明确列出 vssadmin / Defender /
+     * 防火墙 / BCD 没有暂存覆盖层。顶层命令还能靠 executor 的文本闸门拒绝，但
+     * **子进程**（`python test.py` 里的 `subprocess.run(["vssadmin", ...])`）绕过了
+     * 那条闸门：垫片只钩本进程树，服务仍会照做。2026-11-23 的红队报告里
+     * WMI/SCM/计划任务就是这样逃出去的；那三条后来有了重定向，这四条没有。
+     *
+     * 这里在 CreateProcess 处把**写语义**的调用换成 `winstage-probe --deny-*`：
+     * 调用方看到普通的 "Access is denied."（exit 5），真实服务一个字节不动。
+     * 只匹配写语义（`delete shadows` / `advfirewall add|delete|set|reset` /
+     * `bcdedit /set|/deletevalue|/create|/import`），只读查询照常放行。
+     *
+     * 残余（如实声明）：这是**进程创建点**的文本匹配，不是内核边界；把命令编码进
+     * 自写程序仍可绕过。它补的是"子进程里的 CLI"这条最常见的路径。
+     */
+    if (!scRewrite && !exempt && !hasToken && !ws_cli_real_bypass()) {
+        const wchar_t *image = (app && app[0]) ? app : cmd;
+        if (image && image[0]) {
+            int start = 0, end = 0;
+            ws_token_span(image, &start, &end);
+            const int isVss = ws_basename_is_cli(image + start, end - start, L"vssadmin");
+            const int isNet = ws_basename_is_cli(image + start, end - start, L"netsh");
+            const int isBcd = ws_basename_is_cli(image + start, end - start, L"bcdedit");
+            if (isVss || isNet || isBcd) {
+                const wchar_t *line = cmd ? cmd : L"";
+                const int hit =
+                    (isVss && ws_contains_ci(line, L"delete") && ws_contains_ci(line, L"shadows")) ||
+                    (isNet && ws_contains_ci(line, L"advfirewall") &&
+                     (ws_contains_ci(line, L" add ") || ws_contains_ci(line, L" delete ") ||
+                      ws_contains_ci(line, L" set ") || ws_contains_ci(line, L" reset "))) ||
+                    (isBcd && (ws_contains_ci(line, L"/set") || ws_contains_ci(line, L"/deletevalue") ||
+                               ws_contains_ci(line, L"/create") || ws_contains_ci(line, L"/import")));
+                if (hit) {
+                    const wchar_t *mode = isVss ? L"--deny-vss" : (isNet ? L"--deny-firewall" : L"--deny-bcd");
+                    const wchar_t *baseName = isVss ? L"vssadmin" : (isNet ? L"netsh" : L"bcdedit");
+                    wchar_t denyProbe[WS_PATH_MAX];
+                    wchar_t *denyRewrite = ws_cli_rewrite_cmd(app, cmd, baseName, mode, denyProbe, WS_PATH_MAX);
+                    if (!denyRewrite) {
+                        ws_log("service-side deny: could not build the helper command; failing closed");
+                        SetLastError(ERROR_ACCESS_DENIED);
+                        return FALSE;
+                    }
+                    ws_log("%ls is a service-side channel with no staging overlay; blocked at CreateProcess", baseName);
+                    cmd = denyRewrite;
+                    app = denyProbe;
+                }
+            }
+        }
+    }
     wchar_t *wmiRewrite = NULL;
     if (!exempt && !hasToken && cmd && cmd[0]) {
         const wchar_t *image = app ? app : cmd;
@@ -1206,38 +1271,16 @@ static BOOL ws_create_process_common(HANDLE token, int hasToken, LPCWSTR app, LP
                 return FALSE;
             }
             if (hit == 1) {
-                /* Already redirected? The executor rewrites the top-level `wmic`
-                 * before launching it, so the shim sees an inner command that is
-                 * already our launcher. Wrapping it again would create a SECOND
-                 * injector *inside* the sandbox, whose precheck is then denied by
-                 * the store mask (measured: `win32Error 5` on the plugin DLL). */
-                int tokStart = 0, tokEnd = 0;
-                ws_token_span(inner, &tokStart, &tokEnd);
-                const wchar_t *tok = inner + tokStart;
-                int tokLen = tokEnd - tokStart;
-                wchar_t head[1024];
-                size_t hn = (size_t)(innerLen < 1023 ? innerLen : 1023);
-                memcpy(head, inner, hn * sizeof(wchar_t));
-                head[hn] = 0;
-                /* `--job` is our private launcher flag: whatever the quoting did to
-                 * the first token, its presence means "already redirected". */
-                if (ws_basename_is_cli(tok, tokLen, L"launcher") ||
-                    ws_basename_is_cli(tok, tokLen, L"winstage-inject") || wcsstr(head, L"--job ") != NULL) {
-                    ws_log("wmic process create already redirected; leaving it alone: %ls", head);
-                } else {
-                    wchar_t script[WS_PATH_MAX];
-                    if (ws_wmic_write_script(inner, innerLen, script, WS_PATH_MAX)) {
-                        wmiRewrite = ws_wmic_build_inject_cmd(script);
-                    }
-                    if (!wmiRewrite) {
-                        ws_log("wmic process create: could not build the injector command; failing closed");
-                        SetLastError(ERROR_ACCESS_DENIED);
-                        return FALSE;
-                    }
-                    ws_log("wmic process create redirected through the injector: script=%ls", script);
-                    cmd = wmiRewrite;
-                    app = NULL;
-                }
+                /* 2026-11-26：不再改写 WMI 进程创建。
+                 *
+                 * 实测（eval/WINSEC-PREREG.md 的 `wmi-write`）：改写后的内层
+                 * `cmd /c echo > C:\Windows\System32\...` 由未注入的 launcher
+                 * 启动，写的是真实盘；A1 盲批的候选里没有这一行（不可见、不可拒），
+                 * 而 A0 的受限令牌本来会拒绝它。把"看不见的真实写入"交还给调用方，
+                 * 比 fail-closed 更危险。 */
+                ws_log("wmic process call create cannot be staged safely; failing closed");
+                SetLastError(ERROR_ACCESS_DENIED);
+                return FALSE;
             }
         }
     }

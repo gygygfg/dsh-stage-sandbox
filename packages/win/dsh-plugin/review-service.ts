@@ -36,6 +36,8 @@ import { MASK_REASON, maskSensitiveLines, redactedToken } from './sensitive-cont
 import { unstagedSnapshot } from './unstaged-ledger.ts'
 import { REGISTRY_CANDIDATE_SOURCE, createRegistryStage, registryWireBytes } from '../src/registry-stage.ts'
 import { gitPathClass } from '../src/git-path.ts'
+import { assessFileChange, assessRegistryChange, highestLevel, looksSensitiveValueName, type SeverityReason } from '../src/severity.ts'
+import { previewRegistryValue } from '../src/registry-preview.ts'
 import { createRegExeReader, createRegExeWriter } from '../src/registry-bindings.ts'
 
 /**
@@ -502,6 +504,44 @@ export function driftReasonText(reason) {
  * @param {{path: string, external?: boolean, [key: string]: any}} change 暂存条目
  * @param {{workspaceRoot?: string, masks?: Array<object>, dangerMaskIds?: Iterable<string>}} options
  */
+/**
+ * Read a frozen blob's byte length for severity scoring.
+ *
+ * A missing/unreadable blob is treated as 0 bytes (unknown), never as a
+ * reason to raise the level by guesswork.
+ */
+function blobSize(ws, hash: unknown): number {
+  if (typeof hash !== 'string' || hash.length === 0) return 0
+  try {
+    const blob = ws.store.readBlob(hash)
+    return blob === undefined || blob === null ? 0 : Number(blob.length) || 0
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Consequence severity for one file change (see `src/severity.ts`).
+ *
+ * `after.bytes` is recorded by `diffEntries()` for every create/modify; the
+ * base size is read from the frozen blob. A deletion has no after side.
+ */
+function fileSeverity(ws, change, external: boolean): { level: string; reasons: SeverityReason[] } {
+  const beforeBytes = blobSize(ws, change.before?.hash)
+  const afterBytes = change.op === 'delete'
+    ? 0
+    : (typeof change.after?.bytes === 'number' ? Number(change.after.bytes) : blobSize(ws, change.after?.hash))
+  const verdict = assessFileChange({
+    path: change.path,
+    op: change.op,
+    kind: change.kind === 'dir' ? 'dir' : 'file',
+    beforeBytes,
+    afterBytes,
+    external,
+  })
+  return { level: verdict.level, reasons: [...verdict.reasons] }
+}
+
 export function classifyChange(change, options = {}) {
   if (typeof change?.path !== 'string' || change.path.length === 0) {
     throw new TypeError('classifyChange: change.path must be a non-empty string')
@@ -1274,6 +1314,37 @@ export class ReviewService {
             '勾选并批准后才由宿主令牌写入真实 hive，拒绝则丢弃。',
         }
         if (change.valueName !== undefined) row.valueName = change.valueName
+        /**
+         * Consequence level (same rules as `src/severity.ts::assessRegistryChange`).
+         * A registry write is outside the workspace by definition; a Run /
+         * Winlogon / Services / IFEO value is L3 because approving it makes the
+         * payload execute later (logon, service start, shell launch).
+         */
+        const severity = assessRegistryChange({
+          path: change.registryPath ?? change.path,
+          op: change.op,
+          ...(change.valueName === undefined ? {} : { valueName: change.valueName }),
+        })
+        row.level = severity.level
+        row.severityReasons = severity.reasons
+        /**
+         * Value-data preview. The row used to say only "a value under Run
+         * changed", which is not enough to review a persistence payload. The
+         * preview is display-only: apply still replays the frozen journal bytes.
+         * Credential-like names are redacted; `safety:"danger"` rows keep only
+         * the byte length, matching the file-side omission policy.
+         */
+        const side = change.op === 'delete' ? change.before : change.after
+        if (side && typeof side.data === 'string') {
+          const sensitive = verdict.safety === 'danger' || looksSensitiveValueName(change.valueName)
+          const preview = previewRegistryValue(side.type, side.data, { maxChars: 160, sensitive })
+          row.valueType = preview.type ?? side.type
+          row.valueDataPreview = preview.text
+          row.valueDataBytes = preview.bytes
+          if (preview.redacted) row.valueDataRedacted = true
+          if (preview.note !== undefined) row.valueDataNote = preview.note
+          if (change.op === 'delete') row.valueDataDeleted = true
+        }
         if (change.appliable === false) {
           row.appliable = false
           row.note = `该注册表变更**不可应用**：${change.unsupportedReason ?? '覆盖层无法表示'}`
@@ -1391,6 +1462,20 @@ export class ReviewService {
     // 候选被修剪之后这个集合自然收缩到空 —— 它不再是历史的容器。
     const frozenFiles = this.frozenOnlyRows(ws, netKeys)
     const listed = [...netFiles, ...registryFiles, ...frozenFiles]
+    /**
+     * Top-level consequence level: the highest row level, plus a flat list of
+     * the reasons that produced it. `snap.level` is what the eval driver and the
+     * panel use; it is computed from the same rows the reviewer sees, so a
+     * level cannot claim more than the surface actually shows.
+     */
+    const levelCounts = { L1: 0, L2: 0, L3: 0 }
+    const severityReasons = []
+    for (const row of listed) {
+      const level = row && row.level
+      if (level === 'L1' || level === 'L2' || level === 'L3') levelCounts[level] += 1
+      if (row && Array.isArray(row.severityReasons)) severityReasons.push(...row.severityReasons)
+    }
+    const level = highestLevel(listed.map((row) => (row && row.level) || 'L1'))
     /** R12 · D2：被掩码 / 被省略的**净 diff 条目**（顶层 `redactions` 段的来源） */
     const masked = netFiles.filter(
       (entry) => entry && (entry.contentMasked === true || entry.note === SENSITIVE_OMIT_NOTE),
@@ -1475,6 +1560,12 @@ export class ReviewService {
       /** 分页细节（面板据此画"显示前 N / 共 M"）；与 `counts` 同源，不另算一遍 */
       page: { pageSize, listed: files.length, total: listed.length, omitted: Math.max(0, listed.length - files.length) },
       riskCounts: countRisks(listed),
+      /** Highest consequence level across the listed rows (`L1` when empty). */
+      level,
+      /** Per-level row counts, so a caller can say "3 × L3, 12 × L1". */
+      levelCounts,
+      /** Flat, machine-readable reasons behind `level` (bounded to 32 entries). */
+      reasons: severityReasons.slice(0, 32),
       alerts: buildAlerts(netFiles, latest?.id),
       candidates: pending.map((candidate) => ({
         id: candidate.id,
@@ -1654,6 +1745,22 @@ export class ReviewService {
     // 敏感省略说明：**只有** danger 档才有这个字段（`undefined` 在 JSON.stringify 里整键消失，
     // 面板因此可以用 `'note' in item` 判断，不需要猜空串含义）
     if (sensitiveOmitted) item.note = SENSITIVE_OMIT_NOTE
+
+    /**
+     * Consequence level (Windows parity with `candidate/danger.ts`).
+     *
+     * `classifyChange()` above says *where* the write lands; this says *what it
+     * does*. It runs before the `danger` early return so credential paths are
+     * also labelled, and before the directory early return so a directory
+     * deletion is not the one unlabelled destructive row.
+     *
+     * The caller (driver/panel) gets `level` + machine-readable reasons; a
+     * reviewer that rejects "L2+" now has a signal for in-workspace damage.
+     */
+    const severity = fileSeverity(ws, change, verdict.external === true)
+    item.level = severity.level
+    item.severityReasons = severity.reasons
+    if (sensitiveOmitted) item.level = 'L3'
 
     if (item.kind === 'dir') return item
 

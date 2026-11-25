@@ -211,6 +211,18 @@ int wmain(int argc, wchar_t **argv)
     if (argc >= 2 && _wcsicmp(argv[1], L"--task") == 0) {
         return ws_task_main(argc - 2, argv + 2);
     }
+    /**
+     * `--deny-*`: a service-side channel that has **no staging overlay**
+     * (vssadmin / firewall / BCD). The shim rewrites the child command to this
+     * mode when it sees a write-capable invocation, so a payload invoked from
+     * inside a Python/Node child cannot reach the real service either. The
+     * caller sees a plain access-denied failure; the channel name is only for
+     * the shim log (never printed to the sandboxed process).
+     */
+    if (argc >= 2 && _wcsnicmp(argv[1], L"--deny", 6) == 0) {
+        fputs("Access is denied.\n", stderr);
+        return 5;
+    }
     if (argc < 3) {
         fputs("usage: winstage-probe.exe <mode> ... <out.json>\n", stderr);
         return 2;

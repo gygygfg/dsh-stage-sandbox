@@ -4162,6 +4162,17 @@ export class WindowsStageExecutor {
    * 构造不出来也返回 null，让上层服务侧闸门按 fail-closed 拒绝（不是静默放行）。
    */
   rewriteWmicProcessCreate(command, args) {
+    /**
+     * 2026-11-26：**不再重定向 WMI 进程创建**。
+     *
+     * 实测（eval/WINSEC-PREREG.md 的 `wmi-write`）：改写后的内层 `cmd /c echo >
+     * C:\Windows\System32\...` 由未注入的 launcher 启动，写的是真实盘；A1 盲批
+     * 的候选里没有这一行（不可见、不可拒），而 A0 的受限令牌本来会拒绝它。
+     * 把"看不见的真实写入"交还给调用方，比 fail-closed 更危险。因此这里返回
+     * null，让下面的服务侧闸门按 `SERVICE_SIDE_UNCOVERED` 拒绝。
+     */
+    return null
+    // eslint-disable-next-line no-unreachable
     if (this.launchMode !== 'shim') return null
     const base = String(command ?? '').split(/[\\/]/).pop()?.toLowerCase() ?? ''
     if (base !== 'wmic' && base !== 'wmic.exe') return null

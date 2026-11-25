@@ -252,7 +252,6 @@ export function classifyServiceSideWrite(
 
 /**
  * 已经实现"真重定向"（不是拒绝）的通道：
- *   · WMI 进程创建     —— 改写 wmic 内层命令行，子进程先过注入器（executor + shim 两处）；
  *   · SCM（服务）      —— 客户端虚拟化：钩 advapi32 SCM API，写进 service.overlay.jsonl，
  *                        查询时与真实 SCM 合并（shim/src/ws_scm.c）。`sc.exe` 本身是裸 RPC
  *                        客户端（不导入 advapi32），因此 executor/shim 把它改道到
@@ -262,7 +261,6 @@ export function classifyServiceSideWrite(
  *                        （shim/src/ws_scm.c）。
  */
 export const SERVICE_SIDE_REDIRECTED = Object.freeze({
-  [SERVICE_SIDE_CHANNELS.WMI_PROCESS_CREATE]: 'injector-rewrite',
   [SERVICE_SIDE_CHANNELS.SCM_SERVICE]: 'scm-client-overlay',
   [SERVICE_SIDE_CHANNELS.TASK_SCHEDULER]: 'task-cli-overlay',
   [SERVICE_SIDE_CHANNELS.EVENT_LOG]: 'eventlog-journal',
@@ -274,8 +272,17 @@ export function serviceSideRedirectFor(channel, lane) {
   return SERVICE_SIDE_REDIRECTED[channel] ?? null
 }
 
-/** 供状态卡/文档引用：TS 档**尚未覆盖**的服务侧通道清单（WMI/SCM/计划任务/EventLog 已重定向） */
+/**
+ * 供状态卡/文档引用：TS 档**尚未覆盖**的服务侧通道清单。
+ *
+ * WMI 进程创建从"重定向"移到这里（2026-11-26 实测）：把
+ * `wmic process call create "cmd /c echo > C:\Windows\System32\..."` 改写成
+ * 注入器命令行后，内层 cmd 由**未注入**的 launcher 启动，重定向写真实盘——
+ * A1 盲批下 System32 真的出现文件，而候选里**没有这一行**（不可见、不可拒）。
+ * 这比原来的 `wmic` 直接逃逸更隐蔽，所以改为 fail-closed：不再改写，直接拒绝。
+ */
 export const SERVICE_SIDE_UNCOVERED: readonly string[] = Object.freeze([
+  SERVICE_SIDE_CHANNELS.WMI_PROCESS_CREATE,
   SERVICE_SIDE_CHANNELS.VOLUME_SHADOW,
   SERVICE_SIDE_CHANNELS.DEFENDER_POLICY,
   SERVICE_SIDE_CHANNELS.FIREWALL,
