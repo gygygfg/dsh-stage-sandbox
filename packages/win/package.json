@@ -1,6 +1,6 @@
 {
   "name": "dsh-winstage-sandbox",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "DeepSeek Harness (DSH) plugin: WinStage staging–candidate–selective-commit sandbox for Windows. AI changes land in a staging tree (files + registry); a review panel shows the diff and only approved changes are written to the real workspace.",
   "type": "module",
   "license": "MIT",

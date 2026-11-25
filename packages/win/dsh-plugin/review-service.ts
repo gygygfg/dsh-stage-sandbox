@@ -2504,7 +2504,21 @@ export class ReviewService {
  * 是**两个 loader 行**、两个模块实例，必须共享同一份清单对象，
  * 否则两行各自持有内存副本，谁的写都会被对方的 `fresh()` 当成"外部改动"重读。
  */
-const SERVICES = new Map()
+/**
+ * ★ 进程内单例必须**跨模块副本**共享（2026-11-26 实测）。
+ *
+ * 为什么不能只用模块级 Map：DSH 的 loader 按**模块 URL** 缓存，而本包的 `src/`（插件自己
+ * 用）与 `dist/index.mjs`（外部消费者，如评测 driver 的 `import('dsh-winstage-sandbox')`）
+ * 是**两份独立的模块实例**。两份各有一个 `SERVICES` Map ⇒ 同一 canonical 根被建成
+ * **两个 Store**；两个 Store 抢同一个 stage-guard 锁，宿主在首个模型请求前就静止
+ * （实测：1.0.1/1.1.0 的 headless A1 均 240 s 无输出，1.0.0 因拿不到 getReviewService
+ * 反而不建第二个 Store 而正常）。
+ *
+ * 用 `Symbol.for` 挂在 globalThis 上：两份模块拿到的是**同一个 Map**，第二次调用直接
+ * 复用第一次的实例。键仍带 canonical 根与会话键，不同工作区互不干扰。
+ */
+const SERVICES_KEY = Symbol.for('winstage.reviewService.services.v1')
+const SERVICES = globalThis[SERVICES_KEY] ?? (globalThis[SERVICES_KEY] = new Map())
 
 /**
  * FNV-1a（32 位，纯 JS、同步）—— 只用于把**非常规字符**的会话 id 压成目录名。
