@@ -167,6 +167,7 @@ export class StagedShellExecutor extends SandboxBashExecutor {
     }
     // Fallback: the staging tree must be a full private copy, so redirect into it.
     workspace.ensureFullView()
+    this.provider()?.registerShadow(workspace.root, { src: workspace.root, dest: workspace.baseRoot })
     const workdir = workspace.pathFor(spec.workdir) ?? spec.workdir
     const stagedPolicy: SandboxExecutionPolicy = { ...policy, workspaceRoot: workspace.root }
     return { ...spec, workdir, sandboxPolicy: stagedPolicy }

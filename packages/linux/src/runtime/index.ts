@@ -17,7 +17,7 @@ export {
   type RuntimeOptions,
   type SeccompOptions,
 } from './options.ts'
-export { nodeProfileIo, bwrapProfileArgs, type OverlaySpec, type ProfileIo } from './profile.ts'
+export { nodeProfileIo, bwrapProfileArgs, type OverlaySpec, type ProfileIo, type ShadowBind } from './profile.ts'
 export { isWhiteout, mergeManifest, probeOverlaySupport, scanUpper, type OverlayCapture } from './overlay.ts'
 export {
   ResidentSandbox,

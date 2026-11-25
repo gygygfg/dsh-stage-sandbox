@@ -27,6 +27,15 @@ export interface OverlayBind {
 }
 
 /** An overlay writable layer for the policy's workspace root. */
+/** A read-only-visible alias: mount `src` at `dest` inside the sandbox. */
+export interface ShadowBind {
+  /** Host source path. */
+  readonly src: string
+  /** Path inside the sandbox (usually the real workspace root). */
+  readonly dest: string
+}
+
+/** An overlay writable layer for the policy's workspace root. */
 export interface OverlaySpec {
   /** The host directory writes land in (the overlay upper). */
   readonly upper: string
@@ -285,6 +294,7 @@ export function bwrapProfileArgs(
   options: RuntimeOptions = DEFAULT_RUNTIME_OPTIONS,
   io: ProfileIo = nodeProfileIo,
   overlay?: OverlaySpec,
+  shadows: readonly ShadowBind[] = [],
 ): string[] {
   const args: string[] = []
 
@@ -322,6 +332,12 @@ export function bwrapProfileArgs(
         args.push(bind.readOnly === true ? '--ro-bind' : '--bind', bind.src, bind.dest)
       }
     }
+    // The copy-based fallback runs commands inside the private staging tree, so
+    // the model's absolute paths (and `pwd`) would point at a directory the
+    // sandbox cannot see ("No such file or directory"). Mount the same tree at
+    // the real workspace path: absolute and relative access then agree, and the
+    // real directory is never exposed.
+    for (const shadow of shadows) args.push('--bind', shadow.src, shadow.dest)
   } else {
     // read-only still needs the workspace readable.
     args.push('--ro-bind-try', policy.workspaceRoot, policy.workspaceRoot)

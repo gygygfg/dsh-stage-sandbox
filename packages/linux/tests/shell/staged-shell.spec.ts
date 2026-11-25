@@ -20,7 +20,13 @@ class FakeSandboxPolicy extends Service {
     return { mode: this.defaultMode, workspaceRoot: this.root }
   }
 }
-class FakeSandbox extends Service { constructor(ctx: Context) { super(ctx, 'sandbox') } }
+class FakeSandbox extends Service {
+  readonly shadows: { stagingRoot: string; dest: string }[] = []
+  constructor(ctx: Context) { super(ctx, 'sandbox') }
+  registerShadow(stagingRoot: string, bind: { src: string; dest: string }): void {
+    this.shadows.push({ stagingRoot, dest: bind.dest })
+  }
+}
 class FakeSubprocess extends Service { constructor(ctx: Context) { super(ctx, 'subprocess') } }
 
 /** Exposes the protected redirection for a unit assertion. */
@@ -56,9 +62,14 @@ describe('staged shell executor redirection', () => {
     const shell = ctx.shell as unknown as TestShell
     const policy: SandboxExecutionPolicy = { mode: 'workspace-write', workspaceRoot: workspace }
     const staged = shell.expose(spec(policy))
+    const stagingRoot = ctx.sandboxWorkspace.workspaceFor(workspace).root
     expect(staged.workdir).not.toBe(workspace)
-    expect(staged.workdir.startsWith(ctx.sandboxWorkspace.workspaceFor(workspace).root)).toBe(true)
-    expect(staged.sandboxPolicy?.workspaceRoot).toBe(ctx.sandboxWorkspace.workspaceFor(workspace).root)
+    expect(staged.workdir.startsWith(stagingRoot)).toBe(true)
+    expect(staged.sandboxPolicy?.workspaceRoot).toBe(stagingRoot)
+    // ...and the staging tree is aliased at the real workspace path, so the
+    // model's absolute paths (`$PWD/...`) keep resolving inside the sandbox.
+    const sandbox = ctx.sandbox as unknown as FakeSandbox
+    expect(sandbox.shadows).toEqual([{ stagingRoot, dest: workspace }])
   })
 
   it('leaves a danger-full-access spec unchanged', () => {

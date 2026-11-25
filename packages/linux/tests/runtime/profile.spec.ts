@@ -63,6 +63,17 @@ describe('bwrap runtime profile', () => {
     expect(hasSequence(argv, ['--tmpfs', '/tmp'])).toBe(true)
   })
 
+  it('aliases a staging tree at the real workspace path (copy-based fallback)', () => {
+    // The fallback runs inside a private staging tree; without the alias the
+    // model's `$PWD` points at a directory the sandbox cannot see.
+    const staging = '/tmp/dsh-logical-stg'
+    const argv = bwrapProfileArgs(WS, DEFAULT_RUNTIME_OPTIONS, io, undefined,
+      [{ src: staging, dest: '/ws' }])
+    expect(hasSequence(argv, ['--bind', staging, '/ws'])).toBe(true)
+    // the alias has to come after the private tmpfs, or it would be hidden
+    expect(argv.indexOf(staging, argv.indexOf('--tmpfs'))).toBeGreaterThan(argv.indexOf('--tmpfs'))
+  })
+
   it('keeps read-only mode read-only but workspace-readable', () => {
     const argv = bwrapProfileArgs(RO, DEFAULT_RUNTIME_OPTIONS, io)
     expect(hasSequence(argv, ['--bind', '/ws', '/ws'])).toBe(false)

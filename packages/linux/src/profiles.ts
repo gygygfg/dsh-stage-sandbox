@@ -6,7 +6,7 @@
 import { grantArgs as landlockGrantArgs } from '@deepseek-ai/node-addon-system/landlock-run'
 import type { SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
 import { DEFAULT_RUNTIME_OPTIONS, bwrapProfileArgs as runtimeBwrapProfileArgs, nodeProfileIo } from './runtime/index.ts'
-import type { OverlaySpec, RuntimeOptions } from './runtime/index.ts'
+import type { OverlaySpec, RuntimeOptions, ShadowBind } from './runtime/index.ts'
 
 /**
  * Build the bwrap profile arguments for one file-effect policy. Delegates to
@@ -22,8 +22,9 @@ export function bwrapProfileArgs(
   policy: SandboxPolicy,
   options: RuntimeOptions = DEFAULT_RUNTIME_OPTIONS,
   overlay?: OverlaySpec,
+  shadows: readonly ShadowBind[] = [],
 ): string[] {
-  return runtimeBwrapProfileArgs(policy, options, nodeProfileIo, overlay)
+  return runtimeBwrapProfileArgs(policy, options, nodeProfileIo, overlay, shadows)
 }
 
 /**

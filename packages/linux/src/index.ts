@@ -34,7 +34,7 @@ import {
   DEFAULT_READONLY_ROOTS,
   DEFAULT_TMPFS_ROOTS,
 } from './runtime/index.ts'
-import type { OverlaySpec, RuntimeOptions } from './runtime/index.ts'
+import type { OverlaySpec, RuntimeOptions, ShadowBind } from './runtime/index.ts'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
 import {
   DENIAL_SIGNATURES,
@@ -218,6 +218,12 @@ export class LinuxSandboxProvider extends SandboxProvider {
    * make) runs against the overlay without the executor needing to know.
    */
   private readonly overlays = new Map<string, OverlaySpec>()
+  /**
+   * Extra "same tree, real path" mounts per staging root. The copy-based
+   * fallback runs inside a private tree; without this alias the model's
+   * absolute paths point at a directory that does not exist in the sandbox.
+   */
+  private readonly shadows = new Map<string, ShadowBind[]>()
 
   constructor(ctx: Context, config: Config) {
     super(ctx)
@@ -349,6 +355,28 @@ export class LinuxSandboxProvider extends SandboxProvider {
   }
 
   /**
+   * Alias a staging tree at `bind.dest` inside the sandbox, keyed by the tree
+   * that is the command's policy root. Used by the copy-based fallback so the
+   * model keeps seeing its real workspace path.
+   * @param stagingRoot - the staging tree that is the policy root.
+   * @param bind - the source tree and the sandbox path it should appear at.
+   */
+  registerShadow(stagingRoot: string, bind: ShadowBind): void {
+    const key = resolve(stagingRoot)
+    const list = this.shadows.get(key) ?? []
+    if (!list.some((b) => b.dest === bind.dest && b.src === bind.src)) list.push(bind)
+    this.shadows.set(key, list)
+  }
+
+  /**
+   * Forget a staging tree's aliases (the staging tree is being removed).
+   * @param stagingRoot - the staging tree that served as the policy root.
+   */
+  unregisterShadow(stagingRoot: string): void {
+    this.shadows.delete(resolve(stagingRoot))
+  }
+
+  /**
    * The overlay for a policy, or `undefined` when none is registered, the mode
    * cannot overlay, or the registered layer no longer exists (a stale entry is
    * ignored rather than failing the command).
@@ -411,7 +439,9 @@ export class LinuxSandboxProvider extends SandboxProvider {
    * `overlay` is given the workspace root is mounted as an overlay.
    */
   private bwrapRunnerArgv(policy: SandboxPolicy, overlay?: OverlaySpec): string[] {
-    const profile = bwrapProfileArgs(policy, this.runtime, overlay)
+    const shadows = (this.shadows.get(resolve(policy.workspaceRoot)) ?? [])
+      .filter((b) => existsSync(b.src) && existsSync(b.dest))
+    const profile = bwrapProfileArgs(policy, this.runtime, overlay, shadows)
     const seccomp = this.resolveSeccomp()
     if (seccomp === undefined) return ['bwrap', ...profile]
     // The wrapper opens the filter before bwrap starts, but a *resident* shell
