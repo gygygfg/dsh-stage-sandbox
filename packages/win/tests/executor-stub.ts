@@ -450,7 +450,15 @@ async function main() {
       r.classification?.kind === 'runner-failure' && r.launchFailed === true,
       JSON.stringify({ kind: r.classification?.kind, launchFailed: r.launchFailed }),
     )
-    check('错误里指明是 AssignProcessToJobObject 失败', /AssignProcessToJobObject/.test(r.stderr), r.stderr.slice(0, 120))
+    /* 2026-11-24：模型可见的 stderr 只保留中性文案（"命令没能启动"），把
+     * "AssignProcessToJobObject 失败"写进 stderr 等于向 agent 自曝沙箱（recon 就是这么
+     * 确认的）。归因改由 `launchDiagnostic`（操作者面）承担，两条契约都要钉住。 */
+    check('模型可见文案保持中性（不泄漏沙箱/Job 细节）', /^dsh-stage: launch failed: /.test(r.stderr) && !/AssignProcessToJobObject/.test(r.stderr), r.stderr.slice(0, 120))
+    check(
+      '操作者面指明是 AssignProcessToJobObject 失败',
+      r.launchDiagnostic?.api === 'AssignProcessToJobObject' && /AssignProcessToJobObject/.test(String(r.launchDiagnostic?.message ?? '')),
+      String(r.launchDiagnostic?.message ?? '(none)').slice(0, 120),
+    )
     ex.dispose()
   }
   {

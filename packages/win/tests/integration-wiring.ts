@@ -792,12 +792,19 @@ section('6. store.putBlob：超配额拒绝 / 统计不完整拒绝 / 配额内�
 
   // 源码锚点：闸门必须在 putBlob 的**写入之前**（"写完再量"只能事后发现超了）
   const storeSource = readFileSync(new URL('../src/store.ts', import.meta.url), 'utf8')
-  const putBlobBody = storeSource.slice(storeSource.indexOf('putBlob(buffer) {'), storeSource.indexOf('putBlobFromFile('))
+  // 2026-11-23：签名多了 `options`（批处理用一个上界总量做一次配额判定后，
+  // 逐 blob 传 `skipQuota:true` 以免 O(n²) 遍历），锚点随之改成不带右括号。
+  const putBlobBody = storeSource.slice(storeSource.indexOf('putBlob(buffer'), storeSource.indexOf('putBlobFromFile('))
   const atQuota = putBlobBody.indexOf('this.assertStagingQuota(buffer.length)')
   const atWrite = putBlobBody.indexOf('writeFileSync(path, buffer)')
   check('putBlob 真的调用 assertStagingQuota(buffer.length)', atQuota >= 0, `@${atQuota}`)
   check('配额闸门在 writeFileSync 之前（写入前拒绝）', atQuota >= 0 && atQuota < atWrite, `quota@${atQuota} < write@${atWrite}`)
   check('putBlob 的早退路径（hash 已存在）不消耗配额', putBlobBody.indexOf('if (!existsSync(path))') < atQuota, 'existsSync 判断在闸门之前')
+  check(
+    '批处理跳过配额必须是显式 skipQuota（默认路径仍然过闸）',
+    putBlobBody.includes('options.skipQuota !== true'),
+    `skipQuota 显式判定=${putBlobBody.includes('options.skipQuota !== true')}`,
+  )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

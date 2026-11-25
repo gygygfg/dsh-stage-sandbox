@@ -2041,6 +2041,21 @@ static void ws_find_data_w2a(const WIN32_FIND_DATAW *w, WIN32_FIND_DATAA *a)
 
 /* Refuse to enumerate/read the shim's own store + plugin install root even if
  * the agent guesses the path (the mask hides it, this is the belt). */
+
+/* True when the configured workspace and the plugin install root are the same
+ * tree or one contains the other (a dev checkout: plugin lives at
+ * `<workspace>\packages\win`). Hiding the plugin root in that configuration
+ * would hide the agent's own files, so the rule is skipped there. An install
+ * under `%LOCALAPPDATA%\...\profiles\<p>\node_modules` never overlaps. */
+static int ws_workspace_overlaps(const wchar_t *pluginRoot)
+{
+    if (!pluginRoot || !pluginRoot[0] || !g_ws.workspaceRoot[0]) {
+        return 0;
+    }
+    return ws_under_prefix(pluginRoot, g_ws.workspaceRoot) ||
+           ws_under_prefix(g_ws.workspaceRoot, pluginRoot);
+}
+
 static int ws_store_denied_path(const wchar_t *norm)
 {
     if (!norm || !norm[0]) {
@@ -2052,7 +2067,15 @@ static int ws_store_denied_path(const wchar_t *norm)
     if (g_ws.regStageDir[0] && ws_under_prefix(norm, g_ws.regStageDir)) {
         return 1;
     }
-    if (g_ws.pluginRoot[0] && ws_under_prefix(norm, g_ws.pluginRoot)) {
+    /* Plugin install root: hidden because the shim/probe/injector names are a
+     * direct "you are sandboxed" tell. But the agent's own workspace must never
+     * be hidden -- and in a dev checkout the plugin root IS inside the
+     * workspace (`<ws>\packages\win\...`), which used to make `dir` on any
+     * directory under it come back empty. Skip the rule when the two trees
+     * overlap in either direction (measured: r20/r21/r22 suites, whose fixtures
+     * live under the package, went red on `cmd dir` = File Not Found). */
+    if (g_ws.pluginRoot[0] && ws_under_prefix(norm, g_ws.pluginRoot) &&
+        !ws_workspace_overlaps(g_ws.pluginRoot)) {
         return 1;
     }
     return 0;

@@ -217,6 +217,10 @@ if (process.platform !== 'win32') {
           readDenyFile: MASK,
           readDenyFailClosed: true,
           passthrough: [STAGE],
+          /* This fixture tree is the "workspace" for this suite. It lives inside
+           * the package (= the shim's inferred plugin root), so without this the
+           * store guard hides it and every `dir` comes back empty. */
+          workspaceRoot: SCRATCH,
         }),
       )
       const env = { ...process.env }
@@ -319,14 +323,17 @@ if (process.platform !== 'win32') {
        * 过滤的用例必须从干净暂存根开始，否则测到的是那条预存限制。 */
       rmSync(STAGE, { recursive: true, force: true })
       mkdirSync(STAGE, { recursive: true })
-      const hideAll = (text) => {
-        const lower = text.toLowerCase()
-        return !lower.includes('.npmrc') && !lower.includes('.git-credentials')
-      }
+      /* 2026-11-24 契约变更（docs/AI红队渗透实测-2026-11-23.md §12）：策略遮蔽
+       * 现在是"可见但不可读" —— 枚举正常列出，读取以
+       * `[sandbox] read blocked: ... (rule: …)` + Access is denied 拒绝；
+       * 只有沙箱自身存储（plugin root / store / helper / private temp）仍然隐藏。
+       * 因此"列出遮蔽名"不再是泄漏，而是契约的一部分；读边界由 B8.2 / B8.5 证明。 */
+      const showsMasked = (text) =>
+        text.includes('.npmrc') && text.includes('.git-credentials') && text.includes('normal.txt')
       const cmdDir = inject('r19-cmd', CMD, ['/d', '/c', 'dir', '/b', SENS])
       check(
-        'B4.1 cmd dir 不列出 .npmrc/.git-credentials、仍列出 normal.txt',
-        hideAll(cmdDir.text) && cmdDir.text.includes('normal.txt'),
+        'B4.1 cmd dir 列出 normal.txt 与两个策略遮蔽名（新契约：可见但不可读）',
+        showsMasked(cmdDir.text),
         `text=${cmdDir.text.replace(/\r?\n/g, ' | ').slice(0, 200)}`,
       )
       const psDir = inject('r19-ps', PWSH, [
@@ -336,8 +343,8 @@ if (process.platform !== 'win32') {
         `Get-ChildItem -LiteralPath '${SENS}' -Force | ForEach-Object { $_.Name }`,
       ])
       check(
-        'B4.2 powershell Get-ChildItem 不列出 .npmrc/.git-credentials、仍列出 normal.txt',
-        hideAll(psDir.text) && psDir.text.includes('normal.txt'),
+        'B4.2 powershell Get-ChildItem 列出 normal.txt 与两个策略遮蔽名（新契约：可见但不可读）',
+        showsMasked(psDir.text),
         `text=${psDir.text.replace(/\r?\n/g, ' | ').slice(0, 200)}`,
       )
       const nodeDir = inject('r19-node', process.execPath, [
@@ -345,8 +352,8 @@ if (process.platform !== 'win32') {
         `process.stdout.write(require('fs').readdirSync(${JSON.stringify(SENS)}).join(','))`,
       ])
       check(
-        'B4.3 node readdir（NtQueryDirectoryFile 载体）不列出 .npmrc/.git-credentials、仍列出 normal.txt',
-        hideAll(nodeDir.text) && nodeDir.text.includes('normal.txt'),
+        'B4.3 node readdir（NtQueryDirectoryFile 载体）列出 normal.txt 与两个策略遮蔽名（新契约：可见但不可读）',
+        showsMasked(nodeDir.text),
         `text=${nodeDir.text.slice(0, 200)}`,
       )
     }

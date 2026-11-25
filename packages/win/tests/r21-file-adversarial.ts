@@ -132,6 +132,10 @@ if (process.platform !== 'win32' || !existsSync(DLL) || !existsSync(INJECTOR)) {
           readDenyFile: MASK,
           readDenyFailClosed: true,
           passthrough: [STAGE],
+          /* This fixture tree is the "workspace": it lives inside the package
+           * (the shim's inferred plugin root), so without this the store guard
+           * answers ACCESS_DENIED for every enumeration under it. */
+          workspaceRoot: SCRATCH,
         }),
       )
       const env = { ...process.env }
@@ -273,7 +277,7 @@ int main(int argc,char**argv){
       function injectExe(tag, exe, args) {
         cfgSeq += 1
         const cfg = join(SCRATCH, `cfg-${tag}-${cfgSeq}.json`)
-        writeFileSync(cfg, JSON.stringify({ stageRoot: STAGE, logPath: join(STAGE, `shim-${tag}.log`), failClosed: true, readThrough: true, verbose: false, readDenyFile: MASK, readDenyFailClosed: true, passthrough: [STAGE] }))
+        writeFileSync(cfg, JSON.stringify({ stageRoot: STAGE, logPath: join(STAGE, `shim-${tag}.log`), failClosed: true, readThrough: true, verbose: false, readDenyFile: MASK, readDenyFailClosed: true, passthrough: [STAGE], workspaceRoot: SCRATCH }))
         const e = { ...process.env, WINSTAGE_STAGE_ROOT: STAGE, WINSTAGE_SHIM_CONFIG: cfg, WINSTAGE_SHIM_LOG: join(STAGE, `shim-${tag}.log`) }
         const r = spawnSync(INJECTOR, ['--dll', DLL, '--report', join(SCRATCH, `report-${tag}.json`), '--cwd', SCRATCH, '--', exe, ...args], { env: e, encoding: 'utf8', timeout: 120000 })
         return { status: r.status ?? -1, text: `${r.stdout ?? ''}${r.stderr ?? ''}`.trim().replace(/\r?\n/g, ' | ') }
