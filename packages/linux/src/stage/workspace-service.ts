@@ -31,6 +31,7 @@ import type { CandidateRef, CandidateScope, PublicationReceipt } from '../contro
 import { LeaseRegistry } from '../control/lease.ts'
 import { GrantRegistry, type GrantOperation, type TaskGrant } from '../control/grant.ts'
 import { DirectoryPublicationBackend } from '../publish/directory-backend.ts'
+import { GitPublicationRefused } from '../publish/git-control.ts'
 import { Publisher, type PublishOutcome } from '../publish/publisher.ts'
 import { FileReceiptStore, MemoryReceiptStore } from '../publish/receipt-store.ts'
 import type { PolicyFacts } from '../policy/facts.ts'
@@ -535,7 +536,24 @@ export class WorkspaceStagingService extends Service {
       return { kind: 'needs-authorization', candidate, reasonCodes: verdict.reasonCodes, danger }
     }
     const lease = this.leases.acquire(`workspace:${workspaceRoot}`, 'workspace-staging', this.leaseTtlMs)
-    const outcome = await this.publisher.publish({ operationId: `apply_${branchId}_${candidate.digest}`, candidate, expectedBase: candidate.baseVersion, target: workspaceRoot, lease })
+    let outcome: PublishOutcome
+    try {
+      outcome = await this.publisher.publish({ operationId: `apply_${branchId}_${candidate.digest}`, candidate, expectedBase: candidate.baseVersion, target: workspaceRoot, lease })
+    } catch (error) {
+      /**
+       * A `.git` refusal is a *denial with a reason*, not an opaque crash: the
+       * candidate stays pending and the caller can report
+       * `GIT_INTERNAL` / `GIT_POINTER_DELETE` / `GIT_REFERENTIAL_INTEGRITY` /
+       * `GIT_INDEX_CORRUPT` instead of a stack trace. Nothing was written: the
+       * plan is computed before the first byte.
+       */
+      if (error instanceof GitPublicationRefused) {
+        this.leases.release(lease)
+        return { kind: 'denied', candidate, reasonCodes: [error.code] }
+      }
+      this.leases.release(lease)
+      throw error
+    }
     this.leases.release(lease)
     if (outcome.kind === 'published') {
       if (files !== undefined) {

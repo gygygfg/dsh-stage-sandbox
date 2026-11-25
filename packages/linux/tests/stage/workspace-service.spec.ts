@@ -96,9 +96,17 @@ describe('workspace service branches and integrity', () => {
     expect(ctx.sandboxWorkspace.state(workspace).pending).not.toBeNull()
     expect(existsSync(join(workspace, '.git', 'config'))).toBe(false)
 
+    /**
+     * Confirming a dangerous change used to publish it; `.git/config` is where
+     * "dangerous" turns into "arbitrary command execution" (`core.hooksPath`,
+     * `core.pager`), so the publication now refuses the batch outright while
+     * the real file stays untouched. The hold itself is unchanged: the reviewer
+     * still sees it, and the refusal carries the machine-readable reason.
+     */
     const confirmed = await ctx.sandboxWorkspace.apply(workspace, { confirm: true })
-    expect(confirmed.kind).toBe('published')
-    expect(readFileSync(join(workspace, '.git', 'config'), 'utf8')).toBe('[core]\n')
+    expect(confirmed.kind).toBe('denied')
+    expect(confirmed.reasonCodes).toEqual(['GIT_INTERNAL'])
+    expect(existsSync(join(workspace, '.git', 'config'))).toBe(false)
   })
 
   it('applies one file and leaves the rest pending (selective publication)', async () => {

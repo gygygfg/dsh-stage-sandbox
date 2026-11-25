@@ -31,18 +31,30 @@ describe('git atomic apply ordering', () => {
   it('publishes git objects and pointers together', async () => {
     const target = temp('dsh-git-target-')
     const candidatePath = temp('dsh-git-cand-')
+    // A real commit shape: one loose object, a v2 index that references it, and
+    // a ref that points at it. (`cdef` alone would be a dangling reference and a
+    // bare `index` string would be an unparsable index: both are refused now.)
+    const oid = `ab${'c'.repeat(38)}`
     mkdirSync(join(candidatePath, '.git', 'objects', 'ab'), { recursive: true })
     mkdirSync(join(candidatePath, '.git', 'refs', 'heads'), { recursive: true })
-    writeFileSync(join(candidatePath, '.git', 'objects', 'ab', 'cdef'), 'blob')
-    writeFileSync(join(candidatePath, '.git', 'index'), 'index')
-    writeFileSync(join(candidatePath, '.git', 'refs', 'heads', 'main'), 'cdef')
+    writeFileSync(join(candidatePath, '.git', 'objects', 'ab', oid.slice(2)), 'blob')
+    const header = Buffer.alloc(12)
+    header.write('DIRC', 0, 'latin1')
+    header.writeUInt32BE(2, 4)
+    header.writeUInt32BE(1, 8)
+    const entry = Buffer.alloc(64)
+    Buffer.from(oid, 'hex').copy(entry, 40)
+    entry.writeUInt16BE(1, 60)
+    entry.write('a', 62, 'latin1')
+    writeFileSync(join(candidatePath, '.git', 'index'), Buffer.concat([header, entry]))
+    writeFileSync(join(candidatePath, '.git', 'refs', 'heads', 'main'), `${oid}\n`)
 
     const backend = new DirectoryPublicationBackend()
     const candidate = freezeCandidate({ path: candidatePath, baseVersion: await backend.currentVersion(target), scope: SCOPE, entries: scanTree(candidatePath) })
     await backend.apply({ target, candidate, expectedBase: candidate.baseVersion })
 
-    expect(readFileSync(join(target, '.git', 'objects', 'ab', 'cdef'), 'utf8')).toBe('blob')
+    expect(readFileSync(join(target, '.git', 'objects', 'ab', oid.slice(2)), 'utf8')).toBe('blob')
     expect(existsSync(join(target, '.git', 'index'))).toBe(true)
-    expect(readFileSync(join(target, '.git', 'refs', 'heads', 'main'), 'utf8')).toBe('cdef')
+    expect(readFileSync(join(target, '.git', 'refs', 'heads', 'main'), 'utf8').trim()).toBe(oid)
   })
 })

@@ -9,11 +9,12 @@
  * @module dsh-sandbox-linux/publish/directory-backend
  */
 
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { CandidateRef } from '../control/records.ts'
 import { digestFile, manifestDigest, scanTree, type ManifestEntry } from '../candidate/manifest.ts'
 import { PublicationConflictError, type PublicationBackend } from './publisher.ts'
+import { gitApplyRank, planGitPublication } from './git-control.ts'
 
 /** Whether a path exists without following a final symlink. */
 function lexists(path: string): boolean {
@@ -50,20 +51,12 @@ function versionOf(root: string): string {
 /**
  * The order a desired entry is written in. Git's `.git` store is a coupled
  * database: an index/ref (a POINTER) references blobs in `objects/`, so
- * objects must exist first or a reader sees a dangling reference. Objects rank
- * 0, pointers rank 2, everything else ranks 1; ties keep manifest order.
+ * objects must exist first or a reader sees a dangling reference.
  * @param path - the POSIX-relative entry path.
- * @returns the apply rank.
+ * @returns the apply rank (objects 0, ordinary 1, pointers 2).
  */
 export function applyRank(path: string): number {
-  if (path !== '.git' && !path.startsWith('.git/')) return 1
-  const rest = path === '.git' ? '' : path.slice('.git/'.length)
-  if (rest.startsWith('objects/')) return 0
-  if (rest === 'index' || rest === 'HEAD' || rest === 'ORIG_HEAD' || rest === 'MERGE_HEAD'
-    || rest === 'packed-refs' || rest.startsWith('refs/') || rest.startsWith('logs/')) {
-    return 2
-  }
-  return 1
+  return gitApplyRank(path)
 }
 
 /** Whether the target already satisfies one desired entry (content and mode). */
@@ -154,9 +147,26 @@ export class DirectoryPublicationBackend implements PublicationBackend {
     // the changed content (a delta), which is sufficient because the base check
     // above proved every unchanged entry still matches.
     const desired = input.candidate.entries ?? scanTree(input.candidate.path)
-    syncTree(input.target, input.candidate.path, desired, currentEntries)
+    /**
+     * `.git` is not an ordinary subtree: an index/ref only holds object names,
+     * so publishing half of a `git commit` (or a hook that runs on the user's
+     * next commit) must be refused *before* the first byte is written. The plan
+     * is computed against the post-state of every repository in the candidate.
+     */
+    const read = (relPath: string): Buffer | undefined => {
+      for (const base of [input.candidate.path, input.target]) {
+        try {
+          return readFileSync(join(base, relPath))
+        } catch {
+          /* try the next root */
+        }
+      }
+      return undefined
+    }
+    const plan = planGitPublication({ root: input.target, desired, current: currentEntries, read })
+    syncTree(input.target, input.candidate.path, plan.entries, currentEntries)
     const newVersion = versionOf(input.target)
-    if (newVersion !== manifestDigest(desired)) {
+    if (newVersion !== manifestDigest(plan.entries)) {
       throw new Error(`publication verification failed: target ${input.target} does not match the frozen candidate`)
     }
     return { newVersion }
